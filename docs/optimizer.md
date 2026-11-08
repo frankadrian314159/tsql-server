@@ -1,0 +1,56 @@
+# The query optimizer
+
+The optimizer decides *how* a query is answered: which index to read, where to apply each condition, in which
+order to join tables and by which method. It never changes the answer (a test runs 54 query shapes with it on
+and off and compares the results), only how long it takes. There is nothing to configure: no statistics to
+gather and no plan to invalidate; what it needs is worked out from the tables and indexes as they are when
+the query runs. Row counts are kept in the trees; distinct-value counts are read from an index exactly when it is
+small (up to 20,000 entries) and extrapolated from 48 sampled leaf pages when it is large, so planning never reads a
+big index in full. The design follows the optimizer in the sibling `accessor` project.
+
+## What it does
+
+1. **Pushdown.** A `WHERE` conjunct that reads only one table is applied while that table is scanned, before any
+   join. For the null-supplying side of an outer join this would change the answer, so it is not done there.
+2. **Index selection.** For each table the conditions (`=`, `IN`, `<`, `<=`, `>`, `>=`, `BETWEEN`, with constant
+   operands) are matched against the table's indexes: the index with the longest equality prefix wins, a full
+   match on a unique index beats everything, a range on the first column is the fallback. A constant is only used
+   when it converts to the column's type *without loss* (`cust_id = 5.5` is not turned into `= 5`), and string and
+   numeric columns are never compared across types. The executor re-checks every condition, so an index only has to
+   return a superset of the matching rows.
+3. **Join order.** Tables joined with commas or `INNER` / `CROSS JOIN` form a cluster. Each member's row count is
+   estimated (after its pushed-down conditions, using index distinct counts), the smallest is joined first, and
+   then the cheapest table that is connected to the rows so far by a join condition. Join conditions from `ON` and
+   from `WHERE` are both used, so `FROM a, b WHERE a.x = b.y` is a join, not a cross product. The original column
+   order is restored afterwards, so `SELECT *` is unaffected.
+4. **Join methods.** If the next table has an index on its join columns and few rows have been joined so far, its
+   index is probed with the distinct join keys (index nested-loop). Otherwise an equality join is a hash join, with
+   the other conditions as a residual filter.
+5. **Ordered reads.** For a single table, `ORDER BY` over exactly the columns of an index reads the index in order
+   instead of sorting; with `TOP n` / `OFFSET … FETCH` and all conditions applied during the scan it also stops
+   after the rows needed. Descending order is read backwards when the index is unique.
+6. **Locking benefit.** Because seeks touch only the matching rows, a reader of one row does not wait for a writer
+   of another (see [concurrency.md](concurrency.md)).
+
+Outer joins keep their written order; `OR` conditions, functions of columns and subqueries are not used to choose
+indexes; subqueries run per outer row.
+
+## Seeing the plan
+
+```sql
+SET SHOWPLAN_TEXT ON;          -- statements are described, not executed
+SELECT * FROM ord o JOIN cust c ON c.id = o.cust_id WHERE c.id = 4;
+SET SHOWPLAN_TEXT OFF;
+```
+
+```
+SELECT
+  |--join order: c -> o (reordered from the query's order)
+  |--scan c [4 rows]: index seek via PK__cust__000186A2 (1 key(s)) (1 condition(s) pushed down) -> est 1 rows
+  |--scan o [4 rows]: index seek via ix_ord_cust (0 key(s)) (0 condition(s) pushed down) -> est 4 rows
+  |--join o: index nested-loop via ix_ord_cust; 0 rows in, 0 out
+```
+
+From Rust: `conn.explain(sql)` returns the same lines, and `conn.last_plan()` returns the decisions (with actual
+row counts) of the statement that last ran. `SET OPTIMIZER OFF` switches the optimizer off for the session (every
+table is scanned in the written order), which is how the equivalence tests get their baseline.
