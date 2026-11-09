@@ -2,7 +2,7 @@
 name = "tsql-server"
 version = "0.1.0"
 edition = "2021"
-description = "An in-memory clone of Microsoft SQL Server with a T-SQL engine"
+description = "A clone of Microsoft SQL Server with a T-SQL engine, durable storage and a TDS listener"
 license = "MIT"
 
 [lib]
@@ -12,6 +12,21 @@ path = "src/lib.rs"
 [[bin]]
 name = "tsql"
 path = "src/main.rs"
+
+[[bin]]
+name = "tsql-serve"
+path = "src/serve.rs"
+
+# The desktop app is optional so the engine and the shell build without a GUI toolkit:
+#   cargo run --release --features gui --bin tsql-gui
+[[bin]]
+name = "tsql-gui"
+path = "src/gui/main.rs"
+required-features = ["gui"]
+
+[features]
+default = []
+gui = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:rfd"]
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
@@ -25,9 +40,21 @@ regex = "1"
 serde = { version = "1", features = ["derive", "rc"] }
 postcard = { version = "1", features = ["alloc"] }
 crc32fast = "1"
+eframe = { version = "0.32.3", optional = true }
+egui = { version = "0.32.3", optional = true }
+egui_extras = { version = "0.32.3", optional = true }
+rfd = { version = "0.17.2", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+# an independent TDS client, to check the server against a real implementation
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono"] }
+tokio = { version = "1", features = ["rt", "net", "macros"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 
 [profile.release]
 opt-level = 3
+
+# rustc crashes (STACK_BUFFER_OVERRUN) compiling this GUI dependency without optimisation
+[profile.dev.package.simd-adler32]
+opt-level = 1

@@ -11,8 +11,9 @@ statement-terminating vs batch-aborting errors, blocking and deadlocks, permissi
 
 > **Scope note.** "All of T-SQL" is the size of a multi-year product. This project implements
 > the language core and the commonly used surface faithfully and is explicit about what is not
-> implemented (see [Limitations](#limitations)). The wire protocol (TDS) is **not** implemented:
-> you talk to the engine through the Rust API or the bundled shell, not through ODBC/ADO.NET/SSMS.
+> implemented (see [Limitations](#limitations)). The TDS wire protocol
+> is implemented (`tsql-serve`, see [docs/tds.md](docs/tds.md)) for SQL-authenticated, unencrypted connections, so
+> ADO.NET and tiberius can connect; so can the Rust API and the bundled shell. Clients that insist on TLS cannot yet.
 
 ## What it has
 
@@ -22,6 +23,8 @@ statement-terminating vs batch-aborting errors, blocking and deadlocks, permissi
 | **Transactions & isolation** | `READ UNCOMMITTED`, `READ COMMITTED` (locking), `REPEATABLE READ`, `SERIALIZABLE`, `SNAPSHOT`, `READ_COMMITTED_SNAPSHOT`; row and table locks with intent modes, blocking, lock timeouts (1222), deadlock detection (1205). | [docs/concurrency.md](docs/concurrency.md) |
 | **Security** | Logins with salted password hashes, database users, roles (fixed and custom), `GRANT` / `DENY` / `REVOKE`, ownership chaining, `EXECUTE AS`, permission errors with SQL Server's numbers and text. | [docs/security.md](docs/security.md) |
 | **Query optimizer** | Predicate pushdown, index selection (seek / range / IN-list), cost-based join ordering, index nested-loop and hash joins, ordered index reads that stop early for `TOP … ORDER BY`, `SET SHOWPLAN_TEXT`. | [docs/optimizer.md](docs/optimizer.md) |
+| **Shell and desktop app** | `tsql`: an interactive shell with `GO` batches, grids, dot-commands (`.tables`, `.schema`, `.import`, `.export`, `.plan`, `.storage`, …) and script/exit-code support. `tsql-gui`: an egui app with a navigation pane, editable datasheets, a table designer, a query editor with plans, CSV import/export, transactions and live storage statistics. | [docs/shell-and-gui.md](docs/shell-and-gui.md) |
+| **TDS server** | `tsql-serve` listens on a TCP port and speaks TDS 7.4: SQL logins, batches, `sp_executesql`, prepared statements and procedure calls with OUTPUT parameters and return status, transactions, attention, all the data types. Checked against `System.Data.SqlClient` and tiberius. No TLS yet. | [docs/tds.md](docs/tds.md) |
 | **T-SQL language** | Queries, DML, DDL, procedural code, cursors, dynamic SQL, JSON, windows, CTEs, MERGE, triggers, … | [Coverage](#t-sql-coverage) |
 
 ## Quick start
@@ -31,9 +34,11 @@ cargo build --release
 cargo run --release --bin tsql -- -D ./data           # durable shell on ./data (created if missing)
 cargo run --release --bin tsql -- -D ./data --pool-pages 4096   # cache 4096 pages = 32 MiB
 cargo run --release --bin tsql                         # in-memory shell (nothing is written)
+cargo run --release --bin tsql-serve -- ./data --sa-password "Str0ng!pw"   # TDS server on 127.0.0.1:1433
+cargo run --release --features gui --bin tsql-gui      # desktop app (add a data directory to keep your data)
 cargo run --bin tsql -- -D ./data -Q "SELECT @@VERSION"
 cargo run --bin tsql -- -D ./data -U ann -P secret     # log in as a SQL login
-cargo test                                             # ~165 tests
+cargo test                                             # ~200 tests
 TSQL_TEST_PAGED=1 cargo test                           # same tests on a disk server with an 8-page cache
 ```
 
@@ -77,6 +82,9 @@ exactly as described in [docs/concurrency.md](docs/concurrency.md).
 | `storage` | Page file, buffer pool and B+tree (`page`); table heap with MVCC version chains and indexes on top of it; lock manager; transaction and undo-log types |
 | `catalog` | Databases, schemas, tables, views, procedures, functions, triggers, sequences, user types |
 | `persist` | Write-ahead log, checkpoints, crash recovery, data-directory locking |
+| `inspect`, `tools` | Catalog introspection (`table_info`, `objects`, …) and helpers for front ends: result grids, CSV import/export, SQL literals, table scripts |
+| `tds/`, `serve.rs` | The TDS 7.4 listener (`tds::Listener`) and the `tsql-serve` program: packets, login, batches, RPC, transaction-manager requests, token streams, data type encoding |
+| `main.rs`, `gui/` | The `tsql` shell, and the optional `tsql-gui` desktop app (cargo feature `gui`) |
 | `security` | Logins, users, roles, permission resolution |
 | `engine` | Sessions, batches, control flow, `TRY…CATCH`, transactions, procedures; query pipeline; DML with constraints / foreign keys / triggers; DDL; optimizer (`optimizer`, `joins`); lock-aware reads (`txn`); permission checks (`secexec`); built-in functions; `sys.*` views |
 
@@ -134,7 +142,8 @@ window functions, JSON (`JSON_VALUE JSON_QUERY JSON_MODIFY OPENJSON ISJSON`), `H
 
 Things that are **not** implemented, so you are not surprised:
 
-* **TDS wire protocol / network listener** — use the Rust API or the shell.
+* **TDS: TLS, integrated authentication, bulk load, server cursors, MARS** — clients must connect with encryption
+  off or optional (`Encrypt=False`, `sqlcmd -No`); see [docs/tds.md](docs/tds.md).
 * **Memory use** — stored data (heaps, indexes, version chains, large values) live in a paged file and are cached by a
   bounded buffer pool, so a database may be much larger than RAM. What must still fit in memory is the working set of
   one statement (rows it scans and keeps, joins, sorts, aggregates and results are materialised; there is no spill
@@ -153,6 +162,9 @@ Things that are **not** implemented, so you are not surprised:
   sampled for large ones);
   no histograms on unindexed columns, no hints (`OPTION (HASH JOIN)`, `FORCE ORDER`, …), outer joins are not reordered,
   subqueries are executed per row rather than rewritten to semi-joins, and there is no plan cache.
+* **Tools** — the shell and the desktop app use one session each; the app runs statements on its UI thread, and
+  `.schema` / *Script* cannot reproduce `DEFAULT`, `CHECK` and computed-column expressions (see
+  [docs/shell-and-gui.md](docs/shell-and-gui.md)).
 * **XML / spatial / hierarchy** — `xml` is stored as text with no XQuery (`.value()`, `.query()`, `OPENXML`);
   `geography`, `geometry`, `hierarchyid` are not functional. No full-text search, Service Broker, CLR, SQL Agent,
   linked servers, `BULK INSERT`, temporal tables, graph tables, columnstore, partitioning, replication, backup/restore
@@ -169,11 +181,12 @@ cargo clippy              # lint
 ```
 
 Tests are grouped by area: `datatypes`, `queries`, `dml`, `programmability`, `functions`, `ddl_catalog`, `views_dml`,
-`isolation` (real threads), `persistence` (crash simulation, torn log tails), `paging` (data far larger than the buffer
+`isolation` (real threads), `persistence` (crash simulation, torn log tails), `tools` (introspection, CSV, scripts), `cli` (the shell as a process), `tds` (a tiberius client against the listener), `tds_raw` (protocol-level RPC, prepared statements, transaction-manager requests), `paging` (data far larger than the buffer
 pool, eviction of uncommitted pages, crash during a checkpoint, overflow rows, space reuse), `security`, `optimizer`
 (results with the optimizer on and off must be identical, plus plan assertions). Unit tests in `src/storage` check the
 B+tree against a `BTreeMap` while the cache is forced to evict. `TSQL_TEST_PAGED=1 cargo test` runs the whole suite
-against a disk-backed server with an 8-page cache. Expected values encode real SQL Server behaviour.
+against a disk-backed server with an 8-page cache. `cargo test --features gui` also runs the GUI's headless tests
+(views are driven without a window). Expected values encode real SQL Server behaviour.
 
 ## License
 

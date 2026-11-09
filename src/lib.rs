@@ -13,11 +13,14 @@ pub mod convert;
 pub mod decimal;
 pub mod engine;
 pub mod error;
+pub mod inspect;
 pub mod lexer;
 pub mod parser;
 pub mod persist;
 pub mod security;
 pub mod storage;
+pub mod tds;
+pub mod tools;
 pub mod types;
 
 use catalog::ServerState;
