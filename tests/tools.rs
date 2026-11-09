@@ -173,10 +173,10 @@ fn script_table_recreates_the_structure() {
     let ord = tools::script_table(&c.table_info("ord").unwrap());
     assert!(cust.contains("[id] int IDENTITY(1,1) NOT NULL"), "{cust}");
     assert!(cust.contains("CONSTRAINT [uq_email] UNIQUE ([email])"), "{cust}");
-    assert!(cust.contains("-- not reproduced: DEFAULT on email"), "{cust}");
+    assert!(cust.contains("DEFAULT ("), "{cust}");
     assert!(ord.contains("CREATE INDEX [ix_ord_amt] ON [dbo].[ord] ([amt] DESC, [cust_id]);"), "{ord}");
     assert!(ord.contains("FOREIGN KEY ([cust_id]) REFERENCES [dbo].[cust] ([id]) ON DELETE CASCADE"), "{ord}");
-    assert!(ord.contains("-- not reproduced: CHECK ck_amt"), "{ord}");
+    assert!(ord.contains("ADD CONSTRAINT [ck_amt] CHECK ("), "{ord}");
     // the script runs on a fresh server and yields the same structure
     let mut d = conn();
     script(&mut d, &format!("{cust}\nGO\n{ord}\nGO"));
@@ -186,7 +186,30 @@ fn script_table_recreates_the_structure() {
         assert_eq!(cols(&a), cols(&b), "{t}");
         assert_eq!(a.indexes.len(), b.indexes.len(), "{t}");
         assert_eq!(a.foreign_keys.len(), b.foreign_keys.len(), "{t}");
+        let exprs = |t: &tsql_server::inspect::TableInfo| (t.columns.iter().map(|c| c.default_text.clone()).collect::<Vec<_>>(), t.check_defs.iter().map(|k| (k.name.clone(), k.text.clone())).collect::<Vec<_>>());
+        assert_eq!(exprs(&a), exprs(&b), "{t}");
     }
+}
+
+#[test]
+fn script_keeps_defaults_checks_and_computed_columns_working() {
+    let mut c = conn();
+    script(&mut c, "CREATE TABLE ex (id INT PRIMARY KEY, qty INT NOT NULL CONSTRAINT df_qty DEFAULT (1 + 2), price DECIMAL(8,2) NOT NULL DEFAULT 5, total AS (qty * price), CONSTRAINT ck_qty CHECK (qty BETWEEN 0 AND 100 AND id > 0));
+GO
+ALTER TABLE ex ADD note VARCHAR(5) DEFAULT 'n/a' CHECK (LEN(note) > 1);
+GO
+ALTER TABLE ex NOCHECK CONSTRAINT ck_qty;
+GO");
+    let sql = tools::script_table(&c.table_info("ex").unwrap());
+    assert!(sql.contains("[total] AS (qty * price)"), "{sql}");
+    assert!(sql.contains("CONSTRAINT [df_qty] DEFAULT (1 + 2)"), "{sql}");
+    assert!(sql.contains("NOCHECK CONSTRAINT [ck_qty]"), "{sql}");
+    let mut d = conn();
+    script(&mut d, &format!("{sql}
+GO"));
+    exec(&mut d, "INSERT ex (id) VALUES (1)");
+    assert_eq!(rows(&mut d, "SELECT qty, price, total, note FROM ex"), vec![vec!["3", "5.00", "15.00", "n/a"]]);
+    assert!(d.execute("INSERT ex (id, note) VALUES (2, 'x')").first_error().is_some(), "column check must survive scripting");
 }
 
 #[test]

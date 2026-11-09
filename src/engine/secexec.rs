@@ -12,6 +12,18 @@ impl<'a> Engine<'a> {
         self.ses.imp_stack.last().map(|(l, _)| l.clone()).unwrap_or_else(|| self.ses.login.clone())
     }
 
+    /// May this session see masked columns unmasked (sysadmin, db_owner, or granted UNMASK)?
+    pub fn can_unmask(&self) -> bool {
+        if self.is_sysadmin() {
+            return true;
+        }
+        let dbk = self.ses.db.to_lowercase();
+        match (self.db_user(&dbk), self.srv.databases.get(&dbk)) {
+            (Some(u), Some(db)) => db.security.allowed(&u, "UNMASK", "dbo", None),
+            _ => false,
+        }
+    }
+
     pub fn is_sysadmin(&self) -> bool {
         self.srv.security.is_sysadmin(&self.eff_login())
     }
@@ -73,6 +85,61 @@ impl<'a> Engine<'a> {
             let dbname = db.name.clone();
             Err(denied_object(perm, &dbname, schema, display))
         }
+    }
+
+    /// SELECT permission on a table for a query that is about to read it. Without table-wide SELECT, a user who
+    /// holds SELECT on some columns may still read the table; the result says, per column, whether reading it is
+    /// denied (the text completing the error) so that using such a column fails where it is used.
+    /// An empty vector means every column is readable.
+    pub fn select_denials(&self, loc: &Loc, name: &[String], t: &Table) -> Result<Vec<Option<Arc<String>>>> {
+        let shown = name.last().map(|s| s.as_str()).unwrap_or("");
+        let table_wide = self.check_object_perm(loc, "SELECT", shown);
+        let Loc::Db(d, k) = loc else { return table_wide.map(|_| vec![]) };
+        let (schema, obj) = Self::split_key(k);
+        let Some(db) = self.srv.databases.get(d) else { return table_wide.map(|_| vec![]) };
+        let Some(user) = self.db_user(d) else { return table_wide.map(|_| vec![]) };
+        // no column-level entries for this user and table: only the table-wide answer matters
+        if !db.security.has_column_entries(&user, k) {
+            return table_wide.map(|_| vec![]);
+        }
+        // administrators, the owner and ownership chains are never restricted by column entries
+        let owner = self.schema_owner_of(d, &schema);
+        let exempt = self.is_sysadmin() || user.eq_ignore_ascii_case(&owner) || self.ses.module_owner.last().map(|o| *o == owner).unwrap_or(false);
+        if exempt {
+            return table_wide.map(|_| vec![]);
+        }
+        let readable: Vec<bool> = t.columns.iter().map(|c| db.security.allowed_column(&user, "SELECT", &schema, k, &c.name)).collect();
+        if !readable.iter().any(|r| *r) {
+            return Err(table_wide.err().unwrap_or_else(|| denied_object("SELECT", &db.name, &schema, shown)));
+        }
+        if readable.iter().all(|r| *r) {
+            return Ok(vec![]);
+        }
+        let suffix = Arc::new(format!(" of the object '{}', database '{}', schema '{}'.", obj, db.name, schema));
+        Ok(readable.into_iter().map(|r| if r { None } else { Some(suffix.clone()) }).collect())
+    }
+
+    /// UPDATE permission for the columns a statement assigns (column-level grants are honoured).
+    pub fn check_update_columns(&self, loc: &Loc, name: &[String], t: &Table, assigned: &[usize]) -> Result<()> {
+        let shown = name.last().map(|s| s.as_str()).unwrap_or("");
+        let first = match self.check_object_perm(loc, "UPDATE", shown) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        let Loc::Db(d, k) = loc else { return Err(first) };
+        let (schema, obj) = Self::split_key(k);
+        let Some(user) = self.db_user(d) else { return Err(first) };
+        let Some(db) = self.srv.databases.get(d) else { return Err(first) };
+        if assigned.is_empty() || !db.security.has_column_entries(&user, k) {
+            return Err(first);
+        }
+        for &c in assigned {
+            let col = &t.columns[c].name;
+            if !db.security.allowed_column(&user, "UPDATE", &schema, k, col) {
+                return Err(SqlError::with(230, 14, 1, format!("The UPDATE permission was denied on the column '{}' of the object '{}', database '{}', schema '{}'.", col, obj, db.name, schema)));
+            }
+        }
+        Ok(())
     }
 
     fn split_key(key: &str) -> (String, String) {
@@ -166,7 +233,7 @@ impl<'a> Engine<'a> {
                 if let Some(d) = default_db {
                     l.default_db = d.clone();
                 }
-                self.srv.security.logins.insert(k, l);
+                self.srv.cat_mut().security.logins.insert(k, l);
                 self.log_security();
             }
             SecStmt::AlterLogin { name, password, disabled, default_db } => {
@@ -174,7 +241,7 @@ impl<'a> Engine<'a> {
                 if !self.is_sysadmin() && !(own && password.is_some()) {
                     return Err(SqlError::with(15247, 16, 1, "User does not have permission to perform this action."));
                 }
-                let l = self.srv.security.logins.get_mut(&name.to_lowercase()).ok_or_else(|| SqlError::new(15151, format!("Cannot alter the login '{}', because it does not exist or you do not have permission.", name)))?;
+                let l = self.srv.cat_mut().security.logins.get_mut(&name.to_lowercase()).ok_or_else(|| SqlError::new(15151, format!("Cannot alter the login '{}', because it does not exist or you do not have permission.", name)))?;
                 if let Some(p) = password {
                     l.set_password(p);
                 }
@@ -195,7 +262,7 @@ impl<'a> Engine<'a> {
                     }
                 }
                 let mapped = login.clone().or_else(|| Some(name.clone()).filter(|n| self.srv.security.logins.contains_key(&n.to_lowercase())));
-                let d = self.srv.databases.get_mut(&dbk).unwrap();
+                let d = self.srv.cat_mut().databases.get_mut(&dbk).unwrap();
                 if d.security.principals.contains_key(&k) {
                     return Err(SqlError::new(15023, format!("User, group, or role '{}' already exists in the current database.", name)));
                 }
@@ -205,7 +272,7 @@ impl<'a> Engine<'a> {
             }
             SecStmt::AlterUser { name, default_schema, new_name } => {
                 self.require_admin("ALTER USER")?;
-                let d = self.srv.databases.get_mut(&dbk).unwrap();
+                let d = self.srv.cat_mut().databases.get_mut(&dbk).unwrap();
                 let p = d.security.principals.get_mut(&name.to_lowercase()).ok_or_else(|| SqlError::new(15151, format!("Cannot alter the user '{}', because it does not exist or you do not have permission.", name)))?;
                 if let Some(s) = default_schema {
                     p.default_schema = s.clone();
@@ -222,7 +289,7 @@ impl<'a> Engine<'a> {
             SecStmt::CreateRole { name } => {
                 self.require_admin("CREATE ROLE")?;
                 let k = name.to_lowercase();
-                let d = self.srv.databases.get_mut(&dbk).unwrap();
+                let d = self.srv.cat_mut().databases.get_mut(&dbk).unwrap();
                 if d.security.principals.contains_key(&k) {
                     return Err(SqlError::new(15023, format!("User, group, or role '{}' already exists in the current database.", name)));
                 }
@@ -232,7 +299,7 @@ impl<'a> Engine<'a> {
             }
             SecStmt::AlterRole { role, add, member } => {
                 self.require_admin("ALTER ROLE")?;
-                let d = self.srv.databases.get_mut(&dbk).unwrap();
+                let d = self.srv.cat_mut().databases.get_mut(&dbk).unwrap();
                 let r = d.security.principal(role).filter(|p| p.is_role).ok_or_else(|| SqlError::new(15151, format!("Cannot alter the role '{}', because it does not exist or you do not have permission.", role)))?.name.to_lowercase();
                 let m = d.security.principal(member).ok_or_else(|| SqlError::new(15410, format!("User or role '{}' does not exist in this database.", member)))?.name.to_lowercase();
                 if *add {
@@ -250,8 +317,8 @@ impl<'a> Engine<'a> {
                     return Err(SqlError::new(15151, format!("Cannot find the login '{}', because it does not exist or you do not have permission.", member)));
                 }
                 let set = match role.to_lowercase().as_str() {
-                    "sysadmin" => &mut self.srv.security.sysadmins,
-                    "dbcreator" => &mut self.srv.security.dbcreators,
+                    "sysadmin" => &mut self.srv.cat_mut().security.sysadmins,
+                    "dbcreator" => &mut self.srv.cat_mut().security.dbcreators,
                     _ => return Err(SqlError::new(15151, format!("Cannot alter the server role '{}', because it does not exist or you do not have permission.", role))),
                 };
                 if *add {
@@ -261,9 +328,9 @@ impl<'a> Engine<'a> {
                 }
                 self.log_security();
             }
-            SecStmt::Perm { kind, perms, target, principals, with_grant, columns } => {
-                if *columns {
-                    return Err(SqlError::new(15477, "Column-level permissions are not supported; grant the permission on the whole object."));
+            SecStmt::Perm { kind, perms, target, principals, with_grant, cols } => {
+                if cols.iter().any(|c| !c.is_empty()) && !matches!(target, PermTargetAst::Object(_)) {
+                    return Err(SqlError::new(102, "Incorrect syntax: a column list needs an object."));
                 }
                 let (ptarget, owner_ok, schema_for_owner) = match target {
                     PermTargetAst::Database => (PermTarget::Database, false, String::new()),
@@ -297,13 +364,33 @@ impl<'a> Engine<'a> {
                     if !self.srv.databases[&dbk].security.principals.contains_key(&pk) {
                         return Err(SqlError::new(15151, format!("Cannot find the user '{}', because it does not exist or you do not have permission.", pr)));
                     }
-                    for perm in perms {
+                    for (pi, perm) in perms.iter().enumerate() {
                         let state = match kind {
                             PermKind::Grant => Some(PermState::Grant),
                             PermKind::Deny => Some(PermState::Deny),
                             PermKind::Revoke => None,
                         };
-                        self.srv.databases.get_mut(&dbk).unwrap().security.set_perm(pr, perm, ptarget.clone(), state, *with_grant);
+                        let columns = cols.get(pi).cloned().unwrap_or_default();
+                        if columns.is_empty() {
+                            self.srv.cat_mut().databases.get_mut(&dbk).unwrap().security.set_perm(pr, perm, ptarget.clone(), state, *with_grant);
+                            continue;
+                        }
+                        // column-level: SELECT, UPDATE, INSERT and REFERENCES apply to columns
+                        let PermTarget::Object(key) = &ptarget else { unreachable!() };
+                        if !matches!(perm.as_str(), "SELECT" | "UPDATE" | "INSERT" | "REFERENCES") {
+                            return Err(SqlError::new(1049, format!("The {} permission cannot be granted on columns.", perm)));
+                        }
+                        let tbl = match &self.srv.databases[&dbk].objects.get(key) {
+                            Some(Object::Table(t)) => t.clone(),
+                            _ => return Err(SqlError::new(4604, "Column permissions apply to tables and views only.")),
+                        };
+                        for c in &columns {
+                            if tbl.col_index(c).is_none() {
+                                return Err(SqlError::new(207, format!("Invalid column name '{}'.", c)));
+                            }
+                            let canonical = tbl.columns[tbl.col_index(c).unwrap()].name.to_lowercase();
+                            self.srv.cat_mut().databases.get_mut(&dbk).unwrap().security.set_perm(pr, perm, PermTarget::Column(key.clone(), canonical), state, *with_grant);
+                        }
                     }
                 }
                 self.log_db_security();
@@ -346,17 +433,17 @@ impl<'a> Engine<'a> {
                 if k == "sa" {
                     return Err(SqlError::new(15405, "Cannot use the special principal 'sa'."));
                 }
-                if self.srv.security.logins.remove(&k).is_none() && !if_exists {
+                if self.srv.cat_mut().security.logins.remove(&k).is_none() && !if_exists {
                     return Err(SqlError::new(15151, format!("Cannot drop the login '{}', because it does not exist or you do not have permission.", name)));
                 }
-                self.srv.security.sysadmins.remove(&k);
-                self.srv.security.dbcreators.remove(&k);
+                self.srv.cat_mut().security.sysadmins.remove(&k);
+                self.srv.cat_mut().security.dbcreators.remove(&k);
                 self.log_security();
             }
             _ => {
                 self.require_admin("DROP")?;
                 let k = name.to_lowercase();
-                let d = self.srv.databases.get_mut(&dbk).unwrap();
+                let d = self.srv.cat_mut().databases.get_mut(&dbk).unwrap();
                 let is_role = what == "ROLE";
                 let ok = d.security.principals.get(&k).map(|p| p.is_role == is_role).unwrap_or(false);
                 if !ok || crate::security::FIXED_ROLES.contains(&k.as_str()) || k == "dbo" || k == "public" || k == "guest" {

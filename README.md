@@ -12,8 +12,8 @@ statement-terminating vs batch-aborting errors, blocking and deadlocks, permissi
 > **Scope note.** "All of T-SQL" is the size of a multi-year product. This project implements
 > the language core and the commonly used surface faithfully and is explicit about what is not
 > implemented (see [Limitations](#limitations)). The TDS wire protocol
-> is implemented (`tsql-serve`, see [docs/tds.md](docs/tds.md)) for SQL-authenticated, unencrypted connections, so
-> ADO.NET and tiberius can connect; so can the Rust API and the bundled shell. Clients that insist on TLS cannot yet.
+> is implemented (`tsql-serve`, see [docs/tds.md](docs/tds.md)) for SQL-authenticated connections (optionally encrypted with TLS), so
+> ADO.NET and tiberius can connect; so can the Rust API and the bundled shell.
 
 ## What it has
 
@@ -21,10 +21,13 @@ statement-terminating vs batch-aborting errors, blocking and deadlocks, permissi
 | --- | --- | --- |
 | **Durable, paged storage** | Tables and indexes are B+trees of 8 KiB pages in a page file behind a buffer pool, so a database can be far larger than memory. Every commit is written to a checksummed write-ahead log and fsynced before it returns; shadow paging makes checkpoints atomic and lets any page be evicted at any time; recovery replays the log and discards a torn tail. | [docs/storage.md](docs/storage.md) |
 | **Transactions & isolation** | `READ UNCOMMITTED`, `READ COMMITTED` (locking), `REPEATABLE READ`, `SERIALIZABLE`, `SNAPSHOT`, `READ_COMMITTED_SNAPSHOT`; row and table locks with intent modes, blocking, lock timeouts (1222), deadlock detection (1205). | [docs/concurrency.md](docs/concurrency.md) |
+| **Backup & recovery** | `BACKUP DATABASE` (a consistent snapshot while others write), `BACKUP LOG`, `RESTORE DATABASE` / `LOG` with `NORECOVERY`, `STOPAT` point-in-time recovery, `VERIFYONLY`, `HEADERONLY`, recovery models. | [docs/backup.md](docs/backup.md) |
+| **Collations** | `COLLATE` on databases, columns and expressions: case-, accent- and binary-sensitive comparison, ordering, grouping, joins, indexes and unique keys. | [docs/collations.md](docs/collations.md) |
+| **Administration** | `WAITFOR`, `KILL`, `sp_who`/`sp_who2`, `sp_configure`/`RECONFIGURE`, table hints (`NOLOCK`, `UPDLOCK`, `READPAST`, `NOWAIT`, ...), `OPTION` hints, a per-connection parse cache, `sys.dm_exec_sessions`/`requests`/`query_stats`/`cached_plans`. | [docs/administration.md](docs/administration.md) |
 | **Security** | Logins with salted password hashes, database users, roles (fixed and custom), `GRANT` / `DENY` / `REVOKE`, ownership chaining, `EXECUTE AS`, permission errors with SQL Server's numbers and text. | [docs/security.md](docs/security.md) |
 | **Query optimizer** | Predicate pushdown, index selection (seek / range / IN-list), cost-based join ordering, index nested-loop and hash joins, ordered index reads that stop early for `TOP … ORDER BY`, `SET SHOWPLAN_TEXT`. | [docs/optimizer.md](docs/optimizer.md) |
 | **Shell and desktop app** | `tsql`: an interactive shell with `GO` batches, grids, dot-commands (`.tables`, `.schema`, `.import`, `.export`, `.plan`, `.storage`, …) and script/exit-code support. `tsql-gui`: an egui app with a navigation pane, editable datasheets, a table designer, a query editor with plans, CSV import/export, transactions and live storage statistics. | [docs/shell-and-gui.md](docs/shell-and-gui.md) |
-| **TDS server** | `tsql-serve` listens on a TCP port and speaks TDS 7.4: SQL logins, batches, `sp_executesql`, prepared statements and procedure calls with OUTPUT parameters and return status, transactions, attention, all the data types. Checked against `System.Data.SqlClient` and tiberius. No TLS yet. | [docs/tds.md](docs/tds.md) |
+| **TDS server** | `tsql-serve` listens on a TCP port and speaks TDS 7.4: SQL logins, batches, `sp_executesql`, prepared statements and procedure calls with OUTPUT parameters and return status, transactions, attention, all the data types. Checked against `System.Data.SqlClient` and tiberius. TLS supported. | [docs/tds.md](docs/tds.md) |
 | **T-SQL language** | Queries, DML, DDL, procedural code, cursors, dynamic SQL, JSON, windows, CTEs, MERGE, triggers, … | [Coverage](#t-sql-coverage) |
 
 ## Quick start
@@ -142,35 +145,40 @@ window functions, JSON (`JSON_VALUE JSON_QUERY JSON_MODIFY OPENJSON ISJSON`), `H
 
 Things that are **not** implemented, so you are not surprised:
 
-* **TDS: TLS, integrated authentication, bulk load, server cursors, MARS** — clients must connect with encryption
-  off or optional (`Encrypt=False`, `sqlcmd -No`); see [docs/tds.md](docs/tds.md).
+* **TDS: integrated authentication, bulk load, server cursors, MARS** — see [docs/tds.md](docs/tds.md). TLS is
+  supported (a self-signed certificate is generated unless you give one; `--force-encryption` makes it mandatory).
 * **Memory use** — stored data (heaps, indexes, version chains, large values) live in a paged file and are cached by a
   bounded buffer pool, so a database may be much larger than RAM. What must still fit in memory is the working set of
-  one statement (rows it scans and keeps, joins, sorts, aggregates and results are materialised; there is no spill
-  for those operators), the catalog, the page table (~0.1 % of the data size) and the undo log of open transactions.
-  Pages are not merged after deletes and the file never shrinks (freed space is reused). A checkpoint is only taken
+  one statement: single-table `ORDER BY`, `DISTINCT`, `TOP n` and `GROUP BY`, and joins of base tables (a streaming hash
+  join that spills to partition files, grace-hash style), stream and spill to temporary files, and the rows of such a
+  `SELECT` are delivered to a TDS client as they are produced; window functions, scalar aggregates, set operations,
+  CTEs and derived tables are still materialised;
+  plus the catalog, the page table (~0.1 % of the data size) and the undo log of open transactions.
+  Sparse leaves are merged after deletes and the page file is compacted and truncated at checkpoints. A checkpoint is only taken
   when no transaction is open, so a transaction left open indefinitely keeps the log growing. See
   [docs/storage.md](docs/storage.md).
 * **Lock granularity** — row locks and table locks with intent modes; no page locks or lock escalation. `SERIALIZABLE`
-  prevents phantoms with a table-level shared lock rather than key-range locks, so it blocks more writers than SQL
-  Server would. Statements from different sessions are executed one at a time (interleaved at statement boundaries),
-  not in parallel.
-* **Permissions** — object-, schema- and database-level permissions; **column-level** permissions are rejected;
+  prevents phantoms with shared key-range locks on the index ranges it reads (a table lock for a scan with no usable
+  index; see [docs/concurrency.md](docs/concurrency.md)). Statements from different sessions run in parallel: the catalog is shared by queries and DML, writers latch
+  only the key values they check or change, commits are atomic and share log forces (group commit); see the latching
+  section of that document.
+* **Permissions** — object-, schema- and database-level permissions; **column-level** `SELECT` / `UPDATE` permissions (see [docs/security.md](docs/security.md));
   security statements (`CREATE LOGIN`, `GRANT`, …) take effect immediately and are not rolled back with a transaction;
-  no certificates, signatures, row-level security, dynamic data masking, auditing, or Windows authentication.
+  **dynamic data masking** and **row-level security** (filter and block predicates); no certificates, signatures, auditing, or Windows authentication.
 * **Optimizer** — heuristic and statistics-on-demand (distinct counts come from the indexes, exact for small ones and
   sampled for large ones);
-  no histograms on unindexed columns, no hints (`OPTION (HASH JOIN)`, `FORCE ORDER`, …), outer joins are not reordered,
-  subqueries are executed per row rather than rewritten to semi-joins, and there is no plan cache.
-* **Tools** — the shell and the desktop app use one session each; the app runs statements on its UI thread, and
-  `.schema` / *Script* cannot reproduce `DEFAULT`, `CHECK` and computed-column expressions (see
-  [docs/shell-and-gui.md](docs/shell-and-gui.md)).
+  no histograms on unindexed columns, `OPTION (HASH JOIN | LOOP JOIN | FORCE ORDER)` and table hints are honoured (see
+  [docs/administration.md](docs/administration.md)), outer joins are not reordered, subqueries are executed per row rather than
+  rewritten to semi-joins, and only parsed batches (not execution plans) are cached.
+* **Tools** — the shell and the desktop app use one session each (see [docs/shell-and-gui.md](docs/shell-and-gui.md)).
 * **XML / spatial / hierarchy** — `xml` is stored as text with no XQuery (`.value()`, `.query()`, `OPENXML`);
   `geography`, `geometry`, `hierarchyid` are not functional. No full-text search, Service Broker, CLR, SQL Agent,
-  linked servers, `BULK INSERT`, temporal tables, graph tables, columnstore, partitioning, replication, backup/restore
-  statements (copy the data directory while the server is stopped instead).
-* **Collations** — only the case/trailing-space-insensitive default; `COLLATE` clauses are parsed but do not change
-  comparisons. `RANGE` frames with numeric offsets treat the bound as `CURRENT ROW`.
+  linked servers, `BULK INSERT`, temporal tables, graph tables, columnstore, partitioning, replication, 
+  backup compression (full, differential and log backups, restore and point-in-time recovery exist; see [docs/backup.md](docs/backup.md)).
+* **Collations** — case, accent and binary sensitivity (`CI`/`CS`, `AI`/`AS`, `BIN`/`BIN2`) per database, column and expression, in
+  comparisons, sorting, grouping, joins, indexes and constraints; language-specific alphabetical orders and kana/width
+  sensitivity are not implemented (see [docs/collations.md](docs/collations.md)). `RANGE` frames with numeric offsets treat
+  the bound as `CURRENT ROW`.
 * Cultures other than `en-US` for `FORMAT`/`PARSE`; `CHECKSUM`/`BINARY_CHECKSUM` values differ from SQL Server's.
 
 ## Development

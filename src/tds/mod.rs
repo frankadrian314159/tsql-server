@@ -4,14 +4,17 @@
 //! Supported: pre-login, SQL authentication (Login7), SQL batches, RPC requests (`sp_executesql`,
 //! `sp_prepare`/`sp_execute`/`sp_prepexec`/`sp_unprepare`, and calls to stored procedures, with OUTPUT parameters
 //! and return status), transaction-manager requests (begin/commit/rollback/save), attention (cancel), and
-//! the usual data types. Not supported: TLS (the server answers "encryption not supported", so clients must connect
-//! with encryption off or optional), integrated/Windows/AAD authentication, bulk load, server cursors, MARS
-//! and the `sql_variant`/`text`/`ntext`/`image` wire types (they are sent as `nvarchar(max)`, `varchar(max)`, ...).
+//! the usual data types, and TLS (see [`TlsConfig`]; the login is always encrypted when the client supports TLS, the
+//! whole session when the client asks for it or the listener requires it). Not supported: integrated/Windows/AAD
+//! authentication, bulk load, server cursors, MARS and the `sql_variant`/`text`/`ntext`/`image` wire types (they are
+//! sent as `nvarchar(max)`, `varchar(max)`, ...).
 mod rpc;
+mod tls;
 pub mod wire;
 
-use crate::{Connection, Event, Server, SqlError};
-use crate::engine::BatchResult;
+pub use tls::{Encryption, TlsConfig};
+
+use crate::{Connection, Event, Server, SqlError, Streamed};
 use rpc::Proc;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -43,12 +46,30 @@ const SERVER_NAME: &str = "tsql-server";
 
 // ----------------------------------------------------------------------------- packets
 struct Transport {
-    stream: TcpStream,
+    stream: tls::Wire,
     packet_size: usize,
     spid: u16,
+    /// Bytes of a reply that is being streamed and have not been sent yet (see `send_part`).
+    pending: Vec<u8>,
+    /// Packet id of the next packet of the reply being streamed.
+    next_id: u8,
 }
 
 impl Transport {
+    /// Carry on inside the TLS connection `conn` (whose handshake is complete).
+    fn go_tls(&mut self, conn: rustls::ServerConnection) -> io::Result<()> {
+        let sock = self.stream.tcp().try_clone()?;
+        self.stream = tls::Wire::Tls(Box::new(rustls::StreamOwned::new(conn, sock)));
+        Ok(())
+    }
+
+    /// Leave TLS (after the Login7 message of a session that only encrypts the login); the socket carries plain TDS.
+    fn go_plain(&mut self) -> io::Result<()> {
+        let sock = self.stream.tcp().try_clone()?;
+        self.stream = tls::Wire::Plain(sock);
+        Ok(())
+    }
+
     /// Read one complete message (packets up to and including the one marked end-of-message).
     fn read_message(&mut self) -> io::Result<(u8, u8, Vec<u8>)> {
         let mut data = vec![];
@@ -77,9 +98,43 @@ impl Transport {
         }
     }
 
+    /// Send the full packets of a reply that is not finished yet (the rest waits for more data or for `send`), so a
+    /// big result goes out as it is produced.
+    fn send_part(&mut self, kind: u8, payload: &[u8]) -> io::Result<()> {
+        self.pending.extend_from_slice(payload);
+        let room = self.packet_size - 8;
+        let mut buf = vec![];
+        // always keep something back, so that the last packet of the reply can be marked end-of-message
+        while self.pending.len() > room {
+            buf.push(kind);
+            buf.push(0);
+            buf.extend_from_slice(&((room + 8) as u16).to_be_bytes());
+            buf.extend_from_slice(&self.spid.to_be_bytes());
+            buf.push(self.next_id);
+            buf.push(0);
+            buf.extend(self.pending.drain(..room));
+            self.next_id = self.next_id.wrapping_add(1);
+        }
+        if buf.is_empty() {
+            return Ok(());
+        }
+        self.stream.write_all(&buf)?;
+        self.stream.flush()
+    }
+
+    /// Send the rest of a reply (all of it, when `send_part` was not used).
     fn send(&mut self, kind: u8, payload: &[u8]) -> io::Result<()> {
         let room = self.packet_size - 8;
-        let mut id = 1u8;
+        let mut id = if self.pending.is_empty() && self.next_id == 0 { 1 } else { self.next_id.max(1) };
+        let joined;
+        let payload: &[u8] = if self.pending.is_empty() {
+            payload
+        } else {
+            self.pending.extend_from_slice(payload);
+            joined = std::mem::take(&mut self.pending);
+            &joined
+        };
+        self.next_id = 0;
         let mut chunks: Vec<&[u8]> = payload.chunks(room).collect();
         if chunks.is_empty() {
             chunks.push(&[]);
@@ -194,6 +249,95 @@ fn wires_for(rs: &crate::ResultSet) -> Vec<Wire> {
 
 use crate::Value;
 
+// ----------------------------------------------------------------------------- streaming replies
+/// Turns the output of `Connection::execute_streaming` into TDS tokens, sending packets to the client as they fill.
+struct Live {
+    reply: Reply,
+    wires: Vec<Wire>,
+    /// Row count of the result set the engine has just finished, so the row count it reports next is not repeated.
+    skip_count: Option<i64>,
+    /// The last result set of an RPC that carries OUTPUT parameters and the return status (see `rpc::TRAILER`).
+    trailer: Option<Vec<Value>>,
+    errored: bool,
+}
+
+/// Tokens are collected until this many bytes, then sent.
+const FLUSH_AT: usize = 32 << 10;
+
+impl Live {
+    fn new(reply: Reply) -> Live {
+        Live { reply, wires: vec![], skip_count: None, trailer: None, errored: false }
+    }
+
+    /// Handle one item of engine output; returns false when the client can no longer be written to.
+    fn on(&mut self, item: Streamed, out: &mut Vec<u8>, t: &mut Transport) -> bool {
+        let more = match self.reply {
+            Reply::Batch => 0xFD,
+            Reply::Proc => 0xFF,
+        };
+        let skip = self.skip_count.take();
+        match item {
+            Streamed::Event(Event::Rows(rs)) => {
+                if rs.columns.first().map(|c| c == rpc::TRAILER).unwrap_or(false) {
+                    self.skip_count = Some(rs.rows.len() as i64);
+                    self.trailer = rs.rows.into_iter().next();
+                } else if !rs.columns.is_empty() {
+                    let wires = wires_for(&rs);
+                    colmetadata(out, &rs.columns, &wires);
+                    for row in &rs.rows {
+                        out.push(0xD1);
+                        for (c, w) in wires.iter().enumerate() {
+                            write_value(out, w, row.get(c).unwrap_or(&Value::Null));
+                        }
+                    }
+                    done(out, more, DONE_MORE | DONE_COUNT, rs.rows.len() as u64);
+                    self.skip_count = Some(rs.rows.len() as i64);
+                }
+            }
+            Streamed::Event(Event::Message(m)) => info_token(out, 0, &m),
+            Streamed::Event(Event::RowCount(n)) => {
+                if skip != Some(n) {
+                    done(out, more, DONE_MORE | DONE_COUNT, n.max(0) as u64);
+                }
+            }
+            Streamed::Event(Event::Error(e)) => {
+                self.errored = true;
+                error_token(out, &e);
+            }
+            Streamed::Header { columns, types, inferred } => {
+                let probe = crate::ResultSet { columns: columns.clone(), types, rows: vec![] };
+                let mut wires = wires_for(&probe);
+                // the type of an expression was guessed from the first rows: a string column may hold wider or
+                // non-code-page text later, so it is sent as nvarchar(max)
+                for (w, guessed) in wires.iter_mut().zip(inferred.iter()) {
+                    if *guessed && matches!(w, Wire::VarChar(_) | Wire::Char(_) | Wire::NVarChar(_) | Wire::NChar(_)) {
+                        *w = Wire::NVarChar(PLP);
+                    }
+                }
+                colmetadata(out, &columns, &wires);
+                self.wires = wires;
+            }
+            Streamed::Row(row) => {
+                out.push(0xD1);
+                for (c, w) in self.wires.iter().enumerate() {
+                    write_value(out, w, row.get(c).unwrap_or(&Value::Null));
+                }
+                if out.len() >= FLUSH_AT {
+                    if t.send_part(T_REPLY, out).is_err() {
+                        return false;
+                    }
+                    out.clear();
+                }
+            }
+            Streamed::End(n) => {
+                done(out, more, DONE_MORE | DONE_COUNT, n);
+                self.skip_count = Some(n as i64);
+            }
+        }
+        true
+    }
+}
+
 // ----------------------------------------------------------------------------- the session
 /// How a request's reply ends: batches finish with DONE, RPCs with DONEPROC (statements inside with DONEINPROC).
 #[derive(Clone, Copy, PartialEq)]
@@ -214,45 +358,6 @@ struct Session {
 }
 
 impl Session {
-    /// Append the tokens for a batch's events. Returns whether an error occurred and the number of the last one.
-    fn events(&mut self, events: &[Event], reply: Reply, out: &mut Vec<u8>) -> bool {
-        let more = match reply {
-            Reply::Batch => 0xFD,
-            Reply::Proc => 0xFF,
-        };
-        let mut errored = false;
-        let mut i = 0;
-        while i < events.len() {
-            match &events[i] {
-                Event::Rows(rs) => {
-                    if !rs.columns.is_empty() {
-                        let wires = wires_for(rs);
-                        colmetadata(out, &rs.columns, &wires);
-                        for row in &rs.rows {
-                            out.push(0xD1);
-                            for (c, w) in wires.iter().enumerate() {
-                                write_value(out, w, row.get(c).unwrap_or(&Value::Null));
-                            }
-                        }
-                        done(out, more, DONE_MORE | DONE_COUNT, rs.rows.len() as u64);
-                    }
-                    // the engine reports the row count of a SELECT separately; the DONE above already carries it
-                    if matches!(events.get(i + 1), Some(Event::RowCount(n)) if *n == rs.rows.len() as i64) {
-                        i += 1;
-                    }
-                }
-                Event::Message(m) => info_token(out, 0, m),
-                Event::RowCount(n) => done(out, more, DONE_MORE | DONE_COUNT, (*n).max(0) as u64),
-                Event::Error(e) => {
-                    errored = true;
-                    error_token(out, e);
-                }
-            }
-            i += 1;
-        }
-        errored
-    }
-
     /// Tokens describing session changes a request caused: the current database and the transaction state.
     fn changes(&mut self, errored: bool, rolled_back_hint: bool, out: &mut Vec<u8>) {
         let db = self.conn.current_database();
@@ -287,29 +392,29 @@ impl Session {
         let mut rd = Rd::new(payload);
         rd.all_headers()?;
         let sql = rd.utf16(rd.left() / 2)?;
-        let res = self.conn.execute(&sql);
         let mut out = vec![];
-        let errored = self.events(&res.events, Reply::Batch, &mut out);
+        let mut live = Live::new(Reply::Batch);
+        {
+            // rows of a big result go to the client while the statement is still running
+            let Session { t, conn, .. } = self;
+            conn.execute_streaming(&sql, &mut |item| live.on(item, &mut out, t));
+        }
+        let errored = live.errored;
         self.changes(errored, sql.to_ascii_lowercase().contains("rollback"), &mut out);
         Ok(self.finish(out, errored, Reply::Batch))
     }
 
     /// Run the batch for one RPC and write its tokens; returns whether it failed.
     fn run_plan(&mut self, plan: &rpc::Plan, params: &[rpc::Param], out: &mut Vec<u8>, status_override: Option<i32>) -> bool {
-        let mut res: BatchResult = self.conn.execute(&plan.sql);
-        // the trailer is the last result set whose first column is the marker
-        let mut trailer: Option<Vec<Value>> = None;
-        if let Some(pos) = res.events.iter().rposition(|e| matches!(e, Event::Rows(rs) if rs.columns.first().map(|c| c == rpc::TRAILER).unwrap_or(false))) {
-            if let Event::Rows(rs) = res.events.remove(pos) {
-                trailer = rs.rows.into_iter().next();
-            }
-            if matches!(res.events.get(pos), Some(Event::RowCount(1))) {
-                res.events.remove(pos);
-            }
+        // the trailer is the last result set whose first column is the marker; `Live` keeps it apart
+        let mut live = Live::new(Reply::Proc);
+        {
+            let Session { t, conn, .. } = self;
+            conn.execute_streaming(&plan.sql, &mut |item| live.on(item, out, t));
         }
-        let errored = self.events(&res.events, Reply::Proc, out);
+        let errored = live.errored;
         if !errored {
-            if let Some(t) = &trailer {
+            if let Some(t) = &live.trailer {
                 let status = status_override.unwrap_or_else(|| if plan.status { as_i32(&t[0]) } else { 0 });
                 out.push(0x79);
                 out.extend_from_slice(&status.to_le_bytes());
@@ -472,8 +577,37 @@ fn return_value(out: &mut Vec<u8>, ordinal: u16, name: &str, w: &Wire, v: &Value
 }
 
 // ----------------------------------------------------------------------------- pre-login and login
-fn prelogin_reply() -> Vec<u8> {
-    // options: VERSION, ENCRYPTION (not supported), INSTOPT, MARS (off), terminator
+/// The ENCRYPTION option of a pre-login message (0 off, 1 on, 2 not supported, 3 required), if there is one.
+fn prelogin_encryption(p: &[u8]) -> Option<u8> {
+    let mut i = 0;
+    while i < p.len() && p[i] != 0xFF {
+        let entry = p.get(i..i + 5)?;
+        if entry[0] == 1 {
+            let off = u16::from_be_bytes([entry[1], entry[2]]) as usize;
+            return p.get(off).copied();
+        }
+        i += 5;
+    }
+    None
+}
+
+/// What the server answers to the client's encryption request: 0 login only, 1 whole session, 2 none, 3 required
+/// (the client must then give up if it cannot encrypt).
+fn encryption_answer(client: u8, tls: bool, mode: Encryption) -> u8 {
+    if !tls {
+        return 2;
+    }
+    match (client, mode) {
+        (2, Encryption::Required) => 3,
+        (2, _) => 2,
+        (_, Encryption::Required) => 1,
+        (1 | 3, _) => 1,
+        _ => 0,
+    }
+}
+
+fn prelogin_reply(encryption: u8) -> Vec<u8> {
+    // options: VERSION, ENCRYPTION, INSTOPT, MARS (off), terminator
     let table_len = 4 * 5 + 1;
     let mut table = vec![];
     let mut data = vec![];
@@ -484,7 +618,7 @@ fn prelogin_reply() -> Vec<u8> {
         data.extend_from_slice(bytes);
     };
     add(0, &[16, 0, 0x03, 0xE8, 0, 0]);
-    add(1, &[2]);
+    add(1, &[encryption]);
     add(2, &[0]);
     add(4, &[0]);
     table.push(0xFF);
@@ -540,12 +674,36 @@ fn login_failure(t: &mut Transport, number: i32, state: u8, class: u8, text: &st
 
 fn handshake(server: &Server, mut t: Transport, cfg: &Config) -> io::Result<Option<Session>> {
     let bad = |e: String| io::Error::new(io::ErrorKind::InvalidData, e);
-    let (kind, _, _) = t.read_message()?;
+    let (kind, _, pre) = t.read_message()?;
     if kind != T_PRELOGIN {
         return Ok(None);
     }
-    t.send(T_REPLY, &prelogin_reply())?;
+    let answer = encryption_answer(prelogin_encryption(&pre).unwrap_or(2), cfg.tls.is_some(), cfg.encryption);
+    t.send(T_REPLY, &prelogin_reply(answer))?;
+    if answer == 3 {
+        return Ok(None); // the client cannot encrypt and the server insists: it will close the connection
+    }
+    if answer < 2 {
+        let tls = cfg.tls.as_ref().expect("an answer of 0 or 1 needs a certificate");
+        let t_ref = std::cell::RefCell::new(&mut t);
+        let conn = tls::handshake(
+            tls,
+            || {
+                let (kind, _, payload) = t_ref.borrow_mut().read_message()?;
+                if kind != T_PRELOGIN {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "expected a TLS handshake message"));
+                }
+                Ok(payload)
+            },
+            |bytes| t_ref.borrow_mut().send(T_PRELOGIN, bytes),
+        )?;
+        t.go_tls(conn)?;
+    }
     let (kind, _, payload) = t.read_message()?;
+    if answer == 0 {
+        // only the login is encrypted: the rest of the session, starting with the reply to it, is plain
+        t.go_plain()?;
+    }
     if kind == T_SSPI || kind != T_LOGIN7 {
         return Ok(None);
     }
@@ -605,17 +763,45 @@ fn handshake(server: &Server, mut t: Transport, cfg: &Config) -> io::Result<Opti
     Ok(Some(s))
 }
 
+/// Block until the client has sent something. Returns false when the connection is closed or the session was killed
+/// (its open transaction is then rolled back and the caller drops the connection).
+fn wait_readable(tcp: &TcpStream, conn: &mut Connection) -> bool {
+    let _ = tcp.set_read_timeout(Some(std::time::Duration::from_millis(250)));
+    let mut b = [0u8; 1];
+    loop {
+        match tcp.peek(&mut b) {
+            Ok(0) => return false,
+            Ok(_) => {
+                let _ = tcp.set_read_timeout(None);
+                return true;
+            }
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                if conn.is_killed() {
+                    conn.finish_kill();
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
 fn serve_connection(server: Server, stream: TcpStream, cfg: Arc<Config>) {
     let _ = stream.set_nodelay(true);
     // a client that connects and says nothing must not hold a thread forever
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
-    let t = Transport { stream, packet_size: DEFAULT_PACKET, spid: 0 };
+    let t = Transport { stream: tls::Wire::Plain(stream), packet_size: DEFAULT_PACKET, spid: 0, pending: vec![], next_id: 0 };
     let mut s = match handshake(&server, t, &cfg) {
         Ok(Some(s)) => s,
         _ => return,
     };
-    let _ = s.t.stream.set_read_timeout(None);
+    let _ = s.t.stream.tcp().set_read_timeout(None);
+    let Ok(probe) = s.t.stream.tcp().try_clone() else { return };
     loop {
+        // wait for the next request, noticing a KILL of this session while the client is idle
+        if !wait_readable(&probe, &mut s.conn) {
+            return;
+        }
         let (kind, status, payload) = match s.t.read_message() {
             Ok(m) => m,
             Err(_) => return,
@@ -661,11 +847,22 @@ fn serve_connection(server: Server, stream: TcpStream, cfg: Arc<Config>) {
 pub struct Config {
     /// Largest packet size granted to clients.
     pub max_packet: usize,
+    /// The server certificate; without one the listener answers "encryption not supported".
+    pub tls: Option<TlsConfig>,
+    /// Whether clients that cannot encrypt are accepted (only meaningful with a certificate).
+    pub encryption: Encryption,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { max_packet: 32767 }
+        Config { max_packet: 32767, tls: None, encryption: Encryption::Optional }
+    }
+}
+
+impl Config {
+    /// Settings with TLS enabled using `tls`; `encryption` says whether clients without TLS are refused.
+    pub fn with_tls(tls: TlsConfig, encryption: Encryption) -> Config {
+        Config { tls: Some(tls), encryption, ..Config::default() }
     }
 }
 

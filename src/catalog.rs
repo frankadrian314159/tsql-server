@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 pub use crate::storage::Row;
-use crate::storage::{lock::LockManager, IndexSpec, PageStore, ReadView, RowId, TableData, TxId};
+use crate::storage::{IndexSpec, PageStore, ReadView, RowId, TableData};
 pub type Rows = Arc<Vec<Row>>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -16,14 +16,21 @@ pub struct Column {
     pub nullable: bool,
     pub identity: Option<(i64, i64)>,
     pub default: Option<Arc<Expr>>,
+    /// Source text of the default and computed expressions (for scripting).
+    pub default_text: Option<String>,
     pub default_name: Option<String>,
     pub computed: Option<Arc<Expr>>,
+    pub computed_text: Option<String>,
     pub user_type: Option<String>,
+    /// Collation of a string column when it is not the default one (`None`: `SQL_Latin1_General_CP1_CI_AS`).
+    pub collation: Option<String>,
+    /// Dynamic data masking function (`default()`, `email()`, ...), shown to users without UNMASK.
+    pub mask: Option<String>,
 }
 
 impl Column {
     pub fn simple(name: &str, ty: DataType) -> Column {
-        Column { name: name.to_string(), ty, nullable: true, identity: None, default: None, default_name: None, computed: None, user_type: None }
+        Column { name: name.to_string(), ty, nullable: true, identity: None, default: None, default_text: None, default_name: None, computed: None, computed_text: None, user_type: None, collation: None, mask: None }
     }
 }
 
@@ -33,12 +40,19 @@ pub struct KeyDef {
     pub cols: Vec<usize>,
     pub is_index: bool,
     pub clustered: bool,
+    /// Columns carried in the index leaf but not part of its key (`INCLUDE (...)`).
+    #[serde(default)]
+    pub include: Vec<usize>,
+    /// `WHERE` clause of a filtered unique index.
+    #[serde(default)]
+    pub filter: Option<crate::storage::FilterPred>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CheckDef {
     pub name: String,
     pub expr: Arc<Expr>,
+    pub text: String,
     pub enabled: bool,
     pub col: Option<String>,
 }
@@ -60,6 +74,10 @@ pub struct IndexDef {
     pub name: String,
     pub cols: Vec<(usize, bool)>,
     pub unique: bool,
+    #[serde(default)]
+    pub include: Vec<usize>,
+    #[serde(default)]
+    pub filter: Option<crate::storage::FilterPred>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -86,9 +104,45 @@ pub struct Table {
     pub checks: Vec<CheckDef>,
     pub fks: Vec<FkDef>,
     pub indexes: Vec<IndexDef>,
-    pub identity_next: Option<i64>,
+    pub identity_next: SharedCounter,
     pub triggers: Vec<Arc<Trigger>>,
     pub is_temp: bool,
+}
+
+/// A counter that clones share: the next identity value of a table, the current value of a sequence. A statement
+/// working on a copy of the table advances the real counter without writing anything back to the catalog, so
+/// sessions can use identity columns and sequences while holding the catalog only for reading.
+#[derive(Clone, Debug, Default)]
+pub struct SharedCounter(Arc<std::sync::Mutex<Option<i64>>>);
+
+impl Serialize for SharedCounter {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.get().serialize(s)
+    }
+}
+impl<'de> Deserialize<'de> for SharedCounter {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<SharedCounter, D::Error> {
+        Option::<i64>::deserialize(d).map(SharedCounter::new)
+    }
+}
+
+impl SharedCounter {
+    pub fn new(v: Option<i64>) -> SharedCounter {
+        SharedCounter(Arc::new(std::sync::Mutex::new(v)))
+    }
+    pub fn get(&self) -> Option<i64> {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    /// Read, compute and store in one step; `f` returns the new value and a result, or an error to leave it as is.
+    pub fn update<R, E>(&self, f: impl FnOnce(Option<i64>) -> Result<(Option<i64>, R), E>) -> Result<R, E> {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let (v, r) = f(*g)?;
+        *g = v;
+        Ok(r)
+    }
+    pub fn set(&self, v: Option<i64>) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = v;
+    }
 }
 
 impl Table {
@@ -106,7 +160,7 @@ impl Table {
             checks: vec![],
             fks: vec![],
             indexes: vec![],
-            identity_next,
+            identity_next: SharedCounter::new(identity_next),
             triggers: vec![],
             is_temp: false,
         }
@@ -130,18 +184,39 @@ impl Table {
     /// Physical index layout: primary key, every unique key / unique index, then plain indexes.
     pub fn index_specs(&self) -> Vec<IndexSpec> {
         let mut v = vec![];
+        // the collation of each key column, when it is not the built-in one
+        let colls = |cols: &[usize]| -> Vec<Option<String>> {
+            let c: Vec<Option<String>> = cols.iter().map(|&i| self.columns.get(i).and_then(|c| c.collation.clone())).collect();
+            if c.iter().any(|x| x.is_some()) {
+                c
+            } else {
+                vec![]
+            }
+        };
         if let Some(pk) = &self.pk {
-            v.push(IndexSpec { name: pk.name.clone(), cols: pk.cols.clone(), unique: true, pk: true });
+            v.push(IndexSpec { name: pk.name.clone(), cols: pk.cols.clone(), unique: true, pk: true, colls: colls(&pk.cols), filter: None });
         }
         for u in &self.uniques {
-            v.push(IndexSpec { name: u.name.clone(), cols: u.cols.clone(), unique: true, pk: false });
+            v.push(IndexSpec { name: u.name.clone(), cols: u.cols.clone(), unique: true, pk: false, colls: colls(&u.cols), filter: u.filter.clone() });
         }
         for i in &self.indexes {
             if !i.unique {
-                v.push(IndexSpec { name: i.name.clone(), cols: i.cols.iter().map(|c| c.0).collect(), unique: false, pk: false });
+                let cols: Vec<usize> = i.cols.iter().map(|c| c.0).collect();
+                v.push(IndexSpec { name: i.name.clone(), colls: colls(&cols), cols, unique: false, pk: false, filter: i.filter.clone() });
             }
         }
         v
+    }
+
+    /// A hashing key for the values of columns `cols`, in the columns' collations (so `'a'` and `'A'` are the same key in
+    /// a case-insensitive column and different keys in a case-sensitive one).
+    pub fn key_string(&self, cols: &[usize], vals: &[Value]) -> String {
+        let spec = IndexSpec { name: String::new(), cols: cols.to_vec(), unique: false, pk: false, colls: cols.iter().map(|&i| self.columns.get(i).and_then(|c| c.collation.clone())).collect(), filter: None };
+        if spec.colls.iter().any(|c| c.is_some()) {
+            crate::convert::key_of(&spec.xform(vals))
+        } else {
+            crate::convert::key_of(vals)
+        }
     }
 
     /// Re-derive the physical indexes after a metadata change.
@@ -224,7 +299,7 @@ pub struct Sequence {
     pub schema: String,
     pub name: String,
     pub ty: DataType,
-    pub current: Option<i64>,
+    pub current: SharedCounter,
     pub start: i64,
     pub inc: i64,
     pub min: i64,
@@ -327,9 +402,74 @@ pub struct Database {
     pub rcsi: bool,
     pub security: crate::security::DbSecurity,
     pub schema_owner: BTreeMap<String, String>, // lower-case schema -> lower-case owner
+    /// Recovery model: `true` = FULL (log backups possible once a full backup has been taken), `false` = SIMPLE.
+    pub recovery_full: bool,
+    /// The database is being restored (`RESTORE ... WITH NORECOVERY`) and cannot be used yet.
+    pub restoring: bool,
+    /// Commit timestamp up to which the log has been backed up (or the full backup was taken): the log chain.
+    /// `None` until a full backup starts the chain.
+    pub log_chain_ts: Option<u64>,
+    /// While restoring: commit timestamp up to which backups have been applied.
+    pub applied_ts: u64,
+    /// Default collation of the database: what new string columns and literals compared in it use.
+    pub collation: String,
+    /// Row-level security policies.
+    pub policies: Vec<SecurityPolicy>,
+    /// Commit timestamp of the last full (non-COPY_ONLY) backup: the base of differential backups.
+    pub last_full_ts: Option<u64>,
+    /// Signature of each table's column definition at that backup (a differential includes every row of a table whose
+    /// definition has changed since).
+    pub backup_sigs: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PredKind {
+    /// Rows for which the function returns no row are invisible (and untouchable) to the session.
+    Filter,
+    BlockAfterInsert,
+    BlockAfterUpdate,
+    BlockBeforeUpdate,
+    BlockBeforeDelete,
+}
+
+impl PredKind {
+    pub fn describe(&self) -> (&'static str, &'static str) {
+        match self {
+            PredKind::Filter => ("FILTER", ""),
+            PredKind::BlockAfterInsert => ("BLOCK", "AFTER INSERT"),
+            PredKind::BlockAfterUpdate => ("BLOCK", "AFTER UPDATE"),
+            PredKind::BlockBeforeUpdate => ("BLOCK", "BEFORE UPDATE"),
+            PredKind::BlockBeforeDelete => ("BLOCK", "BEFORE DELETE"),
+        }
+    }
+}
+
+/// `ADD FILTER|BLOCK PREDICATE schema.fn(col, ...) ON schema.table`
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Predicate {
+    pub kind: PredKind,
+    pub func: (String, String),
+    /// Columns of the target table passed to the function.
+    pub args: Vec<String>,
+    /// The table key (`schema.name`, lower case).
+    pub table: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SecurityPolicy {
+    pub schema: String,
+    pub name: String,
+    pub object_id: i32,
+    pub enabled: bool,
+    pub preds: Vec<Predicate>,
 }
 
 impl Database {
+    /// The default collation's name for columns that store none (the built-in one: the database default may have changed since).
+    pub fn collation_or_default(&self) -> String {
+        crate::collation::DEFAULT_NAME.to_string()
+    }
+
     /// Re-derive the trigger lookup map from the tables that own the triggers.
     pub fn rebuild_triggers(&mut self) {
         let mut m = HashMap::new();
@@ -360,66 +500,67 @@ impl Database {
             rcsi: false,
             security: crate::security::DbSecurity::default(),
             schema_owner: ["dbo", "guest", "INFORMATION_SCHEMA", "sys"].iter().map(|s| (s.to_lowercase(), "dbo".to_string())).collect(),
+            recovery_full: true,
+            restoring: false,
+            log_chain_ts: None,
+            applied_ts: 0,
+            collation: crate::collation::DEFAULT_NAME.to_string(),
+            policies: vec![],
+            last_full_ts: None,
+            backup_sigs: BTreeMap::new(),
         }
     }
 }
 
 pub struct TxInfo {
     pub snapshot_ts: Option<u64>,
+    /// The transaction has changed the catalog (it is not yet committed, so a backup must wait for it).
+    pub ddl: bool,
 }
 
 pub struct ServerState {
-    pub clock: u64,
-    pub next_tx: TxId,
-    pub active: BTreeMap<TxId, TxInfo>,
-    pub locks: LockManager,
+    /// Clock, counters, running transactions and locks; independent of this struct's lock.
+    pub core: Arc<crate::coord::Core>,
     pub databases: BTreeMap<String, Database>,
     pub security: crate::security::Security,
-    pub persist: Option<crate::persist::Persist>,
+    /// The redo log and checkpoint writer (None for a server that lives in memory), behind its own latch.
+    pub persist: std::sync::Mutex<Option<crate::persist::Persist>>,
     pub global_temp: HashMap<String, Table>,
-    pub next_object_id: i32,
     pub start_time: chrono::NaiveDateTime,
-    pub next_spid: i32,
     pub server_name: String,
-    pub next_rowversion: u64,
     /// Pages of persistent tables.
     pub store: Arc<PageStore>,
     /// Pages of temporary tables and table variables (never recovered).
     pub temp_store: Arc<PageStore>,
+    /// Memory budget and location for operators that spill to disk.
+    pub work: crate::engine::spill::WorkMem,
 }
 
 impl ServerState {
     pub fn new() -> ServerState {
         let mut s = ServerState {
-            clock: 1,
-            next_tx: 1,
-            active: BTreeMap::new(),
-            locks: LockManager::default(),
+            core: Arc::new(crate::coord::Core::new()),
             databases: BTreeMap::new(),
             security: crate::security::Security::default(),
-            persist: None,
+            persist: std::sync::Mutex::new(None),
             global_temp: HashMap::new(),
-            next_object_id: 100_000,
             start_time: chrono::Local::now().naive_local(),
-            next_spid: 51,
             server_name: "TSQL-SERVER".to_string(),
-            next_rowversion: 1,
             store: PageStore::memory(),
             temp_store: PageStore::memory(),
+            work: crate::engine::spill::WorkMem::default(),
         };
         for (i, n) in ["master", "tempdb", "model", "msdb"].iter().enumerate() {
             s.databases.insert(n.to_string(), Database::new(n, i as i32 + 1));
         }
         s
     }
-    /// Oldest timestamp any running snapshot still needs.
-    pub fn horizon(&self) -> u64 {
-        self.active.values().filter_map(|t| t.snapshot_ts).min().unwrap_or(self.clock)
+    pub fn persist(&self) -> std::sync::MutexGuard<'_, Option<crate::persist::Persist>> {
+        self.persist.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    pub fn new_object_id(&mut self) -> i32 {
-        self.next_object_id += 1;
-        self.next_object_id
+    pub fn new_object_id(&self) -> i32 {
+        self.core.new_object_id()
     }
 }
 

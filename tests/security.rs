@@ -263,7 +263,7 @@ fn security_statement_errors() {
     assert_eq!(err_no(&mut sa, "GRANT SELECT ON emp TO ghost"), 15151);
     assert_eq!(err_no(&mut sa, "GRANT SELECT ON nothing TO ann"), 15151);
     assert_eq!(err_no(&mut sa, "ALTER ROLE nothing ADD MEMBER ann"), 15151);
-    assert_eq!(err_no(&mut sa, "GRANT SELECT (name) ON emp TO ann"), 15477);
+    assert_eq!(err_no(&mut sa, "GRANT SELECT (nosuch) ON emp TO ann"), 207);
     assert_eq!(err_no(&mut sa, "DROP LOGIN sa"), 15405);
     exec(&mut sa, "DROP USER ann");
     exec(&mut sa, "DROP LOGIN ann");
@@ -283,4 +283,116 @@ fn permission_functions() {
     assert_eq!(rows(&mut sa, "SELECT name FROM sys.database_principals WHERE name IN ('ann','bob') ORDER BY name"), vec![vec!["ann"], vec!["bob"]]);
     assert_eq!(rows(&mut sa, "SELECT name FROM sys.server_principals WHERE name = 'ann'"), vec![vec!["ann"]]);
     assert_eq!(rows(&mut sa, "SELECT permission_name, state_desc FROM sys.database_permissions p JOIN sys.database_principals u ON p.grantee_principal_id = u.principal_id WHERE u.name = 'ann'"), vec![vec!["SELECT", "GRANT"]]);
+}
+
+fn code(c: &mut Connection, sql: &str) -> i32 {
+    c.execute(sql).first_error().map(|e| e.number).unwrap_or(0)
+}
+
+#[test]
+fn column_level_select() {
+    let (s, mut sa) = setup();
+    exec(&mut sa, "GRANT SELECT (id, name) ON emp TO ann");
+    let mut ann = as_user(&s, "ann");
+    assert_eq!(rows(&mut ann, "SELECT id, name FROM emp ORDER BY id"), vec![vec!["1", "a"], vec!["2", "b"]]);
+    assert_eq!(rows(&mut ann, "SELECT COUNT(*) FROM emp"), vec![vec!["2"]]);
+    // the unreadable column fails wherever it is used: select list, star, filter, ordering, aggregate
+    let e = ann.execute("SELECT salary FROM emp");
+    assert_eq!(e.first_error().unwrap().number, 230);
+    assert!(e.first_error().unwrap().message.contains("column 'salary'"), "{}", e.first_error().unwrap());
+    for q in ["SELECT * FROM emp", "SELECT id FROM emp WHERE salary > 0", "SELECT id FROM emp ORDER BY salary", "SELECT MAX(salary) FROM emp", "SELECT id + salary FROM emp"] {
+        assert_eq!(code(&mut ann, q), 230, "{q}");
+    }
+    // an indexed column must not leak through a seek or an ordered read either
+    exec(&mut sa, "CREATE INDEX ix_sal ON emp (salary)");
+    for q in ["SELECT id FROM emp WHERE salary = 100", "SELECT TOP 1 id FROM emp ORDER BY salary"] {
+        assert_eq!(code(&mut ann, q), 230, "{q}");
+    }
+    // a user with nothing granted still gets the object-level error
+    let mut bob = as_user(&s, "bob");
+    assert_eq!(code(&mut bob, "SELECT id FROM emp"), 229);
+    // joins keep the restriction
+    assert_eq!(code(&mut ann, "SELECT a.id FROM emp a JOIN emp b ON a.salary = b.id"), 230);
+    assert_eq!(rows(&mut ann, "SELECT a.id, b.name FROM emp a JOIN emp b ON a.id = b.id ORDER BY a.id"), vec![vec!["1", "a"], vec!["2", "b"]]);
+}
+
+#[test]
+fn column_deny_overrides_table_grant_and_table_deny_overrides_column_grant() {
+    let (s, mut sa) = setup();
+    exec(&mut sa, "GRANT SELECT ON emp TO ann; DENY SELECT (salary) ON emp TO ann");
+    let mut ann = as_user(&s, "ann");
+    assert_eq!(rows(&mut ann, "SELECT name FROM emp WHERE id = 1"), vec![vec!["a"]]);
+    assert_eq!(code(&mut ann, "SELECT salary FROM emp"), 230);
+    exec(&mut sa, "GRANT SELECT (id, salary) ON emp TO bob; DENY SELECT ON emp TO bob");
+    let mut bob = as_user(&s, "bob");
+    assert_eq!(code(&mut bob, "SELECT id FROM emp"), 229, "a table-level DENY wins over a column GRANT");
+    // REVOKE removes the column entry
+    exec(&mut sa, "REVOKE SELECT (salary) ON emp FROM ann");
+    assert_eq!(rows(&mut as_user(&s, "ann"), "SELECT salary FROM emp WHERE id = 2"), vec![vec!["200"]]);
+}
+
+#[test]
+fn column_level_update_needs_select_on_what_it_reads() {
+    let (s, mut sa) = setup();
+    exec(&mut sa, "GRANT UPDATE (name) ON emp TO ann; GRANT SELECT (id) ON emp TO ann");
+    let mut ann = as_user(&s, "ann");
+    exec(&mut ann, "UPDATE emp SET name = 'z' WHERE id = 1");
+    assert_eq!(rows(&mut sa, "SELECT name FROM emp WHERE id = 1"), vec![vec!["z"]]);
+    assert_eq!(code(&mut ann, "UPDATE emp SET salary = 0 WHERE id = 1"), 230, "salary is not updatable");
+    // reading an unreadable column in WHERE or in the new value would reveal it
+    assert_eq!(code(&mut ann, "UPDATE emp SET name = 'q' WHERE salary = 100"), 230);
+    assert_eq!(code(&mut ann, "UPDATE emp SET name = CAST(salary AS VARCHAR(10))"), 230);
+    assert_eq!(rows(&mut sa, "SELECT salary FROM emp ORDER BY id"), vec![vec!["100"], vec!["200"]]);
+    // no table-wide UPDATE: DELETE and INSERT are still refused
+    assert_eq!(code(&mut ann, "DELETE FROM emp WHERE id = 1"), 229);
+}
+
+#[test]
+fn column_grants_are_validated_and_visible_in_the_catalog() {
+    let (_s, mut sa) = setup();
+    assert_eq!(code(&mut sa, "GRANT SELECT (nosuch) ON emp TO ann"), 207);
+    assert_eq!(code(&mut sa, "GRANT EXECUTE (id) ON emp TO ann"), 1049);
+    exec(&mut sa, "GRANT SELECT (id), UPDATE (name) ON emp TO ann");
+    assert_eq!(scalar(&mut sa, "SELECT COUNT(*) FROM sys.database_permissions WHERE permission_name IN ('SELECT','UPDATE')"), "2");
+}
+
+#[test]
+fn column_permissions_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let s = Server::open(dir.path()).unwrap();
+        let mut sa = s.connect();
+        script(&mut sa, "CREATE TABLE t (a INT, b INT)\nGO\nINSERT t VALUES (1, 2)\nGO\nCREATE LOGIN u WITH PASSWORD = 'upw'\nCREATE USER u FOR LOGIN u\nGRANT SELECT (a) ON t TO u");
+    }
+    let s = Server::open(dir.path()).unwrap();
+    let mut u = s.connect_as("u", "upw").unwrap();
+    assert_eq!(rows(&mut u, "SELECT a FROM t"), vec![vec!["1"]]);
+    assert_eq!(code(&mut u, "SELECT b FROM t"), 230);
+}
+
+#[test]
+fn column_level_insert_grants_allow_inserts_of_exactly_those_columns() {
+    let (s, mut sa) = setup();
+    exec(&mut sa, "GRANT INSERT (id, name) ON emp TO ann");
+    let mut ann = as_user(&s, "ann");
+    exec(&mut ann, "INSERT emp (id, name) VALUES (10, 'x')");
+    assert_eq!(rows(&mut sa, "SELECT id, name FROM emp WHERE id = 10"), vec![vec!["10", "x"]]);
+    assert_eq!(code(&mut ann, "INSERT emp (id, name, salary) VALUES (11, 'y', 5)"), 230, "salary is not insertable");
+    assert_eq!(code(&mut ann, "INSERT emp VALUES (12, 'z', 1)"), 229, "without a column list the whole table is meant");
+    // no table-wide INSERT: DELETE is still refused, and a DENY on a column wins
+    assert_eq!(code(&mut ann, "DELETE FROM emp WHERE id = 10"), 229);
+    exec(&mut sa, "DENY INSERT (name) ON emp TO ann");
+    assert_eq!(code(&mut ann, "INSERT emp (id, name) VALUES (13, 'w')"), 230);
+}
+
+#[test]
+fn delete_needs_select_on_the_columns_its_where_clause_reads() {
+    let (s, mut sa) = setup();
+    exec(&mut sa, "GRANT DELETE ON emp TO ann; GRANT SELECT (id) ON emp TO ann");
+    let mut ann = as_user(&s, "ann");
+    exec(&mut ann, "DELETE FROM emp WHERE id = 1");
+    assert_eq!(code(&mut ann, "DELETE FROM emp WHERE salary = 200"), 230, "the answer would reveal salary");
+    assert_eq!(rows(&mut sa, "SELECT COUNT(*) FROM emp"), vec![vec!["1"]]);
+    exec(&mut sa, "GRANT SELECT ON emp TO ann");
+    exec(&mut ann, "DELETE FROM emp WHERE salary = 200");
 }

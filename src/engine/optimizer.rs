@@ -246,9 +246,45 @@ impl<'a> Engine<'a> {
         out
     }
 
+    /// Do the query's conditions (`preds` are the column conditions found in `conj`) imply every condition of the filtered
+    /// index's `WHERE` clause?
+    fn filter_implied(f: &crate::storage::FilterPred, preds: &[(usize, Pred)], conj: &[&Expr], t: &Table, alias: &str) -> bool {
+        use crate::storage::FilterOp::*;
+        let cmp = |a: &Value, b: &Value| crate::convert::compare(a, b).ok().flatten();
+        f.conds.iter().all(|c| {
+            let on_col = || preds.iter().filter(|(pc, _)| *pc == c.col);
+            match c.op {
+                IsNull => conj.iter().any(|e| matches!(e, Expr::IsNull(x, false) if Self::pred_col(t, alias, x) == Some(c.col))),
+                IsNotNull => on_col().next().is_some() || conj.iter().any(|e| matches!(e, Expr::IsNull(x, true) if Self::pred_col(t, alias, x) == Some(c.col))),
+                Eq | Ne | In => on_col().any(|(_, p)| match p {
+                    Pred::Eq(w) => c.holds(w),
+                    Pred::In(ws) => ws.iter().all(|w| c.holds(w)),
+                    _ => false,
+                }),
+                Gt | Ge | Lt | Le => on_col().any(|(_, p)| match p {
+                    Pred::Eq(w) => c.holds(w),
+                    Pred::In(ws) => ws.iter().all(|w| c.holds(w)),
+                    // x > w (or x >= w) implies x > v / x >= v when w is far enough up
+                    Pred::Lower(w, incl) => match (c.op, cmp(w, &c.vals[0])) {
+                        (Gt, Some(Ordering::Greater)) => true,
+                        (Gt, Some(Ordering::Equal)) => !*incl,
+                        (Ge, Some(Ordering::Greater | Ordering::Equal)) => true,
+                        _ => false,
+                    },
+                    Pred::Upper(w, incl) => match (c.op, cmp(w, &c.vals[0])) {
+                        (Lt, Some(Ordering::Less)) => true,
+                        (Lt, Some(Ordering::Equal)) => !*incl,
+                        (Le, Some(Ordering::Less | Ordering::Equal)) => true,
+                        _ => false,
+                    },
+                }),
+            }
+        })
+    }
+
     /// Pick the cheapest way to find the rows that can satisfy `conj` in table `t` (alias `alias`).
     pub fn choose_access(&mut self, t: &Table, alias: &str, conj: &[&Expr]) -> Access {
-        if !self.ses.optimizer || t.data.specs.is_empty() || conj.is_empty() {
+        if !self.ses.optimizer || t.data.specs.is_empty() || conj.is_empty() || self.ses.hints.get(&t.object_id).is_some_and(|h| h.iter().any(|x| x == "FORCESCAN" || x == "NOEXPAND_SCAN")) {
             return Access::Full;
         }
         let preds = self.column_preds(t, alias, conj);
@@ -257,6 +293,12 @@ impl<'a> Engine<'a> {
         }
         let mut best: Option<(i64, Access)> = None;
         for (ix, sp) in t.data.specs.iter().enumerate() {
+            // a filtered index is usable only when the query's conditions guarantee every row it needs is in it
+            if let Some(f) = &sp.filter {
+                if !Self::filter_implied(f, &preds, conj, t, alias) {
+                    continue;
+                }
+            }
             let mut prefix: Vec<Vec<Value>> = vec![vec![]];
             let mut eq_cols = 0;
             let mut next_col: Option<usize> = None;
@@ -328,7 +370,7 @@ impl<'a> Engine<'a> {
         }
         fn leaves(eng: &Engine, tr: &TableRef, preserved: bool, out: &mut Vec<Leaf>, opaque: &mut bool) {
             match tr {
-                TableRef::Table { name, alias } => {
+                TableRef::Table { name, alias, .. } => {
                     let loc = eng.locate(name);
                     let a = alias.clone().unwrap_or_else(|| name.last().unwrap().clone());
                     match eng.table_ref(&loc) {
@@ -457,7 +499,7 @@ impl<'a> Engine<'a> {
                 return None;
             }
         }
-        let TableRef::Table { name, alias } = &sel.from[0] else { return None };
+        let TableRef::Table { name, alias, .. } = &sel.from[0] else { return None };
         let loc = self.locate(name);
         let t = self.table_ref(&loc)?.clone();
         let a = alias.clone().unwrap_or_else(|| name.last().unwrap().clone());
@@ -470,7 +512,7 @@ impl<'a> Engine<'a> {
             return None;
         }
         // the index must be keyed by exactly the ORDER BY columns so ties come out in row order
-        let idx = t.data.specs.iter().position(|sp| sp.cols == cols)?;
+        let idx = t.data.specs.iter().position(|sp| sp.cols == cols && sp.filter.is_none())?;
         let sp = &t.data.specs[idx];
         if desc && !(sp.unique && sp.cols.len() == cols.len()) {
             return None;

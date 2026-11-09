@@ -1,5 +1,8 @@
 //! Lock manager: multi-granularity locks (table and row), a wait-for graph and deadlock detection.
 use super::{RowId, TxId};
+use crate::convert::sort_cmp;
+use crate::types::Value;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +50,55 @@ impl Mode {
 pub enum Res {
     Table(i32),
     Row(i32, RowId),
+    /// A key range of one index of a table (see [`KeyRange`]); only reported by `snapshot`.
+    Range(i32, usize),
+}
+
+/// A shared lock on a range of one index's key space, taken by SERIALIZABLE readers so that no other
+/// transaction can insert a row whose key falls inside it (a phantom) before the reader commits.
+///
+/// Bounds are key prefixes compared column by column with SQL Server's ordering, so a seek on the first column of a
+/// two-column index locks every key that starts with that value. `None` is unbounded. Readers never conflict with
+/// each other; writers check the keys they are about to add with [`LockManager::range_conflicts`].
+#[derive(Clone, Debug)]
+pub struct KeyRange {
+    pub tx: TxId,
+    pub oid: i32,
+    pub idx: usize,
+    pub lo: Option<(Vec<Value>, bool)>,
+    pub hi: Option<(Vec<Value>, bool)>,
+}
+
+fn cmp_prefix(key: &[Value], bound: &[Value]) -> Ordering {
+    for (a, b) in key.iter().zip(bound.iter()) {
+        let c = sort_cmp(a, b);
+        if c != Ordering::Equal {
+            return c;
+        }
+    }
+    Ordering::Equal
+}
+
+impl KeyRange {
+    pub fn covers(&self, key: &[Value]) -> bool {
+        let above = match &self.lo {
+            None => true,
+            Some((b, incl)) => match cmp_prefix(key, b) {
+                Ordering::Greater => true,
+                Ordering::Equal => *incl,
+                Ordering::Less => false,
+            },
+        };
+        above
+            && match &self.hi {
+                None => true,
+                Some((b, incl)) => match cmp_prefix(key, b) {
+                    Ordering::Less => true,
+                    Ordering::Equal => *incl,
+                    Ordering::Greater => false,
+                },
+            }
+    }
 }
 
 #[derive(Default)]
@@ -54,6 +106,7 @@ pub struct LockManager {
     held: HashMap<Res, Vec<(TxId, Mode)>>,
     by_tx: HashMap<TxId, Vec<Res>>,
     waits: HashMap<TxId, Vec<TxId>>,
+    ranges: Vec<KeyRange>,
 }
 
 impl LockManager {
@@ -90,7 +143,34 @@ impl LockManager {
         Ok(())
     }
 
+    /// Record a shared key-range lock for `tx` (never blocks: readers do not conflict with readers).
+    pub fn acquire_range(&mut self, r: KeyRange) {
+        let same = |a: &Option<(Vec<Value>, bool)>, b: &Option<(Vec<Value>, bool)>| match (a, b) {
+            (None, None) => true,
+            (Some((x, i)), Some((y, j))) => i == j && x.len() == y.len() && cmp_prefix(x, y) == Ordering::Equal,
+            _ => false,
+        };
+        if self.ranges.iter().any(|e| e.tx == r.tx && e.oid == r.oid && e.idx == r.idx && same(&e.lo, &r.lo) && same(&e.hi, &r.hi)) {
+            return;
+        }
+        self.ranges.push(r);
+    }
+
+    /// Are there any key-range locks at all? (A cheap test so writers skip the key checks otherwise.)
+    pub fn has_ranges(&self) -> bool {
+        !self.ranges.is_empty()
+    }
+
+    /// Transactions other than `tx` holding a key-range lock on index `idx` of table `oid` that covers `key`.
+    pub fn range_conflicts(&self, tx: TxId, oid: i32, idx: usize, key: &[Value]) -> Vec<TxId> {
+        let mut v: Vec<TxId> = self.ranges.iter().filter(|r| r.tx != tx && r.oid == oid && r.idx == idx && r.covers(key)).map(|r| r.tx).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
     pub fn release_all(&mut self, tx: TxId) {
+        self.ranges.retain(|r| r.tx != tx);
         if let Some(rs) = self.by_tx.remove(&tx) {
             for r in rs {
                 if let Some(hs) = self.held.get_mut(&r) {
@@ -131,7 +211,7 @@ impl LockManager {
     }
 
     pub fn lock_count(&self, tx: TxId) -> usize {
-        self.by_tx.get(&tx).map(|v| v.len()).unwrap_or(0)
+        self.by_tx.get(&tx).map(|v| v.len()).unwrap_or(0) + self.ranges.iter().filter(|r| r.tx == tx).count()
     }
 
     /// (resource, tx, mode) for every held lock, for sys.dm_tran_locks.
@@ -141,6 +221,9 @@ impl LockManager {
             for (t, m) in hs {
                 v.push((r.clone(), *t, *m));
             }
+        }
+        for r in &self.ranges {
+            v.push((Res::Range(r.oid, r.idx), r.tx, Mode::S));
         }
         v
     }

@@ -33,6 +33,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 uuid = { version = "1", features = ["v4", "serde"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
+unicode-normalization = "0.1"
 sha1 = "0.10"
 md-5 = "0.10"
 rand = "0.8"
@@ -44,12 +45,16 @@ eframe = { version = "0.32.3", optional = true }
 egui = { version = "0.32.3", optional = true }
 egui_extras = { version = "0.32.3", optional = true }
 rfd = { version = "0.17.2", optional = true }
+# TLS for the TDS listener (pure Rust crypto provider, no C toolchain needed)
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
 [dev-dependencies]
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 tempfile = "3"
 # an independent TDS client, to check the server against a real implementation
-tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono"] }
-tokio = { version = "1", features = ["rt", "net", "macros"] }
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono", "rustls"] }
+tokio = { version = "1", features = ["rt", "net", "macros", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 
 [profile.release]

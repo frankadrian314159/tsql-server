@@ -181,7 +181,8 @@ fn dropped_tables_give_their_space_back() {
     exec(&mut c, "DROP TABLE big");
     s.checkpoint();
     let (empty, _) = s.storage_stats();
-    assert!(empty.free_blocks as u64 > full.file_blocks / 2, "dropping the table should release its blocks: before {:?}, after {:?}", full, empty);
+    // the blocks are released: either listed as free or, now that the file shrinks, cut off its end
+    assert!(empty.free_blocks as u64 + empty.truncated > full.file_blocks / 2 && empty.file_blocks < full.file_blocks / 2, "dropping the table should release its blocks: before {:?}, after {:?}", full, empty);
     load_big(&mut c, 8_000);
     s.checkpoint();
     let (again, _) = s.storage_stats();
@@ -277,4 +278,98 @@ fn a_crash_halfway_through_a_checkpoint_loses_nothing() {
     assert_eq!(scalar(&mut c, "SELECT pad FROM big WHERE id = 9000"), "new");
     assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM big WHERE id >= 2500 AND id < 9000"), "0");
     assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM big WHERE grp = 4"), "25");
+}
+
+fn data_file_len(dir: &std::path::Path) -> u64 {
+    std::fs::metadata(dir.join("data.db")).unwrap().len()
+}
+
+#[test]
+fn deleting_most_rows_shrinks_the_page_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = open(dir.path(), 64);
+    let mut c = s.connect();
+    load_big(&mut c, 20_000);
+    s.checkpoint();
+    let big = data_file_len(dir.path());
+    let (st0, _) = s.storage_stats();
+    // scattered deletes leave free blocks all through the file
+    exec(&mut c, "DELETE big WHERE id % 20 <> 0");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM big"), "1000");
+    for _ in 0..3 {
+        s.checkpoint();
+    }
+    let small = data_file_len(dir.path());
+    let (st, _) = s.storage_stats();
+    assert!(small * 3 < big, "page file {big} -> {small} bytes; stats before {:?}, after {:?}", st0, st);
+    assert!(st.file_blocks < st0.file_blocks / 3, "{:?}", st);
+    // what is left is intact, through the table and its secondary index
+    assert_eq!(scalar(&mut c, "SELECT SUM(CAST(id AS BIGINT)) FROM big"), "9990000");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM big WHERE grp = 0"), "200");
+    assert_eq!(scalar(&mut c, "SELECT pad FROM big WHERE id = 12340"), pad());
+    // the space is reused: reloading the rows does not make the file much bigger than it was
+    exec(&mut c, "DELETE big WHERE id >= 0");
+    for i in 0..4 {
+        let vals: Vec<String> = (0..500).map(|k| format!("({}, {}, '{}')", i * 500 + k, k % 100, pad())).collect();
+        exec(&mut c, &format!("INSERT big VALUES {}", vals.join(",")));
+    }
+    s.checkpoint();
+    assert!(data_file_len(dir.path()) < big);
+    drop(c);
+    drop(s);
+    // a cold start reads the compacted file
+    let s = open(dir.path(), 64);
+    let mut c = s.connect();
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM big"), "2000");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM big WHERE grp = 7"), "20");
+}
+
+#[test]
+fn a_crash_after_compaction_but_before_the_checkpoint_loses_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let s = open(dir.path(), 32);
+        let mut c = s.connect();
+        load_big(&mut c, 12_000);
+        s.checkpoint();
+        exec(&mut c, "DELETE big WHERE id % 10 <> 0");
+        exec(&mut c, "UPDATE big SET pad = 'kept' WHERE id % 100 = 0");
+        // compaction moves pages and writes them, then the process dies before the checkpoint file is replaced
+        s.flush_pages_only();
+        s.simulate_crash();
+    }
+    let s = open(dir.path(), 32);
+    let mut c = s.connect();
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM big"), "1200");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM big WHERE pad = 'kept'"), "120");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM big WHERE grp = 10"), "120");
+    assert_eq!(scalar(&mut c, "SELECT SUM(CAST(id AS BIGINT)) FROM big"), "7194000");
+    // and the recovered database can itself be compacted
+    s.checkpoint();
+    s.checkpoint();
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM big"), "1200");
+}
+
+#[test]
+fn heavy_churn_keeps_the_file_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = open(dir.path(), 64);
+    let mut c = s.connect();
+    exec(&mut c, "CREATE TABLE q (id INT PRIMARY KEY, pad VARCHAR(200))");
+    let mut high = 0u64;
+    for round in 0..6 {
+        let base = round * 2000;
+        for i in 0..4 {
+            let vals: Vec<String> = (0..500).map(|k| format!("({}, '{}')", base + i * 500 + k, pad())).collect();
+            exec(&mut c, &format!("INSERT q VALUES {}", vals.join(",")));
+        }
+        // a sliding window: only the newest 200 rows survive each round
+        exec(&mut c, &format!("DELETE q WHERE id < {}", base + 1800));
+        s.checkpoint();
+        s.checkpoint();
+        high = high.max(data_file_len(dir.path()));
+    }
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM q"), "200");
+    let end = data_file_len(dir.path());
+    assert!(end * 2 <= high || end < 400 * 8192, "the file should stay small: end {end}, high-water {high}");
 }

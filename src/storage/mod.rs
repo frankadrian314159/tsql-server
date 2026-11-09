@@ -170,16 +170,118 @@ pub fn cmp_prefix(key: &[Value], bound: &[Value]) -> Ordering {
     Ordering::Equal
 }
 
+/// The comparison of one condition of a filtered index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FilterOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    IsNull,
+    IsNotNull,
+    In,
+}
+
+/// `column <op> constant(s)`: one conjunct of a filtered index's `WHERE` clause.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FilterCond {
+    pub col: usize,
+    pub op: FilterOp,
+    pub vals: Vec<Value>,
+}
+
+impl FilterCond {
+    /// Does a column value satisfy the condition? (A NULL satisfies only `IS NULL`.)
+    pub fn holds(&self, v: &Value) -> bool {
+        use FilterOp::*;
+        match self.op {
+            IsNull => return v.is_null(),
+            IsNotNull => return !v.is_null(),
+            _ => {}
+        }
+        if v.is_null() {
+            return false;
+        }
+        let cmp = |c: &Value| crate::convert::compare(v, c).ok().flatten();
+        match self.op {
+            In => self.vals.iter().any(|c| cmp(c) == Some(Ordering::Equal)),
+            Eq => cmp(&self.vals[0]) == Some(Ordering::Equal),
+            Ne => cmp(&self.vals[0]).is_some_and(|o| o != Ordering::Equal),
+            Lt => cmp(&self.vals[0]) == Some(Ordering::Less),
+            Le => cmp(&self.vals[0]).is_some_and(|o| o != Ordering::Greater),
+            Gt => cmp(&self.vals[0]) == Some(Ordering::Greater),
+            Ge => cmp(&self.vals[0]).is_some_and(|o| o != Ordering::Less),
+            IsNull | IsNotNull => unreachable!(),
+        }
+    }
+}
+
+/// The `WHERE` clause of a filtered index: a conjunction of simple conditions. Only rows that satisfy it are in the index.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FilterPred {
+    pub conds: Vec<FilterCond>,
+    /// The clause as written (for scripting and `sys.indexes.filter_definition`).
+    pub text: String,
+}
+
+impl PartialEq for FilterPred {
+    fn eq(&self, o: &Self) -> bool {
+        self.text == o.text
+    }
+}
+
+impl FilterPred {
+    pub fn admits(&self, row: &Row) -> bool {
+        self.conds.iter().all(|c| row.get(c.col).is_some_and(|v| c.holds(v)))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IndexSpec {
     pub name: String,
     pub cols: Vec<usize>,
     pub unique: bool,
     pub pk: bool,
+    /// Collation of each key column that is not the built-in default (parallel to `cols`, may be shorter). Strings in
+    /// such columns are stored in the index as their sort keys (see `collation.rs`), so the tree orders them as the
+    /// collation does and a unique index is unique in that collation.
+    #[serde(default)]
+    pub colls: Vec<Option<String>>,
+    /// Filtered index: only rows that satisfy this are in the index.
+    #[serde(default)]
+    pub filter: Option<FilterPred>,
+}
+
+impl IndexSpec {
+    /// `vals` (the first key columns) as the index stores them.
+    pub fn xform(&self, vals: &[Value]) -> Vec<Value> {
+        vals.iter()
+            .enumerate()
+            .map(|(i, v)| match (v, self.colls.get(i)) {
+                (Value::Str(s), Some(Some(name))) => match crate::collation::get(name) {
+                    Some(c) if !c.is_default() => Value::Str(c.key(s)),
+                    _ => v.clone(),
+                },
+                _ => v.clone(),
+            })
+            .collect()
+    }
+
+    /// Is `row` in this index (always, unless the index is filtered)?
+    pub fn admits(&self, row: &Row) -> bool {
+        self.filter.as_ref().is_none_or(|f| f.admits(row))
+    }
+
+    fn has_colls(&self) -> bool {
+        self.colls.iter().any(|c| c.is_some())
+    }
 }
 
 fn extract(spec: &IndexSpec, row: &Row) -> KeyVals {
-    KeyVals(spec.cols.iter().map(|&c| row[c].clone()).collect())
+    let vals: Vec<Value> = spec.cols.iter().map(|&c| row[c].clone()).collect();
+    KeyVals(if spec.has_colls() { spec.xform(&vals) } else { vals })
 }
 
 fn heap_key() -> KeyVals {
@@ -292,7 +394,9 @@ impl TableData {
                 for v in &slot.versions {
                     if let Some(r) = &v.row {
                         for &i in &build {
-                            self.indexes[i].put(extract(&self.specs[i], r), *rid as u64, Slot::default());
+                            if self.specs[i].admits(r) {
+                                self.indexes[i].put(extract(&self.specs[i], r), *rid as u64, Slot::default());
+                            }
                         }
                     }
                 }
@@ -305,12 +409,12 @@ impl TableData {
     }
 
     /// Reserve a new row id.
-    pub fn alloc(&mut self) -> RowId {
+    pub fn alloc(&self) -> RowId {
         self.heap.alloc_id() as RowId
     }
 
     /// Make sure `rowid` is never allocated again (log replay).
-    pub fn ensure_slot(&mut self, rowid: RowId) {
+    pub fn ensure_slot(&self, rowid: RowId) {
         self.heap.reserve_id(rowid as u64);
     }
 
@@ -355,11 +459,13 @@ impl TableData {
     }
 
     // ---- writes
-    pub fn push_version(&mut self, rowid: RowId, row: Option<Row>, stamp: Stamp) {
+    pub fn push_version(&self, rowid: RowId, row: Option<Row>, stamp: Stamp) {
         let mut slot = self.slot(rowid).unwrap_or_default();
         if let Some(r) = &row {
             for (i, sp) in self.specs.iter().enumerate() {
-                self.indexes[i].put(extract(sp, r), rowid as u64, Slot::default());
+                if sp.admits(r) {
+                    self.indexes[i].put(extract(sp, r), rowid as u64, Slot::default());
+                }
             }
         }
         slot.versions.push(Version { row, stamp });
@@ -368,8 +474,11 @@ impl TableData {
 
     fn unindex_unused(&self, rowid: RowId, row: &Row, remaining: &Slot) {
         for (i, sp) in self.specs.iter().enumerate() {
+            if !sp.admits(row) {
+                continue; // it never had an entry
+            }
             let key = extract(sp, row);
-            let still_used = remaining.versions.iter().any(|v| v.row.as_ref().map(|r| extract(sp, r) == key).unwrap_or(false));
+            let still_used = remaining.versions.iter().any(|v| v.row.as_ref().map(|r| sp.admits(r) && extract(sp, r) == key).unwrap_or(false));
             if !still_used {
                 self.indexes[i].remove(&key, rowid as u64);
             }
@@ -377,7 +486,7 @@ impl TableData {
     }
 
     /// Remove the newest version of a slot (rollback).
-    pub fn pop_version(&mut self, rowid: RowId) {
+    pub fn pop_version(&self, rowid: RowId) {
         let mut slot = match self.slot(rowid) {
             Some(s) => s,
             None => return,
@@ -391,7 +500,7 @@ impl TableData {
     }
 
     /// Stamp this transaction's versions on the slot as committed at `ts`.
-    pub fn commit_slot(&mut self, rowid: RowId, tx: TxId, ts: u64) {
+    pub fn commit_slot(&self, rowid: RowId, tx: TxId, ts: u64) {
         let mut slot = match self.slot(rowid) {
             Some(s) => s,
             None => return,
@@ -417,7 +526,7 @@ impl TableData {
     }
 
     /// Discard versions no snapshot at or after `horizon` can see.
-    pub fn gc_slot(&mut self, rowid: RowId, horizon: u64) {
+    pub fn gc_slot(&self, rowid: RowId, horizon: u64) {
         let mut slot = match self.slot(rowid) {
             Some(s) => s,
             None => return,
@@ -448,7 +557,7 @@ impl TableData {
     }
 
     /// Replace a slot by a single committed version (or remove it); used by log replay.
-    pub fn replace_slot(&mut self, rowid: RowId, row: Option<Row>, ts: u64) {
+    pub fn replace_slot(&self, rowid: RowId, row: Option<Row>, ts: u64) {
         if let Some(old) = self.slot(rowid) {
             for v in old.versions {
                 if let Some(r) = v.row {
@@ -462,7 +571,9 @@ impl TableData {
         match row {
             Some(r) => {
                 for (i, sp) in self.specs.iter().enumerate() {
-                    self.indexes[i].put(extract(sp, &r), rowid as u64, Slot::default());
+                    if sp.admits(&r) {
+                        self.indexes[i].put(extract(sp, &r), rowid as u64, Slot::default());
+                    }
                 }
                 self.heap.put(heap_key(), rowid as u64, Slot { versions: vec![Version { row: Some(r), stamp: Stamp::Ts(ts) }] });
             }
@@ -570,6 +681,16 @@ impl TableData {
     /// Up to `n` index entries within the bounds, in key order (or reverse), after the entry `after`.
     /// A bound is (values, inclusive) over the first columns of the key.
     pub fn range_chunk(&self, idx: usize, lo: Option<(&[Value], bool)>, hi: Option<(&[Value], bool)>, forward: bool, after: Option<&(KeyVals, u64)>, n: usize) -> Vec<(KeyVals, u64)> {
+        // bounds are given as the user's values: convert them to what the index stores
+        let spec = &self.specs[idx];
+        let (lo_k, hi_k);
+        let (lo, hi) = if spec.has_colls() {
+            lo_k = lo.map(|(v, i)| (spec.xform(v), i));
+            hi_k = hi.map(|(v, i)| (spec.xform(v), i));
+            (lo_k.as_ref().map(|(v, i)| (v.as_slice(), *i)), hi_k.as_ref().map(|(v, i)| (v.as_slice(), *i)))
+        } else {
+            (lo, hi)
+        };
         let ge_lo = |k: &KeyVals| match lo {
             None => true,
             Some((v, incl)) => {
@@ -627,13 +748,19 @@ impl TableData {
         self.seek_range(idx, Some((prefix, true)), Some((prefix, true)), true)
     }
 
+    /// The key of `row` in index `idx` as the index stores it.
     pub fn index_key(&self, idx: usize, row: &Row) -> Vec<Value> {
         extract(&self.specs[idx], row).0
     }
 
+    /// A bound given as the user's values, converted to what index `idx` stores (for lock ranges).
+    pub fn index_bound(&self, idx: usize, vals: &[Value]) -> Vec<Value> {
+        self.specs[idx].xform(vals)
+    }
+
     /// The first index whose serialised key for `row` is longer than SQL Server allows, with its length.
     pub fn oversized_key(&self, row: &Row) -> Option<(String, usize)> {
-        for sp in &self.specs {
+        for sp in self.specs.iter().filter(|sp| sp.admits(row)) {
             let n = postcard::to_allocvec(&extract(sp, row)).map(|v| v.len()).unwrap_or(0);
             if n > MAX_KEY_BYTES {
                 return Some((sp.name.clone(), n));
@@ -697,7 +824,7 @@ mod tests {
     fn table(n: i64, key: impl Fn(i64) -> i64) -> TableData {
         let store = PageStore::memory();
         let mut d = TableData::new(&store);
-        d.set_specs(vec![IndexSpec { name: "ix".into(), cols: vec![0], unique: false, pk: false }]);
+        d.set_specs(vec![IndexSpec { name: "ix".into(), cols: vec![0], unique: false, pk: false, colls: vec![], filter: None }]);
         for i in 0..n {
             let rid = d.alloc();
             d.push_version(rid, Some(vec![Value::BigInt(key(i)), Value::Int(i as i32)]), Stamp::Ts(1));

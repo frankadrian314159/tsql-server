@@ -19,7 +19,81 @@ fn tv(b: Option<bool>) -> Value {
     }
 }
 
+/// Functions whose string result has the collation of their (first string) argument.
+const COLLATION_PASSING: &[&str] = &["UPPER", "LOWER", "LTRIM", "RTRIM", "TRIM", "SUBSTRING", "LEFT", "RIGHT", "REPLACE", "REVERSE", "CONCAT", "ISNULL", "COALESCE", "STUFF", "REPLICATE", "NULLIF"];
+
 impl<'a> Engine<'a> {
+    /// The collation of an expression as SQL Server derives it: an explicit `COLLATE` wins; otherwise the collation of a
+    /// column it is built from; literals and variables take whatever they are compared with. `None` means the
+    /// built-in default (or no string involved). The flag says the collation was asked for explicitly.
+    pub fn expr_coll(&self, e: &Expr, env: &Env<'_>) -> Option<(Arc<crate::collation::Collation>, bool)> {
+        match e {
+            Expr::Col(p) => {
+                let mut cur = Some(env);
+                while let Some(en) = cur {
+                    match en.schema.find_parts(p) {
+                        super::query::Found::One(i) => return en.schema.cols[i].coll.clone().map(|c| (c, false)),
+                        super::query::Found::None => cur = en.parent,
+                        _ => return None,
+                    }
+                }
+                None
+            }
+            Expr::Collate(_, name) => crate::collation::get(name).map(|c| (c, true)),
+            Expr::Paren(x) => self.expr_coll(x, env),
+            Expr::Cast { e, .. } => self.expr_coll(e, env),
+            Expr::Binary(BinOp::Add, a, b) => self.expr_coll(a, env).or_else(|| self.expr_coll(b, env)),
+            Expr::Func(f) if COLLATION_PASSING.contains(&f.name.as_str()) => f.args.iter().find_map(|a| self.expr_coll(a, env)),
+            _ => None,
+        }
+    }
+
+    /// The default collation of the current database, if it is not the built-in one.
+    fn ambient_coll(&self) -> Option<Arc<crate::collation::Collation>> {
+        let db = self.srv.databases.get(&self.ses.db.to_lowercase())?;
+        if db.collation == crate::collation::DEFAULT_NAME {
+            return None;
+        }
+        crate::collation::get(&db.collation).filter(|c| !c.is_default())
+    }
+
+    /// The collation in which `a` and `b` are compared, or `None` for the built-in comparison. Two different
+    /// collations that cannot be reconciled are error 468.
+    pub fn pick_coll(&self, a: &Expr, b: &Expr, env: &Env<'_>) -> Result<Option<Arc<crate::collation::Collation>>> {
+        if !crate::collation::in_use() {
+            return Ok(None);
+        }
+        self.resolve_coll(self.expr_coll(a, env), self.expr_coll(b, env))
+    }
+
+    /// Settle which of two derived collations a comparison uses (see `pick_coll`).
+    pub fn resolve_coll(&self, ca: Option<(Arc<crate::collation::Collation>, bool)>, cb: Option<(Arc<crate::collation::Collation>, bool)>) -> Result<Option<Arc<crate::collation::Collation>>> {
+        let conflict = |x: &crate::collation::Collation, y: &crate::collation::Collation| {
+            SqlError::with(468, 16, 1, format!("Cannot resolve the collation conflict between \"{}\" and \"{}\" in the equal to operation.", y.name, x.name))
+        };
+        Ok(match (ca, cb) {
+            (Some((x, true)), Some((y, true))) | (Some((x, false)), Some((y, false))) => {
+                if !x.name.eq_ignore_ascii_case(&y.name) {
+                    return Err(conflict(&x, &y));
+                }
+                Some(x)
+            }
+            (Some((x, true)), _) | (_, Some((x, true))) => Some(x),
+            (Some((x, false)), None) | (None, Some((x, false))) => Some(x),
+            (None, None) => self.ambient_coll(),
+        })
+    }
+
+    /// Compare two values the way a comparison of expressions `a` and `b` does: strings by their collation.
+    pub fn cmp_exprs(&self, a: &Expr, b: &Expr, l: &Value, r: &Value, env: &Env<'_>) -> Result<Option<Ordering>> {
+        if let (Value::Str(x), Value::Str(y)) = (l, r) {
+            if let Some(c) = self.pick_coll(a, b, env)? {
+                return Ok(Some(c.compare(x, y)));
+            }
+        }
+        compare(l, r)
+    }
+
     pub fn ev(&mut self, e: &Expr, env: &Env<'_>) -> Result<Value> {
         match e {
             Expr::Lit(v) => Ok(v.clone()),
@@ -48,7 +122,7 @@ impl<'a> Engine<'a> {
                 let r = self.ev(b, env)?;
                 match op {
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                        let o = compare(&l, &r)?;
+                        let o = self.cmp_exprs(a, b, &l, &r, env)?;
                         Ok(match o {
                             None => Value::Null,
                             Some(o) => Value::Bit(match op {
@@ -101,7 +175,7 @@ impl<'a> Engine<'a> {
                 let r = self.ev(b, env)?;
                 let same = match (l.is_null(), r.is_null()) {
                     (true, true) => true,
-                    (false, false) => compare(&l, &r)? == Some(Ordering::Equal),
+                    (false, false) => self.cmp_exprs(a, b, &l, &r, env)? == Some(Ordering::Equal),
                     _ => false,
                 };
                 // IS DISTINCT FROM => not same ; IS NOT DISTINCT FROM => same
@@ -115,7 +189,7 @@ impl<'a> Engine<'a> {
                 let mut saw_null = false;
                 for it in items {
                     let r = self.ev(it, env)?;
-                    match compare(&l, &r)? {
+                    match self.cmp_exprs(a, it, &l, &r, env)? {
                         Some(Ordering::Equal) => return Ok(Value::Bit(!*neg)),
                         None => saw_null = true,
                         _ => {}
@@ -164,15 +238,18 @@ impl<'a> Engine<'a> {
                     return Ok(Value::Null);
                 }
                 let escc = esc.as_ref().and_then(|e| if e.is_null() { None } else { to_str(e).chars().next() });
-                let m = like_match(&to_str(&v), &to_str(&pat), escc);
+                let m = match (&v, self.pick_coll(a, p, env)?) {
+                    (Value::Str(_), Some(c)) if !c.is_default() => like_match_fold(&to_str(&v), &to_str(&pat), escc, &|ch| c.fold_char(ch)),
+                    _ => like_match(&to_str(&v), &to_str(&pat), escc),
+                };
                 Ok(Value::Bit(m != *neg))
             }
             Expr::Between(a, lo, hi, neg) => {
                 let v = self.ev(a, env)?;
                 let l = self.ev(lo, env)?;
                 let h = self.ev(hi, env)?;
-                let c1 = compare(&v, &l)?.map(|o| o != Ordering::Less);
-                let c2 = compare(&v, &h)?.map(|o| o != Ordering::Greater);
+                let c1 = self.cmp_exprs(a, lo, &v, &l, env)?.map(|o| o != Ordering::Less);
+                let c2 = self.cmp_exprs(a, hi, &v, &h, env)?.map(|o| o != Ordering::Greater);
                 let r = match (c1, c2) {
                     (Some(false), _) | (_, Some(false)) => Some(false),
                     (Some(true), Some(true)) => Some(true),
@@ -187,8 +264,12 @@ impl<'a> Engine<'a> {
                     return Ok(Value::Bit(*all));
                 }
                 let mut saw_null = false;
+                let lcoll = self.expr_coll(a, env).map(|c| c.0);
                 for r in rs.rows.iter() {
-                    let o = compare(&l, &r[0])?;
+                    let o = match (&l, &r[0], &lcoll) {
+                        (Value::Str(x), Value::Str(y), Some(c)) => Some(c.compare(x, y)),
+                        _ => compare(&l, &r[0])?,
+                    };
                     let b = o.map(|o| match op {
                         BinOp::Eq => o == Ordering::Equal,
                         BinOp::Ne => o != Ordering::Equal,
@@ -263,7 +344,12 @@ impl<'a> Engine<'a> {
                     Err(err) => Err(err),
                 }
             }
-            Expr::Collate(x, _) => self.ev(x, env),
+            Expr::Collate(x, name) => {
+                if crate::collation::get(name).is_none() {
+                    return Err(SqlError::with(448, 16, 1, format!("Invalid collation '{}'.", name)));
+                }
+                self.ev(x, env)
+            }
             Expr::AtTimeZone(x, z) => {
                 let v = self.ev(x, env)?;
                 let zone = self.ev(z, env)?;
@@ -393,30 +479,37 @@ impl<'a> Engine<'a> {
     pub fn next_value(&mut self, name: &[String]) -> Result<Value> {
         let loc = self.locate(name);
         if let Loc::Db(d, k) = &loc {
-            if let Some(Object::Seq(s)) = self.srv.databases.get_mut(d).and_then(|db| db.objects.get_mut(k)) {
-                let next = match s.current {
-                    None => s.start,
-                    Some(c) => {
-                        let n = c + s.inc;
-                        if (s.inc > 0 && n > s.max) || (s.inc < 0 && n < s.min) {
-                            if s.cycle {
-                                if s.inc > 0 {
-                                    s.min
+            if let Some(Object::Seq(s)) = self.srv.databases.get(d).and_then(|db| db.objects.get(k)) {
+                let (start, inc, min, max, cycle, sname, ty) = (s.start, s.inc, s.min, s.max, s.cycle, s.name.clone(), s.ty.clone());
+                let (dbn, keyn) = (d.clone(), k.clone());
+                let srv: &ServerState = &self.srv;
+                let (clock, oid, rv) = (srv.core.clock(), srv.core.object_id(), srv.core.rowversion());
+                let next = s.current.update(|cur| {
+                    let next = match cur {
+                        None => start,
+                        Some(c) => {
+                            let n = c + inc;
+                            if (inc > 0 && n > max) || (inc < 0 && n < min) {
+                                if cycle {
+                                    if inc > 0 {
+                                        min
+                                    } else {
+                                        max
+                                    }
                                 } else {
-                                    s.max
+                                    return Err(SqlError::new(11728, format!("The sequence object '{}' has reached its minimum or maximum value. Restart the sequence object to allow new values to be generated.", sname)));
                                 }
                             } else {
-                                return Err(SqlError::new(11728, format!("The sequence object '{}' has reached its minimum or maximum value. Restart the sequence object to allow new values to be generated.", s.name)));
+                                n
                             }
-                        } else {
-                            n
                         }
+                    };
+                    // logged while the counter is held, so the log records values in the order they were handed out
+                    if let Some(p) = srv.persist().as_mut() {
+                        let _ = p.append(clock, oid, rv, vec![crate::persist::LogOp::SeqSet { db: dbn.clone(), key: keyn.clone(), current: Some(next) }], false);
                     }
-                };
-                s.current = Some(next);
-                let ty = s.ty.clone();
-                let (dbn, keyn) = (d.clone(), k.clone());
-                self.log_nowait(vec![crate::persist::LogOp::SeqSet { db: dbn, key: keyn, current: Some(next) }]);
+                    Ok((Some(next), next))
+                })?;
                 return convert::cast(&Value::BigInt(next), &ty, None);
             }
         }
@@ -448,7 +541,7 @@ impl<'a> Engine<'a> {
             "@@PROCID" => Value::Int(0),
             "@@CONNECTIONS" => Value::Int(1),
             "@@TOTAL_ERRORS" | "@@TOTAL_READ" | "@@TOTAL_WRITE" | "@@IO_BUSY" | "@@CPU_BUSY" | "@@IDLE" | "@@PACK_RECEIVED" | "@@PACK_SENT" | "@@PACKET_ERRORS" | "@@TIMETICKS" => Value::Int(0),
-            "@@DBTS" => Value::Bin(self.srv.next_rowversion.to_be_bytes().to_vec()),
+            "@@DBTS" => Value::Bin(self.srv.core.rowversion().to_be_bytes().to_vec()),
             _ => return Err(SqlError::new(137, format!("Must declare the scalar variable \"{}\".", n))),
         })
     }
@@ -469,11 +562,7 @@ enum Pat {
     Set(Vec<(char, char)>, bool),
 }
 
-fn lc(c: char) -> char {
-    c.to_lowercase().next().unwrap_or(c)
-}
-
-fn compile_like(p: &str, esc: Option<char>) -> Vec<Pat> {
+fn compile_like(p: &str, esc: Option<char>, lc: &dyn Fn(char) -> char) -> Vec<Pat> {
     let ch: Vec<char> = p.chars().collect();
     let mut out = vec![];
     let mut i = 0;
@@ -520,34 +609,41 @@ fn compile_like(p: &str, esc: Option<char>) -> Vec<Pat> {
     out
 }
 
-fn like_rec(p: &[Pat], s: &[char]) -> bool {
+fn like_rec(p: &[Pat], s: &[char], lc: &dyn Fn(char) -> char) -> bool {
     if p.is_empty() {
         return s.is_empty();
     }
     match &p[0] {
         Pat::Many => {
             for k in 0..=s.len() {
-                if like_rec(&p[1..], &s[k..]) {
+                if like_rec(&p[1..], &s[k..], lc) {
                     return true;
                 }
             }
             false
         }
-        Pat::One => !s.is_empty() && like_rec(&p[1..], &s[1..]),
-        Pat::Lit(c) => !s.is_empty() && lc(s[0]) == *c && like_rec(&p[1..], &s[1..]),
+        Pat::One => !s.is_empty() && like_rec(&p[1..], &s[1..], lc),
+        Pat::Lit(c) => !s.is_empty() && lc(s[0]) == *c && like_rec(&p[1..], &s[1..], lc),
         Pat::Set(r, neg) => {
             if s.is_empty() {
                 return false;
             }
             let c = lc(s[0]);
             let inside = r.iter().any(|(a, b)| c >= *a && c <= *b);
-            inside != *neg && like_rec(&p[1..], &s[1..])
+            inside != *neg && like_rec(&p[1..], &s[1..], lc)
         }
     }
 }
 
+/// LIKE with the default (case-insensitive) rules.
 pub fn like_match(s: &str, pat: &str, esc: Option<char>) -> bool {
-    let p = compile_like(pat, esc);
+    like_match_fold(s, pat, esc, &|c: char| c.to_lowercase().next().unwrap_or(c))
+}
+
+/// LIKE where `fold` maps every character of the string and of the pattern to the form that is compared (so the case
+/// and accent rules of a collation can be applied).
+pub fn like_match_fold(s: &str, pat: &str, esc: Option<char>, fold: &dyn Fn(char) -> char) -> bool {
+    let p = compile_like(pat, esc, fold);
     let chars: Vec<char> = s.trim_end_matches(' ').chars().collect();
-    like_rec(&p, &chars)
+    like_rec(&p, &chars, fold)
 }

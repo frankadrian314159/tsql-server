@@ -46,15 +46,21 @@ impl<'a> Engine<'a> {
                 if matches!(ty, DataType::Timestamp) {
                     nullable = false;
                 }
+                let collation = self.column_collation(&c.collation, &ty)?;
+                let mask = self.validated_mask(&c.mask, &ty, &c.name)?;
                 cols.push(Column {
                     name: c.name.clone(),
                     ty,
                     nullable,
                     identity,
                     default: c.default.clone().map(Arc::new),
+                    default_text: c.default_text.clone(),
+                    computed_text: c.computed_text.clone(),
                     default_name: c.default.as_ref().map(|_| c.default_name.clone().unwrap_or_else(|| format!("DF__{}__{}__{:08X}", name, c.name, oid))),
                     computed: c.computed.clone().map(Arc::new),
                     user_type,
+                    collation,
+                    mask,
                 });
             }
         }
@@ -73,11 +79,11 @@ impl<'a> Engine<'a> {
                     }
                     if let Some(n) = &c.unique {
                         let kn = n.clone().unwrap_or_else(|| format!("UQ__{}__{:08X}", name, self.srv.new_object_id()));
-                        t.uniques.push(KeyDef { name: kn, cols: vec![ci], is_index: false, clustered: false });
+                        t.uniques.push(KeyDef { name: kn, cols: vec![ci], is_index: false, clustered: false, include: vec![], filter: None });
                     }
-                    for (n, e) in &c.checks {
+                    for (n, e, ctext) in &c.checks {
                         let cn = n.clone().unwrap_or_else(|| format!("CK__{}__{}__{:08X}", name, c.name, self.srv.new_object_id()));
-                        t.checks.push(CheckDef { name: cn, expr: Arc::new(e.clone()), enabled: true, col: Some(c.name.clone()) });
+                        t.checks.push(CheckDef { name: cn, expr: Arc::new(e.clone()), text: ctext.clone(), enabled: true, col: Some(c.name.clone()) });
                     }
                 }
                 TableDef::PrimaryKey { name: n, cols: kc } => {
@@ -87,20 +93,21 @@ impl<'a> Engine<'a> {
                 TableDef::Unique { name: n, cols: kc } => {
                     let idx: Vec<usize> = kc.iter().map(|(c, _)| idx_of(&t, c)).collect::<Result<_>>()?;
                     let kn = n.clone().unwrap_or_else(|| format!("UQ__{}__{:08X}", name, self.srv.new_object_id()));
-                    t.uniques.push(KeyDef { name: kn, cols: idx, is_index: false, clustered: false });
+                    t.uniques.push(KeyDef { name: kn, cols: idx, is_index: false, clustered: false, include: vec![], filter: None });
                 }
-                TableDef::Check { name: n, e } => {
+                TableDef::Check { name: n, e, text: ctext } => {
                     let cn = n.clone().unwrap_or_else(|| format!("CK__{}__{:08X}", name, self.srv.new_object_id()));
-                    t.checks.push(CheckDef { name: cn, expr: Arc::new(e.clone()), enabled: true, col: None });
+                    t.checks.push(CheckDef { name: cn, expr: Arc::new(e.clone()), text: ctext.clone(), enabled: true, col: None });
                 }
-                TableDef::DefaultFor { name: n, e, col } => {
+                TableDef::DefaultFor { name: n, e, col, text: dtext } => {
                     let ci = idx_of(&t, col)?;
                     t.columns[ci].default = Some(Arc::new(e.clone()));
+                    t.columns[ci].default_text = Some(dtext.clone());
                     t.columns[ci].default_name = Some(n.clone());
                 }
                 TableDef::Index { name: n, cols: kc, unique } => {
                     let idx: Vec<(usize, bool)> = kc.iter().map(|(c, d)| idx_of(&t, c).map(|i| (i, *d))).collect::<Result<_>>()?;
-                    t.indexes.push(IndexDef { name: n.clone(), cols: idx, unique: *unique });
+                    t.indexes.push(IndexDef { name: n.clone(), cols: idx, unique: *unique, include: vec![], filter: None });
                 }
                 TableDef::ForeignKey(_) => {}
             }
@@ -131,7 +138,7 @@ impl<'a> Engine<'a> {
             t.columns[i].nullable = false;
         }
         let kn = name.unwrap_or_else(|| format!("PK__{}__{:08X}", t.name, self.srv.new_object_id()));
-        t.pk = Some(KeyDef { name: kn, cols: idx, is_index: false, clustered: true });
+        t.pk = Some(KeyDef { name: kn, cols: idx, is_index: false, clustered: true, include: vec![], filter: None });
         Ok(())
     }
 
@@ -150,7 +157,7 @@ impl<'a> Engine<'a> {
                     t.pk.clone()
                 } else {
                     match self.srv.databases.get(&ref_db).and_then(|d| d.objects.get(&ref_key)) {
-                        Some(Object::Table(p)) => p.pk.clone().map(|k| KeyDef { name: k.name, cols: k.cols, is_index: false, clustered: true }).map(|k| {
+                        Some(Object::Table(p)) => p.pk.clone().map(|k| KeyDef { name: k.name, cols: k.cols, is_index: false, clustered: true, include: vec![], filter: None }).map(|k| {
                             let _ = &p;
                             k
                         }),
@@ -278,11 +285,11 @@ impl<'a> Engine<'a> {
                         let t = self.build_table(&dbname, &schema, &n, defs, false)?;
                         self.ensure_tx()?;
                         self.undo_object(&db, &key);
-                        self.srv.databases.get_mut(&db).unwrap().objects.insert(key, Object::Table(t));
+                        self.srv.cat_mut().databases.get_mut(&db).unwrap().objects.insert(key, Object::Table(t));
                     }
                 }
             }
-            Stmt::CreateIndex { name, table, cols, unique } => {
+            Stmt::CreateIndex { name, table, cols, unique, include, filter } => {
                 let loc = self.locate(table);
                 let t = self.table_ref(&loc).cloned().ok_or_else(|| self.invalid_object(table))?;
                 self.check_alter(&loc, table.last().unwrap())?;
@@ -294,18 +301,35 @@ impl<'a> Engine<'a> {
                     if t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name)) || t.all_keys().iter().any(|k| k.name.eq_ignore_ascii_case(name)) {
                         return Err(SqlError::new(1913, format!("The operation failed because an index or statistics with name '{}' already exists on table '{}'.", name, t.name)));
                     }
+                    // INCLUDE columns ride along in the index; they may not also be key columns
+                    let mut inc: Vec<usize> = vec![];
+                    for c in include {
+                        let i = t.col_index(c).ok_or_else(|| SqlError::new(1911, format!("Column name '{}' does not exist in the target table or view.", c)))?;
+                        if idx.iter().any(|(k, _)| *k == i) || inc.contains(&i) {
+                            return Err(SqlError::new(1909, format!("Cannot use duplicate column names in index. Column name '{}' listed more than once.", c)));
+                        }
+                        inc.push(i);
+                    }
+                    let fp = match filter {
+                        Some((e, text)) => Some(self.filter_pred(&t, e, text, name)?),
+                        None => None,
+                    };
                     if *unique {
                         let mut seen = HashSet::new();
                         for r in t.rows_vec().iter() {
+                            if fp.as_ref().is_some_and(|f| !f.admits(r)) {
+                                continue; // not in the index, so not subject to its uniqueness
+                            }
                             let vals: Vec<Value> = idx.iter().map(|(i, _)| r[*i].clone()).collect();
-                            if !seen.insert(key_of(&vals)) {
+                            let icols: Vec<usize> = idx.iter().map(|(i, _)| *i).collect();
+                            if !seen.insert(t.key_string(&icols, &vals)) {
                                 let shown = vals.iter().map(|v| if v.is_null() { "<NULL>".into() } else { convert::to_str(v) }).collect::<Vec<_>>().join(", ");
                                 return Err(SqlError::new(1505, format!("CREATE UNIQUE INDEX terminated because a duplicate key was found for the object name '{}.{}' and the index name '{}'. The duplicate key value is ({}).", t.schema, t.name, name, shown)));
                             }
                         }
-                        t.uniques.push(KeyDef { name: name.clone(), cols: idx.iter().map(|x| x.0).collect(), is_index: true, clustered: false });
+                        t.uniques.push(KeyDef { name: name.clone(), cols: idx.iter().map(|x| x.0).collect(), is_index: true, clustered: false, include: inc.clone(), filter: fp.clone() });
                     }
-                    t.indexes.push(IndexDef { name: name.clone(), cols: idx, unique: *unique });
+                    t.indexes.push(IndexDef { name: name.clone(), cols: idx, unique: *unique, include: inc, filter: fp });
                     t.sync_indexes();
                     Ok(())
                 })();
@@ -341,7 +365,7 @@ impl<'a> Engine<'a> {
                 let v = ViewDef { db: dbname, schema, name: n, query: query.clone(), cols: cols.clone(), text: text.clone(), object_id: oid, triggers: vec![] };
                 self.ensure_tx()?;
                 self.undo_object(&db, &key);
-                self.srv.databases.get_mut(&db).unwrap().objects.insert(key, Object::View(v));
+                self.srv.cat_mut().databases.get_mut(&db).unwrap().objects.insert(key, Object::View(v));
             }
             Stmt::CreateProc { name, params, body, text, or_alter, alter } => {
                 let (db, schema, n) = self.ddl_names(name);
@@ -359,7 +383,7 @@ impl<'a> Engine<'a> {
                 let p = ProcDef { schema, name: n, params: params.clone(), body: body.clone(), text: text.clone(), object_id: oid };
                 self.ensure_tx()?;
                 self.undo_object(&db, &key);
-                self.srv.databases.get_mut(&db).unwrap().objects.insert(key, Object::Proc(p));
+                self.srv.cat_mut().databases.get_mut(&db).unwrap().objects.insert(key, Object::Proc(p));
             }
             Stmt::CreateFunction(f) => {
                 let (db, schema, n) = self.ddl_names(&f.name);
@@ -374,7 +398,7 @@ impl<'a> Engine<'a> {
                 let fd = FuncDef { schema, name: n, def: Arc::new((**f).clone()), object_id: oid };
                 self.ensure_tx()?;
                 self.undo_object(&db, &key);
-                self.srv.databases.get_mut(&db).unwrap().objects.insert(key, Object::Func(fd));
+                self.srv.cat_mut().databases.get_mut(&db).unwrap().objects.insert(key, Object::Func(fd));
             }
             Stmt::CreateTrigger { name, table, events, instead, body, or_alter, text } => {
                 let (db, schema, n) = self.ddl_names(name);
@@ -400,7 +424,7 @@ impl<'a> Engine<'a> {
                 t.triggers.push(trg.clone());
                 let tk = t.key();
                 self.put_table(&tloc, t);
-                self.srv.databases.get_mut(&db).unwrap().triggers.insert(tkey, (tk, trg));
+                self.srv.cat_mut().databases.get_mut(&db).unwrap().triggers.insert(tkey, (tk, trg));
             }
             Stmt::CreateSchema(n, owner) => {
                 self.check_create_in("CREATE SCHEMA", None)?;
@@ -414,7 +438,12 @@ impl<'a> Engine<'a> {
                 self.current_db().schemas.insert(n.to_lowercase(), n.clone());
                 self.current_db().schema_owner.insert(n.to_lowercase(), owner);
             }
-            Stmt::CreateDatabase(n) => {
+            Stmt::CreateDatabase(n, coll) => {
+                if let Some(cn) = coll {
+                    if crate::collation::get(cn).is_none() {
+                        return Err(SqlError::with(448, 16, 1, format!("Invalid collation '{}'.", cn)));
+                    }
+                }
                 if !self.is_sysadmin() && !self.srv.security.dbcreators.contains(&self.eff_login().to_lowercase()) {
                     return Err(SqlError::with(262, 14, 1, "CREATE DATABASE permission denied in database 'master'."));
                 }
@@ -425,7 +454,11 @@ impl<'a> Engine<'a> {
                 let id = self.srv.databases.len() as i32 + 1;
                 self.ensure_tx()?;
                 self.push_undo(Undo::Database { key: k.clone(), prev: None });
-                self.srv.databases.insert(k, Database::new(n, id));
+                let mut nd = Database::new(n, id);
+                if let Some(cn) = coll {
+                    nd.collation = cn.clone();
+                }
+                self.srv.cat_mut().databases.insert(k, nd);
             }
             Stmt::CreateType { name, base, nullable, table } => {
                 let (db, schema, n) = self.ddl_names(name);
@@ -442,7 +475,7 @@ impl<'a> Engine<'a> {
                 let id = self.srv.new_object_id();
                 self.ensure_tx()?;
                 self.push_undo(Undo::Type { db: db.clone(), key: key.clone(), prev: None });
-                self.srv.databases.get_mut(&db).unwrap().types.insert(key, UserType { schema, name: n, kind, type_id: id });
+                self.srv.cat_mut().databases.get_mut(&db).unwrap().types.insert(key, UserType { schema, name: n, kind, type_id: id });
             }
             Stmt::CreateSequence { name, opts } => {
                 let (db, schema, n) = self.ddl_names(name);
@@ -488,10 +521,10 @@ impl<'a> Engine<'a> {
                     }
                 };
                 let oid = self.srv.new_object_id();
-                let s = Sequence { schema, name: n, ty, current: None, start, inc, min, max, cycle: opts.cycle.unwrap_or(false), object_id: oid };
+                let s = Sequence { schema, name: n, ty, current: crate::catalog::SharedCounter::new(None), start, inc, min, max, cycle: opts.cycle.unwrap_or(false), object_id: oid };
                 self.ensure_tx()?;
                 self.undo_object(&db, &key);
-                self.srv.databases.get_mut(&db).unwrap().objects.insert(key, Object::Seq(s));
+                self.srv.cat_mut().databases.get_mut(&db).unwrap().objects.insert(key, Object::Seq(s));
             }
             Stmt::AlterSequence { name, opts } => {
                 let (db, schema, n) = self.ddl_names(name);
@@ -512,7 +545,7 @@ impl<'a> Engine<'a> {
                     Some(e) => Some(self.const_i64(e)?),
                     None => None,
                 };
-                match self.srv.databases.get_mut(&db).and_then(|d| d.objects.get_mut(&key)) {
+                match self.srv.cat_mut().databases.get_mut(&db).and_then(|d| d.objects.get_mut(&key)) {
                     Some(Object::Seq(s)) => {
                         if let Some(i) = inc {
                             s.inc = i;
@@ -527,7 +560,7 @@ impl<'a> Engine<'a> {
                             s.cycle = c;
                         }
                         if opts.restart {
-                            s.current = None;
+                            s.current.set(None);
                             if let Some(st) = start {
                                 s.start = st;
                             }
@@ -607,7 +640,7 @@ impl<'a> Engine<'a> {
                         self.ensure_tx()?;
                         let prev = self.srv.global_temp.get(k).cloned();
                         self.push_undo(Undo::GTemp { name: k.clone(), prev });
-                        if self.srv.global_temp.remove(k).is_none() && !if_exists {
+                        if self.srv.cat_mut().global_temp.remove(k).is_none() && !if_exists {
                             return Err(SqlError::new(3701, format!("Cannot drop the table '{}', because it does not exist or you do not have permission.", n)));
                         }
                         return Ok(());
@@ -637,12 +670,12 @@ impl<'a> Engine<'a> {
                 self.check_alter(&loc, &n)?;
                 self.ddl_lock(&loc, &t)?;
                 self.undo_object(&db, &key);
-                let d = self.srv.databases.get_mut(&db).unwrap();
+                let d = self.srv.cat_mut().databases.get_mut(&db).unwrap();
                 d.objects.remove(&key);
                 d.triggers.retain(|_, (tk2, _)| *tk2 != tk);
             }
             "VIEW" | "PROCEDURE" | "FUNCTION" | "SEQUENCE" => {
-                let d = self.srv.databases.get_mut(&db).ok_or_else(|| SqlError::new(911, "Database does not exist."))?;
+                let d = self.srv.cat_mut().databases.get_mut(&db).ok_or_else(|| SqlError::new(911, "Database does not exist."))?;
                 let ok = match d.objects.get(&key) {
                     Some(Object::View(_)) => what == "VIEW",
                     Some(Object::Proc(_)) => what == "PROCEDURE",
@@ -653,14 +686,14 @@ impl<'a> Engine<'a> {
                 if ok {
                     self.ensure_tx()?;
                     self.undo_object(&db, &key);
-                    let d = self.srv.databases.get_mut(&db).unwrap();
+                    let d = self.srv.cat_mut().databases.get_mut(&db).unwrap();
                     d.objects.remove(&key);
                 } else if !if_exists {
                     return Err(SqlError::new(3701, format!("Cannot drop the {} '{}', because it does not exist or you do not have permission.", kind_desc, n)));
                 }
             }
             "TRIGGER" => {
-                let found = self.srv.databases.get_mut(&db).and_then(|d| d.triggers.remove(&key));
+                let found = self.srv.cat_mut().databases.get_mut(&db).and_then(|d| d.triggers.remove(&key));
                 match found {
                     Some((tk, _)) => {
                         let loc = Loc::Db(db.clone(), tk);
@@ -677,7 +710,7 @@ impl<'a> Engine<'a> {
                 }
             }
             "SCHEMA" => {
-                let d = self.srv.databases.get_mut(&db).unwrap();
+                let d = self.srv.cat_mut().databases.get_mut(&db).unwrap();
                 let k = n.to_lowercase();
                 if !d.schemas.contains_key(&k) {
                     if if_exists {
@@ -699,7 +732,7 @@ impl<'a> Engine<'a> {
                     self.ensure_tx()?;
                     self.push_undo(Undo::Database { key: k.clone(), prev: Some(prev) });
                 }
-                if self.srv.databases.remove(&k).is_none() && !if_exists {
+                if self.srv.cat_mut().databases.remove(&k).is_none() && !if_exists {
                     return Err(SqlError::new(3701, format!("Cannot drop the database '{}', because it does not exist or you do not have permission.", n)));
                 }
                 if self.ses.db.eq_ignore_ascii_case(&n) {
@@ -707,7 +740,7 @@ impl<'a> Engine<'a> {
                 }
             }
             "TYPE" => {
-                let d = self.srv.databases.get_mut(&db).unwrap();
+                let d = self.srv.cat_mut().databases.get_mut(&db).unwrap();
                 if d.types.remove(&key).is_none() && !if_exists {
                     return Err(SqlError::new(3701, format!("Cannot drop type '{}', because it does not exist or you do not have permission.", n)));
                 }
@@ -770,7 +803,7 @@ impl<'a> Engine<'a> {
                     }
                     t.replace_rows(rows);
                     if col.identity.is_some() {
-                        t.identity_next = ident;
+                        t.identity_next.set(ident);
                     }
                     t.columns.push(col);
                     let ci = t.columns.len() - 1;
@@ -779,11 +812,11 @@ impl<'a> Engine<'a> {
                     }
                     if let Some(u) = &c.unique {
                         let kn = u.clone().unwrap_or_else(|| format!("UQ__{}__{:08X}", t.name, self.srv.new_object_id()));
-                        t.uniques.push(KeyDef { name: kn, cols: vec![ci], is_index: false, clustered: false });
+                        t.uniques.push(KeyDef { name: kn, cols: vec![ci], is_index: false, clustered: false, include: vec![], filter: None });
                     }
-                    for (n, e) in &c.checks {
+                    for (n, e, ctext) in &c.checks {
                         let cn = n.clone().unwrap_or_else(|| format!("CK__{}__{}__{:08X}", t.name, c.name, self.srv.new_object_id()));
-                        t.checks.push(CheckDef { name: cn, expr: Arc::new(e.clone()), enabled: true, col: Some(c.name.clone()) });
+                        t.checks.push(CheckDef { name: cn, expr: Arc::new(e.clone()), text: ctext.clone(), enabled: true, col: Some(c.name.clone()) });
                     }
                     if let Some(f) = &c.fk {
                         let mut f = f.clone();
@@ -806,12 +839,12 @@ impl<'a> Engine<'a> {
                         TableDef::Unique { name, cols } => {
                             let idx: Vec<usize> = cols.iter().map(|(c, _)| t.col_index(c).ok_or_else(|| SqlError::new(1911, format!("Column name '{}' does not exist in the target table or view.", c)))).collect::<Result<_>>()?;
                             let kn = name.clone().unwrap_or_else(|| format!("UQ__{}__{:08X}", t.name, self.srv.new_object_id()));
-                            t.uniques.push(KeyDef { name: kn, cols: idx, is_index: false, clustered: false });
+                            t.uniques.push(KeyDef { name: kn, cols: idx, is_index: false, clustered: false, include: vec![], filter: None });
                             self.validate_keys(t)?;
                         }
-                        TableDef::Check { name, e } => {
+                        TableDef::Check { name, e, text: ctext } => {
                             let cn = name.clone().unwrap_or_else(|| format!("CK__{}__{:08X}", t.name, self.srv.new_object_id()));
-                            let ck = CheckDef { name: cn, expr: Arc::new(e.clone()), enabled: true, col: None };
+                            let ck = CheckDef { name: cn, expr: Arc::new(e.clone()), text: ctext.clone(), enabled: true, col: None };
                             // existing rows must satisfy
                             let schema = super::dml::table_schema(t, &t.name);
                             for r in t.rows_vec().iter() {
@@ -823,14 +856,15 @@ impl<'a> Engine<'a> {
                             t.checks.push(ck);
                         }
                         TableDef::ForeignKey(f) => self.add_fk(t, f)?,
-                        TableDef::DefaultFor { name, e, col } => {
+                        TableDef::DefaultFor { name, e, col, text: dtext } => {
                             let ci = t.col_index(col).ok_or_else(|| SqlError::new(1911, format!("Column name '{}' does not exist in the target table or view.", col)))?;
                             t.columns[ci].default = Some(Arc::new(e.clone()));
+                    t.columns[ci].default_text = Some(dtext.clone());
                             t.columns[ci].default_name = Some(name.clone());
                         }
                         TableDef::Index { name, cols, unique } => {
                             let idx: Vec<(usize, bool)> = cols.iter().filter_map(|(c, d)| t.col_index(c).map(|i| (i, *d))).collect();
-                            t.indexes.push(IndexDef { name: name.clone(), cols: idx, unique: *unique });
+                            t.indexes.push(IndexDef { name: name.clone(), cols: idx, unique: *unique, include: vec![], filter: None });
                         }
                         TableDef::Column(_) => {}
                     }
@@ -864,6 +898,7 @@ impl<'a> Engine<'a> {
                     for c in t.columns.iter_mut() {
                         if c.default_name.as_deref().map(|d| d.eq_ignore_ascii_case(n)).unwrap_or(false) {
                             c.default = None;
+                            c.default_text = None;
                             c.default_name = None;
                             found = true;
                         }
@@ -922,7 +957,12 @@ impl<'a> Engine<'a> {
                     }
                 }
             }
-            AlterAction::AlterColumn { col, ty, nullable } => {
+            AlterAction::AlterMask { col, mask } => {
+                let ci = t.col_index(col).ok_or_else(|| SqlError::new(4902, format!("Cannot find the object \"{}\" because it does not exist or you do not have permission.", col)))?;
+                let m = self.validated_mask(mask, &t.columns[ci].ty, col)?;
+                t.columns[ci].mask = m;
+            }
+            AlterAction::AlterColumn { col, ty, nullable, collation } => {
                 let ci = t.col_index(col).ok_or_else(|| SqlError::new(4902, format!("Cannot find the object \"{}\" because it does not exist or you do not have permission.", col)))?;
                 let dt = self.resolve_type(ty)?;
                 let mut rows: Vec<Row> = t.rows_vec();
@@ -934,6 +974,9 @@ impl<'a> Engine<'a> {
                     return Err(SqlError::new(515, format!("Cannot insert the value NULL into column '{}', table '{}'; column does not allow nulls. UPDATE fails.", col, t.display_name())));
                 }
                 t.replace_rows(rows);
+                let coll = self.column_collation(collation, &dt)?;
+                // a change of type or collation keeps the old collation unless the statement names one
+                t.columns[ci].collation = if collation.is_some() || !dt.is_string() { coll } else { t.columns[ci].collation.clone() };
                 t.columns[ci].ty = dt;
                 t.columns[ci].nullable = nn;
             }
@@ -958,7 +1001,7 @@ impl<'a> Engine<'a> {
             let mut seen = HashSet::new();
             for r in t.rows_vec().iter() {
                 let vals: Vec<Value> = k.cols.iter().map(|&c| r[c].clone()).collect();
-                if !seen.insert(key_of(&vals)) {
+                if !seen.insert(t.key_string(&k.cols, &vals)) {
                     let shown = vals.iter().map(|v| if v.is_null() { "<NULL>".into() } else { convert::to_str(v) }).collect::<Vec<_>>().join(", ");
                     return Err(SqlError::new(1750, format!("Could not create constraint or index. See previous errors. (duplicate key value {} for '{}')", shown, k.name)));
                 }
@@ -968,6 +1011,107 @@ impl<'a> Engine<'a> {
     }
 
     /// Schema-modification lock: DDL waits for every other transaction using the table.
+    /// Turn the `WHERE` clause of a filtered index into a [`FilterPred`]: a conjunction of `column <op> constant`,
+    /// `column IS [NOT] NULL` and `column IN (constants)`. Anything else is error 10735.
+    pub fn filter_pred(&mut self, t: &Table, e: &Expr, text: &str, index: &str) -> Result<crate::storage::FilterPred> {
+        use crate::storage::{FilterCond, FilterOp};
+        fn flatten<'q>(e: &'q Expr, out: &mut Vec<&'q Expr>) {
+            match e {
+                Expr::And(a, b) => {
+                    flatten(a, out);
+                    flatten(b, out);
+                }
+                Expr::Paren(x) => flatten(x, out),
+                other => out.push(other),
+            }
+        }
+        let bad = || SqlError::with(10735, 15, 1, format!("Incorrect WHERE clause for filtered index '{}' on table '{}'.", index, t.name));
+        let col_of = |x: &Expr| -> Option<usize> {
+            match x {
+                Expr::Col(p) => t.col_index(p.last()?),
+                Expr::Paren(inner) => match &**inner {
+                    Expr::Col(p) => t.col_index(p.last()?),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        let mut parts = vec![];
+        flatten(e, &mut parts);
+        let mut conds = vec![];
+        for p in parts {
+            match p {
+                Expr::IsNull(x, neg) => {
+                    let col = col_of(x).ok_or_else(bad)?;
+                    conds.push(FilterCond { col, op: if *neg { FilterOp::IsNotNull } else { FilterOp::IsNull }, vals: vec![] });
+                }
+                Expr::InList(x, items, false) => {
+                    let col = col_of(x).ok_or_else(bad)?;
+                    let mut vals = vec![];
+                    for it in items {
+                        let v = self.ev(it, &Env::empty())?;
+                        vals.push(super::optimizer::coerce_const_pub(&t.columns[col], v).ok_or_else(bad)?);
+                    }
+                    conds.push(FilterCond { col, op: FilterOp::In, vals });
+                }
+                Expr::Binary(op, a, b) => {
+                    use crate::ast::BinOp::*;
+                    let (col, other, flipped) = match (col_of(a), col_of(b)) {
+                        (Some(c), None) => (c, &**b, false),
+                        (None, Some(c)) => (c, &**a, true),
+                        _ => return Err(bad()),
+                    };
+                    let v = self.ev(other, &Env::empty())?;
+                    let v = super::optimizer::coerce_const_pub(&t.columns[col], v).ok_or_else(bad)?;
+                    let fop = match (op, flipped) {
+                        (Eq, _) => FilterOp::Eq,
+                        (Ne, _) => FilterOp::Ne,
+                        (Lt, false) | (Gt, true) => FilterOp::Lt,
+                        (Le, false) | (Ge, true) => FilterOp::Le,
+                        (Gt, false) | (Lt, true) => FilterOp::Gt,
+                        (Ge, false) | (Le, true) => FilterOp::Ge,
+                        _ => return Err(bad()),
+                    };
+                    conds.push(FilterCond { col, op: fop, vals: vec![v] });
+                }
+                _ => return Err(bad()),
+            }
+        }
+        Ok(crate::storage::FilterPred { conds, text: text.trim().to_string() })
+    }
+
+    /// Check a masking function against the column type; `None` when there is no mask.
+    pub fn validated_mask(&self, text: &Option<String>, ty: &DataType, col: &str) -> Result<Option<String>> {
+        let Some(t) = text else { return Ok(None) };
+        let m = crate::mask::Mask::parse(t).map_err(|e| SqlError::with(16000, 16, 1, format!("Invalid masking function for column '{}': {}.", col, e)))?;
+        if !m.fits(ty) {
+            return Err(SqlError::with(16003, 16, 1, format!("The masking function '{}' cannot be applied to column '{}' of data type {}.", t, col, ty)));
+        }
+        Ok(Some(t.clone()))
+    }
+
+    /// The collation a new string column gets: the one named, else the current database's default. Stored only when it
+    /// is not the built-in default (see `collation.rs`); `None` for columns that are not strings.
+    pub fn column_collation(&self, named: &Option<String>, ty: &DataType) -> Result<Option<String>> {
+        if !ty.is_string() {
+            return Ok(None);
+        }
+        let name = match named {
+            Some(n) => n.clone(),
+            None => self.srv.databases.get(&self.ses.db.to_lowercase()).map(|d| d.collation.clone()).unwrap_or_else(|| crate::collation::DEFAULT_NAME.to_string()),
+        };
+        match crate::collation::get(&name) {
+            None => Err(SqlError::with(448, 16, 1, format!("Invalid collation '{}'.", name))),
+            // the built-in collation needs no entry, unless the database's own default is another one: then the
+            // column must say it is not that
+            Some(c) if c.is_default() => {
+                let db_default = self.srv.databases.get(&self.ses.db.to_lowercase()).map(|d| d.collation.as_str()).unwrap_or(crate::collation::DEFAULT_NAME);
+                Ok(if crate::collation::get(db_default).is_some_and(|d| d.is_default()) { None } else { Some(c.name.clone()) })
+            }
+            Some(c) => Ok(Some(c.name.clone())),
+        }
+    }
+
     pub fn ddl_lock(&mut self, loc: &Loc, t: &Table) -> Result<()> {
         if matches!(loc, Loc::Db(..)) {
             self.lock_table(t.object_id, Mode::X)?;

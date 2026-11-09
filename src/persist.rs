@@ -16,7 +16,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const MAGIC: &[u8; 8] = b"TSQLSNP2";
+const MAGIC: &[u8; 8] = b"TSQLSNP5";
 
 /// One logged change. Applying a record's operations in order reproduces the commit.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -35,6 +35,14 @@ pub enum LogOp {
     DropDatabase { key: String },
     SeqSet { db: String, key: String, current: Option<i64> },
     DbOptions { db: String, allow_snapshot: bool, rcsi: bool },
+    /// `ALTER DATABASE ... SET RECOVERY FULL | SIMPLE`
+    DbRecovery { db: String, full: bool },
+    /// The log chain of a database moved (a full or log backup was taken).
+    DbChain { db: String, ts: Option<u64> },
+    /// The base of differential backups moved (a full backup was taken).
+    DbBackupBase { db: String, ts: Option<u64>, sigs: BTreeMap<String, u64> },
+    /// The row-level security policies of a database.
+    DbPolicies { db: String, policies: Vec<crate::catalog::SecurityPolicy> },
     Security(Security),
     DbSecurity { db: String, sec: crate::security::DbSecurity, owners: BTreeMap<String, String> },
 }
@@ -43,6 +51,8 @@ pub enum LogOp {
 pub struct WalRecord {
     pub lsn: u64,
     pub ts: u64,
+    /// When the record was written, in microseconds since the Unix epoch (for `RESTORE LOG ... STOPAT`).
+    pub wall: i64,
     pub next_object_id: i32,
     pub next_rowversion: u64,
     pub ops: Vec<LogOp>,
@@ -73,6 +83,26 @@ impl Default for StorageOptions {
     fn default() -> Self {
         StorageOptions { pool_pages: crate::storage::page::DEFAULT_POOL_PAGES, temp_pool_pages: 4096 }
     }
+}
+
+/// The records of a log file (`[u32 length][u32 crc][postcard record]` frames); a torn or corrupt tail is ignored.
+fn parse_frames(buf: &[u8]) -> Vec<WalRecord> {
+    let mut out = vec![];
+    let mut pos = 0usize;
+    while pos + 8 <= buf.len() {
+        let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        let crc = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap());
+        let Some(payload) = buf.get(pos + 8..pos + 8 + len) else { break };
+        if crc32fast::hash(payload) != crc {
+            break;
+        }
+        match postcard::from_bytes::<WalRecord>(payload) {
+            Ok(r) => out.push(r),
+            Err(_) => break,
+        }
+        pos += 8 + len;
+    }
+    out
 }
 
 pub struct Persist {
@@ -112,9 +142,9 @@ impl Persist {
             }
             let cp: Checkpoint = postcard::from_bytes(&buf[12..]).map_err(|e| crate::error::SqlError::with(824, 24, 2, format!("Corrupt checkpoint: {}", e)))?;
             lsn = cp.lsn;
-            srv.clock = cp.clock;
-            srv.next_object_id = cp.next_object_id;
-            srv.next_rowversion = cp.next_rowversion;
+            srv.core.advance_clock(cp.clock);
+            srv.core.raise_object_id(cp.next_object_id);
+            srv.core.raise_rowversion(cp.next_rowversion);
             srv.databases = cp.databases;
             srv.security = cp.security;
             image = Some(cp.store);
@@ -175,10 +205,16 @@ impl Persist {
         Ok((p, srv))
     }
 
-    /// Append a frame and force it to disk (when `sync`).
-    pub fn append(&mut self, ts: u64, next_object_id: i32, next_rowversion: u64, ops: Vec<LogOp>, sync: bool) -> Result<(), crate::error::SqlError> {
+    /// A handle on the log file for forcing it to disk without holding the persist latch, and the number of the
+    /// last record written (everything up to it is on disk once the handle has been synced).
+    pub fn sync_handle(&self) -> Result<(u64, File), crate::error::SqlError> {
+        Ok((self.lsn, self.wal.try_clone().map_err(io_err)?))
+    }
+
+    /// Append a frame (and force it to disk when `sync`); returns its log sequence number.
+    pub fn append(&mut self, ts: u64, next_object_id: i32, next_rowversion: u64, ops: Vec<LogOp>, sync: bool) -> Result<u64, crate::error::SqlError> {
         self.lsn += 1;
-        let rec = WalRecord { lsn: self.lsn, ts, next_object_id, next_rowversion, ops };
+        let rec = WalRecord { lsn: self.lsn, ts, wall: chrono::Utc::now().timestamp_micros(), next_object_id, next_rowversion, ops };
         let payload = postcard::to_allocvec(&rec).map_err(|e| crate::error::SqlError::with(9002, 17, 1, format!("log serialisation failed: {}", e)))?;
         let mut frame = Vec::with_capacity(payload.len() + 8);
         frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -189,14 +225,64 @@ impl Persist {
             self.wal.sync_data().map_err(io_err)?;
         }
         self.wal_len += frame.len() as u64;
+        Ok(self.lsn)
+    }
+
+    fn archive_dir(&self) -> PathBuf {
+        self.dir.join("log-archive")
+    }
+
+    /// Keep a copy of the log (as it is about to be truncated) for log backups.
+    fn archive_wal(&mut self) -> Result<(), crate::error::SqlError> {
+        if self.wal_len == 0 {
+            return Ok(());
+        }
+        std::fs::create_dir_all(self.archive_dir()).map_err(io_err)?;
+        let target = self.archive_dir().join(format!("wal-{:020}.log", self.lsn));
+        std::fs::copy(self.dir.join("wal.log"), &target).map_err(io_err)?;
         Ok(())
+    }
+
+    /// Every committed record written after commit timestamp `ts`, from the archived segments and the live log, in log order.
+    pub fn log_records_after(&self, ts: u64) -> Result<Vec<WalRecord>, crate::error::SqlError> {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(self.archive_dir()).map(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "log")).collect()).unwrap_or_default();
+        files.sort();
+        files.push(self.dir.join("wal.log"));
+        let mut by_lsn: BTreeMap<u64, WalRecord> = BTreeMap::new();
+        for f in files {
+            let mut buf = vec![];
+            if File::open(&f).and_then(|mut h| h.read_to_end(&mut buf)).is_err() {
+                continue;
+            }
+            for rec in parse_frames(&buf) {
+                if rec.ts > ts {
+                    by_lsn.insert(rec.lsn, rec);
+                }
+            }
+        }
+        Ok(by_lsn.into_values().collect())
+    }
+
+    /// Delete archived log segments whose records all lie at or before commit timestamp `upto_ts` (they have been backed up).
+    pub fn prune_archive(&self, upto_ts: u64) {
+        let Ok(rd) = std::fs::read_dir(self.archive_dir()) else { return };
+        for e in rd.filter_map(|e| e.ok()) {
+            let path = e.path();
+            let mut buf = vec![];
+            if File::open(&path).and_then(|mut h| h.read_to_end(&mut buf)).is_err() {
+                continue;
+            }
+            if parse_frames(&buf).iter().all(|r| r.ts <= upto_ts) {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
     }
 
     /// Write a checkpoint of all committed state and truncate the log.
     pub fn checkpoint(&mut self, srv: &ServerState) -> Result<(), crate::error::SqlError> {
         // every changed page goes to the page file first; the checkpoint then names the page table
         let image = srv.store.prepare_checkpoint()?;
-        let cp = Checkpoint { lsn: self.lsn, clock: srv.clock, next_object_id: srv.next_object_id, next_rowversion: srv.next_rowversion, databases: srv.databases.clone(), security: srv.security.clone(), store: image };
+        let cp = Checkpoint { lsn: self.lsn, clock: srv.core.clock(), next_object_id: srv.core.object_id(), next_rowversion: srv.core.rowversion(), databases: srv.databases.clone(), security: srv.security.clone(), store: image };
         let body = postcard::to_allocvec(&cp).map_err(|e| crate::error::SqlError::with(9002, 17, 1, format!("checkpoint serialisation failed: {}", e)))?;
         let tmp = self.dir.join("snapshot.tmp");
         {
@@ -208,6 +294,10 @@ impl Persist {
         }
         std::fs::rename(&tmp, self.dir.join("snapshot.bin")).map_err(io_err)?;
         srv.store.commit_checkpoint();
+        // a database in the FULL recovery model with a log chain keeps its log until it has been backed up
+        if srv.databases.values().any(|d| d.recovery_full && d.log_chain_ts.is_some()) {
+            self.archive_wal()?;
+        }
         self.wal.set_len(0).map_err(io_err)?;
         self.wal.seek(SeekFrom::Start(0)).map_err(io_err)?;
         self.wal.sync_data().map_err(io_err)?;
@@ -216,11 +306,11 @@ impl Persist {
     }
 }
 
-fn apply_record(srv: &mut ServerState, rec: &WalRecord) {
+pub fn apply_record(srv: &mut ServerState, rec: &WalRecord) {
     let store = srv.store.clone();
-    srv.clock = srv.clock.max(rec.ts);
-    srv.next_object_id = srv.next_object_id.max(rec.next_object_id);
-    srv.next_rowversion = srv.next_rowversion.max(rec.next_rowversion);
+    srv.core.advance_clock(rec.ts);
+    srv.core.raise_object_id(rec.next_object_id);
+    srv.core.raise_rowversion(rec.next_rowversion);
     for op in &rec.ops {
         match op {
             LogOp::Put { db, key, rowid, row } => {
@@ -236,7 +326,7 @@ fn apply_record(srv: &mut ServerState, rec: &WalRecord) {
             }
             LogOp::SetIdentity { db, key, next } => {
                 if let Some(Object::Table(t)) = srv.databases.get_mut(db).and_then(|d| d.objects.get_mut(key)) {
-                    t.identity_next = *next;
+                    t.identity_next.set(*next);
                 }
             }
             LogOp::PutObject { db, key, obj } => {
@@ -296,13 +386,34 @@ fn apply_record(srv: &mut ServerState, rec: &WalRecord) {
             }
             LogOp::SeqSet { db, key, current } => {
                 if let Some(Object::Seq(s)) = srv.databases.get_mut(db).and_then(|d| d.objects.get_mut(key)) {
-                    s.current = *current;
+                    s.current.set(*current);
                 }
             }
             LogOp::DbOptions { db, allow_snapshot, rcsi } => {
                 if let Some(d) = srv.databases.get_mut(db) {
                     d.allow_snapshot = *allow_snapshot;
                     d.rcsi = *rcsi;
+                }
+            }
+            LogOp::DbRecovery { db, full } => {
+                if let Some(d) = srv.databases.get_mut(db) {
+                    d.recovery_full = *full;
+                }
+            }
+            LogOp::DbPolicies { db, policies } => {
+                if let Some(d) = srv.databases.get_mut(db) {
+                    d.policies = policies.clone();
+                }
+            }
+            LogOp::DbBackupBase { db, ts, sigs } => {
+                if let Some(d) = srv.databases.get_mut(db) {
+                    d.last_full_ts = *ts;
+                    d.backup_sigs = sigs.clone();
+                }
+            }
+            LogOp::DbChain { db, ts } => {
+                if let Some(d) = srv.databases.get_mut(db) {
+                    d.log_chain_ts = *ts;
                 }
             }
             LogOp::Security(s) => srv.security = s.clone(),

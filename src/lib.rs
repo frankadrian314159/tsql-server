@@ -10,11 +10,14 @@
 pub mod ast;
 pub mod catalog;
 pub mod convert;
+pub mod collation;
+pub mod coord;
 pub mod decimal;
 pub mod engine;
 pub mod error;
 pub mod inspect;
 pub mod lexer;
+pub mod mask;
 pub mod parser;
 pub mod persist;
 pub mod security;
@@ -25,17 +28,16 @@ pub mod types;
 
 use catalog::ServerState;
 use engine::{Engine, SessionState, SrvGuard};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, RwLock};
 
-pub use engine::{BatchResult, Event, ResultSet};
+pub use engine::{BatchResult, Event, ResultSet, Streamed};
 pub use error::SqlError;
 pub use persist::StorageOptions;
 pub use storage::StoreStats;
 pub use types::{DataType, Value};
 
 struct Shared {
-    state: Mutex<ServerState>,
-    cv: Condvar,
+    state: RwLock<ServerState>,
     crashed: std::sync::atomic::AtomicBool,
 }
 
@@ -43,9 +45,10 @@ impl Drop for Shared {
     fn drop(&mut self) {
         // clean shutdown: fold the log into a checkpoint (skipped when simulating a crash)
         let crashed = self.crashed.load(std::sync::atomic::Ordering::SeqCst);
-        if let Ok(mut g) = self.state.lock() {
-            if !crashed && g.active.is_empty() {
-                if let Some(mut p) = g.persist.take() {
+        if let Ok(g) = self.state.write() {
+            if !crashed && g.core.no_active() {
+                let taken = g.persist().take();
+                if let Some(mut p) = taken {
                     let _ = p.checkpoint(&g);
                 }
             }
@@ -71,7 +74,7 @@ impl Default for Server {
 impl Server {
     /// A server whose data lives only in memory (nothing is written to disk).
     pub fn new() -> Server {
-        Server { shared: Arc::new(Shared { state: Mutex::new(ServerState::new()), cv: Condvar::new(), crashed: Default::default() }) }
+        Server { shared: Arc::new(Shared { state: RwLock::new(ServerState::new()), crashed: Default::default() }) }
     }
 
     /// Open (or create) a server whose data lives in `dir`. Committed work survives crashes:
@@ -84,8 +87,8 @@ impl Server {
     /// Like [`Server::open`] with explicit storage settings (buffer pool size).
     pub fn open_with(dir: impl AsRef<std::path::Path>, opts: StorageOptions) -> Result<Server, SqlError> {
         let (p, mut state) = persist::Persist::open(dir.as_ref(), opts)?;
-        state.persist = Some(p);
-        Ok(Server { shared: Arc::new(Shared { state: Mutex::new(state), cv: Condvar::new(), crashed: Default::default() }) })
+        state.persist = std::sync::Mutex::new(Some(p));
+        Ok(Server { shared: Arc::new(Shared { state: RwLock::new(state), crashed: Default::default() }) })
     }
 
     /// Drop the server as if the process had been killed: no final checkpoint is written, so the
@@ -97,11 +100,10 @@ impl Server {
 
     /// Force a checkpoint now (a no-op for in-memory servers or while transactions are open).
     pub fn checkpoint(&self) {
-        let mut g = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        if g.active.is_empty() {
-            if let Some(mut p) = g.persist.take() {
+        let g = self.shared.state.write().unwrap_or_else(|e| e.into_inner());
+        if g.core.no_active() {
+            if let Some(p) = g.persist().as_mut() {
                 let _ = p.checkpoint(&g);
-                g.persist = Some(p);
             }
         }
     }
@@ -110,13 +112,31 @@ impl Server {
     /// died halfway through a checkpoint. Intended for tests.
     #[doc(hidden)]
     pub fn flush_pages_only(&self) {
-        let g = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let g = self.shared.state.write().unwrap_or_else(|e| e.into_inner());
         let _ = g.store.prepare_checkpoint();
+    }
+
+    /// Set how much memory a sort or `DISTINCT` may use before spilling to temporary files in `dir` (the system
+    /// temporary directory by default), and from how many heap slots a single-table query uses the streaming
+    /// executor.
+    pub fn set_work_mem(&self, bytes: usize, stream_min_slots: usize, dir: Option<std::path::PathBuf>) {
+        let mut g = self.shared.state.write().unwrap_or_else(|e| e.into_inner());
+        g.work.bytes = bytes.max(1);
+        g.work.stream_min_slots = stream_min_slots;
+        if let Some(d) = dir {
+            g.work.dir = d;
+        }
+    }
+
+    /// How many times the redo log has been forced to disk for commits (sessions that commit together share a force).
+    pub fn log_forces(&self) -> u64 {
+        let g = self.shared.state.read().unwrap_or_else(|e| e.into_inner());
+        g.core.log_forces()
     }
 
     /// Buffer pool and page file statistics: `(persistent tables, temporary tables)`.
     pub fn storage_stats(&self) -> (StoreStats, StoreStats) {
-        let g = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let g = self.shared.state.write().unwrap_or_else(|e| e.into_inner());
         (g.store.stats(), g.temp_store.stats())
     }
 
@@ -128,7 +148,7 @@ impl Server {
     /// Authenticate with a login name and password.
     pub fn connect_as(&self, login: &str, password: &str) -> Result<Connection, SqlError> {
         {
-            let g = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            let g = self.shared.state.write().unwrap_or_else(|e| e.into_inner());
             let ok = g.security.logins.get(&login.to_lowercase()).map(|l| !l.disabled && l.check_password(password)).unwrap_or(false);
             if !ok {
                 return Err(SqlError::with(18456, 14, 1, format!("Login failed for user '{}'.", login)));
@@ -138,9 +158,8 @@ impl Server {
     }
 
     fn session_for(&self, login: &str) -> Connection {
-        let mut g = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        g.next_spid += 1;
-        let spid = g.next_spid;
+        let g = self.shared.state.write().unwrap_or_else(|e| e.into_inner());
+        let spid = g.core.next_spid();
         let mut session = SessionState::new(spid);
         let canonical = g.security.logins.get(&login.to_lowercase()).map(|l| l.name.clone()).unwrap_or_else(|| login.to_string());
         session.login = canonical.clone();
@@ -149,6 +168,20 @@ impl Server {
                 session.db = g.databases[&l.default_db.to_lowercase()].name.clone();
             }
         }
+        let now = chrono::Local::now().naive_local();
+        g.core.register_session(coord::SessionInfo {
+            spid,
+            login: session.login.clone(),
+            host: session.host_name.clone(),
+            app: session.app_name.clone(),
+            db: session.db.clone(),
+            status: "sleeping",
+            isolation: session.isolation.level(),
+            login_time: now,
+            last_batch: now,
+            batches: 0,
+            command: String::new(),
+        });
         drop(g);
         Connection { server: self.clone(), session }
     }
@@ -164,10 +197,22 @@ impl Connection {
     /// Execute a single batch (no `GO` handling).
     pub fn execute(&mut self, sql: &str) -> BatchResult {
         let shared = self.server.shared.clone();
-        let guard = SrvGuard::lock(&shared.state, &shared.cv);
+        let guard = SrvGuard::new(&shared.state);
         let mut eng = Engine::new(guard, &mut self.session);
         eng.run_batch(sql);
         BatchResult { events: eng.out }
+    }
+
+    /// Execute a single batch, reporting its output to `sink` as it is produced instead of collecting it: messages,
+    /// errors and row counts as [`Streamed::Event`], and the rows of a plain `SELECT` over a big table or join one at
+    /// a time (`Header`, `Row`..., `End`), so the result set is never held in memory. `sink` returns false when the
+    /// consumer has gone away; the statement is then abandoned. Small results and every other kind of result set
+    /// arrive whole, as `Event::Rows`.
+    pub fn execute_streaming(&mut self, sql: &str, sink: &mut dyn FnMut(Streamed) -> bool) {
+        let shared = self.server.shared.clone();
+        let guard = SrvGuard::new(&shared.state);
+        let mut eng = Engine::with_sink(guard, &mut self.session, sink);
+        eng.run_batch(sql);
     }
 
     /// Execute a script containing `GO` batch separators.
@@ -221,12 +266,37 @@ impl Connection {
     }
 }
 
+impl Connection {
+    /// The session id (`@@SPID`).
+    pub fn spid(&self) -> i32 {
+        self.session.spid
+    }
+
+    /// Has another session asked this one to stop (`KILL`)? Listeners check this while a client is idle.
+    pub fn is_killed(&self) -> bool {
+        self.server.shared.state.read().unwrap_or_else(|e| e.into_inner()).core.is_killed(self.session.spid)
+    }
+
+    /// Roll back whatever a killed session had open and forget the kill request.
+    pub fn finish_kill(&mut self) {
+        let shared = self.server.shared.clone();
+        let guard = SrvGuard::new(&shared.state);
+        let mut eng = Engine::new(guard, &mut self.session);
+        eng.rollback_all();
+        eng.srv.core.clear_kill(eng.ses.spid);
+    }
+}
+
 impl Drop for Connection {
     fn drop(&mut self) {
+        {
+            let g = self.server.shared.state.read().unwrap_or_else(|e| e.into_inner());
+            g.core.unregister_session(self.session.spid);
+        }
         // roll back any open transaction and release its locks
         if self.session.tx.is_some() {
             let shared = self.server.shared.clone();
-            let guard = SrvGuard::lock(&shared.state, &shared.cv);
+            let guard = SrvGuard::new(&shared.state);
             let mut eng = Engine::new(guard, &mut self.session);
             eng.rollback_all();
         }

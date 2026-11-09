@@ -80,6 +80,8 @@ pub enum PermTarget {
     Database,
     Schema(String), // lower-case schema name
     Object(String), // "schema.name" lower-case key
+    /// A column of an object: (object key, lower-case column name). Appended last so older data stays readable.
+    Column(String, String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -179,6 +181,7 @@ impl DbSecurity {
             PermTarget::Database => true,
             PermTarget::Schema(s) => s.eq_ignore_ascii_case(schema),
             PermTarget::Object(k) => key.map(|x| x.eq_ignore_ascii_case(k)).unwrap_or(false),
+            PermTarget::Column(..) => false,
         };
         // fixed-role denies
         if who.contains("db_denydatareader") && perm == "SELECT" {
@@ -205,6 +208,45 @@ impl DbSecurity {
         false
     }
 
+    /// Does `user` hold `perm` on one column of an object? A table-wide (or schema/database) DENY and a column DENY
+    /// win; a table-wide GRANT or a GRANT on the column allow.
+    pub fn allowed_column(&self, user: &str, perm: &str, schema: &str, key: &str, col: &str) -> bool {
+        let u = user.to_lowercase();
+        if u == "dbo" {
+            return true;
+        }
+        let who = self.closure(&u);
+        if who.contains("db_owner") {
+            return true;
+        }
+        let perm = perm.to_uppercase();
+        let in_scope = |t: &PermTarget| match t {
+            PermTarget::Database => true,
+            PermTarget::Schema(s) => s.eq_ignore_ascii_case(schema),
+            PermTarget::Object(k) => k.eq_ignore_ascii_case(key),
+            PermTarget::Column(k, c) => k.eq_ignore_ascii_case(key) && c.eq_ignore_ascii_case(col),
+        };
+        if who.contains("db_denydatareader") && perm == "SELECT" {
+            return false;
+        }
+        if who.contains("db_denydatawriter") && perm == "UPDATE" {
+            return false;
+        }
+        if self.perms.iter().any(|e| e.state == PermState::Deny && who.contains(&e.grantee) && implies(&e.perm, &perm) && in_scope(&e.target)) {
+            return false;
+        }
+        if self.perms.iter().any(|e| e.state == PermState::Grant && who.contains(&e.grantee) && implies(&e.perm, &perm) && in_scope(&e.target)) {
+            return true;
+        }
+        (who.contains("db_datareader") && perm == "SELECT") || (who.contains("db_datawriter") && perm == "UPDATE")
+    }
+
+    /// Is there any column-level entry on the object that concerns `user` (or a role it belongs to)?
+    pub fn has_column_entries(&self, user: &str, key: &str) -> bool {
+        let who = self.closure(&user.to_lowercase());
+        self.perms.iter().any(|e| who.contains(&e.grantee) && matches!(&e.target, PermTarget::Column(k, _) if k.eq_ignore_ascii_case(key)))
+    }
+
     pub fn set_perm(&mut self, grantee: &str, perm: &str, target: PermTarget, state: Option<PermState>, with_grant: bool) {
         let g = grantee.to_lowercase();
         let p = perm.to_uppercase();
@@ -217,5 +259,5 @@ impl DbSecurity {
 
 /// Database-level permissions that can be granted without a securable.
 pub fn is_db_permission(p: &str) -> bool {
-    p.starts_with("CREATE ") || p == "CONNECT" || p == "CONTROL" || p == "VIEW ANY DEFINITION" || p == "ALTER ANY SCHEMA" || p == "ALTER ANY USER" || p == "ALTER ANY ROLE" || p == "SHOWPLAN" || p == "BACKUP DATABASE" || p == "VIEW DATABASE STATE" || p == "EXECUTE" || p == "SELECT" || p == "INSERT" || p == "UPDATE" || p == "DELETE" || p == "ALTER" || p == "REFERENCES" || p == "ALL"
+    p.starts_with("CREATE ") || p == "CONNECT" || p == "CONTROL" || p == "VIEW ANY DEFINITION" || p == "ALTER ANY SCHEMA" || p == "ALTER ANY USER" || p == "ALTER ANY ROLE" || p == "SHOWPLAN" || p == "UNMASK" || p == "BACKUP DATABASE" || p == "VIEW DATABASE STATE" || p == "EXECUTE" || p == "SELECT" || p == "INSERT" || p == "UPDATE" || p == "DELETE" || p == "ALTER" || p == "REFERENCES" || p == "ALL"
 }

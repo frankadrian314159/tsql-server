@@ -1743,6 +1743,31 @@ impl<'a> Engine<'a> {
             "HOST_NAME" => Value::Str(self.ses.host_name.clone()),
             "APP_NAME" => Value::Str(self.ses.app_name.clone()),
             "HOST_ID" => Value::Str("1234".into()),
+            "DATABASEPROPERTYEX" => {
+                need(name, &a, 2)?;
+                let key = s(&a[0]).to_lowercase();
+                let Some(d) = self.srv.databases.get(&key) else { return Ok(Some(Value::Null)) };
+                match s(&a[1]).to_lowercase().as_str() {
+                    "collation" => Value::Str(d.collation.clone()),
+                    "recovery" => Value::Str(if d.recovery_full { "FULL" } else { "SIMPLE" }.into()),
+                    "status" => Value::Str(if d.restoring { "RESTORING" } else { "ONLINE" }.into()),
+                    "isanalyticsprocessingenabled" | "isautoclose" | "isautoshrink" => Value::Int(0),
+                    "updateability" => Value::Str("READ_WRITE".into()),
+                    "userfaccess" | "useraccess" => Value::Str("MULTI_USER".into()),
+                    _ => Value::Null,
+                }
+            }
+            "COLLATIONPROPERTY" => {
+                need(name, &a, 2)?;
+                let Some(c) = crate::collation::get(&s(&a[0])) else { return Ok(Some(Value::Null)) };
+                match s(&a[1]).to_lowercase().as_str() {
+                    "codepage" => Value::Int(1252),
+                    "lcid" => Value::Int(1033),
+                    "comparisonstyle" => Value::Int((if c.case_insensitive { 0 } else { 1 }) + (if c.accent_insensitive { 2 } else { 0 }) + (if c.binary { 0x1_0000 } else { 0 })),
+                    "version" => Value::Int(if c.name.contains("_100") { 2 } else { 0 }),
+                    _ => Value::Null,
+                }
+            }
             "SERVERPROPERTY" => {
                 need(name, &a, 1)?;
                 match s(&a[0]).to_lowercase().as_str() {
@@ -1751,7 +1776,7 @@ impl<'a> Engine<'a> {
                     "edition" => Value::Str("Developer Edition (64-bit)".into()),
                     "engineedition" => Value::Int(3),
                     "servername" | "machinename" => Value::Str(self.srv.server_name.clone()),
-                    "collation" => Value::Str("SQL_Latin1_General_CP1_CI_AS".into()),
+                    "collation" => Value::Str(crate::collation::DEFAULT_NAME.into()),
                     "isclustered" | "isintegratedsecurityonly" => Value::Int(0),
                     "productlevel" => Value::Str("RTM".into()),
                     "instancename" => Value::Null,
@@ -1791,7 +1816,7 @@ impl<'a> Engine<'a> {
                 let parts: Vec<String> = s(&a[0]).split('.').map(|p| p.trim_matches(|c| c == '[' || c == ']').to_string()).collect();
                 let loc = self.locate(&parts);
                 match self.table_ref(&loc) {
-                    Some(t) => match (t.identity_col(), t.identity_next) {
+                    Some(t) => match (t.identity_col(), t.identity_next.get()) {
                         (Some(c), Some(n)) => { let inc = t.columns[c].identity.unwrap().1; if t.live_rows() == 0 && n == t.columns[c].identity.unwrap().0 { Value::Dec(Dec::from_int(n)) } else { Value::Dec(Dec::from_int(n - inc)) } }
                         _ => Value::Null,
                     },
@@ -1962,9 +1987,9 @@ impl<'a> Engine<'a> {
                         return Err(SqlError::new(174, "The string_split function requires 2 argument(s)."));
                     }
                     let ordinal = args.get(2).map(|v| v.as_i64().unwrap_or(0) != 0).unwrap_or(false);
-                    let mut cols = vec![ColMeta { qual: None, name: "value".into(), ty: Some(DataType::NVarChar(MAX)) }];
+                    let mut cols = vec![ColMeta { qual: None, name: "value".into(), ty: Some(DataType::NVarChar(MAX)), denied: None, coll: None, mask: None }];
                     if ordinal {
-                        cols.push(ColMeta { qual: None, name: "ordinal".into(), ty: Some(DataType::BigInt) });
+                        cols.push(ColMeta { qual: None, name: "ordinal".into(), ty: Some(DataType::BigInt), denied: None, coll: None, mask: None });
                     }
                     if args[0].is_null() {
                         return Ok(Rowset::new(Schema::new(cols), vec![]));
@@ -1987,7 +2012,7 @@ impl<'a> Engine<'a> {
                     if args.len() < 2 {
                         return Err(SqlError::new(174, "The generate_series function requires 2 argument(s)."));
                     }
-                    let col = |ty| Schema::new(vec![ColMeta { qual: None, name: "value".into(), ty: Some(ty) }]);
+                    let col = |ty| Schema::new(vec![ColMeta { qual: None, name: "value".into(), ty: Some(ty), denied: None, coll: None, mask: None }]);
                     if args.iter().any(|v| v.is_null()) {
                         return Ok(Rowset::new(col(DataType::Int), vec![]));
                     }
@@ -2011,7 +2036,19 @@ impl<'a> Engine<'a> {
                 }
                 "OPENJSON" => return self.openjson(&args, with),
                 "FN_HELPCOLLATIONS" => {
-                    return Ok(Rowset::from_rows(&["name".to_string(), "description".to_string()], vec![vec![Value::Str("SQL_Latin1_General_CP1_CI_AS".into()), Value::Str("Latin1-General, case-insensitive, accent-sensitive".into())]]));
+                    // the collations this server implements: every sensitivity combination of the common families
+                    let mut rows = vec![];
+                    for fam in ["SQL_Latin1_General_CP1", "Latin1_General", "Latin1_General_100", "French", "German_PhoneBook", "Turkish"] {
+                        for sens in ["CI_AS", "CS_AS", "CI_AI", "CS_AI"] {
+                            let n = format!("{}_{}", fam, sens);
+                            let desc = format!("{}, {}, {}", fam.replace('_', "-"), if sens.contains("CI") { "case-insensitive" } else { "case-sensitive" }, if sens.contains("AI") { "accent-insensitive" } else { "accent-sensitive" });
+                            rows.push(vec![Value::Str(n), Value::Str(desc)]);
+                        }
+                        for bin in ["BIN", "BIN2"] {
+                            rows.push(vec![Value::Str(format!("{}_{}", fam, bin)), Value::Str(format!("{}, binary code point comparison sort", fam.replace('_', "-")))]);
+                        }
+                    }
+                    return Ok(Rowset::from_rows(&["name".to_string(), "description".to_string()], rows));
                 }
                 _ => {}
             }
@@ -2024,7 +2061,7 @@ impl<'a> Engine<'a> {
         Err(SqlError::new(208, format!("Invalid object name '{}'.", name.join("."))))
     }
 
-    fn call_tvf(&mut self, f: &FuncDef, args: Vec<Value>) -> Result<Rowset> {
+    pub fn call_tvf(&mut self, f: &FuncDef, args: Vec<Value>) -> Result<Rowset> {
         let def = f.def.clone();
         let fdb = self.ses.db.to_lowercase();
         self.check_perm("SELECT", &fdb, &f.schema, Some(&obj_key(&f.schema, &f.name)), &f.name)?;
@@ -2098,7 +2135,7 @@ impl<'a> Engine<'a> {
             let mut types = vec![];
             for (n, tr, _) in w {
                 let dt = self.resolve_type(tr)?;
-                cols.push(ColMeta { qual: None, name: n.clone(), ty: Some(dt.clone()) });
+                cols.push(ColMeta { qual: None, name: n.clone(), ty: Some(dt.clone()), denied: None, coll: None, mask: None });
                 types.push(dt);
             }
             let mut rows = vec![];

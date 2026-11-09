@@ -11,6 +11,7 @@ mod datasheet;
 mod design;
 mod query;
 mod sample;
+mod session;
 mod ui;
 
 fn main() -> Result<(), eframe::Error> {

@@ -51,9 +51,11 @@ fn alter_table_constraints() {
 #[test]
 fn create_index_and_drop() {
     let mut c = conn();
-    exec(&mut c, "CREATE TABLE t (a INT, b INT)");
+    exec(&mut c, "CREATE TABLE t (a INT, b INT, c INT)");
     exec(&mut c, "CREATE INDEX ix_a ON t (a)");
-    exec(&mut c, "CREATE NONCLUSTERED INDEX ix_ab ON t (a DESC, b) INCLUDE (b)");
+    exec(&mut c, "CREATE NONCLUSTERED INDEX ix_ab ON t (a DESC, b) INCLUDE (c)");
+    // a column cannot be both a key column and an included one
+    assert_eq!(err_no(&mut c, "CREATE INDEX ix_dup ON t (a) INCLUDE (a)"), 1909);
     exec(&mut c, "CREATE UNIQUE CLUSTERED INDEX ux ON t (b)");
     assert_eq!(err_no(&mut c, "CREATE INDEX ix_a ON t (a)"), 1913);
     assert_eq!(rows(&mut c, "SELECT name FROM sys.indexes WHERE object_id = OBJECT_ID('t') AND name IS NOT NULL ORDER BY name"), vec![vec!["ix_a"], vec!["ix_ab"], vec!["ux"]]);

@@ -23,8 +23,10 @@ All table data lives in **B+trees made of 8 KiB pages** (`src/storage/page.rs`):
 * a table's **heap** is a B+tree from row id to the row's *slot* (its chain of versions, oldest first);
 * every primary key, unique constraint and index is a B+tree from `(key columns, row id)` to nothing, ordered
   with SQL Server's comparison rules (case-insensitive strings, NULL first);
-* leaves are doubly linked, the root page of a tree never moves, and pages are never merged after deletes
-  (a table that shrank a lot keeps its pages for reuse by later inserts; dropping it frees them all).
+* leaves are doubly linked and the root page of a tree never moves. A delete that leaves a leaf under a quarter full
+  merges it into a neighbour under the same parent when the two fit in three quarters of a page; an inner node left
+  with a single child is replaced by that child, and a root left with one child takes over the child's contents, so
+  a tree whose rows were all deleted is a single empty page again (see *Reclaiming space* below).
 
 A version chain whose serialised form exceeds 1 KiB is stored in **overflow pages**, so rows of any size
 (`nvarchar(max)` values of hundreds of kilobytes) work. Index keys are limited to 1700 bytes (error 1946, as in
@@ -42,6 +44,80 @@ returns, the rows a `JOIN`/`GROUP BY`/`ORDER BY` operator materialises, and the 
 Pushed-down conditions are applied while a table is read, so a selective query over a huge table only keeps the
 matching rows, and index seeks and early-stopping ordered reads touch only the pages they need. The undo log of an
 open transaction (a few dozen bytes per changed row) is also in memory.
+
+## Reclaiming space
+
+* **Merging.** Deletes merge sparse leaves as described above, so the pages of deleted rows are returned to the free
+  list (`pages_live` falls) instead of staying half empty.
+* **Compaction.** At each checkpoint, if at least a quarter of `data.db` is free blocks, live pages from the end of the
+  file are copied into free blocks nearer its start (at most 4,096 pages, 32 MiB, per checkpoint). A moved page gets a
+  new, unprotected block and its old block is released only after the checkpoint that no longer refers to it, so the
+  shadow-paging rule (a checkpointed block is never overwritten) still holds and a crash at any point recovers from
+  the previous checkpoint plus the log.
+* **Truncation.** After a checkpoint is durable, free blocks at the end of the file are cut off (`set_len`), so a
+  database that shrank gets a smaller file within a couple of checkpoints (`StoreStats::{merges, moved, truncated}`).
+  Small files (under 256 blocks) are left alone.
+
+## Working memory and spilling to disk
+
+A single-table `SELECT` that sorts, groups, de-duplicates or limits, and any join of base tables (see below), runs in a
+**streaming executor** (`src/engine/stream.rs`) once a table in it has at least `stream_min_slots` heap slots
+(default 20,000): the table is read a chunk at a time and each qualifying row goes into a sink instead of into a vector
+that is then copied several times.
+
+| Clause | Sink | Memory |
+| --- | --- | --- |
+| `ORDER BY` | external merge sort (`src/engine/spill.rs`): sorted runs of at most `work_mem` bytes are written to temporary files and merged (fan-in 48, multi-pass) | `work_mem` |
+| `TOP n` / `OFFSET .. FETCH` with `ORDER BY` | the best `offset + n` rows are kept (up to 200,000), everything else is discarded as it is read | O(n) |
+| `TOP n` without `ORDER BY` | the scan stops after `n` rows | O(n) |
+| `DISTINCT` | rows are sorted by identity (spilling), the first arrival of each is kept, then the requested order is restored | `work_mem` |
+| `GROUP BY` (plain expressions) | rows are sorted by group key (spilling); each group is aggregated, filtered by `HAVING` and projected as soon as it is complete, then its rows are dropped; groups keep first-appearance order unless `ORDER BY` says otherwise | `work_mem` + the largest group |
+
+### Joins: streaming hash join with a grace fallback
+
+A `FROM` clause that is a left-deep chain of base tables joined with `INNER`, `CROSS` (as a comma list with `WHERE`
+equalities) or `LEFT` joins, with at least one equality between each new table and the tables before it, is joined by
+`src/engine/hashjoin.rs`. The biggest table (for inner joins; the first one when there is a `LEFT JOIN`) is *probed*: it
+is read a chunk at a time and each row is pushed through the join stages into the same sinks as above. Every other table
+is a *build* side with a share of `work_mem`:
+
+* if its rows fit, they are hashed in memory by the join key (and the output order is the probe order, as in the general
+  executor);
+* if they do not, the stage becomes a **grace hash join**: the rows already hashed and the rest of the build side are
+  written to 32 partition files by the hash of the join key, probe rows are partitioned the same way, and when the probe
+  input is exhausted each partition pair is joined on its own. A partition whose build side still exceeds the budget
+  (skewed keys) is joined in several passes, reading the build partition in chunks that fit and the probe partition once
+  per chunk, so memory is bounded however skewed the data is. Left joins keep a flag per probe row across the passes.
+
+Rows with a NULL key never match (they appear only null-extended in a left join). The plan says how each stage ran:
+`streaming hash join [n probe rows read]: scan f: ... -> scan d [rows]: ...; grace hash, 32 partition(s) spilled`.
+A big table joined to a handful of rows through one of its indexes is left to the general executor, whose index
+nested-loop join is the better plan there. Right and full outer joins, `APPLY`, derived tables, views, CTEs and joins
+without an equality use the general executor.
+
+### Streamed results
+
+`Connection::execute_streaming(sql, sink)` reports output as it is produced (`Streamed::Event` for messages, errors and
+row counts, and `Header`, `Row`..., `End` for the rows of a plain top-level `SELECT` that the streaming executor ran),
+so the result set is never held in memory: rows leave the final sort or merge one at a time. `tsql-serve` uses it for
+every batch and RPC, writing rows into TDS packets and sending them as they fill. The column types of expressions are
+not declared, so they are guessed from the first 64 rows (held back until then); the TDS layer sends such string
+columns as `nvarchar(max)` so later, wider or non-code-page values are not lost. If the consumer goes away the
+statement stops (error 64) and its spill files are removed. `SELECT ... INTO`, `TOP ... PERCENT`/`WITH TIES`, results
+captured by `INSERT ... EXEC`, set operations and CTEs deliver the whole result set (`Event::Rows`).
+
+Results are identical to the general executor's (the tests run both and compare, and `TSQL_TEST_SPILL=1 cargo test`
+runs the whole suite with the streaming executor forced on and a 2 KiB budget). Ties keep the order rows were read in,
+like a stable in-memory sort. Run files are named `tsql-spill-<pid>-<n>.run`, live in the system temporary directory
+(`TSQL_SPILL_DIR` or `Server::set_work_mem` choose another) and are deleted when the statement ends, including when it
+fails. `Server::set_work_mem(bytes, stream_min_slots, dir)` changes the budget; the plan (`last_plan()`,
+`SET SHOWPLAN_TEXT`-style output) says `streaming scan ... external sort (n spilled run(s))`.
+
+Everything else still materialises: window functions, scalar aggregates (one group holding every row),
+`ROLLUP`/`CUBE`, set operations, views, CTEs, derived tables, the outer join kinds listed above, and results that are
+captured rather than delivered. So the bound for the streamed shapes is `work_mem` plus the largest group, not a
+constant for every query. A query whose ordered index read already provides the order (and can stop early) keeps using
+that instead of a sort, unless its whole result is being streamed to a client.
 
 ## Crash safety without a write-ahead rule: shadow paging
 
@@ -123,10 +199,10 @@ with their own, smaller pool (`temp_pool_pages`) and spill to `temp.db`, so they
 
 ## Limits
 
-* Statement working set must fit in memory (see above); there is no spill-to-disk for sorts, hash joins or aggregates.
+* Joins, window functions, scalar aggregates, set operations and result sets are not spilled (see above); sorts, `DISTINCT`, `TOP n` and `GROUP BY` over a single table are.
 * The page table (about 8 bytes per page) and the catalog are memory resident and are rewritten at each checkpoint.
-* Pages are not merged or compacted after deletes; there is no `ALTER INDEX … REBUILD` to shrink a file, and the
-  file never shrinks (freed blocks are reused).
+* Only leaves are merged: inner nodes are not rebalanced, so a tree can stay slightly taller than a freshly built one
+  after heavy deletes, and there is no `ALTER INDEX … REBUILD`. The temporary-table file (`temp.db`) is not shrunk.
 * A checkpoint needs a moment with no open transaction; a transaction left open indefinitely keeps the log growing.
 * `ALTER TABLE` rewrites and `SELECT INTO` hold the table's rows in memory and log them as one commit record.
 * Stored sizes follow this engine's own row format, not SQL Server's.

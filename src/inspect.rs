@@ -37,8 +37,22 @@ pub struct ColumnInfo {
     /// `(seed, increment)` of an `IDENTITY` column.
     pub identity: Option<(i64, i64)>,
     pub has_default: bool,
+    /// Source text of the `DEFAULT` expression.
+    pub default_text: Option<String>,
+    pub default_name: Option<String>,
     pub computed: bool,
+    /// Source text of a computed column's formula.
+    pub computed_text: Option<String>,
     pub primary_key: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct CheckInfo {
+    pub name: String,
+    pub text: String,
+    pub enabled: bool,
+    /// The column of a column-level constraint.
+    pub column: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -51,6 +65,10 @@ pub struct IndexInfo {
     /// Declared as a constraint (drop it with `ALTER TABLE ... DROP CONSTRAINT`) rather than
     /// created with `CREATE INDEX` (drop it with `DROP INDEX`).
     pub constraint: bool,
+    /// `INCLUDE (...)` columns.
+    pub include: Vec<String>,
+    /// The `WHERE` clause of a filtered index.
+    pub filter: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -72,8 +90,10 @@ pub struct TableInfo {
     /// Primary key and unique constraints first, then the other indexes.
     pub indexes: Vec<IndexInfo>,
     pub foreign_keys: Vec<ForeignKeyInfo>,
-    /// Names of the check constraints (their expressions are not kept as text).
+    /// Names of the check constraints.
     pub checks: Vec<String>,
+    /// The check constraints with their expressions.
+    pub check_defs: Vec<CheckInfo>,
     pub triggers: Vec<String>,
     /// Slots in the heap: live rows plus deleted rows not yet collected. Cheap, approximate.
     pub approx_rows: usize,
@@ -131,23 +151,26 @@ fn describe(db: &str, t: &Table) -> TableInfo {
             nullable: c.nullable && !pk_cols.contains(&i),
             identity: c.identity,
             has_default: c.default.is_some(),
+            default_text: c.default_text.clone(),
+            default_name: c.default_name.clone(),
             computed: c.computed.is_some(),
+            computed_text: c.computed_text.clone(),
             primary_key: pk_cols.contains(&i),
         })
         .collect();
     let col_name = |i: usize| t.columns.get(i).map(|c| c.name.clone()).unwrap_or_default();
     let mut indexes = vec![];
     if let Some(pk) = &t.pk {
-        indexes.push(IndexInfo { name: pk.name.clone(), columns: pk.cols.iter().map(|&c| (col_name(c), false)).collect(), unique: true, primary_key: true, constraint: true });
+        indexes.push(IndexInfo { name: pk.name.clone(), columns: pk.cols.iter().map(|&c| (col_name(c), false)).collect(), unique: true, primary_key: true, constraint: true, include: vec![], filter: None });
     }
     for u in &t.uniques {
         // a unique index also has an index definition, which knows the sort direction of its columns
         let desc = |pos: usize| t.indexes.iter().find(|i| i.name == u.name).and_then(|i| i.cols.get(pos)).map(|c| c.1).unwrap_or(false);
-        indexes.push(IndexInfo { name: u.name.clone(), columns: u.cols.iter().enumerate().map(|(p, &c)| (col_name(c), desc(p))).collect(), unique: true, primary_key: false, constraint: !u.is_index });
+        indexes.push(IndexInfo { name: u.name.clone(), columns: u.cols.iter().enumerate().map(|(p, &c)| (col_name(c), desc(p))).collect(), unique: true, primary_key: false, constraint: !u.is_index, include: u.include.iter().map(|&c| col_name(c)).collect(), filter: u.filter.as_ref().map(|f| f.text.clone()) });
     }
     for i in &t.indexes {
         if !i.unique {
-            indexes.push(IndexInfo { name: i.name.clone(), columns: i.cols.iter().map(|&(c, d)| (col_name(c), d)).collect(), unique: false, primary_key: false, constraint: false });
+            indexes.push(IndexInfo { name: i.name.clone(), columns: i.cols.iter().map(|&(c, d)| (col_name(c), d)).collect(), unique: false, primary_key: false, constraint: false, include: i.include.iter().map(|&c| col_name(c)).collect(), filter: i.filter.as_ref().map(|f| f.text.clone()) });
         }
     }
     let foreign_keys = t
@@ -170,6 +193,7 @@ fn describe(db: &str, t: &Table) -> TableInfo {
         indexes,
         foreign_keys,
         checks: t.checks.iter().map(|c| c.name.clone()).collect(),
+        check_defs: t.checks.iter().map(|c| CheckInfo { name: c.name.clone(), text: c.text.clone(), enabled: c.enabled, column: c.col.clone() }).collect(),
         triggers: t.triggers.iter().map(|t| t.name.clone()).collect(),
         approx_rows: t.data.slot_count(),
     }
@@ -177,7 +201,7 @@ fn describe(db: &str, t: &Table) -> TableInfo {
 
 impl Connection {
     fn with_db<T>(&self, f: impl FnOnce(&Database) -> T) -> Option<T> {
-        let g = self.server.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let g = self.server.shared.state.read().unwrap_or_else(|e| e.into_inner());
         g.databases.get(&self.session.db.to_lowercase()).map(f)
     }
 
@@ -228,7 +252,7 @@ impl Connection {
 
     /// Names of all databases on the server.
     pub fn databases(&self) -> Vec<String> {
-        let g = self.server.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let g = self.server.shared.state.read().unwrap_or_else(|e| e.into_inner());
         g.databases.values().map(|d| d.name.clone()).collect()
     }
 

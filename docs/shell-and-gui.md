@@ -34,8 +34,8 @@ values cut at 60 characters); `PRINT` output and errors (`Msg N, Level L, State 
 | `.storage`, `.locks`, `.checkpoint` | buffer pool statistics, held locks, write a checkpoint |
 | `.help`, `.quit` | |
 
-`.schema` cannot reproduce `DEFAULT` expressions, `CHECK` expressions or computed-column formulas (the engine does not
-keep them as text); it lists their names in comments. CSV import maps an empty field to `NULL` in a nullable column
+`.schema` reproduces `DEFAULT` expressions, `CHECK` constraints (also disabled ones) and computed-column formulas from the
+source text the engine keeps with them. CSV import maps an empty field to `NULL` in a nullable column
 (and to an empty string in a `NOT NULL` text column); the header row names the columns, case-insensitively.
 
 ## `tsql-gui` — the desktop app
@@ -65,5 +65,9 @@ cargo run --release --features gui --bin tsql-gui -- [DATA_DIR] [--pool-pages N]
   closing or switching databases with one open asks whether to commit or roll back.
 
 The app uses one session, so it shows the effect of isolation levels and locks held by its own open transaction but
-cannot demonstrate blocking between sessions; use two shells or the library for that. Statements run on the UI
-thread, so a long query freezes the window until it finishes. Only one process can have a data folder open.
+cannot demonstrate blocking between sessions; use two shells or the library for that. A script run from the Query tab
+executes on a worker thread (the session moves to it and comes back with the results), so the window stays responsive,
+shows the elapsed time, and keeps the transaction and isolation level of the one session. While it runs the rest of
+the app (menus, navigation, other tabs) is disabled, because they would need the same session; there is no cancel
+button yet, since the engine cannot interrupt a running statement. Datasheet edits and the designer run on the UI
+thread (they are short statements). Only one process can have a data folder open.

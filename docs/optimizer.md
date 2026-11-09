@@ -54,3 +54,17 @@ SELECT
 From Rust: `conn.explain(sql)` returns the same lines, and `conn.last_plan()` returns the decisions (with actual
 row counts) of the statement that last ran. `SET OPTIMIZER OFF` switches the optimizer off for the session (every
 table is scanned in the written order), which is how the equivalence tests get their baseline.
+
+## Filtered and included-column indexes
+
+```sql
+CREATE INDEX ix_open ON ord (cust) INCLUDE (amount) WHERE status = 'open';
+CREATE UNIQUE INDEX ux_email ON acct (email) WHERE email IS NOT NULL AND active = 1;
+```
+
+A filtered index contains only the rows that satisfy its `WHERE` clause: a conjunction of `column <op> constant`,
+`column IS [NOT] NULL` and `column IN (constants)` (anything else is error 10735). A *unique* filtered index constrains only
+the rows it contains, and a row enters or leaves it as its columns change. The optimizer uses a filtered index only when the
+query's own conditions imply the filter (`amount > 600` implies `amount > 500`; `amount >= 500` does not), and foreign keys, joins
+and ordered reads never rely on one. `INCLUDE` columns are recorded (`sys.index_columns.is_included_column`, scripts) but, with
+no covering-index reads, they change nothing at run time. `sys.indexes` shows `has_filter` and `filter_definition`.

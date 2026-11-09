@@ -1,10 +1,10 @@
 //! Query view: a T-SQL editor with result grids, messages and the optimizer's plan.
 use std::path::PathBuf;
-use std::time::Instant;
 
 use egui::{Key, RichText, TextEdit};
 use tsql_server::{tools, Connection, Event as SqlEvent, ResultSet, SqlError};
 
+use crate::session::{Finished, Session};
 use crate::ui::{result_grid, Event, ERROR};
 
 /// What a batch produced, in order.
@@ -33,11 +33,13 @@ pub struct QueryTab {
     /// Selected text of the editor as a character range, from the last frame.
     selection: Option<(usize, usize)>,
     ran_selection: bool,
+    /// A script of this tab is running on the session's worker thread.
+    pub running: bool,
 }
 
 impl QueryTab {
     pub fn new(name: Option<String>, sql: String) -> Self {
-        QueryTab { name, sql, file: None, items: vec![], pane: Pane::Messages, elapsed_ms: None, plan: vec![], selection: None, ran_selection: false }
+        QueryTab { name, sql, file: None, items: vec![], pane: Pane::Messages, elapsed_ms: None, plan: vec![], selection: None, ran_selection: false, running: false }
     }
 
     pub fn title(&self) -> String {
@@ -72,16 +74,24 @@ impl QueryTab {
         }
     }
 
-    /// Run the selection (or the whole editor); batches are separated by `GO`.
-    pub fn run(&mut self, conn: &mut Connection, ev: &mut Vec<Event>) {
+    /// Start running the selection (or the whole editor) on the session's worker thread; batches are separated
+    /// by `GO`. The results arrive through [`QueryTab::finish`].
+    pub fn start(&mut self, sess: &mut Session, ctx: &egui::Context) {
         let text = self.text_to_run();
         self.ran_selection = self.selection.is_some_and(|(a, b)| b > a);
-        if text.trim().is_empty() {
+        if text.trim().is_empty() || sess.is_busy() {
             return;
         }
-        let t = Instant::now();
-        let results = conn.execute_script(&text);
-        self.elapsed_ms = Some(t.elapsed().as_secs_f64() * 1e3);
+        self.running = true;
+        let ctx = ctx.clone();
+        sess.start(text, move || ctx.request_repaint());
+    }
+
+    /// Take the results of the finished script.
+    pub fn finish(&mut self, fin: Finished, ev: &mut Vec<Event>) {
+        self.running = false;
+        let results = fin.results;
+        self.elapsed_ms = Some(fin.elapsed.as_secs_f64() * 1e3);
         self.items.clear();
         self.plan.clear();
         for r in results {
@@ -169,20 +179,25 @@ impl QueryTab {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, conn: &mut Connection, ev: &mut Vec<Event>) {
+    pub fn ui(&mut self, ui: &mut egui::Ui, conn: &mut Session, ev: &mut Vec<Event>) {
         ui.push_id(("query", self.name.clone()), |ui| self.show(ui, conn, ev));
     }
 
-    fn show(&mut self, ui: &mut egui::Ui, conn: &mut Connection, ev: &mut Vec<Event>) {
-        let shortcut = ui.input(|i| (i.modifiers.command && i.key_pressed(Key::Enter)) || i.key_pressed(Key::F5));
+    fn show(&mut self, ui: &mut egui::Ui, conn: &mut Session, ev: &mut Vec<Event>) {
+        let busy = conn.is_busy();
+        let shortcut = !busy && ui.input(|i| (i.modifiers.command && i.key_pressed(Key::Enter)) || i.key_pressed(Key::F5));
         let mut run = shortcut;
         let mut explain = false;
         ui.horizontal(|ui| {
-            if ui.button("Run  (Ctrl+Enter)").on_hover_text("Runs the selected text, or everything if nothing is selected").clicked() {
+            if ui.add_enabled(!busy, egui::Button::new("Run  (Ctrl+Enter)")).on_hover_text("Runs the selected text, or everything if nothing is selected").clicked() {
                 run = true;
             }
-            if ui.button("Explain").on_hover_text("Show the optimizer's plan without running the query").clicked() {
+            if ui.add_enabled(!busy, egui::Button::new("Explain")).on_hover_text("Show the optimizer's plan without running the query").clicked() {
                 explain = true;
+            }
+            if let (true, Some(d)) = (self.running, conn.running_for()) {
+                ui.spinner();
+                ui.label(RichText::new(format!("Running... {:.1} s", d.as_secs_f64())).strong());
             }
             ui.separator();
             if ui.button("Open...").clicked() {
@@ -221,10 +236,10 @@ impl QueryTab {
             let (a, b) = (r.primary.index, r.secondary.index);
             self.selection = if a != b { Some((a.min(b), a.max(b))) } else { None };
         }
-        if explain {
+        if explain && !busy {
             self.explain(conn);
         } else if run {
-            self.run(conn, ev);
+            self.start(conn, ui.ctx());
         }
         ui.separator();
 
@@ -283,8 +298,16 @@ mod tests {
     use super::*;
     use tsql_server::Server;
 
-    fn conn() -> Connection {
-        Server::new().connect()
+    fn conn() -> Session {
+        Session::new(Server::new().connect())
+    }
+
+    /// Run the tab's script to completion, as the app does over several frames.
+    fn run(q: &mut QueryTab, s: &mut Session, ev: &mut Vec<Event>) {
+        q.start(s, &egui::Context::default());
+        if let Some(f) = s.wait() {
+            q.finish(f, ev);
+        }
     }
 
     #[test]
@@ -292,7 +315,7 @@ mod tests {
         let mut c = conn();
         let mut ev = vec![];
         let mut q = QueryTab::new(None, "CREATE TABLE t (a INT)\nGO\nINSERT t VALUES (1),(2)\nGO\nPRINT 'hello'\nSELECT a FROM t\nSELECT 1/0".into());
-        q.run(&mut c, &mut ev);
+        run(&mut q, &mut c, &mut ev);
         assert!(matches!(ev.as_slice(), [Event::Changed]));
         assert_eq!(q.sets().len(), 1);
         assert_eq!(q.sets()[0].rows.len(), 2);
@@ -311,13 +334,13 @@ mod tests {
         let mut c = conn();
         let mut ev = vec![];
         let mut q = QueryTab::new(None, "SELECT 1 AS a; SELECT 2 AS b".into());
-        q.run(&mut c, &mut ev);
+        run(&mut q, &mut c, &mut ev);
         assert_eq!(q.pane, Pane::Results(0));
         assert_eq!(q.sets().len(), 2);
         // select just "SELECT 2 AS b"
         q.selection = Some((15, 28));
         assert_eq!(q.text_to_run(), "SELECT 2 AS b");
-        q.run(&mut c, &mut ev);
+        run(&mut q, &mut c, &mut ev);
         assert_eq!(q.sets().len(), 1);
         assert_eq!(q.sets()[0].columns, vec!["b"]);
         assert!(q.ran_selection);
@@ -328,7 +351,7 @@ mod tests {
         let mut c = conn();
         let mut ev = vec![];
         let mut q = QueryTab::new(None, "CREATE TABLE t (id INT PRIMARY KEY, v INT)\nGO\nINSERT t VALUES (1, 1)".into());
-        q.run(&mut c, &mut ev);
+        run(&mut q, &mut c, &mut ev);
         q.sql = "SELECT * FROM t WHERE id = 1".into();
         q.explain(&mut c);
         assert_eq!(q.pane, Pane::Plan);

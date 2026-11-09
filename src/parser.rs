@@ -31,7 +31,7 @@ VALUES VARYING VIEW WAITFOR WHEN WHERE WHILE WITH WITHIN WRITETEXT THROW OUTPUT 
 const STMT_START: &[&str] = &[
     "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "ALTER", "DROP", "TRUNCATE", "DECLARE", "SET", "IF", "WHILE", "BEGIN", "RETURN", "BREAK", "CONTINUE", "PRINT",
     "EXEC", "EXECUTE", "USE", "COMMIT", "ROLLBACK", "SAVE", "THROW", "RAISERROR", "OPEN", "CLOSE", "FETCH", "DEALLOCATE", "WAITFOR", "GOTO", "GRANT", "REVOKE", "DENY",
-    "DBCC", "WITH", "END", "ELSE", "REVERT",
+    "DBCC", "WITH", "END", "ELSE", "REVERT", "BACKUP", "RESTORE", "KILL", "RECONFIGURE",
 ];
 const NILADIC: &[&str] = &["CURRENT_TIMESTAMP", "CURRENT_USER", "SESSION_USER", "SYSTEM_USER", "USER", "CURRENT_DATE"];
 const DATEPART_FUNCS: &[&str] = &["DATEADD", "DATEDIFF", "DATEDIFF_BIG", "DATEPART", "DATENAME", "DATETRUNC", "DATE_BUCKET"];
@@ -57,6 +57,31 @@ pub fn parse_param_decls(sql: &str) -> R<Vec<Param>> {
         return Err(p.err());
     }
     Ok(params)
+}
+
+/// `text` without one pair of parentheses that encloses all of it, so scripted text is stable.
+fn unwrap_parens(text: &str) -> String {
+    let t = text.trim();
+    let mut depth = 0i32;
+    let mut quoted = false;
+    for (i, ch) in t.char_indices() {
+        match ch {
+            '\'' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => {
+                depth -= 1;
+                if depth == 0 && i + 1 < t.len() {
+                    return t.to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    if t.starts_with('(') && t.ends_with(')') && depth == 0 {
+        t[1..t.len() - 1].trim().to_string()
+    } else {
+        t.to_string()
+    }
 }
 
 pub fn parse_expr_str(sql: &str) -> R<Expr> {
@@ -155,6 +180,138 @@ impl Parser {
     fn at_eos(&self) -> bool {
         self.is_eof() || self.is_op(";")
     }
+    /// The part of CREATE/ALTER SECURITY POLICY after the keywords.
+    fn policy_body(&mut self) -> R<PolicyStmt> {
+        use crate::catalog::{PredKind, Predicate};
+        let name = self.name_parts()?;
+        let (mut add, mut drop, mut state) = (vec![], vec![], None);
+        loop {
+            let adding = if self.accept_kw("ADD") {
+                true
+            } else if self.accept_kw("DROP") {
+                false
+            } else {
+                break;
+            };
+            let filter = if self.accept_kw("FILTER") {
+                true
+            } else {
+                self.expect_kw("BLOCK")?;
+                false
+            };
+            self.expect_kw("PREDICATE")?;
+            // DROP names only the table (and kind); ADD names the function too
+            let f = if adding { self.name_parts()? } else { vec![] };
+            let func = (if f.len() >= 2 { f[f.len() - 2].clone() } else { "dbo".to_string() }, f.last().cloned().unwrap_or_default());
+            let mut args = vec![];
+            if adding {
+                self.expect_op("(")?;
+                if !self.is_op(")") {
+                    loop {
+                        args.push(self.ident()?);
+                        if !self.accept_op(",") {
+                            break;
+                        }
+                    }
+                }
+                self.expect_op(")")?;
+            }
+            self.expect_kw("ON")?;
+            let t = self.name_parts()?;
+            let table = format!("{}.{}", if t.len() >= 2 { t[t.len() - 2].clone() } else { "dbo".to_string() }, t.last().cloned().unwrap_or_default()).to_lowercase();
+            let mut kind = if filter { PredKind::Filter } else { PredKind::BlockAfterInsert };
+            let mut explicit = false;
+            if !filter && self.is_kw_any(&["AFTER", "BEFORE"]) {
+                let when = self.advance().up;
+                let op = self.advance().up;
+                explicit = true;
+                kind = match (when.as_str(), op.as_str()) {
+                    ("AFTER", "INSERT") => PredKind::BlockAfterInsert,
+                    ("AFTER", "UPDATE") => PredKind::BlockAfterUpdate,
+                    ("BEFORE", "UPDATE") => PredKind::BlockBeforeUpdate,
+                    ("BEFORE", "DELETE") => PredKind::BlockBeforeDelete,
+                    _ => return Err(self.err()),
+                };
+            }
+            let pred = Predicate { kind, func, args, table };
+            if adding {
+                // a block predicate without AFTER/BEFORE covers every operation
+                if !filter && !explicit {
+                    for k in [PredKind::BlockAfterInsert, PredKind::BlockAfterUpdate, PredKind::BlockBeforeUpdate, PredKind::BlockBeforeDelete] {
+                        add.push(Predicate { kind: k, ..pred.clone() });
+                    }
+                } else {
+                    add.push(pred);
+                }
+            } else {
+                drop.push(pred);
+            }
+            if !self.accept_op(",") {
+                if !self.is_kw_any(&["ADD", "DROP"]) {
+                    break;
+                }
+            }
+        }
+        if self.accept_kw("WITH") {
+            self.expect_op("(")?;
+            loop {
+                let k = self.ident()?.to_uppercase();
+                self.expect_op("=")?;
+                let v = self.advance().up;
+                if k == "STATE" {
+                    state = Some(v == "ON");
+                }
+                if !self.accept_op(",") {
+                    break;
+                }
+            }
+            self.expect_op(")")?;
+        }
+        Ok(PolicyStmt { name, add, drop, state })
+    }
+
+    /// `MASKED WITH (FUNCTION = 'default()')`: the function text.
+    fn masked_with(&mut self) -> R<String> {
+        self.expect_kw("MASKED")?;
+        self.expect_kw("WITH")?;
+        self.expect_op("(")?;
+        self.expect_kw("FUNCTION")?;
+        self.expect_op("=")?;
+        let f = match self.advance().tok {
+            Tok::Str(s) => s,
+            _ => return Err(self.err()),
+        };
+        self.expect_op(")")?;
+        Ok(f)
+    }
+
+    /// `DISK = 'path'` (one device only).
+    fn backup_device(&mut self) -> R<Expr> {
+        self.expect_kw("DISK")?;
+        self.expect_op("=")?;
+        let e = self.expr()?;
+        if self.is_op(",") {
+            return Err(SqlError::new(3205, "Too many backup devices specified for BACKUP or RESTORE; this server supports one DISK device."));
+        }
+        Ok(e)
+    }
+
+    /// `WITH name [= value] [, ...]`
+    fn backup_options(&mut self) -> R<Vec<(String, Option<Expr>)>> {
+        let mut opts = vec![];
+        if self.accept_kw("WITH") {
+            loop {
+                let name = self.ident()?.to_uppercase();
+                let val = if self.accept_op("=") { Some(self.expr()?) } else { None };
+                opts.push((name, val));
+                if !self.accept_op(",") {
+                    break;
+                }
+            }
+        }
+        Ok(opts)
+    }
+
     fn is_stmt_start(&self) -> bool {
         self.is_kw_any(STMT_START)
     }
@@ -209,6 +366,13 @@ impl Parser {
     // ------------------------------------------------------------ expressions
     pub fn expr(&mut self) -> R<Expr> {
         self.or_expr()
+    }
+    /// An expression together with its source text.
+    fn expr_text(&mut self) -> R<(Expr, String)> {
+        let start = self.toks.get(self.i).map(|t| t.pos).unwrap_or(self.src.len());
+        let e = self.expr()?;
+        let end = if self.i > 0 { self.toks[self.i - 1].end } else { start };
+        Ok((e, unwrap_parens(self.src.get(start..end).unwrap_or(""))))
     }
     fn or_expr(&mut self) -> R<Expr> {
         let mut l = self.and_expr()?;
@@ -378,6 +542,7 @@ impl Parser {
         let mut e = self.primary()?;
         loop {
             if self.is_kw("COLLATE") {
+                crate::collation::mark_in_use();
                 self.i += 1;
                 let n = self.ident()?;
                 e = Expr::Collate(Box::new(e), n);
@@ -747,24 +912,41 @@ impl Parser {
             for_clause = Some(self.for_clause()?);
         }
         let mut maxrecursion = None;
+        let mut options: Vec<String> = vec![];
         if self.is_kw("OPTION") && self.peek_is_op(1, "(") {
             self.i += 2;
             let mut depth = 1;
+            let mut cur = String::new();
             while depth > 0 && !self.is_eof() {
                 let t = self.advance();
                 match t.tok {
                     Tok::Op("(") => depth += 1,
                     Tok::Op(")") => depth -= 1,
+                    Tok::Op(",") if depth == 1 => {
+                        if !cur.is_empty() {
+                            options.push(std::mem::take(&mut cur));
+                        }
+                    }
                     Tok::Id(_) if t.up == "MAXRECURSION" => {
                         if let Tok::Int(n) = self.tok().tok {
                             maxrecursion = Some(n as i32);
                         }
+                        cur.push_str("MAXRECURSION");
+                    }
+                    Tok::Id(_) | Tok::Int(_) if depth == 1 => {
+                        if !cur.is_empty() {
+                            cur.push(' ');
+                        }
+                        cur.push_str(&t.up);
                     }
                     _ => {}
                 }
             }
+            if !cur.is_empty() {
+                options.push(cur);
+            }
         }
-        Ok(Query { ctes, body, order, offset, fetch, for_clause, maxrecursion })
+        Ok(Query { ctes, body, order, offset, fetch, for_clause, maxrecursion, options })
     }
 
     fn for_clause(&mut self) -> R<ForClause> {
@@ -1199,13 +1381,27 @@ impl Parser {
                 node = TableRef::Func { name, args, alias, cols, with };
             } else {
                 let (alias, _) = self.opt_alias()?;
-                node = TableRef::Table { name, alias };
+                let mut hints = vec![];
                 if self.is_kw("WITH") && self.peek_is_op(1, "(") {
-                    self.i += 1;
-                    self.skip_parens()?;
+                    self.i += 2;
+                    // table hints: names, some with arguments (INDEX(ix), FORCESEEK(ix(col)))
+                    let mut depth = 1;
+                    while depth > 0 {
+                        if self.is_eof() {
+                            return Err(self.err());
+                        }
+                        let t = self.advance();
+                        match t.tok {
+                            Tok::Op("(") => depth += 1,
+                            Tok::Op(")") => depth -= 1,
+                            Tok::Id(_) if depth == 1 => hints.push(t.up.clone()),
+                            _ => {}
+                        }
+                    }
                 } else if self.accept_kw("TABLESAMPLE") && self.is_op("(") {
                     self.skip_parens()?;
                 }
+                node = TableRef::Table { name, alias, hints };
             }
         }
         if self.is_kw("PIVOT") && self.peek_is_op(1, "(") {
@@ -1385,9 +1581,30 @@ impl Parser {
                     }
                     "WAITFOR" => {
                         self.i += 1;
-                        self.advance();
-                        self.expr()?;
-                        Ok(Stmt::WaitFor)
+                        let time = if self.accept_kw("DELAY") {
+                            false
+                        } else if self.accept_kw("TIME") {
+                            true
+                        } else {
+                            return Err(SqlError::new(102, "Incorrect syntax near WAITFOR: only WAITFOR DELAY and WAITFOR TIME are supported."));
+                        };
+                        let e = self.expr()?;
+                        Ok(Stmt::WaitFor { time, e })
+                    }
+                    "KILL" => {
+                        self.i += 1;
+                        let e = self.expr()?;
+                        if self.accept_kw("WITH") {
+                            self.advance();
+                        }
+                        Ok(Stmt::Kill(e))
+                    }
+                    "RECONFIGURE" => {
+                        self.i += 1;
+                        if self.accept_kw("WITH") {
+                            self.advance();
+                        }
+                        Ok(Stmt::Reconfigure)
                     }
                     "OPEN" | "CLOSE" | "DEALLOCATE" => {
                         let op = self.advance().up;
@@ -1436,6 +1653,17 @@ impl Parser {
                             let opts = self.sequence_opts()?;
                             return Ok(Stmt::AlterSequence { name, opts });
                         }
+                        if self.is_kw("SECURITY") && self.peek_kw(1, &["POLICY"]) {
+                            self.i += 2;
+                            return Ok(Stmt::AlterSecurityPolicy(Box::new(self.policy_body()?)));
+                        }
+                        if self.is_kw("DATABASE") && self.peek_kw(2, &["COLLATE"]) {
+                            self.i += 1;
+                            let db = self.ident()?;
+                            self.expect_kw("COLLATE")?;
+                            let name = self.ident()?;
+                            return Ok(Stmt::AlterDatabase { db, options: vec![("COLLATE".to_string(), name)] });
+                        }
                         if self.is_kw("DATABASE") && !self.peek_kw(2, &["MODIFY", "ADD", "REMOVE", "COLLATE"]) && self.peek_kw(2, &["SET"]) {
                             self.i += 1;
                             let db = self.ident()?;
@@ -1447,6 +1675,8 @@ impl Parser {
                                 if self.is_kw_any(&["ON", "OFF"]) {
                                     val = self.advance().up;
                                 } else if self.accept_op("=") {
+                                    val = self.advance().up;
+                                } else if name == "RECOVERY" {
                                     val = self.advance().up;
                                 }
                                 options.push((name, val));
@@ -1573,6 +1803,38 @@ impl Parser {
                         self.i += 1;
                         Ok(Stmt::Checkpoint)
                     }
+                    "BACKUP" => {
+                        self.i += 1;
+                        let log = if self.accept_kw("LOG") {
+                            true
+                        } else {
+                            self.expect_kw("DATABASE")?;
+                            false
+                        };
+                        let db = self.ident()?;
+                        self.expect_kw("TO")?;
+                        let path = self.backup_device()?;
+                        let opts = self.backup_options()?;
+                        Ok(Stmt::Backup(Box::new(BackupStmt { log, db, path, opts })))
+                    }
+                    "RESTORE" => {
+                        self.i += 1;
+                        let (kind, db) = if self.accept_kw("DATABASE") {
+                            (RestoreKind::Database, Some(self.ident()?))
+                        } else if self.accept_kw("LOG") {
+                            (RestoreKind::Log, Some(self.ident()?))
+                        } else if self.accept_kw("VERIFYONLY") {
+                            (RestoreKind::VerifyOnly, None)
+                        } else if self.accept_kw("HEADERONLY") {
+                            (RestoreKind::HeaderOnly, None)
+                        } else {
+                            return Err(self.err());
+                        };
+                        self.expect_kw("FROM")?;
+                        let path = self.backup_device()?;
+                        let opts = self.backup_options()?;
+                        Ok(Stmt::Restore(Box::new(RestoreStmt { kind, db, path, opts })))
+                    }
                     _ => {
                         // label?
                         if self.peek_is_op(1, ":") {
@@ -1605,7 +1867,7 @@ impl Parser {
             self.accept_kw("FOR");
         }
         let mut perms: Vec<String> = vec![];
-        let mut columns = false;
+        let mut cols: Vec<Vec<String>> = vec![];
         loop {
             let mut words: Vec<String> = vec![];
             while !self.is_eof() && !self.is_op(",") && !self.is_op("(") && !self.is_kw_any(&["ON", "TO", "FROM"]) {
@@ -1618,11 +1880,18 @@ impl Parser {
             if p == "ALL PRIVILEGES" {
                 p = "ALL".to_string();
             }
-            if self.is_op("(") {
-                columns = true;
-                self.skip_parens()?;
+            let mut these = vec![];
+            if self.accept_op("(") {
+                loop {
+                    these.push(self.ident()?);
+                    if !self.accept_op(",") {
+                        break;
+                    }
+                }
+                self.expect_op(")")?;
             }
             perms.push(p);
+            cols.push(these);
             if !self.accept_op(",") {
                 break;
             }
@@ -1644,9 +1913,21 @@ impl Parser {
             } else {
                 target = PermTargetAst::Object(self.name_parts()?);
             }
-            if self.is_op("(") {
-                columns = true;
-                self.skip_parens()?;
+            if self.accept_op("(") {
+                // GRANT SELECT ON t (a, b): the column list applies to every permission named
+                let mut these = vec![];
+                loop {
+                    these.push(self.ident()?);
+                    if !self.accept_op(",") {
+                        break;
+                    }
+                }
+                self.expect_op(")")?;
+                for c in cols.iter_mut() {
+                    if c.is_empty() {
+                        *c = these.clone();
+                    }
+                }
             }
         }
         if !(self.accept_kw("TO") || self.accept_kw("FROM")) {
@@ -1668,7 +1949,7 @@ impl Parser {
                 break;
             }
         }
-        Ok(Stmt::Security(Box::new(SecStmt::Perm { kind, perms, target, principals, with_grant, columns })))
+        Ok(Stmt::Security(Box::new(SecStmt::Perm { kind, perms, target, principals, with_grant, cols })))
     }
 
     fn skip_ignored(&mut self) -> R<Stmt> {
@@ -2210,6 +2491,16 @@ impl Parser {
             }
             return Ok(Stmt::DropIndex { names, if_exists });
         }
+        if what == "SECURITY" {
+            self.expect_kw("POLICY")?;
+            let mut if_exists = false;
+            if self.accept_kw("IF") {
+                self.expect_kw("EXISTS")?;
+                if_exists = true;
+            }
+            let name = self.name_parts()?;
+            return Ok(Stmt::DropSecurityPolicy { name, if_exists });
+        }
         if !["TABLE", "VIEW", "PROC", "PROCEDURE", "FUNCTION", "SCHEMA", "DATABASE", "TYPE", "SEQUENCE", "TRIGGER", "LOGIN", "USER", "ROLE", "SYNONYM", "STATISTICS"].contains(&what.as_str()) {
             return Err(SqlError::syntax(&what));
         }
@@ -2322,17 +2613,27 @@ impl Parser {
                     }
                     self.expect_op(")")?;
                 }
+                let (mut include, mut filter) = (vec![], None);
                 while self.is_kw_any(&["INCLUDE", "WHERE", "WITH", "ON"]) {
                     let w = self.advance().up;
                     if w == "WHERE" {
-                        self.expr()?;
+                        filter = Some(self.expr_text()?);
+                    } else if w == "INCLUDE" && self.is_op("(") {
+                        self.i += 1;
+                        loop {
+                            include.push(self.ident()?);
+                            if !self.accept_op(",") {
+                                break;
+                            }
+                        }
+                        self.expect_op(")")?;
                     } else if self.is_op("(") {
                         self.skip_parens()?;
                     } else {
                         self.i += 1;
                     }
                 }
-                Ok(Stmt::CreateIndex { name, table, cols, unique })
+                Ok(Stmt::CreateIndex { name, table, cols, unique, include, filter })
             }
             "VIEW" => {
                 let name = self.name_parts()?;
@@ -2377,6 +2678,10 @@ impl Parser {
                 let body = self.rest_body()?;
                 Ok(Stmt::CreateTrigger { name, table, events, instead, body: Rc::new(body), or_alter: or_alter || alter, text: self.src[start..].to_string() })
             }
+            "SECURITY" => {
+                self.expect_kw("POLICY")?;
+                Ok(Stmt::CreateSecurityPolicy(Box::new(self.policy_body()?)))
+            }
             "SCHEMA" => {
                 let name = self.ident()?;
                 let owner = if self.accept_kw("AUTHORIZATION") { Some(self.ident()?) } else { None };
@@ -2384,10 +2689,15 @@ impl Parser {
             }
             "DATABASE" => {
                 let name = self.ident()?;
+                let mut collation = None;
                 while !self.at_eos() && !self.is_stmt_start() {
-                    self.i += 1;
+                    if self.accept_kw("COLLATE") {
+                        collation = Some(self.ident()?);
+                    } else {
+                        self.i += 1;
+                    }
                 }
-                Ok(Stmt::CreateDatabase(name))
+                Ok(Stmt::CreateDatabase(name, collation))
             }
             "TYPE" => {
                 let name = self.name_parts()?;
@@ -2656,9 +2966,9 @@ impl Parser {
         if self.is_kw("CHECK") {
             self.i += 1;
             self.expect_op("(")?;
-            let e = self.expr()?;
+            let (e, text) = self.expr_text()?;
             self.expect_op(")")?;
-            return Ok(TableDef::Check { name: cname, e });
+            return Ok(TableDef::Check { name: cname, e, text });
         }
         if self.is_kw("FOREIGN") {
             self.i += 1;
@@ -2671,10 +2981,10 @@ impl Parser {
         }
         if self.is_kw("DEFAULT") && cname.is_some() {
             self.i += 1;
-            let e = self.expr()?;
+            let (e, text) = self.expr_text()?;
             self.expect_kw("FOR")?;
             let col = self.ident()?;
-            return Ok(TableDef::DefaultFor { name: cname.unwrap(), e, col });
+            return Ok(TableDef::DefaultFor { name: cname.unwrap(), e, col, text });
         }
         if self.is_kw("INDEX") {
             self.i += 1;
@@ -2690,9 +3000,11 @@ impl Parser {
 
     fn column_def(&mut self) -> R<TableDef> {
         let name = self.ident()?;
-        let mut col = ColumnDef { name, ty: None, nullable: None, identity: None, default: None, default_name: None, computed: None, pk: None, unique: None, checks: vec![], fk: None };
+        let mut col = ColumnDef { name, ty: None, nullable: None, identity: None, default: None, default_text: None, default_name: None, computed: None, computed_text: None, pk: None, unique: None, checks: vec![], fk: None, collation: None, mask: None };
         if self.accept_kw("AS") {
-            col.computed = Some(self.expr()?);
+            let (e, t) = self.expr_text()?;
+            col.computed = Some(e);
+            col.computed_text = Some(t);
             self.accept_kw("PERSISTED");
             if self.is_kw("NOT") && self.peek_kw(1, &["NULL"]) {
                 self.i += 2;
@@ -2723,7 +3035,9 @@ impl Parser {
                     self.i += 3;
                 }
             } else if self.accept_kw("DEFAULT") {
-                col.default = Some(self.expr()?);
+                let (e, t) = self.expr_text()?;
+                col.default = Some(e);
+                col.default_text = Some(t);
                 col.default_name = cname;
             } else if self.is_kw("PRIMARY") && self.peek_kw(1, &["KEY"]) {
                 self.i += 2;
@@ -2739,15 +3053,17 @@ impl Parser {
                 col.unique = Some(cname);
             } else if self.accept_kw("CHECK") {
                 self.expect_op("(")?;
-                let e = self.expr()?;
+                let (e, t) = self.expr_text()?;
                 self.expect_op(")")?;
-                col.checks.push((cname, e));
+                col.checks.push((cname, e, t));
             } else if self.is_kw("REFERENCES") {
                 let mut fk = self.references()?;
                 fk.name = cname;
                 col.fk = Some(fk);
             } else if self.accept_kw("COLLATE") {
-                self.ident()?;
+                col.collation = Some(self.ident()?);
+            } else if self.is_kw("MASKED") {
+                col.mask = Some(self.masked_with()?);
             } else if self.is_kw_any(&["SPARSE", "ROWGUIDCOL", "FILESTREAM", "PERSISTED", "CLUSTERED", "NONCLUSTERED"]) {
                 self.i += 1;
             } else {
@@ -2790,15 +3106,29 @@ impl Parser {
         if self.accept_kw("ALTER") {
             self.expect_kw("COLUMN")?;
             let col = self.ident()?;
-            let ty = self.parse_type()?;
-            let mut nullable = None;
-            if self.accept_kw("NOT") {
-                self.expect_kw("NULL")?;
-                nullable = Some(false);
-            } else if self.accept_kw("NULL") {
-                nullable = Some(true);
+            if self.accept_kw("ADD") {
+                let mask = self.masked_with()?;
+                return Ok(Stmt::AlterTable { name, action: AlterAction::AlterMask { col, mask: Some(mask) } });
             }
-            return Ok(Stmt::AlterTable { name, action: AlterAction::AlterColumn { col, ty, nullable } });
+            if self.accept_kw("DROP") {
+                self.expect_kw("MASKED")?;
+                return Ok(Stmt::AlterTable { name, action: AlterAction::AlterMask { col, mask: None } });
+            }
+            let ty = self.parse_type()?;
+            let (mut nullable, mut collation) = (None, None);
+            loop {
+                if self.accept_kw("COLLATE") {
+                    collation = Some(self.ident()?);
+                } else if self.accept_kw("NOT") {
+                    self.expect_kw("NULL")?;
+                    nullable = Some(false);
+                } else if self.accept_kw("NULL") {
+                    nullable = Some(true);
+                } else {
+                    break;
+                }
+            }
+            return Ok(Stmt::AlterTable { name, action: AlterAction::AlterColumn { col, ty, nullable, collation } });
         }
         if self.is_kw_any(&["NOCHECK", "CHECK", "WITH"]) {
             if self.accept_kw("WITH") {

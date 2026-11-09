@@ -3,12 +3,13 @@ use std::path::PathBuf;
 
 use egui::{Key, RichText};
 use tsql_server::inspect::{ObjectEntry, ObjectKind};
-use tsql_server::{tools, Connection, Server, StorageOptions};
+use tsql_server::{tools, Server, StorageOptions};
 
 use crate::datasheet::Datasheet;
 use crate::design::Design;
 use crate::query::QueryTab;
 use crate::sample::SAMPLE_SQL;
+use crate::session::Session;
 use crate::ui::{result_grid, Event, ACCENT, ERROR};
 
 enum Tab {
@@ -77,7 +78,7 @@ struct ImportDialog {
 
 pub struct App {
     server: Server,
-    conn: Connection,
+    conn: Session,
     dir: Option<PathBuf>,
     opts: StorageOptions,
     tabs: Vec<Tab>,
@@ -127,7 +128,7 @@ impl App {
         visuals.hyperlink_color = ACCENT;
         ctx.set_visuals(visuals);
         let server = Server::new();
-        let conn = server.connect();
+        let conn = Session::new(server.connect());
         let mut app = App {
             server,
             conn,
@@ -163,7 +164,7 @@ impl App {
         self.active = 0;
         // release the old directory first: only one server may have it open
         self.server = Server::new();
-        self.conn = self.server.connect();
+        self.conn.replace(self.server.connect());
         self.dir = None;
         match &dir {
             None => {
@@ -172,7 +173,7 @@ impl App {
             }
             Some(d) => match Server::open_with(d, self.opts) {
                 Ok(s) => {
-                    self.conn = s.connect();
+                    self.conn.replace(s.connect());
                     self.server = s;
                     self.dir = dir.clone();
                     self.status = format!("Opened {}", d.display());
@@ -321,7 +322,14 @@ impl App {
     // ----- UI pieces ----------------------------------------------------------
 
     fn menu(&mut self, ctx: &egui::Context, ev: &mut Vec<Event>) {
+        let busy = self.conn.is_busy();
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
+            ui.add_enabled_ui(!busy, |ui| self.menu_contents(ui, ctx, ev));
+        });
+    }
+
+    fn menu_contents(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, ev: &mut Vec<Event>) {
+        {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Open data folder...").clicked() {
@@ -419,11 +427,15 @@ impl App {
                     }
                 });
             });
-        });
+        }
     }
 
     fn nav_pane(&mut self, ctx: &egui::Context, ev: &mut Vec<Event>) {
+        let busy = self.conn.is_busy();
         egui::SidePanel::left("nav").resizable(true).default_width(240.0).show(ctx, |ui| {
+            if busy {
+                ui.disable();
+            }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Database").strong().color(ACCENT));
@@ -513,6 +525,9 @@ impl App {
     }
 
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
+        if self.conn.is_busy() {
+            ui.disable();
+        }
         let mut close = None;
         ui.horizontal_wrapped(|ui| {
             for (i, t) in self.tabs.iter().enumerate() {
@@ -756,6 +771,32 @@ impl App {
     pub fn frame(&mut self, ctx: &egui::Context) {
         let mut ev: Vec<Event> = Vec::new();
 
+        // a script that was running on the worker thread has finished: hand the results to its tab
+        if let Some(fin) = self.conn.poll() {
+            let mut fin = Some(fin);
+            for t in self.tabs.iter_mut() {
+                if let (Tab::Query(q), true) = (&mut *t, fin.is_some()) {
+                    if q.running {
+                        q.finish(fin.take().unwrap(), &mut ev);
+                    }
+                }
+            }
+        }
+        if self.conn.is_lost() {
+            // the worker panicked and took the connection with it: start a new session on the same server
+            self.conn.replace(self.server.connect());
+            for t in self.tabs.iter_mut() {
+                if let Tab::Query(q) = t {
+                    q.running = false;
+                }
+            }
+            self.error = Some("The running script crashed its session; a new session was started (an open transaction was lost).".into());
+        }
+        if self.conn.is_busy() {
+            // keep the elapsed time ticking
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+
         // Closing the window must not silently throw a transaction away.
         if ctx.input(|i| i.viewport().close_requested()) && self.conn.transaction_count() > 0 && !matches!(self.confirm, Some(Confirm::Transaction(_))) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -782,12 +823,17 @@ impl App {
             ui.separator();
             let i = self.active.min(self.tabs.len() - 1);
             match &mut self.tabs[i] {
+                Tab::Datasheet(_) | Tab::Design(_) if self.conn.is_busy() => {
+                    ui.label("Waiting for the running script to finish...");
+                }
                 Tab::Datasheet(d) => d.ui(ui, &mut self.conn, &mut ev),
                 Tab::Design(d) => d.ui(ui, &mut self.conn, &mut ev),
                 Tab::Query(q) => q.ui(ui, &mut self.conn, &mut ev),
             }
         });
-        self.dialogs(ctx, &mut ev);
+        if !self.conn.is_busy() {
+            self.dialogs(ctx, &mut ev);
+        }
         self.handle(ev);
     }
 }
@@ -813,6 +859,49 @@ mod tests {
         for _ in 0..n {
             let _ = ctx.run(egui::RawInput::default(), |ctx| a.frame(ctx));
         }
+    }
+
+    #[test]
+    fn a_running_script_does_not_block_the_window() {
+        let (ctx, mut a) = app();
+        let mut q = QueryTab::new(None, "DECLARE @i INT = 0; WHILE @i < 600000 SET @i += 1; SELECT 42 AS answer".into());
+        q.start(&mut a.conn, &ctx);
+        a.tabs.push(Tab::Query(q));
+        assert!(a.conn.is_busy());
+        // frames are drawn while the script runs, quickly, and the session reports its cached state
+        let t = std::time::Instant::now();
+        frames(&ctx, &mut a, 5);
+        assert!(t.elapsed() < std::time::Duration::from_millis(800), "frames must not wait for the script");
+        assert!(a.conn.is_busy());
+        assert_eq!(a.conn.transaction_count(), 0);
+        // when it finishes, the results reach the tab and the session is usable again
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while a.conn.is_busy() && std::time::Instant::now() < deadline {
+            frames(&ctx, &mut a, 1);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        frames(&ctx, &mut a, 1);
+        assert!(!a.conn.is_busy());
+        match &a.tabs[0] {
+            Tab::Query(q) => {
+                assert!(!q.running);
+                assert_eq!(q.shown_results().unwrap().rows[0][0].to_string(), "42");
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(a.conn.query("SELECT 1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_transaction_started_in_a_background_script_stays_with_the_session() {
+        let (ctx, mut a) = app();
+        a.run_script("CREATE TABLE bg (x INT)", "ok");
+        let mut q = QueryTab::new(None, "BEGIN TRAN; INSERT bg VALUES (1)".into());
+        q.start(&mut a.conn, &ctx);
+        let fin = a.conn.wait().expect("finished");
+        q.finish(fin, &mut vec![]);
+        assert_eq!(a.conn.transaction_count(), 1);
+        assert_eq!(a.conn.query("SELECT COUNT(*) FROM bg").unwrap()[0][0].to_string(), "1");
     }
 
     #[test]

@@ -104,7 +104,7 @@ impl<'a> Engine<'a> {
     }
 
     fn table_leaf(&mut self, tr: &TableRef) -> Option<TblLeaf> {
-        if let TableRef::Table { name, alias } = tr {
+        if let TableRef::Table { name, alias, .. } = tr {
             if name.len() == 1 {
                 let l = name[0].to_lowercase();
                 if self.ses.cte_stack.iter().any(|m| m.contains_key(&l)) || l == "inserted" || l == "deleted" {
@@ -200,7 +200,7 @@ impl<'a> Engine<'a> {
         let n = leaves.len();
         let mut order: Vec<usize> = vec![];
         let mut remaining: Vec<usize> = (0..n).collect();
-        if !self.ses.optimizer {
+        if !self.ses.optimizer || self.ses.query_opts.iter().any(|o| o == "FORCE ORDER") {
             order = (0..n).collect();
             remaining.clear();
         } else {
@@ -354,7 +354,8 @@ impl<'a> Engine<'a> {
     /// If joining `tl` to the rows gathered so far can use one of its indexes, return a seek access
     /// path holding the distinct join keys of those rows.
     fn probe_access(&mut self, tl: &TblLeaf, here: &[Expr], acc: &Rowset, acc_est: f64, outer: Option<&Env<'_>>) -> Result<Option<Access>> {
-        if !self.ses.optimizer || tl.t.data.specs.is_empty() || here.is_empty() {
+        // OPTION (HASH JOIN) / (MERGE JOIN) rule out the index nested loop
+        if !self.ses.optimizer || tl.t.data.specs.is_empty() || here.is_empty() || self.ses.query_opts.iter().any(|o| o == "HASH JOIN" || o == "MERGE JOIN") {
             return Ok(None);
         }
         let total = tl.t.data.slot_count() as f64;
@@ -383,6 +384,9 @@ impl<'a> Engine<'a> {
         // best index: longest equality prefix
         let mut best: Option<(usize, Vec<(usize, &Expr)>)> = None;
         for (ix, sp) in tl.t.data.specs.iter().enumerate() {
+            if sp.filter.is_some() {
+                continue; // a filtered index lacks some rows: not usable to look every match up
+            }
             let mut matched = vec![];
             for &c in &sp.cols {
                 match pairs.iter().find(|(pc, _)| *pc == c) {
@@ -418,7 +422,9 @@ impl<'a> Engine<'a> {
                     None => return Ok(None),
                 }
             }
-            if k.len() == matched.len() && seen.insert(crate::convert::key_of(&k)) {
+            let kcolls: super::query::Colls = matched.iter().map(|(col, _)| tl.t.columns[*col].collation.as_deref().and_then(crate::collation::get)).collect();
+            let dedupe_key = if super::query::any_coll(&kcolls) { crate::convert::key_of(&super::query::keyed(&k, &kcolls)) } else { crate::convert::key_of(&k) };
+            if k.len() == matched.len() && seen.insert(dedupe_key) {
                 keys.push(k);
             }
             if keys.len() > 20_000 {
@@ -444,16 +450,20 @@ impl<'a> Engine<'a> {
     /// Read one table: the best index for its pushed-down conditions (or `forced`), honouring
     /// ordered-read hints, recording the choice in the plan.
     pub fn scan_table_leaf(&mut self, loc: &Loc, t: &Table, alias: &str, name: &[String], pushed: &[Expr], forced: Option<Access>) -> Result<Rowset> {
-        self.check_select_permission(loc, name)?;
+        let denied = self.select_denials(loc, name, t)?;
+        // a table with unreadable columns is read plainly: an index seek or an ordered read must not be able to
+        // test or order by a column the user may not see
+        let guarded = denied.iter().any(|d| d.is_some());
         let conj: Vec<&Expr> = pushed.iter().collect();
         let mut ap = match forced {
+            _ if guarded => Access::Full,
             Some(a) => a,
             None => self.choose_access(t, alias, &conj),
         };
         let total = t.data.slot_count();
         let mut limit: Option<usize> = None;
         let mut ordered = false;
-        if let Some(h) = self.ses.order_hint.clone() {
+        if let Some(h) = self.ses.order_hint.clone().filter(|_| !guarded) {
             if h.alias.eq_ignore_ascii_case(alias) && t.data.specs.len() > h.idx {
                 let compatible = match &ap {
                     Access::Full => true,
@@ -478,7 +488,13 @@ impl<'a> Engine<'a> {
         }
         let ps = pushed.len();
         let desc = ap.describe();
-        let schema = super::dml::table_schema(t, alias);
+        let mut schema = super::dml::table_schema(t, alias);
+        let mark = |s: &mut Schema| {
+            for (c, d) in s.cols.iter_mut().zip(denied.iter()) {
+                c.denied = d.clone();
+            }
+        };
+        mark(&mut schema);
         if self.ses.dry_run {
             let est = self.estimate_table(t, alias, pushed);
             self.ses.plan.push(format!("scan {} [{} rows]: {}{} ({} condition(s) pushed down) -> est {} rows", alias, total, desc, if ordered { ", read in index order" } else { "" }, ps, est as i64));
@@ -488,6 +504,10 @@ impl<'a> Engine<'a> {
             Some(lim) => {
                 let mut out: Vec<(RowId, Row)> = vec![];
                 if let Access::Range { idx, lo, hi, forward, .. } = &ap {
+                    if matches!(loc, Loc::Db(..)) && self.ses.tx.as_ref().map(|t| t.isolation == Isolation::Serializable).unwrap_or(false) {
+                        // the rows below are read by id, so lock the whole range up front
+                        self.lock_for_serializable(t, &ap)?;
+                    }
                     // read the index a chunk at a time and stop as soon as enough rows qualify
                     let (lo, hi) = (lo.as_ref().map(|(v, i)| (v.as_slice(), *i)), hi.as_ref().map(|(v, i)| (v.as_slice(), *i)));
                     let mut after = None;
@@ -511,7 +531,9 @@ impl<'a> Engine<'a> {
             }
         };
         self.ses.plan.push(format!("scan {} [{} rows]: {}{} ({} condition(s) pushed down) -> {} rows", alias, total, desc, if ordered { ", read in index order" } else { "" }, ps, rows.len()));
-        Ok(Rowset::table_rows(t, alias, rows))
+        let mut rs = Rowset::table_rows(t, alias, rows);
+        mark(&mut rs.schema);
+        Ok(rs)
     }
 }
 

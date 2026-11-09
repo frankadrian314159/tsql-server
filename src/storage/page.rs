@@ -48,6 +48,14 @@ const NO_BLOCK: u64 = u64::MAX;
 pub const SPILL_AT: usize = 1024;
 /// A node is split once its estimated size exceeds this.
 const NODE_MAX: usize = 6000;
+/// A leaf that shrinks below this after a delete is merged into a neighbour when the two fit together in
+/// `MERGE_FIT`, which is well below `NODE_MAX` so a merged leaf does not split again at the next insert.
+const MERGE_BELOW: usize = NODE_MAX / 4;
+const MERGE_FIT: usize = NODE_MAX * 3 / 4;
+/// The most pages moved by one checkpoint when compacting the file.
+const COMPACT_MOVES: usize = 4096;
+/// Files smaller than this many blocks are never compacted.
+const COMPACT_MIN_BLOCKS: u64 = 256;
 /// Longest index key (serialised) accepted; SQL Server's limit for non-clustered keys is also 1700.
 pub const MAX_KEY_BYTES: usize = 1700;
 pub const DEFAULT_POOL_PAGES: usize = 16384; // 128 MiB of pages
@@ -153,6 +161,12 @@ pub struct StoreStats {
     pub writes: u64,
     pub hits: u64,
     pub evictions: u64,
+    /// Leaf pages merged into a neighbour after deletes.
+    pub merges: u64,
+    /// Pages moved to lower blocks while compacting the file.
+    pub moved: u64,
+    /// Blocks cut off the end of the file.
+    pub truncated: u64,
 }
 
 struct Pool {
@@ -587,17 +601,139 @@ impl Pool {
     }
 
     fn bt_remove(&mut self, root: PageId, key: &KeyVals, rid: u64) -> R<bool> {
-        let leaf = self.find_leaf(root, &|k, r| cmp_tk(k, r, key, rid) == Ordering::Greater, &mut vec![])?;
-        let f = self.frame(leaf)?;
-        if let Node::Leaf { entries, .. } = &mut f.node {
+        let mut path = vec![];
+        let leaf = self.find_leaf(root, &|k, r| cmp_tk(k, r, key, rid) == Ordering::Greater, &mut path)?;
+        let size;
+        {
+            let f = self.frame(leaf)?;
+            let Node::Leaf { entries, .. } = &mut f.node else { return Ok(false) };
             let pos = entries.partition_point(|e| cmp_tk(&e.key, e.rid, key, rid) == Ordering::Less);
-            if pos < entries.len() && cmp_tk(&entries[pos].key, entries[pos].rid, key, rid) == Ordering::Equal {
-                entries.remove(pos);
-                f.dirty = true;
-                return Ok(true);
+            if !(pos < entries.len() && cmp_tk(&entries[pos].key, entries[pos].rid, key, rid) == Ordering::Equal) {
+                return Ok(false);
+            }
+            entries.remove(pos);
+            f.dirty = true;
+            size = entries.iter().map(|e| e.est()).sum::<usize>() + 16;
+        }
+        if leaf != root && size < MERGE_BELOW {
+            self.merge_leaf(root, leaf, path)?;
+        }
+        Ok(true)
+    }
+
+    /// Fold an under-filled leaf into a sibling under the same parent when they fit together, and collapse
+    /// inner nodes that are left with a single child. The root page never moves: when the root is left with one
+    /// child, the child's contents are copied into it.
+    fn merge_leaf(&mut self, root: PageId, leaf: PageId, mut path: Vec<(PageId, usize)>) -> R<()> {
+        let Some(&(parent, c)) = path.last() else { return Ok(()) };
+        let (left, right, sep_idx) = {
+            let f = self.frame(parent)?;
+            let Node::Inner { children, leafy, .. } = &f.node else { return Err("tree corrupt: expected an inner node".into()) };
+            if !*leafy {
+                return Ok(());
+            }
+            if c + 1 < children.len() {
+                (leaf, children[c + 1], c)
+            } else if c > 0 {
+                (children[c - 1], leaf, c - 1)
+            } else {
+                return Ok(());
+            }
+        };
+        let size_of = |p: &mut Pool, id: PageId| -> R<usize> {
+            match &p.frame(id)?.node {
+                Node::Leaf { entries, .. } => Ok(entries.iter().map(|e| e.est()).sum::<usize>() + 16),
+                _ => Err("tree corrupt: expected a leaf".to_string()),
+            }
+        };
+        if size_of(self, left)? + size_of(self, right)? > MERGE_FIT {
+            return Ok(());
+        }
+        // move the right leaf's entries into the left one
+        let (moved, right_next, right_chains) = {
+            let f = self.frame(right)?;
+            let chains = std::mem::take(&mut f.chains);
+            match &mut f.node {
+                Node::Leaf { entries, next, .. } => (std::mem::take(entries), *next, chains),
+                _ => return Err("tree corrupt: expected a leaf".into()),
+            }
+        };
+        {
+            let f = self.frame(left)?;
+            f.dirty = true;
+            if let Node::Leaf { entries, next, .. } = &mut f.node {
+                entries.extend(moved);
+                *next = right_next;
             }
         }
-        Ok(false)
+        if right_next != NO_PAGE {
+            let f = self.frame(right_next)?;
+            f.dirty = true;
+            if let Node::Leaf { prev, .. } = &mut f.node {
+                *prev = left;
+            }
+        }
+        // the entries live on in the left leaf (whose overflow chains are rewritten when it is flushed)
+        for p in right_chains {
+            self.free_id(p);
+        }
+        self.free_id(right);
+        {
+            let f = self.frame(parent)?;
+            f.dirty = true;
+            if let Node::Inner { keys, children, .. } = &mut f.node {
+                keys.remove(sep_idx);
+                children.remove(sep_idx + 1);
+            }
+        }
+        self.stats.merges += 1;
+        self.collapse(root, &mut path)
+    }
+
+    /// While the node at the end of `path` has a single child, replace it by that child.
+    fn collapse(&mut self, root: PageId, path: &mut Vec<(PageId, usize)>) -> R<()> {
+        while let Some(&(pid, _)) = path.last() {
+            let only = match &self.frame(pid)?.node {
+                Node::Inner { keys, children, .. } if keys.is_empty() && children.len() == 1 => children[0],
+                _ => return Ok(()),
+            };
+            if pid == root {
+                // copy the child into the root page
+                let (node, chains) = {
+                    let f = self.frame(only)?;
+                    let chains = std::mem::take(&mut f.chains);
+                    let node = match &mut f.node {
+                        Node::Leaf { entries, .. } => Node::Leaf { entries: std::mem::take(entries), prev: NO_PAGE, next: NO_PAGE },
+                        Node::Inner { keys, children, leafy } => Node::Inner { keys: std::mem::take(keys), children: std::mem::take(children), leafy: *leafy },
+                    };
+                    (node, chains)
+                };
+                let f = self.frame(root)?;
+                f.node = node;
+                f.chains = chains;
+                f.dirty = true;
+                self.free_id(only);
+                path.pop();
+                // the new root may itself be a single-child inner node
+                continue;
+            }
+            // not the root: the parent's parent points straight at the only child
+            if path.len() < 2 {
+                return Ok(());
+            }
+            let (gp, gc) = path[path.len() - 2];
+            {
+                let f = self.frame(gp)?;
+                f.dirty = true;
+                if let Node::Inner { children, .. } = &mut f.node {
+                    children[gc] = only;
+                }
+            }
+            self.free_id(pid);
+            path.pop();
+            return Ok(());
+        }
+        Ok(())
     }
 
     /// Visit entries starting at the first one for which `first_true` holds (forward), or walking
@@ -723,6 +859,75 @@ impl Pool {
         }
         let pend = std::mem::take(&mut self.pending_free);
         self.free_blocks.extend(pend);
+        if let Err(e) = self.shrink_file() {
+            self.failed = Some(e);
+        }
+    }
+
+    /// Move pages from the end of the file into free blocks nearer its start, so that the end can be cut off.
+    /// A moved page gets a new, unprotected block; its old block is released by the checkpoint that follows
+    /// (or at once when no checkpoint refers to it), so a crash before that checkpoint still finds every page
+    /// where the last checkpoint left it. At most `COMPACT_MOVES` pages are moved per call.
+    fn compact(&mut self) -> R<()> {
+        if self.file.is_none() || self.nblocks < COMPACT_MIN_BLOCKS {
+            return Ok(());
+        }
+        let live = self.table.iter().filter(|e| e.phys != NO_BLOCK).count() as u64;
+        // worth doing only when a good part of the file is free
+        if self.free_blocks.len() as u64 * 4 < self.nblocks {
+            return Ok(());
+        }
+        let target = live + live / 16 + 8; // keep a little slack for growth
+        if target >= self.nblocks {
+            return Ok(());
+        }
+        let mut high: Vec<(u64, usize)> = self.table.iter().enumerate().filter(|(_, e)| e.phys != NO_BLOCK && e.phys >= target).map(|(i, e)| (e.phys, i)).collect();
+        high.sort_unstable_by(|a, b| b.cmp(a));
+        let mut low: Vec<u64> = self.free_blocks.iter().copied().filter(|b| *b < target).collect();
+        low.sort_unstable();
+        // one destination block per page moved
+        let n = high.len().min(COMPACT_MOVES).min(low.len());
+        let dests: Vec<u64> = low.into_iter().take(n).collect();
+        let reserved: std::collections::HashSet<u64> = dests.iter().copied().collect();
+        self.free_blocks.retain(|b| !reserved.contains(b));
+        for ((phys, id), dest) in high.into_iter().zip(dests) {
+            let mut buf = vec![0u8; PAGE_SIZE];
+            {
+                let f = self.file.as_mut().ok_or("no page file")?;
+                f.seek(SeekFrom::Start(phys * PAGE_SIZE as u64)).map_err(|e| format!("page read failed: {}", e))?;
+                f.read_exact(&mut buf).map_err(|e| format!("page read failed: {}", e))?;
+                f.seek(SeekFrom::Start(dest * PAGE_SIZE as u64)).map_err(|e| format!("page write failed: {}", e))?;
+                f.write_all(&buf).map_err(|e| format!("page write failed: {}", e))?;
+            }
+            let was_protected = self.table[id].protected;
+            self.table[id] = PEntry { phys: dest, protected: false };
+            if was_protected {
+                self.pending_free.push(phys);
+            } else {
+                self.free_blocks.push(phys);
+            }
+            self.stats.moved += 1;
+        }
+        Ok(())
+    }
+
+    /// Cut free blocks off the end of the file.
+    fn shrink_file(&mut self) -> R<()> {
+        let Some(f) = self.file.as_ref() else { return Ok(()) };
+        self.free_blocks.sort_unstable_by(|a, b| b.cmp(a)); // descending: the highest block first, `pop` gives the lowest
+        let before = self.nblocks;
+        let mut free: std::collections::HashSet<u64> = self.free_blocks.iter().copied().collect();
+        while self.nblocks > 0 && free.remove(&(self.nblocks - 1)) {
+            self.nblocks -= 1;
+        }
+        if self.nblocks < before {
+            self.free_blocks.retain(|b| *b < self.nblocks);
+            f.set_len(self.nblocks * PAGE_SIZE as u64).map_err(|e| format!("could not shrink the page file: {}", e))?;
+            self.stats.truncated += before - self.nblocks;
+        }
+        // keep the free list ordered so the lowest block is allocated first
+        self.free_blocks.sort_unstable_by(|a, b| b.cmp(a));
+        Ok(())
     }
 }
 
@@ -841,7 +1046,9 @@ impl PageStore {
             return Err(SqlError::with(823, 24, 2, format!("The page store has failed: {}", e)));
         }
         p.pinned.clear();
-        if let Err(e) = p.flush_all() {
+        // compaction is only for the durable store; a failure to compact is a failure of the store
+        let r = if p.durable { p.compact() } else { Ok(()) };
+        if let Err(e) = r.and_then(|_| p.flush_all()) {
             p.failed = Some(e.clone());
             return Err(SqlError::with(823, 24, 2, e));
         }
@@ -1075,5 +1282,110 @@ mod tests {
             assert!(store.stats().pages_live > before + 10);
         }
         assert_eq!(store.stats().pages_live, before);
+    }
+
+    fn lcg(seed: &mut u64) -> u64 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed >> 33
+    }
+
+    #[test]
+    fn deleting_most_entries_merges_leaves_and_collapses_the_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PageStore::open(&dir.path().join("m.db"), true, 24, None).unwrap();
+        let t = Tree::new(&store);
+        let n = 4000;
+        for k in 0..n {
+            t.put(key(k), 0, slot(k, 60));
+        }
+        let full = store.stats().pages_live;
+        assert!(full > 30, "{full}");
+        // delete in pseudo-random order, keeping every 20th entry
+        let mut order: Vec<i32> = (0..n).filter(|k| k % 20 != 0).collect();
+        let mut seed = 7u64;
+        for i in (1..order.len()).rev() {
+            let j = (lcg(&mut seed) as usize) % (i + 1);
+            order.swap(i, j);
+        }
+        for (i, k) in order.iter().enumerate() {
+            t.remove(&key(*k), 0);
+            if i % 997 == 0 {
+                assert!(store.failed().is_none());
+            }
+        }
+        let want: Vec<(i32, u64)> = (0..n).filter(|k| k % 20 == 0).map(|k| (k, 0)).collect();
+        assert_eq!(dump(&t), want);
+        let st = store.stats();
+        assert!(st.merges > 20, "leaves should have been merged: {:?}", st);
+        assert!(st.pages_live * 3 < full, "pages should have been freed: {} of {}", st.pages_live, full);
+        // backward scans and seeks still agree, and the tree accepts new entries
+        let mut back = vec![];
+        t.scan(&|_, _| false, false, &mut |k, r, _| {
+            if let Value::Int(i) = &k.0[0] {
+                back.push((*i, r));
+            }
+            true
+        });
+        back.reverse();
+        assert_eq!(back, want);
+        assert!(t.with(&key(40), 0, |s| s.is_some()));
+        assert!(t.with(&key(41), 0, |s| s.is_none()));
+        for k in 0..n {
+            t.put(key(k), 1, slot(k, 10));
+        }
+        assert_eq!(t.entries() as usize, want.len() + n as usize);
+        // delete everything: the root is a single empty leaf again, with no other pages left
+        for k in 0..n {
+            t.remove(&key(k), 1);
+            t.remove(&key(k), 0);
+        }
+        assert_eq!(dump(&t), vec![]);
+        assert_eq!(store.stats().pages_live, 1, "{:?}", store.stats());
+        t.put(key(5), 0, slot(5, 1));
+        assert_eq!(dump(&t), vec![(5, 0)]);
+        assert!(store.failed().is_none());
+    }
+
+    #[test]
+    fn the_page_file_is_compacted_and_truncated_after_big_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.db");
+        let store = PageStore::open(&path, true, 64, None).unwrap();
+        let t = Tree::new(&store);
+        let n = 6000;
+        for k in 0..n {
+            t.put(key(k), 0, slot(k, 400));
+        }
+        let checkpoint = |store: &Arc<PageStore>| {
+            store.prepare_checkpoint().unwrap();
+            store.commit_checkpoint();
+        };
+        checkpoint(&store);
+        let big = std::fs::metadata(&path).unwrap().len();
+        assert!(big > 256 * PAGE_SIZE as u64, "{big}");
+        // delete 95% in a scattered pattern, so free blocks are spread through the file
+        for k in 0..n {
+            if k % 20 != 0 {
+                t.remove(&key(k), 0);
+            }
+        }
+        for _ in 0..3 {
+            checkpoint(&store);
+        }
+        let small = std::fs::metadata(&path).unwrap().len();
+        let st = store.stats();
+        assert!(small * 3 < big, "file went from {big} to {small}: {:?}", st);
+        assert!(st.moved > 0 && st.truncated > 0, "{:?}", st);
+        assert_eq!(st.file_blocks * PAGE_SIZE as u64, small);
+        // everything that is left reads back correctly from the compacted file
+        let want: Vec<(i32, u64)> = (0..n).filter(|k| k % 20 == 0).map(|k| (k, 0)).collect();
+        assert_eq!(dump(&t), want);
+        // and the freed room is reused rather than growing the file
+        for k in 0..2000 {
+            t.put(key(100_000 + k), 0, slot(k, 400));
+        }
+        checkpoint(&store);
+        assert!(std::fs::metadata(&path).unwrap().len() < big);
+        assert!(store.failed().is_none());
     }
 }

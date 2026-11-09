@@ -348,3 +348,114 @@ fn read_modify_write_with_repeatable_read_deadlocks_are_resolved() {
     }
     assert_eq!(scalar(&mut c, "SELECT n FROM ctr"), "15");
 }
+
+// ---------------------------------------------------------------- key-range locks (SERIALIZABLE)
+fn ranges() -> (Server, Connection, Connection) {
+    let (s, mut a, b) = two();
+    script(&mut a, "CREATE TABLE kr (id INT PRIMARY KEY, grp INT, v INT)\nGO\nCREATE INDEX ix_grp ON kr (grp)\nGO\nINSERT kr VALUES (10, 1, 0), (20, 1, 0), (30, 2, 0), (40, 2, 0), (50, 3, 0)");
+    exec(&mut a, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+    (s, a, b)
+}
+
+#[test]
+fn an_index_range_read_blocks_inserts_into_the_range_only() {
+    let (_s, mut a, mut b) = ranges();
+    exec(&mut a, "BEGIN TRAN");
+    assert_eq!(scalar(&mut a, "SELECT COUNT(*) FROM kr WHERE id BETWEEN 15 AND 35"), "2");
+    assert!(a.last_plan().join("\n").contains("index"), "the read must use the primary key range: {:?}", a.last_plan());
+    // outside the range nothing blocks: inserts, updates and deletes of other rows go through
+    exec(&mut b, "INSERT kr VALUES (5, 9, 0)");
+    exec(&mut b, "INSERT kr VALUES (45, 9, 0)");
+    exec(&mut b, "UPDATE kr SET v = 1 WHERE id = 50");
+    exec(&mut b, "DELETE kr WHERE id = 40");
+    // inside the range an insert is a phantom and must wait
+    let ins = Async::start(b, "INSERT kr VALUES (25, 9, 0)");
+    assert!(ins.blocked(), "a phantom insert into a locked key range must wait");
+    assert_eq!(scalar(&mut a, "SELECT COUNT(*) FROM kr WHERE id BETWEEN 15 AND 35"), "2", "the range still reads the same");
+    exec(&mut a, "COMMIT");
+    let (mut b, r) = ins.finish();
+    assert!(r.errors().is_empty());
+    assert_eq!(scalar(&mut b, "SELECT COUNT(*) FROM kr WHERE id BETWEEN 15 AND 35"), "3");
+}
+
+#[test]
+fn a_seek_that_finds_nothing_still_protects_the_gap() {
+    let (_s, mut a, mut b) = ranges();
+    exec(&mut a, "BEGIN TRAN");
+    assert_eq!(scalar(&mut a, "SELECT COUNT(*) FROM kr WHERE id = 25"), "0");
+    exec(&mut b, "INSERT kr VALUES (26, 9, 0)");
+    let ins = Async::start(b, "INSERT kr VALUES (25, 9, 0)");
+    assert!(ins.blocked(), "inserting the very key that was looked up and not found is a phantom");
+    exec(&mut a, "ROLLBACK");
+    let (_b, r) = ins.finish();
+    assert!(r.errors().is_empty());
+}
+
+#[test]
+fn an_update_that_moves_a_row_into_the_range_waits() {
+    let (_s, mut a, b) = ranges();
+    exec(&mut a, "BEGIN TRAN");
+    assert_eq!(scalar(&mut a, "SELECT COUNT(*) FROM kr WHERE grp = 2"), "2");
+    let mv = Async::start(b, "UPDATE kr SET grp = 2 WHERE id = 50");
+    assert!(mv.blocked(), "changing a row's key into a locked range is a phantom");
+    exec(&mut a, "COMMIT");
+    let (mut b, r) = mv.finish();
+    assert!(r.errors().is_empty());
+    assert_eq!(scalar(&mut b, "SELECT COUNT(*) FROM kr WHERE grp = 2"), "3");
+}
+
+#[test]
+fn reads_without_a_usable_index_still_lock_the_whole_table() {
+    let (_s, mut a, b) = ranges();
+    exec(&mut a, "BEGIN TRAN");
+    assert_eq!(scalar(&mut a, "SELECT COUNT(*) FROM kr WHERE v = 0"), "5");
+    let ins = Async::start(b, "INSERT kr VALUES (999, 9, 0)");
+    assert!(ins.blocked(), "a scan has no key range, so it locks the table");
+    exec(&mut a, "COMMIT");
+    ins.finish().1.errors().is_empty().then_some(()).expect("insert after commit");
+}
+
+#[test]
+fn read_committed_and_repeatable_read_take_no_ranges() {
+    let (_s, mut a, mut b) = two();
+    script(&mut a, "CREATE TABLE kq (id INT PRIMARY KEY, v INT)\nGO\nINSERT kq VALUES (1, 0), (9, 0)");
+    exec(&mut a, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+    exec(&mut a, "BEGIN TRAN");
+    assert_eq!(scalar(&mut a, "SELECT COUNT(*) FROM kq WHERE id BETWEEN 2 AND 8"), "0");
+    exec(&mut b, "INSERT kq VALUES (5, 0)");
+    assert_eq!(scalar(&mut a, "SELECT COUNT(*) FROM kq WHERE id BETWEEN 2 AND 8"), "1", "phantoms are allowed at REPEATABLE READ");
+    exec(&mut a, "COMMIT");
+}
+
+#[test]
+fn key_ranges_are_released_at_commit_and_listed_in_the_lock_view() {
+    let (_s, mut a, mut b) = ranges();
+    exec(&mut a, "BEGIN TRAN");
+    exec(&mut a, "SELECT * FROM kr WHERE id BETWEEN 15 AND 35");
+    assert_eq!(scalar(&mut b, "SELECT COUNT(*) FROM sys.dm_tran_locks WHERE resource_type = 'KEY_RANGE' AND request_mode = 'RangeS_S'"), "1");
+    exec(&mut a, "COMMIT");
+    assert_eq!(scalar(&mut b, "SELECT COUNT(*) FROM sys.dm_tran_locks WHERE resource_type = 'KEY_RANGE'"), "0");
+    exec(&mut b, "INSERT kr VALUES (25, 9, 0)");
+}
+
+#[test]
+fn two_serializable_transactions_that_insert_into_each_others_ranges_deadlock() {
+    let (s, mut a, b) = ranges();
+    let mut b = b;
+    exec(&mut b, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+    exec(&mut a, "BEGIN TRAN");
+    exec(&mut b, "BEGIN TRAN");
+    assert_eq!(scalar(&mut a, "SELECT COUNT(*) FROM kr WHERE id BETWEEN 11 AND 19"), "0");
+    assert_eq!(scalar(&mut b, "SELECT COUNT(*) FROM kr WHERE id BETWEEN 41 AND 49"), "0");
+    let first = Async::start(a, "INSERT kr VALUES (45, 9, 0)");
+    assert!(first.blocked());
+    let second = Async::start(b, "INSERT kr VALUES (15, 9, 0)");
+    thread::sleep(Duration::from_millis(400));
+    // one of the two was chosen as the deadlock victim and the other could go on
+    let (mut a, ra) = first.finish();
+    let (mut b, rb) = second.finish();
+    let victims = ra.errors().iter().chain(rb.errors().iter()).filter(|e| e.number == 1205).count();
+    assert_eq!(victims, 1, "exactly one deadlock victim: {:?} / {:?}", ra.errors(), rb.errors());
+    let _ = (a.execute("ROLLBACK"), b.execute("ROLLBACK"));
+    drop(s);
+}

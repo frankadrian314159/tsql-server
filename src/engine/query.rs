@@ -10,6 +10,13 @@ pub struct ColMeta {
     pub qual: Option<String>,
     pub name: String,
     pub ty: Option<DataType>,
+    /// Set when the user may not read this column (column-level permissions): the text that completes the
+    /// error message, e.g. ` of the object 't', database 'd', schema 's'.`
+    pub denied: Option<Arc<String>>,
+    /// Collation of a string column when it is not the built-in default (see `collation.rs`).
+    pub coll: Option<Arc<crate::collation::Collation>>,
+    /// Masking function of a masked column (see `mask.rs`); applied when the column is returned to a user without UNMASK.
+    pub mask: Option<Arc<crate::mask::Mask>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -75,7 +82,7 @@ impl Rowset {
         Rowset { schema, rows: Arc::new(rows), suppress: false, report_count: false }
     }
     pub fn from_rows(cols: &[String], rows: Vec<Row>) -> Rowset {
-        let schema = Schema::new(cols.iter().map(|c| ColMeta { qual: None, name: c.clone(), ty: None }).collect());
+        let schema = Schema::new(cols.iter().map(|c| ColMeta { qual: None, name: c.clone(), ty: None, denied: None, coll: None, mask: None }).collect());
         Rowset::new(schema, rows)
     }
     /// All rows of a private table (table variable, temp table) as its owner sees them.
@@ -84,7 +91,7 @@ impl Rowset {
         Rowset::table_rows(t, alias, rows)
     }
     pub fn table_rows(t: &Table, alias: &str, rows: Vec<Row>) -> Rowset {
-        let schema = Schema::new(t.columns.iter().map(|c| ColMeta { qual: Some(alias.to_string()), name: c.name.clone(), ty: Some(c.ty.clone()) }).collect());
+        let schema = Schema::new(t.columns.iter().map(|c| ColMeta { qual: Some(alias.to_string()), name: c.name.clone(), ty: Some(c.ty.clone()), denied: None, coll: c.collation.as_deref().and_then(crate::collation::get), mask: c.mask.as_deref().and_then(|m| crate::mask::Mask::parse(m).ok()).map(Arc::new) }).collect());
         Rowset { schema, rows: Arc::new(rows), suppress: false, report_count: false }
     }
     pub fn empty() -> Rowset {
@@ -120,7 +127,12 @@ impl<'a> Env<'a> {
         let mut cur = Some(self);
         while let Some(e) = cur {
             match e.schema.find_parts(parts) {
-                Found::One(i) => return Ok(e.row[i].clone()),
+                Found::One(i) => {
+                    if let Some(w) = &e.schema.cols[i].denied {
+                        return Err(SqlError::with(230, 14, 1, format!("The SELECT permission was denied on the column '{}'{}", e.schema.cols[i].name, w)));
+                    }
+                    return Ok(e.row[i].clone());
+                }
                 Found::Ambiguous => return Err(SqlError::new(209, format!("Ambiguous column name '{}'.", parts[parts.len() - 1]))),
                 Found::None => {}
             }
@@ -256,7 +268,7 @@ struct Unit {
     group: Option<GroupCtx>,
 }
 
-fn cmp_keys(a: &[Value], b: &[Value], desc: &[bool]) -> Ordering {
+pub fn cmp_keys(a: &[Value], b: &[Value], desc: &[bool]) -> Ordering {
     for i in 0..desc.len() {
         let mut o = sort_cmp(&a[i], &b[i]);
         if desc[i] {
@@ -267,6 +279,47 @@ fn cmp_keys(a: &[Value], b: &[Value], desc: &[bool]) -> Ordering {
         }
     }
     Ordering::Equal
+}
+
+/// One column of a SELECT list after `*` is expanded.
+pub struct OutCol<'q> {
+    pub name: String,
+    pub expr: Option<&'q Expr>,
+    pub src_idx: Option<usize>,
+    pub ty: Option<DataType>,
+    /// Collation of the column when it is not the built-in default.
+    pub coll: Option<Arc<crate::collation::Collation>>,
+    /// The column is masked for this user: its values are replaced by the masked form on output.
+    pub mask: Option<(Arc<crate::mask::Mask>, DataType)>,
+}
+
+impl OutCol<'_> {
+    /// The value as returned to the user (masked if the column is masked for them).
+    pub fn out_value(&self, v: Value) -> Value {
+        match &self.mask {
+            Some((m, ty)) => m.apply(ty, &v),
+            None => v,
+        }
+    }
+}
+
+pub type Colls = Vec<Option<Arc<crate::collation::Collation>>>;
+
+/// `vals` with every string replaced by its sort key in the matching collation, so the built-in hashing and ordering
+/// treat the values as that collation does. Values without a collation (or with the default one) are left alone.
+pub fn keyed(vals: &[Value], colls: &[Option<Arc<crate::collation::Collation>>]) -> Vec<Value> {
+    vals.iter()
+        .enumerate()
+        .map(|(i, v)| match (v, colls.get(i)) {
+            (Value::Str(s), Some(Some(c))) if !c.is_default() => Value::Str(c.key(s)),
+            _ => v.clone(),
+        })
+        .collect()
+}
+
+/// Does any entry change how values compare?
+pub fn any_coll(colls: &[Option<Arc<crate::collation::Collation>>]) -> bool {
+    colls.iter().any(|c| c.as_ref().is_some_and(|c| !c.is_default()))
 }
 
 impl<'a> Engine<'a> {
@@ -284,7 +337,10 @@ impl<'a> Engine<'a> {
         if q.maxrecursion.is_some() {
             self.ses.maxrec = q.maxrecursion;
         }
+        let new_opts = if q.options.is_empty() { self.ses.query_opts.clone() } else { q.options.clone() };
+        let prev_opts = std::mem::replace(&mut self.ses.query_opts, new_opts);
         let r = self.exec_query_inner(q, outer);
+        self.ses.query_opts = prev_opts;
         self.ses.maxrec = prev_rec;
         if pushed {
             self.ses.cte_stack.pop();
@@ -316,7 +372,9 @@ impl<'a> Engine<'a> {
                 if l.schema.cols.len() != r.schema.cols.len() {
                     return Err(SqlError::new(205, "All queries combined using a UNION, INTERSECT or EXCEPT operator must have an equal number of expressions in their target lists."));
                 }
-                let schema = Schema::new(l.schema.cols.iter().map(|c| ColMeta { qual: None, name: c.name.clone(), ty: c.ty.clone() }).collect());
+                let schema = Schema::new(l.schema.cols.iter().map(|c| ColMeta { qual: None, name: c.name.clone(), ty: c.ty.clone(), denied: None, coll: c.coll.clone(), mask: None }).collect());
+                let sc: Colls = l.schema.cols.iter().map(|c| c.coll.clone()).collect();
+                let rk_of = |r: &Row| if any_coll(&sc) { key_of(&keyed(r, &sc)) } else { key_of(r) };
                 let lrows = (*l.rows).clone();
                 let rrows = (*r.rows).clone();
                 let rows = match (op, all) {
@@ -329,25 +387,25 @@ impl<'a> Engine<'a> {
                         let mut seen = std::collections::HashSet::new();
                         let mut v = vec![];
                         for row in lrows.into_iter().chain(rrows) {
-                            if seen.insert(key_of(&row)) {
+                            if seen.insert(rk_of(&row)) {
                                 v.push(row);
                             }
                         }
                         v
                     }
                     (SetOp::Intersect, _) => {
-                        let rk: std::collections::HashSet<String> = rrows.iter().map(|r| key_of(r)).collect();
+                        let rk: std::collections::HashSet<String> = rrows.iter().map(|r| rk_of(r)).collect();
                         let mut seen = std::collections::HashSet::new();
                         lrows.into_iter().filter(|r| {
-                            let k = key_of(r);
+                            let k = rk_of(r);
                             rk.contains(&k) && seen.insert(k)
                         }).collect()
                     }
                     (SetOp::Except, _) => {
-                        let rk: std::collections::HashSet<String> = rrows.iter().map(|r| key_of(r)).collect();
+                        let rk: std::collections::HashSet<String> = rrows.iter().map(|r| rk_of(r)).collect();
                         let mut seen = std::collections::HashSet::new();
                         lrows.into_iter().filter(|r| {
-                            let k = key_of(r);
+                            let k = rk_of(r);
                             !rk.contains(&k) && seen.insert(k)
                         }).collect()
                     }
@@ -361,6 +419,19 @@ impl<'a> Engine<'a> {
     fn order_output(&mut self, rs: Rowset, order: &[OrderItem], offset: &Option<Expr>, fetch: &Option<Expr>, outer: Option<&Env<'_>>) -> Result<Rowset> {
         let mut rows = (*rs.rows).clone();
         if !order.is_empty() {
+            let oc: Colls = if crate::collation::in_use() {
+                let empty: Row = vec![];
+                let env = Env::new(&rs.schema, &empty, outer);
+                order
+                    .iter()
+                    .map(|o| match &o.e {
+                        Expr::Lit(Value::Int(n)) if *n >= 1 => rs.schema.cols.get(*n as usize - 1).and_then(|c| c.coll.clone()),
+                        e => self.expr_coll(e, &env).map(|c| c.0),
+                    })
+                    .collect()
+            } else {
+                vec![]
+            };
             let mut keys: Vec<Vec<Value>> = vec![];
             for row in &rows {
                 let env = Env::new(&rs.schema, row, outer);
@@ -375,6 +446,9 @@ impl<'a> Engine<'a> {
                     } else {
                         k.push(self.ev(&o.e, &env)?);
                     }
+                }
+                if any_coll(&oc) {
+                    k = keyed(&k, &oc);
                 }
                 keys.push(k);
             }
@@ -408,7 +482,7 @@ impl<'a> Engine<'a> {
 
     /// Verify that every column reference binds (SQL Server binds names at compile time,
     /// so an unknown column is an error even when the table is empty).
-    fn validate_columns(&self, e: &Expr, schema: &Schema, outer: Option<&Env<'_>>) -> Result<()> {
+    pub fn validate_columns(&self, e: &Expr, schema: &Schema, outer: Option<&Env<'_>>) -> Result<()> {
         if let Expr::Col(parts) = e {
             match schema.find_parts(parts) {
                 Found::One(_) => return Ok(()),
@@ -443,6 +517,12 @@ impl<'a> Engine<'a> {
 
     // ------------------------------------------------------------- SELECT
     fn exec_select(&mut self, sel: &Select, order: &[OrderItem], offset: &Option<Expr>, fetch: &Option<Expr>, outer: Option<&Env<'_>>) -> Result<Rowset> {
+        // only the outermost SELECT of a statement may stream; subqueries started from it must not
+        let may_stream = std::mem::take(&mut self.ses.stream_ok);
+        self.collect_hints(&sel.from)?;
+        if let Some(rs) = self.try_stream_select(sel, order, offset, fetch, outer, may_stream)? {
+            return Ok(rs);
+        }
         // FROM (conditions on single tables are applied while those tables are read)
         let mut ordered = false;
         let src = if sel.from.is_empty() {
@@ -546,58 +626,7 @@ impl<'a> Engine<'a> {
         let wins: Vec<HashMap<usize, Value>> = if wins_all.is_empty() { vec![] } else { self.compute_windows(&wins_all, &schema, &units, outer)? };
 
         // projection setup
-        struct OutCol<'q> {
-            name: String,
-            expr: Option<&'q Expr>,
-            src_idx: Option<usize>,
-            ty: Option<DataType>,
-        }
-        let mut cols: Vec<OutCol> = vec![];
-        for it in &sel.items {
-            match it {
-                SelectItem::Star(q) => {
-                    if sel.from.is_empty() {
-                        return Err(SqlError::new(4104, "No tables specified for SELECT *."));
-                    }
-                    let mut any = false;
-                    for (i, c) in schema.cols.iter().enumerate() {
-                        let ok = match q {
-                            None => true,
-                            Some(qp) => c.qual.as_deref().map(|x| x.eq_ignore_ascii_case(&qp[qp.len() - 1])).unwrap_or(false),
-                        };
-                        if ok {
-                            any = true;
-                            cols.push(OutCol { name: c.name.clone(), expr: None, src_idx: Some(i), ty: c.ty.clone() });
-                        }
-                    }
-                    if !any && q.is_some() {
-                        return Err(SqlError::new(208, format!("Invalid object name '{}'.", q.as_ref().unwrap().join("."))));
-                    }
-                }
-                SelectItem::Expr { e, alias } => {
-                    let mut name = alias.clone().unwrap_or_default();
-                    let mut ty = None;
-                    match e {
-                        Expr::Col(parts) => {
-                            if let Found::One(i) = schema.find_parts(parts) {
-                                if alias.is_none() {
-                                    name = schema.cols[i].name.clone();
-                                }
-                                ty = schema.cols[i].ty.clone();
-                            } else if alias.is_none() {
-                                name = parts[parts.len() - 1].clone();
-                            }
-                        }
-                        Expr::Cast { ty: tr, try_: _, .. } => {
-                            ty = self.resolve_type_cast(tr).ok();
-                        }
-                        _ => {}
-                    }
-                    cols.push(OutCol { name, expr: Some(e), src_idx: None, ty });
-                }
-                SelectItem::Assign { .. } => {}
-            }
-        }
+        let cols = self.out_columns(sel, &schema)?;
 
         // assignment select
         if has_assign {
@@ -628,6 +657,9 @@ impl<'a> Engine<'a> {
         // project + order keys
         let mut out: Vec<(Row, Vec<Value>)> = vec![];
         let desc: Vec<bool> = order.iter().map(|o| o.desc).collect();
+        // collations of the output columns and of the ORDER BY expressions (empty when none is non-default)
+        let out_colls: Colls = cols.iter().map(|c| c.coll.clone()).collect();
+        let order_colls: Colls = self.order_colls(order, &cols, &schema, outer);
         let mut ident_counter: Vec<Option<(i64, i64, i64)>> = vec![None; cols.len()];
         for (ci, c) in cols.iter().enumerate() {
             if let Some(Expr::IdentityFn { seed, inc, .. }) = c.expr {
@@ -642,12 +674,13 @@ impl<'a> Engine<'a> {
             let mut row = Vec::with_capacity(cols.len());
             for (ci, c) in cols.iter().enumerate() {
                 if let Some(i) = c.src_idx {
-                    row.push(u.row[i].clone());
+                    row.push(c.out_value(u.row[i].clone()));
                 } else if let Some((s, inc, n)) = ident_counter[ci].as_mut() {
                     row.push(Value::BigInt(*s + *n * *inc));
                     *n += 1;
                 } else {
-                    row.push(self.ev(c.expr.unwrap(), &env)?);
+                    let v = self.ev(c.expr.unwrap(), &env)?;
+                    row.push(c.out_value(v));
                 }
             }
             let mut keys = Vec::with_capacity(order.len());
@@ -674,17 +707,115 @@ impl<'a> Engine<'a> {
                     keys.push(self.ev(&o.e, &env)?);
                 }
             }
+            if any_coll(&order_colls) {
+                keys = keyed(&keys, &order_colls);
+            }
             out.push((row, keys));
         }
         // DISTINCT
         if sel.distinct {
             let mut seen = std::collections::HashSet::new();
-            out.retain(|(r, _)| seen.insert(key_of(r)));
+            let dc = any_coll(&out_colls);
+            out.retain(|(r, _)| seen.insert(if dc { key_of(&keyed(r, &out_colls)) } else { key_of(r) }));
         }
         // ORDER BY (skipped when the rows were already read in index order)
         if !order.is_empty() && !ordered {
             out.sort_by(|a, b| cmp_keys(&a.1, &b.1, &desc));
         }
+        self.finish_rows(sel, order, offset, fetch, &cols, out, &ident_counter)
+    }
+
+    /// Expand the SELECT list into output columns (`*` becomes its columns).
+    /// The collation of each ORDER BY expression (an output position, an output column name, or an expression over the
+    /// source columns); empty when none of them has a non-default collation.
+    pub fn order_colls(&self, order: &[OrderItem], cols: &[OutCol<'_>], schema: &Schema, outer: Option<&Env<'_>>) -> Colls {
+        if order.is_empty() || !crate::collation::in_use() {
+            return vec![];
+        }
+        let empty: Row = vec![];
+        let env = Env::new(schema, &empty, outer);
+        let v: Colls = order
+            .iter()
+            .map(|o| match &o.e {
+                Expr::Lit(Value::Int(n)) if *n >= 1 => cols.get(*n as usize - 1).and_then(|c| c.coll.clone()),
+                Expr::Col(p) if p.len() == 1 && cols.iter().any(|c| !c.name.is_empty() && c.name.eq_ignore_ascii_case(&p[0])) => cols.iter().find(|c| !c.name.is_empty() && c.name.eq_ignore_ascii_case(&p[0])).and_then(|c| c.coll.clone()),
+                e => self.expr_coll(e, &env).map(|c| c.0),
+            })
+            .collect();
+        if any_coll(&v) {
+            v
+        } else {
+            vec![]
+        }
+    }
+
+    pub fn out_columns<'q>(&mut self, sel: &'q Select, schema: &Schema) -> Result<Vec<OutCol<'q>>> {
+        let mut cols: Vec<OutCol> = vec![];
+        let unmask = self.can_unmask();
+        for it in &sel.items {
+            match it {
+                SelectItem::Star(q) => {
+                    if sel.from.is_empty() {
+                        return Err(SqlError::new(4104, "No tables specified for SELECT *."));
+                    }
+                    let mut any = false;
+                    for (i, c) in schema.cols.iter().enumerate() {
+                        let ok = match q {
+                            None => true,
+                            Some(qp) => c.qual.as_deref().map(|x| x.eq_ignore_ascii_case(&qp[qp.len() - 1])).unwrap_or(false),
+                        };
+                        if ok {
+                            if let Some(w) = &c.denied {
+                                return Err(SqlError::with(230, 14, 1, format!("The SELECT permission was denied on the column '{}'{}", c.name, w)));
+                            }
+                            any = true;
+                            cols.push(OutCol { name: c.name.clone(), expr: None, src_idx: Some(i), ty: c.ty.clone(), coll: c.coll.clone(), mask: if unmask { None } else { c.mask.clone().zip(c.ty.clone()) } });
+                        }
+                    }
+                    if !any && q.is_some() {
+                        return Err(SqlError::new(208, format!("Invalid object name '{}'.", q.as_ref().unwrap().join("."))));
+                    }
+                }
+                SelectItem::Expr { e, alias } => {
+                    let mut name = alias.clone().unwrap_or_default();
+                    let mut ty = None;
+                    let mut mask = None;
+                    let coll = if crate::collation::in_use() {
+                        let empty: Row = vec![];
+                        self.expr_coll(e, &Env::new(schema, &empty, None)).map(|c| c.0).filter(|c| !c.is_default())
+                    } else {
+                        None
+                    };
+                    match e {
+                        Expr::Col(parts) => {
+                            if let Found::One(i) = schema.find_parts(parts) {
+                                if alias.is_none() {
+                                    name = schema.cols[i].name.clone();
+                                }
+                                ty = schema.cols[i].ty.clone();
+                                if !unmask {
+                                    mask = schema.cols[i].mask.clone().zip(ty.clone());
+                                }
+                            } else if alias.is_none() {
+                                name = parts[parts.len() - 1].clone();
+                            }
+                        }
+                        Expr::Cast { ty: tr, try_: _, .. } => {
+                            ty = self.resolve_type_cast(tr).ok();
+                        }
+                        _ => {}
+                    }
+                    cols.push(OutCol { name, expr: Some(e), src_idx: None, ty, coll, mask });
+                }
+                SelectItem::Assign { .. } => {}
+            }
+        }
+        Ok(cols)
+    }
+
+    /// OFFSET / FETCH, TOP and SELECT INTO over rows that are already filtered, projected, distinct and ordered.
+    pub fn finish_rows(&mut self, sel: &Select, order: &[OrderItem], offset: &Option<Expr>, fetch: &Option<Expr>, cols: &[OutCol<'_>], mut out: Vec<(Row, Vec<Value>)>, ident_counter: &[Option<(i64, i64, i64)>]) -> Result<Rowset> {
+        let desc: Vec<bool> = order.iter().map(|o| o.desc).collect();
         // OFFSET / FETCH
         if offset.is_some() || fetch.is_some() {
             let rows: Vec<Row> = out.iter().map(|x| x.0.clone()).collect();
@@ -723,7 +854,7 @@ impl<'a> Engine<'a> {
                 out.truncate(n);
             }
         }
-        let schema_out = Schema::new(cols.iter().map(|c| ColMeta { qual: None, name: c.name.clone(), ty: c.ty.clone() }).collect());
+        let schema_out = Schema::new(cols.iter().map(|c| ColMeta { qual: None, name: c.name.clone(), ty: c.ty.clone(), denied: None, coll: c.coll.clone(), mask: None }).collect());
         let rows: Vec<Row> = out.into_iter().map(|x| x.0).collect();
         // SELECT INTO
         if let Some(into) = &sel.into {
@@ -842,21 +973,39 @@ impl<'a> Engine<'a> {
             }
         }
         let base_str: Vec<String> = base.iter().map(|b| format!("{:?}", b)).collect();
+        // collations of the grouping expressions (strings are grouped by their sort keys)
+        let base_colls: Colls = if crate::collation::in_use() {
+            let empty: Row = vec![];
+            let env = Env::new(schema, &empty, outer);
+            let v: Colls = base.iter().map(|b| self.expr_coll(b, &env).map(|c| c.0)).collect();
+            if any_coll(&v) {
+                v
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
         // evaluate base keys per row once
         let mut keyvals: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+        let mut group_keys: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
         for r in &rows {
             let env = Env::new(schema, r, outer);
             let mut kv = vec![];
             for b in &base {
                 kv.push(self.ev(b, &env)?);
             }
+            if !base_colls.is_empty() {
+                group_keys.push(keyed(&kv, &base_colls));
+            }
             keyvals.push(kv);
         }
+        let key_src: &Vec<Vec<Value>> = if base_colls.is_empty() { &keyvals } else { &group_keys };
         let mut units = vec![];
         for set in &sets {
             let mut order: Vec<Vec<usize>> = vec![];
             let mut map: HashMap<String, usize> = HashMap::new();
-            for (ri, kv) in keyvals.iter().enumerate() {
+            for (ri, kv) in key_src.iter().enumerate() {
                 let key: Vec<Value> = set.iter().map(|&i| kv[i].clone()).collect();
                 let k = key_of(&key);
                 match map.get(&k) {
@@ -932,9 +1081,13 @@ impl<'a> Engine<'a> {
             vals.sort_by(|a, b| cmp_keys(&a.1, &b.1, &desc));
         }
         let mut vs: Vec<Value> = vals.into_iter().map(|x| x.0).filter(|v| !v.is_null()).collect();
+        let acoll: Option<Arc<crate::collation::Collation>> = if crate::collation::in_use() { envs.first().and_then(|e0| self.expr_coll(&fc.args[0], e0)).map(|c| c.0).filter(|c| !c.is_default()) } else { None };
         if fc.distinct {
             let mut seen = std::collections::HashSet::new();
-            vs.retain(|v| seen.insert(key_of(std::slice::from_ref(v))));
+            vs.retain(|v| match (&acoll, v) {
+                (Some(c), Value::Str(s)) => seen.insert(key_of(&[Value::Str(c.key(s))])),
+                _ => seen.insert(key_of(std::slice::from_ref(v))),
+            });
         }
         match name {
             "COUNT" => Ok(Value::Int(vs.len() as i32)),
@@ -978,7 +1131,10 @@ impl<'a> Engine<'a> {
                     best = Some(match best {
                         None => v,
                         Some(b) => {
-                            let o = compare(&v, &b)?.unwrap_or(Ordering::Equal);
+                            let o = match (&acoll, &v, &b) {
+                                (Some(c), Value::Str(x), Value::Str(y)) => c.compare(x, y),
+                                _ => compare(&v, &b)?.unwrap_or(Ordering::Equal),
+                            };
                             if (name == "MIN" && o == Ordering::Less) || (name == "MAX" && o == Ordering::Greater) {
                                 v
                             } else {
@@ -1303,7 +1459,7 @@ impl<'a> Engine<'a> {
     // ------------------------------------------------------------ FROM
     pub fn eval_table_ref(&mut self, tr: &TableRef, outer: Option<&Env<'_>>) -> Result<Rowset> {
         match tr {
-            TableRef::Table { name, alias } => self.eval_named_source(name, alias.as_deref()),
+            TableRef::Table { name, alias, .. } => self.eval_named_source(name, alias.as_deref()),
             TableRef::TableVar { name, alias } => match self.ses.frames.last().and_then(|f| f.tables.get(name)) {
                 Some(t) => Ok(Rowset::from_table(t, alias.as_deref().unwrap_or(name))),
                 None => Err(SqlError::new(1087, format!("Must declare the table variable \"{}\".", name))),
@@ -1406,8 +1562,8 @@ impl<'a> Engine<'a> {
                 }).collect::<Result<_>>()?;
                 let keep: Vec<usize> = (0..s.schema.cols.len()).filter(|i| !unp.contains(i)).collect();
                 let mut sc: Vec<ColMeta> = keep.iter().map(|&i| s.schema.cols[i].clone()).collect();
-                sc.push(ColMeta { qual: alias.clone(), name: ncol.clone(), ty: None });
-                sc.push(ColMeta { qual: alias.clone(), name: vcol.clone(), ty: None });
+                sc.push(ColMeta { qual: alias.clone(), name: ncol.clone(), ty: None, denied: None, coll: None, mask: None });
+                sc.push(ColMeta { qual: alias.clone(), name: vcol.clone(), ty: None, denied: None, coll: None, mask: None });
                 let mut rows = vec![];
                 for r in s.rows.iter() {
                     for (k, &ui) in unp.iter().enumerate() {
@@ -1507,7 +1663,7 @@ impl<'a> Engine<'a> {
         for m in members {
             let refs = match m {
                 QueryBody::Select(s) => s.from.iter().any(|t| {
-                    let q = Query { ctes: vec![], body: QueryBody::Select(Box::new(Select { distinct: false, top: None, items: vec![], into: None, from: vec![t.clone()], where_: None, group: None, having: None })), order: vec![], offset: None, fetch: None, for_clause: None, maxrecursion: None };
+                    let q = Query { ctes: vec![], body: QueryBody::Select(Box::new(Select { distinct: false, top: None, items: vec![], into: None, from: vec![t.clone()], where_: None, group: None, having: None })), order: vec![], offset: None, fetch: None, for_clause: None, maxrecursion: None, options: vec![] };
                     query_refs_name(&q, lname)
                 }),
                 _ => false,
@@ -1612,8 +1768,29 @@ impl<'a> Engine<'a> {
                 }
             }
         }
+        // OPTION (LOOP JOIN): no hash table, every pair of rows is tested against the whole condition
+        if self.ses.query_opts.iter().any(|o| o == "LOOP JOIN") {
+            keys.clear();
+            residual.clear();
+        }
         let l_rows = l.rows.clone();
         let r_rows = r.rows.clone();
+        // collation each join key is compared in (strings are hashed by their sort keys)
+        let jcolls: Colls = if crate::collation::in_use() && !keys.is_empty() {
+            let empty: Row = vec![];
+            let (el, er) = (Env::new(&l.schema, &empty, outer), Env::new(&r.schema, &empty, outer));
+            let mut v = vec![];
+            for (lk, rk) in &keys {
+                v.push(self.resolve_coll(self.expr_coll(lk, &el), self.expr_coll(rk, &er))?);
+            }
+            if any_coll(&v) {
+                v
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
         if !keys.is_empty() {
             let mut map: HashMap<String, Vec<usize>> = HashMap::new();
             for (j, rr) in r_rows.iter().enumerate() {
@@ -1628,7 +1805,7 @@ impl<'a> Engine<'a> {
                     kv.push(v);
                 }
                 if !has_null {
-                    map.entry(key_of(&kv)).or_default().push(j);
+                    map.entry(if jcolls.is_empty() { key_of(&kv) } else { key_of(&keyed(&kv, &jcolls)) }).or_default().push(j);
                 }
             }
             for lr in l_rows.iter() {
@@ -1644,7 +1821,7 @@ impl<'a> Engine<'a> {
                 }
                 let mut matched = false;
                 if !has_null {
-                    if let Some(cands) = map.get(&key_of(&kv)) {
+                    if let Some(cands) = map.get(&if jcolls.is_empty() { key_of(&kv) } else { key_of(&keyed(&kv, &jcolls)) }) {
                         for &j in cands {
                             let mut row = lr.clone();
                             row.extend(r_rows[j].iter().cloned());
@@ -1749,9 +1926,9 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        let mut sc: Vec<ColMeta> = keep.iter().map(|&i| ColMeta { qual: alias.map(|a| a.to_string()), name: s.schema.cols[i].name.clone(), ty: s.schema.cols[i].ty.clone() }).collect();
+        let mut sc: Vec<ColMeta> = keep.iter().map(|&i| ColMeta { qual: alias.map(|a| a.to_string()), name: s.schema.cols[i].name.clone(), ty: s.schema.cols[i].ty.clone(), denied: None, coll: s.schema.cols[i].coll.clone(), mask: None }).collect();
         for v in vals {
-            sc.push(ColMeta { qual: alias.map(|a| a.to_string()), name: v.clone(), ty: None });
+            sc.push(ColMeta { qual: alias.map(|a| a.to_string()), name: v.clone(), ty: None, denied: None, coll: None, mask: None });
         }
         let fc = FuncCall { name: agg.to_string(), schema: None, parts: vec![], args: vec![arg.clone()], distinct: false, star: false, over: None, within: None };
         let mut rows = vec![];
@@ -1806,6 +1983,7 @@ impl<'a> Engine<'a> {
                 }
             });
             let mut col = Column::simple(&c.name, ty);
+            col.collation = c.coll.as_ref().map(|x| x.name.clone());
             if let Some((_, s, inc)) = idents.iter().find(|(ci, _, _)| *ci == i) {
                 col.identity = Some((*s, *inc));
                 col.nullable = false;
@@ -1824,7 +2002,7 @@ impl<'a> Engine<'a> {
             stored.push(nr);
         }
         if let Some((_, s, inc)) = idents.first().map(|x| (x.0, x.1, x.2)) {
-            t.identity_next = Some(s + stored.len() as i64 * inc);
+            t.identity_next.set(Some(s + stored.len() as i64 * inc));
         }
         t.load_rows(stored);
         match &loc {

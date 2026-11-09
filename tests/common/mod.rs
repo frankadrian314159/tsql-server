@@ -4,6 +4,15 @@ use tsql_server::*;
 /// A fresh server. With `TSQL_TEST_PAGED=1` it is a disk-backed server with a tiny buffer pool
 /// (8 pages), so the whole suite doubles as an eviction stress test of the storage engine.
 pub fn server() -> Server {
+    let s = server_inner();
+    // with TSQL_TEST_SPILL=1 every eligible single-table query uses the streaming executor with a tiny budget
+    if std::env::var("TSQL_TEST_SPILL").is_ok() {
+        s.set_work_mem(2048, 0, None);
+    }
+    s
+}
+
+fn server_inner() -> Server {
     if std::env::var("TSQL_TEST_PAGED").is_ok() {
         let dir = tempfile::tempdir().unwrap();
         let s = Server::open_with(dir.path(), StorageOptions { pool_pages: 8, temp_pool_pages: 8 }).unwrap();

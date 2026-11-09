@@ -254,3 +254,113 @@ async fn date_and_time_parameters_keep_their_precision() {
     assert_eq!(rows[0].get::<NaiveDate, _>(2), NaiveDate::from_ymd_opt(1999, 12, 31));
     l.shutdown();
 }
+
+// ------------------------------------------------------------------------------------------------ streamed replies
+async fn streaming_fixture() -> (Listener, tsql_server::Server, C) {
+    let (l, s) = start();
+    let mut c = sa(&l).await;
+    c.simple_query("CREATE TABLE sbig (id INT PRIMARY KEY, grp INT, name VARCHAR(30), note NVARCHAR(40) NULL)").await.unwrap().into_results().await.unwrap();
+    let mut sql = String::new();
+    for i in 0..5000 {
+        sql.push_str(&format!("INSERT sbig VALUES ({}, {}, 'name{}', {});\n", i, (i * 7919) % 41, (i * 31) % 301, if i % 4 == 0 { "NULL".to_string() } else { format!("N'note ☃ {}'", i % 13) }));
+    }
+    c.simple_query(sql).await.unwrap().into_results().await.unwrap();
+    c.simple_query("CREATE TABLE sdim (grp INT PRIMARY KEY, label VARCHAR(20))").await.unwrap().into_results().await.unwrap();
+    let mut sql = String::new();
+    for g in 0..41 {
+        sql.push_str(&format!("INSERT sdim VALUES ({}, 'group {}');\n", g, g));
+    }
+    c.simple_query(sql).await.unwrap().into_results().await.unwrap();
+    // every eligible query uses the streaming executor with a tiny budget, so its rows are sent as they are produced
+    s.set_work_mem(4096, 0, None);
+    (l, s, c)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_big_sorted_result_is_streamed_to_the_client() {
+    let (l, _s, mut c) = streaming_fixture().await;
+    let rows = c.simple_query("SELECT id, name, note FROM sbig ORDER BY grp, id").await.unwrap().into_first_result().await.unwrap();
+    assert_eq!(rows.len(), 5000);
+    let mut last = (-1i32, -1i32);
+    for r in &rows {
+        let id = r.get::<i32, _>("id").unwrap();
+        let grp = (id * 7919) % 41;
+        assert!((grp, id) > last, "rows out of order at id {}", id);
+        last = (grp, id);
+        assert_eq!(r.get::<&str, _>("name"), Some(format!("name{}", (id * 31) % 301).as_str()));
+        if id % 4 == 0 {
+            assert_eq!(r.get::<&str, _>("note"), None);
+        } else {
+            assert_eq!(r.get::<&str, _>("note"), Some(format!("note ☃ {}", id % 13).as_str()));
+        }
+    }
+    // the session carries on normally after a streamed reply
+    let two = c.simple_query("SELECT 1 + 1 AS two").await.unwrap().into_first_result().await.unwrap();
+    assert_eq!(two[0].get::<i32, _>("two"), Some(2));
+    l.shutdown();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_streamed_join_with_messages_and_counts_around_it() {
+    let (l, _s, mut c) = streaming_fixture().await;
+    let results = c
+        .simple_query("PRINT 'start'; SELECT b.id, d.label FROM sbig b JOIN sdim d ON b.grp = d.grp ORDER BY b.id; SELECT COUNT(*) AS n FROM sbig; PRINT 'done'")
+        .await
+        .unwrap()
+        .into_results()
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].len(), 5000);
+    assert_eq!(results[1][0].get::<i32, _>("n"), Some(5000));
+    assert_eq!(results[0][17].get::<&str, _>("label"), Some(format!("group {}", (17 * 7919) % 41).as_str()));
+    l.shutdown();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn parameterised_queries_stream_too_and_keep_their_output_values() {
+    let (l, _s, mut c) = streaming_fixture().await;
+    let rows = c.query("SELECT id, grp FROM sbig WHERE grp >= @P1 ORDER BY id DESC", &[&30i32]).await.unwrap().into_first_result().await.unwrap();
+    let expected = (0..5000).filter(|i| (i * 7919) % 41 >= 30).count();
+    assert_eq!(rows.len(), expected);
+    assert_eq!(rows[0].get::<i32, _>("id"), (0..5000).rev().find(|i| (i * 7919) % 41 >= 30));
+    // an OUTPUT parameter and a return value after a streamed result set (sp_executesql with OUTPUT)
+    let r = c
+        .simple_query("DECLARE @n INT; EXEC sp_executesql N'SELECT id FROM sbig ORDER BY name, id; SELECT @cnt = COUNT(*) FROM sbig', N'@cnt INT OUTPUT', @cnt = @n OUTPUT; SELECT @n AS n")
+        .await
+        .unwrap()
+        .into_results()
+        .await
+        .unwrap();
+    assert_eq!(r[0].len(), 5000);
+    assert_eq!(r.last().unwrap()[0].get::<i32, _>("n"), Some(5000));
+    l.shutdown();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn columns_of_guessed_type_can_hold_any_text_when_streamed() {
+    let (l, _s, mut c) = streaming_fixture().await;
+    // the first 64 rows are ASCII, later ones are not representable in the code page: the column must not be varchar
+    let rows = c.simple_query("SELECT id, CASE WHEN id < 200 THEN 'plain' ELSE N'snow ☃ ' + name END AS txt FROM sbig ORDER BY id").await.unwrap().into_first_result().await.unwrap();
+    assert_eq!(rows.len(), 5000);
+    assert_eq!(rows[10].get::<&str, _>("txt"), Some("plain"));
+    assert_eq!(rows[4999].get::<&str, _>("txt"), Some(format!("snow ☃ name{}", (4999 * 31) % 301).as_str()));
+    l.shutdown();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_client_that_disconnects_mid_result_does_not_hurt_the_server() {
+    let (l, s, mut c) = streaming_fixture().await;
+    {
+        let mut other = sa(&l).await;
+        // start a big result and drop the connection without reading it all
+        let stream = other.simple_query("SELECT id, name, note FROM sbig ORDER BY name, id").await.unwrap();
+        drop(stream);
+        drop(other);
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let rows = c.simple_query("SELECT COUNT(*) AS n FROM sbig").await.unwrap().into_first_result().await.unwrap();
+    assert_eq!(rows[0].get::<i32, _>("n"), Some(5000));
+    let _ = s;
+    l.shutdown();
+}

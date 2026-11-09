@@ -8,6 +8,12 @@ pub mod joins;
 pub mod optimizer;
 pub mod query;
 pub mod secexec;
+pub mod spill;
+pub mod admin;
+pub mod backup;
+pub mod hashjoin;
+pub mod rls;
+pub mod stream;
 pub mod sysprocs;
 pub mod sysviews;
 pub mod txn;
@@ -21,9 +27,9 @@ use crate::types::*;
 use std::collections::{HashMap, HashSet};
 use crate::storage::tx::{Isolation, Tx};
 use crate::storage::TxId;
-use std::ops::{Deref, DerefMut};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::Duration;
+use std::ops::Deref;
+use std::cell::OnceCell;
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 // ------------------------------------------------------------------ results
 #[derive(Clone, Debug)]
@@ -40,6 +46,23 @@ pub enum Event {
     RowCount(i64),
     Error(SqlError),
 }
+
+/// What a streaming run (`Connection::execute_streaming`) reports, in order. Everything the engine reports as an
+/// [`Event`] arrives as `Event`; the rows of a big `SELECT` arrive one at a time between `Header` and `End`, as
+/// the final sort or merge produces them, so the result set is never held in memory.
+#[derive(Clone, Debug)]
+pub enum Streamed {
+    Event(Event),
+    /// A result set starts. `inferred[i]` says the type of column `i` was guessed from the first rows (an expression
+    /// has no declared type); a string in such a column may be wider than the guess.
+    Header { columns: Vec<String>, types: Vec<DataType>, inferred: Vec<bool> },
+    Row(Vec<Value>),
+    /// The result set ends; it had this many rows.
+    End(u64),
+}
+
+/// Receives the output of a streaming run; returns false when the consumer is gone (the statement is abandoned).
+pub type Sink<'a> = &'a mut dyn FnMut(Streamed) -> bool;
 
 #[derive(Clone, Debug, Default)]
 pub struct BatchResult {
@@ -125,6 +148,20 @@ pub struct SessionState {
     pub rowcount_limit: i64,
     pub datefirst: i32,
     pub identity_insert: HashSet<String>,
+    /// Tables a DML statement is currently working on (see `Engine::checkout_table`).
+    pub checked_out: Vec<String>,
+    /// The next `SELECT` to start may stream its rows (see `Engine::try_stream_select`).
+    pub stream_ok: bool,
+    /// Table hints of the statement being run, by table object id (see `Engine::collect_hints`).
+    pub hints: HashMap<i32, Vec<String>>,
+    /// A NOWAIT table hint is in effect: a lock that cannot be granted at once is error 1222.
+    pub nowait: bool,
+    /// A row-level security predicate function is being evaluated (policies do not apply inside it).
+    pub in_rls: bool,
+    /// `OPTION (...)` hints of the query being run.
+    pub query_opts: Vec<String>,
+    /// Table latches this session holds (see `Engine::apply_changes`).
+    pub latched: Vec<i32>,
     pub last_identity: Option<i64>,
     pub rowcount: i64,
     pub last_error: i32,
@@ -175,6 +212,13 @@ impl SessionState {
             rowcount_limit: 0,
             datefirst: 7,
             identity_insert: HashSet::new(),
+            checked_out: vec![],
+            stream_ok: false,
+            hints: HashMap::new(),
+            nowait: false,
+            in_rls: false,
+            query_opts: vec![],
+            latched: vec![],
             last_identity: None,
             rowcount: 0,
             last_error: 0,
@@ -206,61 +250,169 @@ pub enum Loc {
     Db(String, String),
 }
 
-/// The server mutex, which can be released while a statement waits for a lock.
+/// Statements that only read the catalog (queries, DML, session `SET`s) run under a shared catalog guard, so sessions
+/// execute them in parallel; everything else (DDL, security, database options, ...) takes it exclusively.
+pub const SHARED_READS: bool = true;
+
+/// A session's hold on the catalog ([`ServerState`]).
+///
+/// The guard is taken lazily, on the first access after [`SrvGuard::release`] (which the engine calls between
+/// top-level statements and while a statement waits for a lock), in the mode set by [`SrvGuard::set_intent`].
+/// Reading goes through `Deref`. Code that changes the catalog must call [`SrvGuard::cat_mut`], which switches
+/// to exclusive mode (releasing the shared guard first, so the catalog can change at that point; nothing borrowed
+/// from it can be alive, because `cat_mut` needs `&mut self`).
 pub struct SrvGuard<'a> {
-    pub mutex: &'a Mutex<ServerState>,
-    pub cv: &'a Condvar,
-    guard: Option<MutexGuard<'a, ServerState>>,
+    lock: &'a RwLock<ServerState>,
+    write: bool,
+    r: OnceCell<RwLockReadGuard<'a, ServerState>>,
+    w: OnceCell<RwLockWriteGuard<'a, ServerState>>,
 }
 
 impl<'a> SrvGuard<'a> {
-    pub fn lock(mutex: &'a Mutex<ServerState>, cv: &'a Condvar) -> SrvGuard<'a> {
-        let g = mutex.lock().unwrap_or_else(|e| e.into_inner());
-        SrvGuard { mutex, cv, guard: Some(g) }
+    /// A guard that takes the catalog exclusively when first used.
+    pub fn new(lock: &'a RwLock<ServerState>) -> SrvGuard<'a> {
+        SrvGuard { lock, write: true, r: OnceCell::new(), w: OnceCell::new() }
     }
-    /// Wait for a notification; returns true when the timeout elapsed.
-    pub fn wait(&mut self, timeout: Option<Duration>) -> bool {
-        let g = self.guard.take().unwrap();
-        match timeout {
-            Some(d) => {
-                let (g, r) = self.cv.wait_timeout(g, d).unwrap_or_else(|e| e.into_inner());
-                self.guard = Some(g);
-                r.timed_out()
-            }
-            None => {
-                let g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
-                self.guard = Some(g);
-                false
-            }
+    /// Choose the mode for the next acquisition; a guard held in another mode is released.
+    pub fn set_intent(&mut self, write: bool) {
+        if write != self.write {
+            self.release();
+            self.write = write;
         }
     }
-    pub fn cv_notify(&self) {
-        self.cv.notify_all();
+    /// Give the catalog up (it is taken again on the next access).
+    pub fn release(&mut self) {
+        self.r.take();
+        self.w.take();
+    }
+    /// Run `f` without holding the catalog (to wait for something that other sessions have to do).
+    pub fn unlocked<T>(&mut self, f: impl FnOnce() -> T) -> T {
+        self.release();
+        f()
     }
     /// Let other sessions run between statements.
     pub fn yield_lock(&mut self) {
-        drop(self.guard.take());
+        self.release();
         std::thread::yield_now();
-        self.guard = Some(self.mutex.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+    /// Exclusive access to the catalog.
+    pub fn cat_mut(&mut self) -> &mut ServerState {
+        if self.w.get().is_none() {
+            if !self.write && std::env::var_os("TSQL_TRACE_UPGRADES").is_some() {
+                eprintln!("catalog upgrade:
+{}", std::backtrace::Backtrace::force_capture());
+            }
+            self.r.take();
+            self.write = true;
+            let g = self.lock.write().unwrap_or_else(|e| e.into_inner());
+            let _ = self.w.set(g);
+        }
+        &mut **self.w.get_mut().unwrap()
     }
 }
 
 impl<'a> Deref for SrvGuard<'a> {
     type Target = ServerState;
     fn deref(&self) -> &ServerState {
-        self.guard.as_ref().unwrap()
+        if let Some(w) = self.w.get() {
+            return w;
+        }
+        if self.write {
+            self.w.get_or_init(|| self.lock.write().unwrap_or_else(|e| e.into_inner()))
+        } else {
+            self.r.get_or_init(|| self.lock.read().unwrap_or_else(|e| e.into_inner()))
+        }
     }
 }
-impl<'a> DerefMut for SrvGuard<'a> {
-    fn deref_mut(&mut self) -> &mut ServerState {
-        self.guard.as_mut().unwrap()
-    }
+
+/// Does this statement change the catalog (so that it must hold it exclusively from the start)?
+/// Queries, DML, variables, cursors and transaction control only read it; anything that does change it
+/// (an undo of DDL, `SELECT ... INTO`) switches to exclusive mode where it happens ([`SrvGuard::cat_mut`]).
+pub fn stmt_needs_write(st: &Stmt) -> bool {
+    !matches!(
+        st,
+        Stmt::Query(_)
+            | Stmt::Insert(_)
+            | Stmt::Update(_)
+            | Stmt::Delete(_)
+            | Stmt::Merge(_)
+            | Stmt::Declare(_)
+            | Stmt::Set { .. }
+            | Stmt::SetCursorVar { .. }
+            | Stmt::SetOpts(_)
+            | Stmt::Print(_)
+            | Stmt::BeginTran(_)
+            | Stmt::Commit(_)
+            | Stmt::Rollback(_)
+            | Stmt::SaveTran(_)
+            | Stmt::DeclareCursor { .. }
+            | Stmt::CursorOp { .. }
+            | Stmt::Fetch { .. }
+            | Stmt::Backup(_)
+            | Stmt::WaitFor { .. }
+            | Stmt::Kill(_)
+            | Stmt::Reconfigure
+            | Stmt::Noop
+    )
 }
 
 pub struct Engine<'a> {
     pub srv: SrvGuard<'a>,
     pub ses: &'a mut SessionState,
     pub out: Vec<Event>,
+    /// Where output goes instead of `out` when running in streaming mode.
+    pub sink: Option<Sink<'a>>,
+}
+
+// ------------------------------------------------------------------------------ plan cache
+//
+// The parsed form of a batch is kept per thread (a connection's thread, for the listener) so a statement a client sends
+// again, as most applications do, is not parsed again. The cache is keyed by the exact batch text; entries are dropped
+// at random-ish once there are too many. `DBCC FREEPROCCACHE` empties it. (Execution plans themselves are not cached:
+// the optimizer's decisions depend on the data and on the parameter values.)
+thread_local! {
+    static PARSE_CACHE: std::cell::RefCell<HashMap<String, (std::rc::Rc<Vec<Stmt>>, u64)>> = std::cell::RefCell::new(HashMap::new());
+}
+
+const PARSE_CACHE_ENTRIES: usize = 512;
+const PARSE_CACHE_MAX_TEXT: usize = 64 << 10;
+
+pub fn cached_parse(sql: &str) -> std::result::Result<std::rc::Rc<Vec<Stmt>>, SqlError> {
+    if sql.len() <= PARSE_CACHE_MAX_TEXT {
+        let hit = PARSE_CACHE.with(|c| {
+            c.borrow_mut().get_mut(sql).map(|e| {
+                e.1 += 1;
+                e.0.clone()
+            })
+        });
+        if let Some(h) = hit {
+            return Ok(h);
+        }
+    }
+    let stmts = std::rc::Rc::new(parser::parse(sql)?);
+    if sql.len() <= PARSE_CACHE_MAX_TEXT {
+        PARSE_CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.len() >= PARSE_CACHE_ENTRIES {
+                // make room: drop the least used half
+                let mut uses: Vec<u64> = c.values().map(|e| e.1).collect();
+                uses.sort_unstable();
+                let cut = uses[uses.len() / 2];
+                c.retain(|_, e| e.1 > cut);
+            }
+            c.insert(sql.to_string(), (stmts.clone(), 1));
+        });
+    }
+    Ok(stmts)
+}
+
+pub fn clear_parse_cache() {
+    PARSE_CACHE.with(|c| c.borrow_mut().clear());
+}
+
+/// (batch text, times used) of this thread's cache.
+pub fn parse_cache_entries() -> Vec<(String, u64)> {
+    PARSE_CACHE.with(|c| c.borrow().iter().map(|(k, v)| (k.clone(), v.1)).collect())
 }
 
 pub fn obj_key(schema: &str, name: &str) -> String {
@@ -269,18 +421,44 @@ pub fn obj_key(schema: &str, name: &str) -> String {
 
 impl<'a> Engine<'a> {
     pub fn new(srv: SrvGuard<'a>, ses: &'a mut SessionState) -> Engine<'a> {
-        Engine { srv, ses, out: vec![] }
+        Engine { srv, ses, out: vec![], sink: None }
+    }
+
+    /// An engine that reports its output to `sink` as it is produced instead of collecting it.
+    pub fn with_sink(srv: SrvGuard<'a>, ses: &'a mut SessionState, sink: Sink<'a>) -> Engine<'a> {
+        Engine { srv, ses, out: vec![], sink: Some(sink) }
+    }
+
+    /// Report one event (collected, or passed to the sink).
+    pub fn emit(&mut self, ev: Event) {
+        match self.sink.as_mut() {
+            Some(s) => {
+                let _ = s(Streamed::Event(ev)); // a vanished consumer is noticed when rows are streamed
+            }
+            None => self.out.push(ev),
+        }
+    }
+
+    /// Pass a streamed row set item to the sink; an error when the consumer has gone away.
+    pub fn stream_item(&mut self, item: Streamed) -> Result<()> {
+        if let Some(s) = self.sink.as_mut() {
+            if !s(item) {
+                return Err(SqlError::new(64, "A transport-level error has occurred when sending the request to the client."));
+            }
+        }
+        Ok(())
     }
 
     // --------------------------------------------------------- batch driver
     pub fn run_batch(&mut self, sql: &str) {
-        let stmts = match parser::parse(sql) {
+        let stmts = match cached_parse(sql) {
             Ok(s) => s,
             Err(e) => {
-                self.out.push(Event::Error(e));
+                self.emit(Event::Error(e));
                 return;
             }
         };
+        let started = std::time::Instant::now();
         self.ses.frames.push(Frame::default());
         self.ses.try_depth = 0;
         self.ses.strict = 0;
@@ -294,12 +472,14 @@ impl<'a> Engine<'a> {
         self.ses.trigger_stack.clear();
         self.ses.capture.clear();
         self.ses.catch_stack.clear();
+        self.ses.checked_out.clear();
+        self.srv.core.record_stat(sql, started.elapsed().as_micros() as u64, self.ses.rowcount.max(0) as u64);
         // a batch-aborting error with an open XACT_ABORT transaction rolls back
     }
 
     pub fn report_error(&mut self, e: SqlError) {
         self.ses.last_error = e.number;
-        self.out.push(Event::Error(e));
+        self.emit(Event::Error(e));
     }
 
     // ----------------------------------------------------------- statements
@@ -324,6 +504,9 @@ impl<'a> Engine<'a> {
     pub fn exec_stmt(&mut self, st: &Stmt) -> Flow<()> {
         let leaf = !matches!(st, Stmt::If { .. } | Stmt::While { .. } | Stmt::Block(_) | Stmt::Try { .. } | Stmt::Exec(_) | Stmt::ExecStr(_));
         if !leaf {
+            if self.ses.nest_level == 0 {
+                self.srv.set_intent(!SHARED_READS);
+            }
             return match self.exec_inner(st) {
                 Err(Interrupt::Error(e)) => self.handle_error(e),
                 other => other,
@@ -338,7 +521,33 @@ impl<'a> Engine<'a> {
         loop {
             let owns = self.ses.tx.is_none();
             let mark = self.ses.tx.as_ref().map(|t| t.undo.len()).unwrap_or(0);
-            self.ses.stmt_ts = self.srv.clock;
+            if self.ses.nest_level == 0 {
+                let spid = self.ses.spid;
+                if self.srv.core.is_killed(spid) {
+                    let e = self.kill_error();
+                    return self.handle_error(e);
+                }
+                let (db, iso) = (self.ses.db.clone(), self.ses.isolation.level());
+                let cmd: String = format!("{:?}", st).chars().take_while(|c| c.is_alphanumeric()).collect();
+                self.srv.core.update_session(spid, |s| {
+                    s.db = db;
+                    s.status = "running";
+                    s.isolation = iso;
+                    s.command = cmd;
+                    s.last_batch = chrono::Local::now().naive_local();
+                    s.batches += 1;
+                });
+            }
+            let write = !SHARED_READS || stmt_needs_write(st);
+            if self.ses.nest_level == 0 || write {
+                // a statement that changes the catalog takes it exclusively from the start, wherever it is nested
+                self.srv.set_intent(write);
+            }
+            self.ses.stmt_ts = self.srv.core.clock();
+            if self.ses.nest_level == 0 {
+                self.ses.hints.clear();
+                self.ses.nowait = false;
+            }
             let r = self.exec_inner(st);
             match r {
                 Ok(()) => {
@@ -347,7 +556,10 @@ impl<'a> Engine<'a> {
                             return self.handle_error(e);
                         }
                     }
-                    self.srv.yield_lock();
+                    if self.ses.nest_level == 0 {
+                        self.srv.core.update_session(self.ses.spid, |s| s.status = "sleeping");
+                        self.srv.yield_lock();
+                    }
                     return Ok(());
                 }
                 Err(Interrupt::Error(e)) if e.number == txn::BLOCKED => {
@@ -442,18 +654,28 @@ impl<'a> Engine<'a> {
     }
 
     fn exec_inner(&mut self, st: &Stmt) -> Flow<()> {
+        // a database that is being restored cannot be used (only a few statements work in it)
+        if self.srv.databases.get(&self.ses.db.to_lowercase()).is_some_and(|d| d.restoring)
+            && !matches!(st, Stmt::Use(_) | Stmt::Backup(_) | Stmt::Restore(_) | Stmt::SetOpts(_) | Stmt::Set { .. } | Stmt::Declare(_) | Stmt::Print(_) | Stmt::Block(_) | Stmt::If { .. } | Stmt::Try { .. } | Stmt::Noop | Stmt::Rollback(_) | Stmt::Commit(_))
+        {
+            return Err(SqlError::with(927, 14, 1, format!("Database '{}' cannot be opened. It is in the middle of a restore.", self.ses.db)).into());
+        }
         match st {
             Stmt::Query(q) => {
-                let rs = self.exec_query(q, None)?;
+                // the rows of a plain top-level SELECT may go straight to the client
+                self.ses.stream_ok = self.sink.is_some() && self.ses.capture.is_empty() && q.ctes.is_empty() && q.for_clause.is_none() && matches!(q.body, QueryBody::Select(_));
+                let rs = self.exec_query(q, None);
+                self.ses.stream_ok = false;
+                let rs = rs?;
                 if !rs.suppress {
                     let n = rs.rows.len() as i64;
                     self.ses.rowcount = n;
                     self.emit_rowset(rs);
                     if !self.ses.nocount {
-                        self.out.push(Event::RowCount(n));
+                        self.emit(Event::RowCount(n));
                     }
                 } else if !self.ses.nocount && rs.report_count {
-                    self.out.push(Event::RowCount(self.ses.rowcount));
+                    self.emit(Event::RowCount(self.ses.rowcount));
                 }
                 self.ses.last_error = 0;
             }
@@ -518,7 +740,7 @@ impl<'a> Engine<'a> {
                 let env = query::Env::empty();
                 let v = self.ev(e, &env)?;
                 let s = if v.is_null() { String::new() } else { convert::to_str(&v) };
-                self.out.push(Event::Message(s));
+                self.emit(Event::Message(s));
             }
             Stmt::Throw(args) => self.exec_throw(args)?,
             Stmt::RaiseError { args, opts } => self.exec_raiserror(args, opts)?,
@@ -572,8 +794,11 @@ impl<'a> Engine<'a> {
                 if self.db_user(&key).is_none() {
                     return Err(SqlError::with(916, 14, 1, format!("The server principal \"{}\" is not able to access the database \"{}\" under the current security context.", self.eff_login(), db)).into());
                 }
+                if self.srv.databases[&key].restoring {
+                    return Err(SqlError::with(927, 14, 1, format!("Database '{}' cannot be opened. It is in the middle of a restore.", db)).into());
+                }
                 self.ses.db = self.srv.databases[&key].name.clone();
-                self.out.push(Event::Message(format!("Changed database context to '{}'.", self.ses.db)));
+                self.emit(Event::Message(format!("Changed database context to '{}'.", self.ses.db)));
             }
             Stmt::Exec(ex) => self.exec_exec(ex)?,
             Stmt::ExecStr(parts) => {
@@ -585,7 +810,14 @@ impl<'a> Engine<'a> {
                 }
                 self.exec_dynamic(&sql)?;
             }
-            Stmt::WaitFor => {}
+            Stmt::WaitFor { time, e } => self.exec_waitfor(*time, e)?,
+            Stmt::Kill(e) => self.exec_kill(e)?,
+            Stmt::Reconfigure => {
+                if !self.is_sysadmin() {
+                    return Err(SqlError::with(262, 14, 1, "RECONFIGURE permission denied in database 'master'.").into());
+                }
+                self.srv.core.config_apply();
+            }
             Stmt::DeclareCursor { name, query } => {
                 self.ses.cursors.insert(name.clone(), Cursor { query: query.clone(), rows: vec![], columns: vec![], pos: -1, open: false });
             }
@@ -594,6 +826,9 @@ impl<'a> Engine<'a> {
             Stmt::Dbcc { name, args } => self.exec_dbcc(name, args)?,
             Stmt::Security(s) => self.exec_security(s)?,
             Stmt::Checkpoint => self.do_checkpoint(),
+            Stmt::Backup(b) => self.exec_backup(b)?,
+            Stmt::CreateSecurityPolicy(_) | Stmt::AlterSecurityPolicy(_) | Stmt::DropSecurityPolicy { .. } => self.exec_policy(st)?,
+            Stmt::Restore(r) => self.exec_restore(r)?,
             Stmt::AlterDatabase { db, options } => {
                 let key = if db.eq_ignore_ascii_case("current") { self.ses.db.to_lowercase() } else { db.to_lowercase() };
                 if !self.srv.databases.contains_key(&key) {
@@ -601,10 +836,28 @@ impl<'a> Engine<'a> {
                 }
                 for (name, val) in options {
                     let on = val == "ON";
-                    let d = self.srv.databases.get_mut(&key).unwrap();
+                    let d = self.srv.cat_mut().databases.get_mut(&key).unwrap();
                     match name.as_str() {
                         "ALLOW_SNAPSHOT_ISOLATION" => d.allow_snapshot = on,
                         "READ_COMMITTED_SNAPSHOT" => d.rcsi = on,
+                        "COLLATE" => {
+                            if crate::collation::get(val).is_none() {
+                                return Err(SqlError::with(448, 16, 1, format!("Invalid collation '{}'.", val)).into());
+                            }
+                            d.collation = val.clone(); // new objects use it; existing columns keep theirs
+                        }
+                        "RECOVERY" => {
+                            match val.as_str() {
+                                "FULL" | "BULK_LOGGED" => d.recovery_full = true,
+                                "SIMPLE" => {
+                                    d.recovery_full = false;
+                                    d.log_chain_ts = None; // SIMPLE breaks the log chain
+                                }
+                                other => return Err(SqlError::new(5058, format!("Option '{}' cannot be set in database '{}'; use FULL, BULK_LOGGED or SIMPLE.", other, db)).into()),
+                            }
+                            let full = d.recovery_full;
+                            self.log_nowait(vec![crate::persist::LogOp::DbRecovery { db: key.clone(), full }]);
+                        }
                         _ => {}
                     }
                 }
@@ -618,7 +871,7 @@ impl<'a> Engine<'a> {
             | Stmt::CreateFunction(_)
             | Stmt::CreateTrigger { .. }
             | Stmt::CreateSchema(..)
-            | Stmt::CreateDatabase(_)
+            | Stmt::CreateDatabase(..)
             | Stmt::CreateType { .. }
             | Stmt::CreateSequence { .. }
             | Stmt::AlterSequence { .. }
@@ -646,13 +899,13 @@ impl<'a> Engine<'a> {
         if let Some(cap) = self.ses.capture.last_mut() {
             cap.push(r);
         } else {
-            self.out.push(Event::Rows(r));
+            self.emit(Event::Rows(r));
         }
     }
 
     pub fn current_db(&mut self) -> &mut Database {
         let k = self.ses.db.to_lowercase();
-        self.srv.databases.get_mut(&k).expect("current database")
+        self.srv.cat_mut().databases.get_mut(&k).expect("current database")
     }
 
     pub fn db_of(&self, name: &str) -> Option<&Database> {
@@ -859,7 +1112,7 @@ impl<'a> Engine<'a> {
         };
         let _ = opts;
         if sev <= 10 {
-            self.out.push(Event::Message(msg));
+            self.emit(Event::Message(msg));
             return Ok(());
         }
         let e = SqlError::with(50000, sev as u8, state as u8, msg);
@@ -932,7 +1185,7 @@ impl<'a> Engine<'a> {
             Loc::Temp(n) => self.ses.temp.get(n),
             Loc::GTemp(n) => self.srv.global_temp.get(n),
             Loc::Var(n) => self.ses.frames.last().and_then(|f| f.tables.get(n)),
-            Loc::Db(d, k) => match self.srv.databases.get(d).and_then(|db| db.objects.get(k)) {
+            Loc::Db(d, k) => match self.srv.databases.get(d).filter(|db| !db.restoring).and_then(|db| db.objects.get(k)) {
                 Some(Object::Table(t)) => Some(t),
                 _ => None,
             },
@@ -946,13 +1199,33 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// A working copy of the table at `loc` for a DML statement. The catalog keeps its entry (copies share the
+    /// row storage and the identity counter), so this needs no exclusive access to the catalog. `None` when the
+    /// table is already checked out further up the call stack (a cascade that came back around).
+    pub fn checkout_table(&mut self, loc: &Loc) -> Option<Table> {
+        let key = format!("{:?}", loc);
+        if self.ses.checked_out.contains(&key) {
+            return None;
+        }
+        let t = self.table_ref(loc).cloned()?;
+        self.ses.checked_out.push(key);
+        Some(t)
+    }
+
+    pub fn checkin_table(&mut self, loc: &Loc, _t: Table) {
+        let key = format!("{:?}", loc);
+        if let Some(i) = self.ses.checked_out.iter().rposition(|k| *k == key) {
+            self.ses.checked_out.remove(i);
+        }
+    }
+
     pub fn take_table(&mut self, loc: &Loc) -> Option<Table> {
         match loc {
             Loc::Temp(n) => self.ses.temp.remove(n),
-            Loc::GTemp(n) => self.srv.global_temp.remove(n),
+            Loc::GTemp(n) => self.srv.cat_mut().global_temp.remove(n),
             Loc::Var(n) => self.ses.frames.last_mut().and_then(|f| f.tables.remove(n)),
             Loc::Db(d, k) => {
-                let db = self.srv.databases.get_mut(d)?;
+                let db = self.srv.cat_mut().databases.get_mut(d)?;
                 match db.objects.remove(k) {
                     Some(Object::Table(t)) => Some(t),
                     Some(other) => {
@@ -971,7 +1244,7 @@ impl<'a> Engine<'a> {
                 self.ses.temp.insert(n.clone(), t);
             }
             Loc::GTemp(n) => {
-                self.srv.global_temp.insert(n.clone(), t);
+                self.srv.cat_mut().global_temp.insert(n.clone(), t);
             }
             Loc::Var(n) => {
                 if let Some(f) = self.ses.frames.last_mut() {
@@ -979,7 +1252,7 @@ impl<'a> Engine<'a> {
                 }
             }
             Loc::Db(d, k) => {
-                if let Some(db) = self.srv.databases.get_mut(d) {
+                if let Some(db) = self.srv.cat_mut().databases.get_mut(d) {
                     db.objects.insert(k.clone(), Object::Table(t));
                 }
             }
@@ -987,6 +1260,11 @@ impl<'a> Engine<'a> {
     }
 
     pub fn invalid_object(&self, parts: &[String]) -> SqlError {
+        if parts.len() >= 3 {
+            if let Some(d) = self.srv.databases.get(&parts[0].to_lowercase()).filter(|d| d.restoring) {
+                return SqlError::with(927, 14, 1, format!("Database '{}' cannot be opened. It is in the middle of a restore.", d.name));
+            }
+        }
         SqlError::new(208, format!("Invalid object name '{}'.", parts.join(".")))
     }
 
@@ -1097,6 +1375,14 @@ impl<'a> Engine<'a> {
     fn exec_dbcc(&mut self, name: &str, args: &[Expr]) -> Flow<()> {
         let env = query::Env::empty();
         match name {
+            "FREEPROCCACHE" | "FREESYSTEMCACHE" | "DROPCLEANBUFFERS" => {
+                if !self.is_sysadmin() {
+                    return Err(SqlError::with(262, 14, 1, format!("DBCC {} permission denied in database 'master'.", name)).into());
+                }
+                clear_parse_cache();
+                self.srv.core.clear_stats();
+                self.emit(Event::Message("DBCC execution completed. If DBCC printed error messages, contact your system administrator.".into()));
+            }
             "CHECKIDENT" => {
                 let tn = self.ev(&args[0], &env)?;
                 let parts: Vec<String> = convert::to_str(&tn).split('.').map(|s| s.trim_matches(|c| c == '[' || c == ']').to_string()).collect();
@@ -1104,26 +1390,26 @@ impl<'a> Engine<'a> {
                 let reseed = args.get(1).map(|a| self.ev(a, &env)).transpose()?;
                 let reseed_c = reseed.clone();
                 let newv = args.get(2).map(|a| self.ev(a, &env)).transpose()?;
-                let mut t = self.take_table(&loc).ok_or_else(|| self.invalid_object(&parts))?;
+                let t = self.take_table(&loc).ok_or_else(|| self.invalid_object(&parts))?;
                 if let Some(c) = t.identity_col() {
                     let inc = t.columns[c].identity.unwrap().1;
-                    let last = t.identity_next.map(|n| n - inc);
+                    let last = t.identity_next.get().map(|n| n - inc);
                     if let (Some(r), Some(nv)) = (reseed.clone(), newv) {
                         if convert::to_str(&r).eq_ignore_ascii_case("RESEED") {
-                            t.identity_next = nv.as_i64().map(|v| v + inc);
+                            t.identity_next.set(nv.as_i64().map(|v| v + inc));
                         }
                     } else if reseed_c.is_some() {
                         // RESEED with no value: set to max
                     }
                     let msg = format!("Checking identity information: current identity value '{}'.", last.map(|v| v.to_string()).unwrap_or("NULL".into()));
                     self.put_table(&loc, t);
-                    self.out.push(Event::Message(msg));
+                    self.emit(Event::Message(msg));
                 } else {
                     self.put_table(&loc, t);
                 }
-                self.out.push(Event::Message("DBCC execution completed. If DBCC printed error messages, contact your system administrator.".into()));
+                self.emit(Event::Message("DBCC execution completed. If DBCC printed error messages, contact your system administrator.".into()));
             }
-            _ => self.out.push(Event::Message("DBCC execution completed. If DBCC printed error messages, contact your system administrator.".into())),
+            _ => self.emit(Event::Message("DBCC execution completed. If DBCC printed error messages, contact your system administrator.".into())),
         }
         Ok(())
     }

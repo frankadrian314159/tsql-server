@@ -28,7 +28,7 @@ pub struct Applied {
 }
 
 pub fn table_schema(t: &Table, alias: &str) -> Schema {
-    Schema::new(t.columns.iter().map(|c| ColMeta { qual: Some(alias.to_string()), name: c.name.clone(), ty: Some(c.ty.clone()) }).collect())
+    Schema::new(t.columns.iter().map(|c| ColMeta { qual: Some(alias.to_string()), name: c.name.clone(), ty: Some(c.ty.clone()), denied: None, coll: c.collation.as_deref().and_then(crate::collation::get), mask: c.mask.as_deref().and_then(|m| crate::mask::Mask::parse(m).ok()).map(Arc::new) }).collect())
 }
 
 fn fmt_key(vals: &[&Value]) -> String {
@@ -65,7 +65,9 @@ impl<'a> Engine<'a> {
                 if self.table_ref(&loc).is_none() {
                     return Err(self.invalid_object(&name));
                 }
-                self.check_dml_permission(&loc, &name, perm)?;
+                if !perm.is_empty() {
+                    self.check_dml_permission(&loc, &name, perm)?;
+                }
                 Ok((loc, name))
             }
         }
@@ -94,7 +96,8 @@ impl<'a> Engine<'a> {
     }
 
     fn exec_insert_inner(&mut self, ins: &Insert) -> Result<()> {
-        let (loc, _name) = self.dml_target(&ins.target, &[], "INSERT")?;
+        let (loc, name) = self.dml_target(&ins.target, &[], "")?;
+        self.check_insert_permission(&loc, &name, ins)?;
         let mut src_rows: Vec<Vec<Option<Value>>> = vec![];
         let mut src_ncols = 0usize;
         match &ins.src {
@@ -214,14 +217,12 @@ impl<'a> Engine<'a> {
             self.run_trigger(&trg, t, "INSERT", new_rows, vec![], &vec![true; ncols])?;
             return Ok(None);
         }
-        let ident_next = t.identity_next;
         let ncols = t.columns.len();
         let _ = t;
-        let mut real = self.take_table(loc).ok_or_else(|| SqlError::new(208, "Invalid object name."))?;
-        real.identity_next = ident_next;
+        let mut real = self.checkout_table(loc).ok_or_else(|| SqlError::new(208, "Invalid object name."))?;
         let r = self.apply_changes(loc, &mut real, Changes { updates: vec![], deletes: vec![], inserts: new_rows }, &vec![true; ncols], "INSERT");
         let tc = real.clone();
-        self.put_table(loc, real);
+        self.checkin_table(loc, real);
         let ap = r?;
         Ok(Some((ap, n, tc)))
     }
@@ -250,10 +251,10 @@ impl<'a> Engine<'a> {
                         return Err(SqlError::new(544, format!("Cannot insert explicit value for identity column in table '{}' when IDENTITY_INSERT is set to OFF.", t.name)));
                     }
                     if let (Some(x), Some((_, inc))) = (nv.as_i64(), col.identity) {
-                        let next = t.identity_next.unwrap_or(x);
-                        if (inc > 0 && x >= next) || (inc < 0 && x <= next) {
-                            t.identity_next = Some(x + inc);
-                        }
+                        let _ = t.identity_next.update(|cur| {
+                            let next = cur.unwrap_or(x);
+                            Ok::<_, ()>(if (inc > 0 && x >= next) || (inc < 0 && x <= next) { (Some(x + inc), ()) } else { (cur, ()) })
+                        });
                     }
                 }
                 row[ci] = nv;
@@ -269,18 +270,22 @@ impl<'a> Engine<'a> {
                 continue;
             }
             if let Some((_, inc)) = col.identity {
-                let cur = t.identity_next.unwrap_or(1);
-                let max_ok = match col.ty {
-                    DataType::TinyInt => cur <= 255,
-                    DataType::SmallInt => cur <= 32767 && cur >= -32768,
-                    DataType::Int => cur <= i32::MAX as i64 && cur >= i32::MIN as i64,
-                    _ => true,
-                };
-                if !max_ok {
-                    return Err(SqlError::new(8115, format!("Arithmetic overflow error converting IDENTITY to data type {}.", col.ty)));
-                }
+                // take the value and advance the counter in one step, so sessions never get the same one
+                let ty = col.ty.clone();
+                let cur = t.identity_next.update(|cur| {
+                    let cur = cur.unwrap_or(1);
+                    let max_ok = match ty {
+                        DataType::TinyInt => cur <= 255,
+                        DataType::SmallInt => cur <= 32767 && cur >= -32768,
+                        DataType::Int => cur <= i32::MAX as i64 && cur >= i32::MIN as i64,
+                        _ => true,
+                    };
+                    if !max_ok {
+                        return Err(SqlError::new(8115, format!("Arithmetic overflow error converting IDENTITY to data type {}.", ty)));
+                    }
+                    Ok((Some(cur + inc), cur))
+                })?;
                 row[ci] = convert::cast(&Value::BigInt(cur), &col.ty, None)?;
-                t.identity_next = Some(cur + inc);
                 self.ses.last_identity = Some(cur);
                 continue;
             }
@@ -298,8 +303,7 @@ impl<'a> Engine<'a> {
     }
 
     fn next_rowversion(&mut self) -> Value {
-        self.srv.next_rowversion += 1;
-        Value::Bin(self.srv.next_rowversion.to_be_bytes().to_vec())
+        Value::Bin(self.srv.core.new_rowversion().to_be_bytes().to_vec())
     }
 
     /// Compute computed columns and enforce NOT NULL.
@@ -326,8 +330,145 @@ impl<'a> Engine<'a> {
     // --------------------------------------------------- apply & validate
     /// Validate and apply a set of row changes to `t` (which must be the table stored at `loc`,
     /// currently taken out of the catalog). Everything is checked before the first write.
-    pub fn apply_changes(&mut self, loc: &Loc, t: &mut Table, mut ch: Changes, upd_cols: &[bool], verb: &str) -> Result<Applied> {
-        let persistent = matches!(loc, Loc::Db(..));
+    pub fn apply_changes(&mut self, loc: &Loc, t: &mut Table, ch: Changes, upd_cols: &[bool], verb: &str) -> Result<Applied> {
+        if ch.is_empty() {
+            return Ok(Applied { old_updated: vec![], new_updated: vec![], deleted: vec![], inserted: vec![] });
+        }
+        // The checks and writes below must not interleave with another session's where that could break a rule:
+        //
+        // * Most tables are latched shared (writers to one table run side by side) plus *stripes* for the key values
+        //   the statement checks or changes: the keys of unique indexes it writes, and the foreign-key values it
+        //   inserts (child side) or removes (parent side). Two inserts of one key, or a child insert beside the
+        //   delete of its parent, hash to the same stripe and take turns; everything else proceeds in parallel.
+        // * A table connected through foreign keys to a cascading action may have rows in any of those tables changed
+        //   by this statement, so the whole connected set is latched exclusively (in table-id order).
+        //
+        // A SERIALIZABLE reader's key range is checked *after* the writes (see `apply_changes_latched`), not here.
+        let latch = if matches!(loc, Loc::Db(..) | Loc::GTemp(_)) {
+            let (mut oids, cascade) = self.fk_component(t);
+            if cascade {
+                oids.retain(|o| !self.ses.latched.contains(o));
+                if oids.is_empty() {
+                    None
+                } else {
+                    let set = self.srv.core.latch(&oids.iter().map(|o| (*o, true)).collect::<Vec<_>>());
+                    self.ses.latched.extend(oids.iter().copied());
+                    Some((set, oids))
+                }
+            } else if self.ses.latched.contains(&t.object_id) {
+                None
+            } else {
+                let mut keys: Vec<(i64, bool)> = vec![(t.object_id as i64, false)];
+                keys.extend(self.write_stripes(loc, t, &ch).into_iter().map(|s| (s, true)));
+                Some((self.srv.core.latch_keys(&keys), vec![]))
+            }
+        } else {
+            None
+        };
+        let r = self.apply_changes_latched(loc, t, ch, upd_cols, verb);
+        if let Some((_set, oids)) = latch {
+            self.ses.latched.retain(|o| !oids.contains(o));
+        }
+        r
+    }
+
+    /// The latch stripes a write of `ch` to `t` needs (see `apply_changes`).
+    fn write_stripes(&self, loc: &Loc, t: &Table, ch: &Changes) -> Vec<i64> {
+        use crate::coord::stripe;
+        let oid = t.object_id;
+        let mut out: Vec<i64> = vec![];
+        let images: Vec<&Row> = ch.updates.iter().map(|(_, r)| r).chain(ch.inserts.iter()).collect();
+        for (ix, sp) in t.data.specs.iter().enumerate() {
+            if sp.unique {
+                for im in &images {
+                    let key: Vec<Value> = sp.cols.iter().map(|&c| im[c].clone()).collect();
+                    out.push(stripe(oid, 1 + ix as u32, &key_of(&sp.xform(&key))));
+                }
+            }
+        }
+        for fk in t.fks.iter().filter(|f| f.enabled) {
+            let poid = if fk.ref_key == t.key() && fk.ref_db.eq_ignore_ascii_case(&t.db) {
+                Some(oid)
+            } else {
+                self.table_ref(&Loc::Db(fk.ref_db.clone(), fk.ref_key.clone())).map(|p| p.object_id)
+            };
+            let Some(poid) = poid else { continue };
+            for im in &images {
+                let vals: Vec<Value> = fk.cols.iter().map(|&c| im[c].clone()).collect();
+                if !vals.iter().any(|v| v.is_null()) {
+                    out.push(stripe(poid, 1000, &t.key_string(&fk.cols, &vals)));
+                }
+            }
+        }
+        let view = self.row_view(loc);
+        let olds: Vec<Row> = ch.updates.iter().map(|u| u.0).chain(ch.deletes.iter().copied()).filter_map(|rid| t.data.get(rid, &view)).collect();
+        if !olds.is_empty() {
+            for (_, _, fk) in self.referencing_fks(t) {
+                let idx: Vec<usize> = fk.ref_cols.iter().filter_map(|c| t.col_index(c)).collect();
+                if idx.len() != fk.ref_cols.len() {
+                    continue;
+                }
+                for o in &olds {
+                    let vals: Vec<Value> = idx.iter().map(|&c| o[c].clone()).collect();
+                    if !vals.iter().any(|v| v.is_null()) {
+                        out.push(stripe(oid, 1000, &t.key_string(&idx, &vals)));
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Ids of the tables connected to `t` by foreign keys, in either direction, transitively (including `t`), and
+    /// whether any foreign key among them has a cascading action (`ON DELETE/UPDATE CASCADE | SET NULL | SET DEFAULT`).
+    fn fk_component(&self, t: &Table) -> (Vec<i32>, bool) {
+        use std::collections::{HashMap, VecDeque};
+        type K = (String, String);
+        let mut adj: HashMap<K, Vec<K>> = HashMap::new();
+        let mut ids: HashMap<K, i32> = HashMap::new();
+        let mut cascading: HashSet<K> = HashSet::new();
+        for (dn, db) in &self.srv.databases {
+            for (k, o) in &db.objects {
+                if let Object::Table(c) = o {
+                    let me: K = (dn.to_lowercase(), k.clone());
+                    ids.insert(me.clone(), c.object_id);
+                    for fk in &c.fks {
+                        if fk.on_delete != "NO ACTION" || fk.on_update != "NO ACTION" {
+                            cascading.insert(me.clone());
+                        }
+                        let parent: K = (fk.ref_db.to_lowercase(), fk.ref_key.clone());
+                        adj.entry(me.clone()).or_default().push(parent.clone());
+                        adj.entry(parent).or_default().push(me.clone());
+                    }
+                }
+            }
+        }
+        let start: K = (t.db.to_lowercase(), t.key());
+        let mut seen: HashSet<K> = HashSet::new();
+        let mut q = VecDeque::new();
+        seen.insert(start.clone());
+        q.push_back(start);
+        while let Some(k) = q.pop_front() {
+            for n in adj.get(&k).into_iter().flatten() {
+                if seen.insert(n.clone()) {
+                    q.push_back(n.clone());
+                }
+            }
+        }
+        let cascade = seen.iter().any(|k| cascading.contains(k)) || t.fks.iter().any(|f| f.on_delete != "NO ACTION" || f.on_update != "NO ACTION");
+        let mut out: Vec<i32> = seen.iter().filter_map(|k| ids.get(k).copied()).collect();
+        if !out.contains(&t.object_id) {
+            out.push(t.object_id);
+        }
+        out.sort_unstable();
+        out.dedup();
+        (out, cascade)
+    }
+
+    fn apply_changes_latched(&mut self, loc: &Loc, t: &mut Table, mut ch: Changes, upd_cols: &[bool], verb: &str) -> Result<Applied> {
+        let persistent = matches!(loc, Loc::Db(..) | Loc::GTemp(_));
         let is_var = matches!(loc, Loc::Var(_));
         let mut applied = Applied { old_updated: vec![], new_updated: vec![], deleted: vec![], inserted: vec![] };
         if ch.is_empty() {
@@ -346,6 +487,11 @@ impl<'a> Engine<'a> {
                     }
                 }
                 self.lock_row(t.object_id, rid, Mode::X)?;
+                // The row was read before it was locked: if another transaction committed a change to it since this
+                // statement began, the new row image was computed from stale data. Run the statement again.
+                if t.data.latest_committed_ts(rid) > self.ses.stmt_ts {
+                    return Err(self.blocked(vec![]));
+                }
             }
         }
         // parent-side foreign keys (may add cascaded changes to this table)
@@ -367,9 +513,25 @@ impl<'a> Engine<'a> {
                 return Err(SqlError::new(1946, format!("Operation failed. The index entry of length {} bytes for the index '{}' exceeds the maximum length of {} bytes for nonclustered indexes.", n, name, crate::storage::MAX_KEY_BYTES)));
             }
         }
-        let keys_touched = !ch.inserts.is_empty() || t.all_keys().iter().any(|k| k.cols.iter().any(|&c| upd_cols.get(c).copied().unwrap_or(true)));
+        let keys_touched = !ch.inserts.is_empty() || t.all_keys().iter().any(|k| k.cols.iter().any(|&c| upd_cols.get(c).copied().unwrap_or(true)))
+            // a row can also enter a filtered unique index by changing a column of its filter
+            || t.data.specs.iter().any(|sp| sp.unique && sp.filter.as_ref().is_some_and(|f| f.conds.iter().any(|c| upd_cols.get(c.col).copied().unwrap_or(true))));
         if keys_touched {
             self.check_unique(t, &ch, tx)?;
+        }
+        // row-level security: block predicates on the rows about to be written (new images) or changed (old images)
+        // (only for tables that have a block predicate: reading every old row back would cost a lookup per row)
+        if persistent && self.has_block_policy(loc) {
+            use crate::catalog::PredKind;
+            let olds_upd: Vec<Row> = ch.updates.iter().filter_map(|u| t.data.get(u.0, &view)).collect();
+            let olds_del: Vec<Row> = ch.deletes.iter().filter_map(|rid| t.data.get(*rid, &view)).collect();
+            let (old_upd, old_del): (Vec<&Row>, Vec<&Row>) = (olds_upd.iter().collect(), olds_del.iter().collect());
+            let new_upd: Vec<&Row> = ch.updates.iter().map(|(_, r)| r).collect();
+            let new_ins: Vec<&Row> = ch.inserts.iter().collect();
+            self.rls_check(loc, t, PredKind::BlockBeforeUpdate, &old_upd)?;
+            self.rls_check(loc, t, PredKind::BlockBeforeDelete, &old_del)?;
+            self.rls_check(loc, t, PredKind::BlockAfterUpdate, &new_upd)?;
+            self.rls_check(loc, t, PredKind::BlockAfterInsert, &new_ins)?;
         }
         // ---- writes
         let stamp = if is_var { Stamp::Ts(0) } else { Stamp::Tx(tx) };
@@ -377,7 +539,7 @@ impl<'a> Engine<'a> {
         let oid = t.object_id;
         let mut touched: Vec<RowId> = vec![];
         {
-            let d = t.data_mut();
+            let d = &*t.data;
             for (rid, row) in &ch.updates {
                 if let Some(old) = d.get(*rid, &view) {
                     applied.old_updated.push(old);
@@ -404,7 +566,7 @@ impl<'a> Engine<'a> {
             }
         }
         if is_var {
-            let d = t.data_mut();
+            let d = &*t.data;
             for rid in touched {
                 d.gc_slot(rid, u64::MAX);
             }
@@ -414,11 +576,20 @@ impl<'a> Engine<'a> {
             for (i, rid) in touched.iter().enumerate() {
                 if persistent && i >= first_new {
                     // fresh rows are exclusively ours
-                    let _ = self.srv.locks.acquire(tx, &crate::storage::lock::Res::Row(oid, *rid), Mode::X);
+                    let _ = self.srv.core.locks.acquire(tx, &crate::storage::lock::Res::Row(oid, *rid), Mode::X);
                 }
                 if let Some(tab) = &tab {
                     self.push_undo(Undo::Row { tab: tab.clone(), rowid: *rid });
                 }
+            }
+            // A SERIALIZABLE reader's key range must not gain a row (a phantom). This is checked after the new
+            // versions are in place: a reader registers its range before it reads, so either it sees these
+            // (uncommitted) versions and waits for us, or we see its range here and wait for it. A wait unwinds
+            // the statement, which removes the versions again.
+            if persistent {
+                let mut images: Vec<&Row> = ch.updates.iter().map(|(_, r)| r).collect();
+                images.extend(ch.inserts.iter());
+                self.check_key_ranges(t, &images)?;
             }
         }
         Ok(applied)
@@ -443,8 +614,11 @@ impl<'a> Engine<'a> {
             let mut batch: HashSet<String> = HashSet::new();
             let updated_images = ch.updates.iter().map(|(_, r)| r);
             for image in updated_images.chain(ch.inserts.iter()) {
+                if !sp.admits(image) {
+                    continue; // a filtered unique index only constrains the rows it contains
+                }
                 let key: Vec<Value> = sp.cols.iter().map(|&c| image[c].clone()).collect();
-                let kk = key_of(&key);
+                let kk = key_of(&sp.xform(&key));
                 if !batch.insert(kk.clone()) {
                     let refs: Vec<&Value> = key.iter().collect();
                     return Err(Self::key_error(t, &sp.name, is_index, &refs));
@@ -461,7 +635,7 @@ impl<'a> Engine<'a> {
                         }
                         if let Some(r) = &v.row {
                             let existing: Vec<Value> = sp.cols.iter().map(|&c| r[c].clone()).collect();
-                            if key_of(&existing) == kk {
+                            if key_of(&sp.xform(&existing)) == kk {
                                 let refs: Vec<&Value> = key.iter().collect();
                                 return Err(Self::key_error(t, &sp.name, is_index, &refs));
                             }
@@ -509,6 +683,10 @@ impl<'a> Engine<'a> {
             }
             let self_ref = fk.ref_key == t.key() && fk.ref_db.eq_ignore_ascii_case(&t.db);
             let ploc = Loc::Db(fk.ref_db.clone(), fk.ref_key.clone());
+            // a parent that is itself being changed up the stack (a cascade) is checked by that statement
+            if !self_ref && self.ses.checked_out.contains(&format!("{:?}", ploc)) {
+                continue;
+            }
             let ptab: Table = if self_ref {
                 t.clone()
             } else {
@@ -519,13 +697,13 @@ impl<'a> Engine<'a> {
             };
             let pview = if self_ref { ReadView::committed(tx) } else { self.row_view(&ploc) };
             let ref_idx: Vec<usize> = fk.ref_cols.iter().filter_map(|c| ptab.col_index(c)).collect();
-            let spec_pos = ptab.data.specs.iter().position(|sp| sp.unique && sp.cols.len() == ref_idx.len() && sp.cols.iter().all(|c| ref_idx.contains(c)));
+            let spec_pos = ptab.data.specs.iter().position(|sp| sp.unique && sp.filter.is_none() && sp.cols.len() == ref_idx.len() && sp.cols.iter().all(|c| ref_idx.contains(c)));
             // keys from this batch (self references may point at rows inserted together)
             let mut batch: HashSet<String> = HashSet::new();
             if self_ref {
                 for r in ch.updates.iter().map(|(_, r)| r).chain(ch.inserts.iter()) {
                     let vals: Vec<Value> = ref_idx.iter().map(|&c| r[c].clone()).collect();
-                    batch.insert(key_of(&vals));
+                    batch.insert(ptab.key_string(&ref_idx, &vals));
                 }
             }
             for r in relevant {
@@ -533,7 +711,7 @@ impl<'a> Engine<'a> {
                 if vals.iter().any(|v| v.is_null()) {
                     continue;
                 }
-                let mut found = batch.contains(&key_of(&vals));
+                let mut found = batch.contains(&ptab.key_string(&ref_idx, &vals));
                 if !found {
                     match spec_pos {
                         Some(sp) => {
@@ -552,10 +730,10 @@ impl<'a> Engine<'a> {
                             }
                         }
                         None => {
-                            let want = key_of(&vals);
+                            let want = ptab.key_string(&ref_idx, &vals);
                             for (_, pr) in ptab.data.iter(pview).into_iter() {
                                 let pv: Vec<Value> = ref_idx.iter().map(|&c| pr[c].clone()).collect();
-                                if key_of(&pv) == want {
+                                if ptab.key_string(&ref_idx, &pv) == want {
                                     found = true;
                                     break;
                                 }
@@ -586,8 +764,8 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        // self references live in the taken table, which is absent from the catalog
-        for fk in &t.fks {
+        // a temporary table is not in the catalog
+        for fk in t.fks.iter().filter(|_| t.is_temp) {
             if fk.ref_key == tk && fk.ref_db.eq_ignore_ascii_case(&t.db) {
                 out.push((t.db.to_lowercase(), tk.clone(), fk.clone()));
             }
@@ -600,7 +778,7 @@ impl<'a> Engine<'a> {
         let tx = self.cur_tx();
         let view = self.row_view(cloc);
         let mut out = vec![];
-        if let Some(ix) = ctab.data.specs.iter().position(|s| s.cols == fk.cols) {
+        if let Some(ix) = ctab.data.specs.iter().position(|s| s.cols == fk.cols && s.filter.is_none()) {
             let mut seen = HashSet::new();
             for k in keys {
                 for rid in ctab.data.seek_eq(ix, k) {
@@ -616,13 +794,13 @@ impl<'a> Engine<'a> {
                 }
             }
         } else {
-            let want: HashSet<String> = keys.iter().map(|k| key_of(k)).collect();
+            let want: HashSet<String> = keys.iter().map(|k| ctab.key_string(&fk.cols, k)).collect();
             for (rid, r) in self.scan_rows(cloc, ctab)? {
                 let vals: Vec<Value> = fk.cols.iter().map(|&c| r[c].clone()).collect();
                 if vals.iter().any(|v| v.is_null()) {
                     continue;
                 }
-                if want.contains(&key_of(&vals)) {
+                if want.contains(&ctab.key_string(&fk.cols, &vals)) {
                     out.push((rid, r));
                 }
             }
@@ -631,13 +809,13 @@ impl<'a> Engine<'a> {
     }
 
     fn apply_child(&mut self, cloc: &Loc, ch: Changes, verb: &str) -> Result<()> {
-        let mut c = match self.take_table(cloc) {
+        let mut c = match self.checkout_table(cloc) {
             Some(c) => c,
             None => return Ok(()), // cycle: already being modified further up
         };
         let n = c.columns.len();
         let r = self.apply_changes(cloc, &mut c, ch, &vec![true; n], verb);
-        self.put_table(cloc, c);
+        self.checkin_table(cloc, c);
         r.map(|_| ())
     }
 
@@ -763,7 +941,7 @@ impl<'a> Engine<'a> {
                 if let Some(old) = t.data.get(*i, &view) {
                     let ov: Vec<Value> = ref_idx.iter().map(|&c| old[c].clone()).collect();
                     let nv: Vec<Value> = ref_idx.iter().map(|&c| new[c].clone()).collect();
-                    if key_of(&ov) != key_of(&nv) && !ov.iter().any(|v| v.is_null()) {
+                    if t.key_string(&ref_idx, &ov) != t.key_string(&ref_idx, &nv) && !ov.iter().any(|v| v.is_null()) {
                         old_new.push((ov, nv));
                     }
                 }
@@ -786,11 +964,11 @@ impl<'a> Engine<'a> {
             if hits.is_empty() {
                 continue;
             }
-            let map: HashMap<String, Vec<Value>> = old_new.iter().map(|(o, n)| (key_of(o), n.clone())).collect();
+            let map: HashMap<String, Vec<Value>> = old_new.iter().map(|(o, n)| (ctab.key_string(&fk.cols, o), n.clone())).collect();
             let mut child_updates = vec![];
             for (rid, mut r) in hits {
                 let cur: Vec<Value> = fk.cols.iter().map(|&c| r[c].clone()).collect();
-                let nv = map.get(&key_of(&cur)).cloned().unwrap_or_default();
+                let nv = map.get(&ctab.key_string(&fk.cols, &cur)).cloned().unwrap_or_default();
                 match fk.on_update.as_str() {
                     "CASCADE" | "SET NULL" | "SET DEFAULT" => {
                         for (k, &c) in fk.cols.iter().enumerate() {
@@ -880,17 +1058,17 @@ impl<'a> Engine<'a> {
             }
         }
         if !self.ses.nocount {
-            self.out.push(Event::RowCount(nrows as i64));
+            self.emit(Event::RowCount(nrows as i64));
         }
         Ok(())
     }
 
     fn emit_output(&mut self, o: &Output, t: &Table, ins: &[Row], del: &[Row], action: Option<&[String]>) -> Result<()> {
         let ncols = t.columns.len();
-        let mut cols: Vec<ColMeta> = t.columns.iter().map(|c| ColMeta { qual: Some("inserted".into()), name: c.name.clone(), ty: Some(c.ty.clone()) }).collect();
-        cols.extend(t.columns.iter().map(|c| ColMeta { qual: Some("deleted".into()), name: c.name.clone(), ty: Some(c.ty.clone()) }));
+        let mut cols: Vec<ColMeta> = t.columns.iter().map(|c| ColMeta { qual: Some("inserted".into()), name: c.name.clone(), ty: Some(c.ty.clone()), denied: None, coll: c.collation.as_deref().and_then(crate::collation::get), mask: None }).collect();
+        cols.extend(t.columns.iter().map(|c| ColMeta { qual: Some("deleted".into()), name: c.name.clone(), ty: Some(c.ty.clone()), denied: None, coll: c.collation.as_deref().and_then(crate::collation::get), mask: None }));
         if action.is_some() {
-            cols.push(ColMeta { qual: None, name: "$action".into(), ty: Some(DataType::NVarChar(10)) });
+            cols.push(ColMeta { qual: None, name: "$action".into(), ty: Some(DataType::NVarChar(10)), denied: None, coll: None, mask: None });
         }
         let schema = Schema::new(cols);
         let n = ins.len().max(del.len());
@@ -965,7 +1143,7 @@ impl<'a> Engine<'a> {
             }
             out.push(row);
         }
-        let sch = Schema::new(cols.iter().map(|c| ColMeta { qual: None, name: c.0.clone(), ty: c.3.clone() }).collect());
+        let sch = Schema::new(cols.iter().map(|c| ColMeta { qual: None, name: c.0.clone(), ty: c.3.clone(), denied: None, coll: None, mask: None }).collect());
         Ok(Rowset::new(sch, out))
     }
 
@@ -1080,9 +1258,106 @@ impl<'a> Engine<'a> {
         Ok(out)
     }
 
+    /// UPDATE permission: table-wide, or on every column the statement assigns; in the column-level case the
+    /// columns read by `WHERE` and by the assigned expressions need SELECT permission too.
+    /// INSERT needs the INSERT permission on the table, or INSERT granted on every column the statement names.
+    fn check_insert_permission(&mut self, loc: &Loc, name: &[String], ins: &Insert) -> Result<()> {
+        let shown = name.last().map(|s| s.as_str()).unwrap_or("");
+        let first = match self.check_object_perm(loc, "INSERT", shown) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        let (Loc::Db(dbk, key), Some(cols)) = (loc, &ins.cols) else { return Err(first) };
+        let Some(t) = self.table_ref(loc) else { return Err(first) };
+        let (Some(user), Some(db)) = (self.db_user(dbk), self.srv.databases.get(dbk)) else { return Err(first) };
+        if cols.is_empty() || !db.security.has_column_entries(&user, key) {
+            return Err(first);
+        }
+        let schema = key.split('.').next().unwrap_or("dbo").to_string();
+        for c in cols {
+            let Some(i) = t.col_index(c) else { continue };
+            let col = &t.columns[i].name;
+            if !db.security.allowed_column(&user, "INSERT", &schema, key, col) {
+                return Err(SqlError::with(230, 14, 1, format!("The INSERT permission was denied on the column '{}' of the object '{}', database '{}', schema '{}'.", col, t.name, db.name, schema)));
+            }
+        }
+        Ok(())
+    }
+
+    /// DELETE needs SELECT on every column its WHERE clause reads (table-wide SELECT, or column grants).
+    fn check_delete_reads(&mut self, loc: &Loc, t: &Table, d: &Delete) -> Result<()> {
+        let Some(w) = &d.where_ else { return Ok(()) };
+        let Loc::Db(dbk, key) = loc else { return Ok(()) };
+        if self.check_object_perm(loc, "SELECT", &t.name).is_ok() {
+            return Ok(());
+        }
+        let mut stack: Vec<&Expr> = vec![w];
+        let mut read: Vec<String> = vec![];
+        while let Some(e) = stack.pop() {
+            if let Expr::Col(p) = e {
+                read.push(p[p.len() - 1].clone());
+            }
+            super::query::children(e, &mut stack);
+        }
+        let schema = key.split('.').next().unwrap_or("dbo").to_string();
+        if let (Some(user), Some(db)) = (self.db_user(dbk), self.srv.databases.get(dbk)) {
+            for c in read {
+                if let Some(i) = t.col_index(&c) {
+                    let col = &t.columns[i].name;
+                    if !db.security.allowed_column(&user, "SELECT", &schema, key, col) {
+                        return Err(SqlError::with(230, 14, 1, format!("The SELECT permission was denied on the column '{}' of the object '{}', database '{}', schema '{}'.", col, t.name, db.name, schema)));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_update_permission(&mut self, loc: &Loc, name: &[String], t: &Table, u: &Update) -> Result<()> {
+        let shown = name.last().map(|s| s.as_str()).unwrap_or("");
+        if self.check_object_perm(loc, "UPDATE", shown).is_ok() {
+            return Ok(());
+        }
+        let assigned: Vec<usize> = u
+            .sets
+            .iter()
+            .filter_map(|s| if let SetItem::Col { parts, .. } = s { parts.last().and_then(|c| t.col_index(c)) } else { None })
+            .collect();
+        self.check_update_columns(loc, name, t, &assigned)?;
+        // columns read by the statement
+        let mut exprs: Vec<&Expr> = u.where_.iter().collect();
+        for s in &u.sets {
+            let (SetItem::Col { e, .. } | SetItem::Var { e, .. }) = s;
+            exprs.push(e);
+        }
+        let mut stack = exprs;
+        let mut read: Vec<String> = vec![];
+        while let Some(e) = stack.pop() {
+            if let Expr::Col(p) = e {
+                read.push(p[p.len() - 1].clone());
+            }
+            super::query::children(e, &mut stack);
+        }
+        if let Loc::Db(dbk, key) = loc {
+            let schema = key.split('.').next().unwrap_or("dbo").to_string();
+            if let (Some(user), Some(db)) = (self.db_user(dbk), self.srv.databases.get(dbk)) {
+                for c in read {
+                    if let Some(i) = t.col_index(&c) {
+                        let col = &t.columns[i].name;
+                        if !db.security.allowed_column(&user, "SELECT", &schema, key, col) {
+                            return Err(SqlError::with(230, 14, 1, format!("The SELECT permission was denied on the column '{}' of the object '{}', database '{}', schema '{}'.", col, t.name, db.name, schema)));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn exec_update_inner(&mut self, u: &Update) -> Result<()> {
-        let (loc, name) = self.dml_target(&u.target, &u.from, "UPDATE")?;
+        let (loc, name) = self.dml_target(&u.target, &u.from, "")?;
         let mut t = self.table_ref(&loc).cloned().ok_or_else(|| self.invalid_object(&name))?;
+        self.check_update_permission(&loc, &name, &t, u)?;
         let plan = self.update_core(&loc, &mut t, u, &name)?;
         match plan {
             UpdPlan::Instead { trg, ins, del, upd_cols } => {
@@ -1093,10 +1368,10 @@ impl<'a> Engine<'a> {
             UpdPlan::Apply { updates, upd_cols } => {
                 drop(t);
                 let n = updates.len();
-                let mut real = self.take_table(&loc).ok_or_else(|| self.invalid_object(&name))?;
+                let mut real = self.checkout_table(&loc).ok_or_else(|| self.invalid_object(&name))?;
                 let r = self.apply_changes(&loc, &mut real, Changes { updates, deletes: vec![], inserts: vec![] }, &upd_cols, "UPDATE");
                 let tc = real.clone();
-                self.put_table(&loc, real);
+                self.checkin_table(&loc, real);
                 let ap = r?;
                 self.ses.rowcount = n as i64;
                 self.after_dml(&loc, &tc, "UPDATE", &ap, &upd_cols, u.output.as_ref(), n)
@@ -1217,6 +1492,7 @@ impl<'a> Engine<'a> {
     fn exec_delete_inner(&mut self, d: &Delete) -> Result<()> {
         let (loc, name) = self.dml_target(&d.target, &d.from, "DELETE")?;
         let t = self.table_ref(&loc).cloned().ok_or_else(|| self.invalid_object(&name))?;
+        self.check_delete_reads(&loc, &t, d)?;
         let mut aliases = vec![t.name.clone(), name.last().unwrap().clone()];
         if let Target::Table(orig) = &d.target {
             aliases.push(orig.last().unwrap().clone());
@@ -1238,10 +1514,10 @@ impl<'a> Engine<'a> {
         }
         let ncols = t.columns.len();
         drop(t); // release the snapshot's hold on the data
-        let mut real = self.take_table(&loc).ok_or_else(|| self.invalid_object(&name))?;
+        let mut real = self.checkout_table(&loc).ok_or_else(|| self.invalid_object(&name))?;
         let r = self.apply_changes(&loc, &mut real, Changes { updates: vec![], deletes: idxs, inserts: vec![] }, &vec![true; ncols], "DELETE");
         let tc = real.clone();
-        self.put_table(&loc, real);
+        self.checkin_table(&loc, real);
         let ap = r?;
         let n = ap.deleted.len();
         self.ses.rowcount = n as i64;
@@ -1261,9 +1537,9 @@ impl<'a> Engine<'a> {
         }
         let rows = self.scan_rows(&loc, &t)?;
         drop(t);
-        let mut real = self.take_table(&loc).ok_or_else(|| self.invalid_object(&name))?;
+        let mut real = self.checkout_table(&loc).ok_or_else(|| self.invalid_object(&name))?;
         if let Some(c) = real.identity_col() {
-            real.identity_next = real.columns[c].identity.map(|(s, _)| s);
+            real.identity_next.set(real.columns[c].identity.map(|(s, _)| s));
         }
         let ncols = real.columns.len();
         let ids: Vec<RowId> = rows.iter().map(|r| r.0).collect();
@@ -1271,7 +1547,7 @@ impl<'a> Engine<'a> {
         let saved_fks = std::mem::take(&mut real.fks);
         let r = self.apply_changes(&loc, &mut real, Changes { updates: vec![], deletes: ids, inserts: vec![] }, &vec![true; ncols], "DELETE");
         real.fks = saved_fks;
-        self.put_table(&loc, real);
+        self.checkin_table(&loc, real);
         r.map(|_| ())
     }
 
@@ -1293,14 +1569,12 @@ impl<'a> Engine<'a> {
         }
         let src = self.eval_table_ref(&m.source, None)?;
         let (ch, upd_cols, actions) = self.merge_core(&loc, &mut t, m, src)?;
-        let ident_next = t.identity_next;
         drop(t);
         let n = actions.len();
-        let mut real = self.take_table(&loc).ok_or_else(|| self.invalid_object(&m.target))?;
-        real.identity_next = ident_next;
+        let mut real = self.checkout_table(&loc).ok_or_else(|| self.invalid_object(&m.target))?;
         let r = self.apply_changes(&loc, &mut real, ch, &upd_cols, "MERGE");
         let tc = real.clone();
-        self.put_table(&loc, real);
+        self.checkin_table(&loc, real);
         let ap = r?;
         self.ses.rowcount = n as i64;
         if let Some(o) = &m.output {
@@ -1320,7 +1594,7 @@ impl<'a> Engine<'a> {
             }
         }
         if !self.ses.nocount {
-            self.out.push(Event::RowCount(n as i64));
+            self.emit(Event::RowCount(n as i64));
         }
         Ok(())
     }
@@ -1558,7 +1832,7 @@ fn and_filter(w: &Option<Expr>, f: Option<Expr>) -> Option<Expr> {
 fn find_alias(from: &[TableRef], alias: &str) -> Option<Vec<String>> {
     fn walk(t: &TableRef, alias: &str) -> Option<Vec<String>> {
         match t {
-            TableRef::Table { name, alias: a } => {
+            TableRef::Table { name, alias: a, .. } => {
                 if a.as_deref().map(|x| x.eq_ignore_ascii_case(alias)).unwrap_or(false) {
                     Some(name.clone())
                 } else {

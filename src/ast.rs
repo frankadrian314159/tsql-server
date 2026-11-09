@@ -144,6 +144,8 @@ pub struct Query {
     pub fetch: Option<Expr>,
     pub for_clause: Option<ForClause>,
     pub maxrecursion: Option<i32>,
+    /// `OPTION (...)` query hints other than MAXRECURSION, upper-case (`HASH JOIN`, `FORCE ORDER`, `MAXDOP 4`, ...).
+    pub options: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -193,7 +195,7 @@ pub enum JoinKind {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum TableRef {
-    Table { name: Name, alias: Option<String> },
+    Table { name: Name, alias: Option<String>, hints: Vec<String> },
     TableVar { name: String, alias: Option<String> },
     Derived { query: Box<Query>, alias: Option<String>, cols: Option<Vec<String>> },
     Values { rows: Vec<Vec<Expr>>, alias: Option<String>, cols: Option<Vec<String>> },
@@ -302,12 +304,16 @@ pub struct ColumnDef {
     pub nullable: Option<bool>,
     pub identity: Option<(Expr, Expr)>,
     pub default: Option<Expr>,
+    pub default_text: Option<String>,
     pub default_name: Option<String>,
     pub computed: Option<Expr>,
+    pub computed_text: Option<String>,
     pub pk: Option<Option<String>>,
     pub unique: Option<Option<String>>,
-    pub checks: Vec<(Option<String>, Expr)>,
+    pub checks: Vec<(Option<String>, Expr, String)>,
     pub fk: Option<ForeignKeyDef>,
+    pub collation: Option<String>,
+    pub mask: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -325,9 +331,9 @@ pub enum TableDef {
     Column(ColumnDef),
     PrimaryKey { name: Option<String>, cols: Vec<(String, bool)> },
     Unique { name: Option<String>, cols: Vec<(String, bool)> },
-    Check { name: Option<String>, e: Expr },
+    Check { name: Option<String>, e: Expr, text: String },
     ForeignKey(ForeignKeyDef),
-    DefaultFor { name: String, e: Expr, col: String },
+    DefaultFor { name: String, e: Expr, col: String, text: String },
     Index { name: String, cols: Vec<(String, bool)>, unique: bool },
 }
 
@@ -386,7 +392,9 @@ pub enum AlterAction {
     AddDefs(Vec<TableDef>),
     DropConstraint(Vec<String>, bool),
     DropColumn(Vec<String>, bool),
-    AlterColumn { col: String, ty: TypeRef, nullable: Option<bool> },
+    AlterColumn { col: String, ty: TypeRef, nullable: Option<bool>, collation: Option<String> },
+    /// `ALTER COLUMN c ADD MASKED WITH (FUNCTION = '...')` / `DROP MASKED`
+    AlterMask { col: String, mask: Option<String> },
     CheckConstraint { name: Option<String>, enable: bool },
 }
 
@@ -421,21 +429,29 @@ pub enum Stmt {
     Use(String),
     Exec(Box<ExecStmt>),
     ExecStr(Vec<Expr>),
-    WaitFor,
+    /// `WAITFOR DELAY e` (time = false) or `WAITFOR TIME e` (time = true)
+    WaitFor { time: bool, e: Expr },
+    Kill(Expr),
+    Reconfigure,
     CreateTable { name: Name, defs: Vec<TableDef> },
-    CreateIndex { name: String, table: Name, cols: Vec<(String, bool)>, unique: bool },
+    CreateIndex { name: String, table: Name, cols: Vec<(String, bool)>, unique: bool, include: Vec<String>, filter: Option<(Expr, String)> },
     CreateView { name: Name, cols: Option<Vec<String>>, query: Rc<Query>, text: String, or_alter: bool, alter: bool },
     CreateProc { name: Name, params: Vec<Param>, body: Rc<Vec<Stmt>>, text: String, or_alter: bool, alter: bool },
     CreateFunction(Box<CreateFunction>),
     CreateTrigger { name: Name, table: Name, events: Vec<String>, instead: bool, body: Rc<Vec<Stmt>>, or_alter: bool, text: String },
     CreateSchema(String, Option<String>),
-    CreateDatabase(String),
+    CreateDatabase(String, Option<String>),
     CreateType { name: Name, base: Option<TypeRef>, nullable: Option<bool>, table: Option<Vec<TableDef>> },
     CreateSequence { name: Name, opts: SequenceOpts },
     AlterSequence { name: Name, opts: SequenceOpts },
     AlterDatabase { db: String, options: Vec<(String, String)> },
     Security(Box<SecStmt>),
     Checkpoint,
+    Backup(Box<BackupStmt>),
+    CreateSecurityPolicy(Box<PolicyStmt>),
+    AlterSecurityPolicy(Box<PolicyStmt>),
+    DropSecurityPolicy { name: Name, if_exists: bool },
+    Restore(Box<RestoreStmt>),
     AlterTable { name: Name, action: AlterAction },
     Drop { what: String, names: Vec<Name>, if_exists: bool },
     DropIndex { names: Vec<(Name, Option<Name>)>, if_exists: bool },
@@ -469,7 +485,7 @@ pub enum SecStmt {
     CreateRole { name: String },
     AlterRole { role: String, add: bool, member: String },
     AlterServerRole { role: String, add: bool, member: String },
-    Perm { kind: PermKind, perms: Vec<String>, target: PermTargetAst, principals: Vec<String>, with_grant: bool, columns: bool },
+    Perm { kind: PermKind, perms: Vec<String>, target: PermTargetAst, principals: Vec<String>, with_grant: bool, cols: Vec<Vec<String>> },
     ExecuteAs { login: bool, name: String },
     Revert,
 }
@@ -485,4 +501,40 @@ pub struct CreateFunction {
     pub body: Rc<Vec<Stmt>>,
     pub or_alter: bool,
     pub text: String,
+}
+
+/// `BACKUP DATABASE db TO DISK = 'file' [WITH ...]` or `BACKUP LOG db TO DISK = 'file' [WITH ...]`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BackupStmt {
+    pub log: bool,
+    pub db: String,
+    pub path: Expr,
+    /// `WITH` options: upper-case name and optional value.
+    pub opts: Vec<(String, Option<Expr>)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RestoreKind {
+    Database,
+    Log,
+    VerifyOnly,
+    HeaderOnly,
+}
+
+/// `RESTORE DATABASE|LOG db FROM DISK = 'file' [WITH ...]`, `RESTORE VERIFYONLY|HEADERONLY FROM DISK = 'file'`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RestoreStmt {
+    pub kind: RestoreKind,
+    pub db: Option<String>,
+    pub path: Expr,
+    pub opts: Vec<(String, Option<Expr>)>,
+}
+
+/// `CREATE | ALTER SECURITY POLICY name [ADD ...] [DROP ...] [WITH (STATE = ON|OFF)]`
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PolicyStmt {
+    pub name: Name,
+    pub add: Vec<crate::catalog::Predicate>,
+    pub drop: Vec<crate::catalog::Predicate>,
+    pub state: Option<bool>,
 }

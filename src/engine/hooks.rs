@@ -9,8 +9,8 @@ impl<'a> Engine<'a> {
     /// Append operations to the log without waiting for them to reach the disk
     /// (non-transactional changes such as sequence values and security settings).
     pub fn log_nowait(&mut self, ops: Vec<LogOp>) {
-        let (clock, oid, rv) = (self.srv.clock, self.srv.next_object_id, self.srv.next_rowversion);
-        if let Some(p) = self.srv.persist.as_mut() {
+        let (clock, oid, rv) = (self.srv.core.clock(), self.srv.core.object_id(), self.srv.core.rowversion());
+        if let Some(p) = self.srv.persist().as_mut() {
             let _ = p.append(clock, oid, rv, ops, false);
         }
     }
@@ -30,14 +30,15 @@ impl<'a> Engine<'a> {
             ops.push(LogOp::Put { db: db.to_string(), key: key.to_string(), rowid, row: Some(row) });
         }
         if t.identity_col().is_some() {
-            ops.push(LogOp::SetIdentity { db: db.to_string(), key: key.to_string(), next: t.identity_next });
+            ops.push(LogOp::SetIdentity { db: db.to_string(), key: key.to_string(), next: t.identity_next.get() });
         }
     }
 
-    /// Make a committing transaction durable: write its redo records and force them to disk.
-    pub fn write_redo(&mut self, tx: TxId, undo: &[Undo], ts: u64) -> Result<()> {
-        if self.srv.persist.is_none() {
-            return Ok(());
+    /// Write a committing transaction's redo records to the log (without forcing them to disk). Returns the log
+    /// sequence number to wait for with [`Engine::sync_log`], or `None` when there is nothing to make durable.
+    pub fn write_redo(&mut self, tx: TxId, undo: &[Undo], ts: u64) -> Result<Option<u64>> {
+        if self.srv.persist().is_none() {
+            return Ok(None);
         }
         if let Some(e) = self.srv.store.failed() {
             return Err(SqlError::with(823, 24, 2, format!("The transaction cannot be committed because the storage engine has failed: {}", e)));
@@ -143,35 +144,53 @@ impl<'a> Engine<'a> {
                     };
                     ops.push(LogOp::Put { db: db.clone(), key: key.clone(), rowid: *rowid, row });
                     if idents_seen.insert((db.clone(), key.clone())) && t.identity_col().is_some() {
-                        ops.push(LogOp::SetIdentity { db: db.clone(), key: key.clone(), next: t.identity_next });
+                        ops.push(LogOp::SetIdentity { db: db.clone(), key: key.clone(), next: t.identity_next.get() });
                     }
                 }
             }
         }
         if ops.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
-        let (oid, rv) = (self.srv.next_object_id, self.srv.next_rowversion);
-        let p = self.srv.persist.as_mut().unwrap();
-        p.append(ts, oid, rv, ops, true)?;
-        Ok(())
+        let (oid, rv) = (self.srv.core.object_id(), self.srv.core.rowversion());
+        let mut g = self.srv.persist();
+        let lsn = g.as_mut().unwrap().append(ts, oid, rv, ops, false)?;
+        Ok(Some(lsn))
+    }
+
+    /// Wait until the log is on disk up to `lsn` (group commit: one session forces the log for all that wait).
+    pub fn sync_log(&mut self, lsn: u64) -> Result<()> {
+        let srv: &ServerState = &self.srv;
+        srv.core.sync_log(lsn, || {
+            // the force happens outside the persist latch, so other sessions can keep appending during it
+            let (upto, file) = match srv.persist().as_ref() {
+                Some(p) => p.sync_handle().map_err(|e| e.message.clone())?,
+                None => return Err("no log".to_string()),
+            };
+            file.sync_data().map(|_| upto).map_err(|e| format!("I/O error: {}", e))
+        })
+        .map_err(|e| SqlError::with(3314, 21, 1, format!("I/O error: {}", e)))
     }
 
     /// Checkpoint the data directory when the log has grown and nothing is in flight.
     pub fn maybe_checkpoint(&mut self) {
-        let due = self.srv.persist.as_ref().map(|p| p.wal_len > p.checkpoint_threshold).unwrap_or(false);
-        if due && self.srv.active.is_empty() {
+        let due = self.srv.persist().as_ref().map(|p| p.wal_len > p.checkpoint_threshold).unwrap_or(false);
+        if due && self.srv.core.no_active() {
             self.do_checkpoint();
         }
     }
 
     pub fn do_checkpoint(&mut self) {
-        if !self.srv.active.is_empty() {
+        if !self.srv.core.no_active() {
             return;
         }
-        if let Some(mut p) = self.srv.persist.take() {
-            let _ = p.checkpoint(&self.srv);
-            self.srv.persist = Some(p);
+        // a checkpoint needs the catalog to itself: no statement may change a table while it is written
+        let srv: &ServerState = self.srv.cat_mut();
+        if !srv.core.no_active() {
+            return;
+        }
+        if let Some(p) = srv.persist().as_mut() {
+            let _ = p.checkpoint(srv);
         }
     }
 

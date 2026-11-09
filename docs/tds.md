@@ -50,11 +50,32 @@ on its own threads (one per client) and returns a handle with `local_addr()`, `w
 * Packets above the negotiated size are split; a message is limited to 256 MiB; a client that connects and sends
   nothing is dropped after 30 seconds, and an unrecognised packet type closes the connection.
 
+## Encryption (TLS)
+
+`tsql-serve` offers TLS by default, with a self-signed certificate generated at start-up (as SQL Server does when no
+certificate is installed). Clients must then trust the server certificate (`TrustServerCertificate=True`,
+`Encrypt=Optional`, tiberius `trust_cert()`), or you supply a real one:
+
+```text
+tsql-serve data --tls-cert server.pem --tls-key server.key      # PEM certificate chain and private key
+tsql-serve data --force-encryption                             # refuse clients that cannot use TLS
+tsql-serve data --no-tls                                       # do not offer TLS
+```
+
+How the listener answers the client's pre-login `ENCRYPTION` request:
+
+| client asks for | listener (optional) | listener (`--force-encryption`) |
+|---|---|---|
+| off | the login is encrypted, the rest of the session is plain | whole session encrypted |
+| on / required | whole session encrypted | whole session encrypted |
+| not supported | plain session | refused |
+
+TLS 1.2 and 1.3 are supported (rustls). As in TDS, the handshake travels inside pre-login packets and the records
+follow as they are; with "login only" encryption TLS is dropped again after the Login7 message. From Rust:
+`Config::with_tls(TlsConfig::from_pem_files(cert, key)?, Encryption::Required)`.
+
 ## Not supported
 
-* **TLS.** The pre-login answer is "encryption not supported". Clients that require encryption (the default of
-  recent ODBC and Microsoft.Data.SqlClient drivers) must be told `Encrypt=False` or `Optional`. Passwords are only
-  obfuscated, not protected, on the wire, so keep the listener on loopback or a trusted network.
 * Integrated (Windows/Kerberos/NTLM) and Azure AD authentication.
 * Bulk load (`bcp`, `SqlBulkCopy`), server-side cursors (`sp_cursor*`, used by some JDBC settings), MARS,
   query notifications, table-valued parameters, and `sql_variant` and `hierarchyid`/spatial types on the wire.

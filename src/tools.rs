@@ -302,17 +302,26 @@ pub fn quote_name(name: &str) -> String {
     parts.iter().map(|p| bracket(p)).collect::<Vec<_>>().join(".")
 }
 
-/// T-SQL that recreates a table's structure: columns, primary key, other indexes and foreign keys.
-/// Default values, check constraints and computed-column formulas are not kept as text by the engine,
-/// so they are listed in comments instead of being reproduced.
+/// T-SQL that recreates a table's structure: columns with their defaults and computed formulas, keys,
+/// other indexes, check constraints and foreign keys.
 pub fn script_table(t: &TableInfo) -> String {
     let mut lines: Vec<String> = vec![];
     for c in &t.columns {
+        if let (true, Some(f)) = (c.computed, &c.computed_text) {
+            lines.push(format!("    {} AS ({})", bracket(&c.name), f));
+            continue;
+        }
         let mut l = format!("    {} {}", bracket(&c.name), c.ty);
         if let Some((s, i)) = c.identity {
             l.push_str(&format!(" IDENTITY({},{})", s, i));
         }
         l.push_str(if c.nullable { " NULL" } else { " NOT NULL" });
+        if let Some(d) = &c.default_text {
+            if let Some(n) = c.default_name.as_ref().filter(|n| !n.starts_with("DF__")) {
+                l.push_str(&format!(" CONSTRAINT {}", bracket(n)));
+            }
+            l.push_str(&format!(" DEFAULT ({})", d));
+        }
         lines.push(l);
     }
     for ix in t.indexes.iter().filter(|i| i.primary_key || i.unique) {
@@ -322,7 +331,9 @@ pub fn script_table(t: &TableInfo) -> String {
     let mut out = format!("CREATE TABLE {} (\n{}\n);\n", t.quoted(), lines.join(",\n"));
     for ix in t.indexes.iter().filter(|i| !i.primary_key && !i.unique) {
         let cols = ix.columns.iter().map(|(c, d)| format!("{}{}", bracket(c), if *d { " DESC" } else { "" })).collect::<Vec<_>>().join(", ");
-        out.push_str(&format!("CREATE INDEX {} ON {} ({});\n", bracket(&ix.name), t.quoted(), cols));
+        let include = if ix.include.is_empty() { String::new() } else { format!(" INCLUDE ({})", ix.include.iter().map(|c| bracket(c)).collect::<Vec<_>>().join(", ")) };
+        let filter = ix.filter.as_ref().map(|f| format!(" WHERE {}", f)).unwrap_or_default();
+        out.push_str(&format!("CREATE INDEX {} ON {} ({}){}{};\n", bracket(&ix.name), t.quoted(), cols, include, filter));
     }
     for f in &t.foreign_keys {
         let own = f.columns.iter().map(|c| bracket(c)).collect::<Vec<_>>().join(", ");
@@ -338,16 +349,13 @@ pub fn script_table(t: &TableInfo) -> String {
         out.push_str(&s);
         out.push_str(";\n");
     }
-    let defaults: Vec<&str> = t.columns.iter().filter(|c| c.has_default).map(|c| c.name.as_str()).collect();
-    if !defaults.is_empty() {
-        out.push_str(&format!("-- not reproduced: DEFAULT on {}\n", defaults.join(", ")));
-    }
-    if !t.checks.is_empty() {
-        out.push_str(&format!("-- not reproduced: CHECK {}\n", t.checks.join(", ")));
-    }
-    let computed: Vec<&str> = t.columns.iter().filter(|c| c.computed).map(|c| c.name.as_str()).collect();
-    if !computed.is_empty() {
-        out.push_str(&format!("-- not reproduced: computed column formula of {}\n", computed.join(", ")));
+    for ck in &t.check_defs {
+        out.push_str(&format!("ALTER TABLE {} ADD CONSTRAINT {} CHECK ({});
+", t.quoted(), bracket(&ck.name), ck.text));
+        if !ck.enabled {
+            out.push_str(&format!("ALTER TABLE {} NOCHECK CONSTRAINT {};
+", t.quoted(), bracket(&ck.name)));
+        }
     }
     out
 }

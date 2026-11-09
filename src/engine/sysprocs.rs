@@ -110,7 +110,7 @@ impl<'a> Engine<'a> {
                     let loc = self.locate(&parts);
                     match &loc {
                         Loc::Db(d, k) => {
-                            let db = self.srv.databases.get_mut(d).unwrap();
+                            let db = self.srv.cat_mut().databases.get_mut(d).unwrap();
                             let mut o = db.objects.remove(k).ok_or_else(|| SqlError::new(15225, format!("No item by the name of '{}' could be found in the current database '{}', given that @itemtype was input as '{}'.", objname, self.ses.db, objtype)))?;
                             let schema = o.schema().to_string();
                             match &mut o {
@@ -125,7 +125,7 @@ impl<'a> Engine<'a> {
                         _ => {}
                     }
                 }
-                self.out.push(Event::Message("Caution: Changing any part of an object name could break scripts and stored procedures.".into()));
+                self.emit(Event::Message("Caution: Changing any part of an object name could break scripts and stored procedures.".into()));
                 Ok(Some(Value::Int(0)))
             }
             "sp_helptext" => {
@@ -175,8 +175,11 @@ impl<'a> Engine<'a> {
                 Ok(Some(Value::Int(0)))
             }
             "sp_who" | "sp_who2" => {
-                let row = vec![Value::Int(self.ses.spid), Value::Str(self.ses.login.clone()), Value::Str(self.ses.host_name.clone()), Value::Str(self.ses.db.clone()), Value::Str("SELECT".into())];
-                self.emit_rowset(Rowset::from_rows(&["spid".into(), "loginame".into(), "hostname".into(), "dbname".into(), "cmd".into()], vec![row]));
+                self.sp_who(name == "sp_who2");
+                Ok(Some(Value::Int(0)))
+            }
+            "sp_configure" => {
+                self.sp_configure(args)?;
                 Ok(Some(Value::Int(0)))
             }
             "sp_help" => {
@@ -210,7 +213,7 @@ impl<'a> Engine<'a> {
                 self.exec_security(&crate::ast::SecStmt::CreateUser { name: user, login: Some(login), default_schema: None })?;
                 Ok(Some(Value::Int(0)))
             }
-            "sp_configure" | "sp_addextendedproperty" | "sp_updateextendedproperty" | "sp_dropextendedproperty" | "sp_recompile" | "sp_refreshview" | "sp_updatestats" | "sp_autostats" | "sp_setapprole" | "sp_procoption" | "sp_unbindrule" | "sp_bindrule" => Ok(Some(Value::Int(0))),
+            "sp_addextendedproperty" | "sp_updateextendedproperty" | "sp_dropextendedproperty" | "sp_recompile" | "sp_refreshview" | "sp_updatestats" | "sp_autostats" | "sp_setapprole" | "sp_procoption" | "sp_unbindrule" | "sp_bindrule" => Ok(Some(Value::Int(0))),
             "sp_spaceused" => {
                 self.emit_rowset(Rowset::from_rows(&["database_name".into(), "database_size".into()], vec![vec![Value::Str(self.ses.db.clone()), Value::Str("8.00 MB".into())]]));
                 Ok(Some(Value::Int(0)))
