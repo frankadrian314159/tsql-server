@@ -89,6 +89,7 @@ impl<'a> Engine<'a> {
 
     // ------------------------------------------------------------ INSERT
     pub fn exec_insert(&mut self, ins: &Insert) -> Result<()> {
+        crate::span!("exec_insert");
         let mut ins = ins.clone();
         self.rewrite_insert_target(&mut ins);
         let ins = &ins;
@@ -310,6 +311,7 @@ impl<'a> Engine<'a> {
 
     /// Compute computed columns and enforce NOT NULL.
     fn finish_row(&mut self, t: &Table, row: &mut Row, verb: &str) -> Result<()> {
+        crate::span!("finish_row");
         Self::fill_period(t, row);
         if t.columns.iter().any(|c| c.computed.is_some()) {
             let schema = table_schema(t, &t.name);
@@ -334,6 +336,7 @@ impl<'a> Engine<'a> {
     /// Validate and apply a set of row changes to `t` (which must be the table stored at `loc`,
     /// currently taken out of the catalog). Everything is checked before the first write.
     pub fn apply_changes(&mut self, loc: &Loc, t: &mut Table, ch: Changes, upd_cols: &[bool], verb: &str) -> Result<Applied> {
+        crate::span!("apply_changes");
         if ch.is_empty() {
             return Ok(Applied { old_updated: vec![], new_updated: vec![], deleted: vec![], inserted: vec![] });
         }
@@ -483,6 +486,7 @@ impl<'a> Engine<'a> {
     }
 
     fn apply_changes_latched(&mut self, loc: &Loc, t: &mut Table, mut ch: Changes, upd_cols: &[bool], verb: &str) -> Result<Applied> {
+        crate::span!("apply_changes_latched");
         let persistent = matches!(loc, Loc::Db(..) | Loc::GTemp(_));
         let is_var = matches!(loc, Loc::Var(_));
         let mut applied = Applied { old_updated: vec![], new_updated: vec![], deleted: vec![], inserted: vec![] };
@@ -557,6 +561,7 @@ impl<'a> Engine<'a> {
         let oid = t.object_id;
         let mut touched: Vec<RowId> = vec![];
         {
+            crate::span!("write_versions");
             let d = &*t.data;
             for (rid, row) in &ch.updates {
                 if let Some(old) = d.get(*rid, &view) {
@@ -589,6 +594,7 @@ impl<'a> Engine<'a> {
                 d.gc_slot(rid, u64::MAX);
             }
         } else {
+            crate::span!("undo_and_locks");
             let n_new = ch.inserts.len();
             let first_new = touched.len() - n_new;
             for (i, rid) in touched.iter().enumerate() {
@@ -605,6 +611,7 @@ impl<'a> Engine<'a> {
             // (uncommitted) versions and waits for us, or we see its range here and wait for it. A wait unwinds
             // the statement, which removes the versions again.
             if persistent {
+                crate::span!("key_range_check");
                 let mut images: Vec<&Row> = ch.updates.iter().map(|(_, r)| r).collect();
                 images.extend(ch.inserts.iter());
                 self.check_key_ranges(t, &images)?;
@@ -623,6 +630,7 @@ impl<'a> Engine<'a> {
     }
 
     fn check_unique(&mut self, t: &Table, ch: &Changes, tx: TxId) -> Result<()> {
+        crate::span!("check_unique");
         let excluded: HashSet<RowId> = ch.updates.iter().map(|u| u.0).chain(ch.deletes.iter().copied()).collect();
         for (ix, sp) in t.data.specs.iter().enumerate() {
             if !sp.unique {
@@ -666,6 +674,7 @@ impl<'a> Engine<'a> {
     }
 
     fn check_constraints(&mut self, t: &Table, rows: &[&Row], verb: &str) -> Result<()> {
+        crate::span!("check_constraints");
         if t.checks.is_empty() {
             return Ok(());
         }
@@ -687,6 +696,7 @@ impl<'a> Engine<'a> {
     }
 
     fn check_fk_child(&mut self, t: &Table, ch: &Changes, upd_cols: &[bool], verb: &str, _view: ReadView, tx: TxId) -> Result<()> {
+        crate::span!("check_fk_child");
         for fk in &t.fks {
             if !fk.enabled {
                 continue;
@@ -1061,6 +1071,7 @@ impl<'a> Engine<'a> {
 
     #[allow(clippy::too_many_arguments)]
     fn after_dml(&mut self, _loc: &Loc, t: &Table, event: &str, ap: &Applied, upd_cols: &[bool], output: Option<&Output>, nrows: usize) -> Result<()> {
+        crate::span!("after_dml");
         if let Some(o) = output {
             let (ins, del): (Vec<Row>, Vec<Row>) = match event {
                 "INSERT" => (ap.inserted.clone(), vec![]),
@@ -1175,6 +1186,7 @@ impl<'a> Engine<'a> {
 
     // ------------------------------------------------------------ UPDATE
     pub fn exec_update(&mut self, u: &Update) -> Result<()> {
+        crate::span!("exec_update");
         let mut u = u.clone();
         if let (Target::Table(name), true) = (&u.target, u.from.is_empty()) {
             if let Some((base, filter, _)) = self.updatable_source(name, &u.ctes) {
@@ -1408,6 +1420,7 @@ impl<'a> Engine<'a> {
     }
 
     fn update_core(&mut self, loc: &Loc, t: &mut Table, u: &Update, name: &[String]) -> Result<UpdPlan> {
+        crate::span!("update_core");
         let mut aliases = vec![t.name.clone()];
         if let Target::Table(orig) = &u.target {
             aliases.push(orig.last().unwrap().clone());
@@ -1506,6 +1519,7 @@ impl<'a> Engine<'a> {
 
     // ------------------------------------------------------------ DELETE
     pub fn exec_delete(&mut self, d: &Delete) -> Result<()> {
+        crate::span!("exec_delete");
         let mut d = d.clone();
         if let (Target::Table(name), true) = (&d.target, d.from.is_empty()) {
             if let Some((base, filter, _)) = self.updatable_source(name, &d.ctes) {

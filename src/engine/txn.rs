@@ -75,6 +75,7 @@ impl<'a> Engine<'a> {
 
     /// Commit the current transaction: write the redo log, stamp versions, release locks.
     pub fn commit_tx(&mut self) -> Result<()> {
+        crate::span!("commit_tx");
         let tx = match self.ses.tx.take() {
             Some(t) => t,
             None => return Ok(()),

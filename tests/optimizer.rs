@@ -259,3 +259,21 @@ fn locking_reads_touch_only_rows_found_by_the_index() {
     assert_eq!(err_no(&mut b, "SELECT COUNT(*) FROM t"), 1222, "a full scan must wait for the locked row");
     exec(&mut a, "ROLLBACK");
 }
+
+/// A comparison between a column of a correlated subquery's table and a column of the outer row is evaluated with
+/// the outer value as a constant (so it can use an index); the answers must be the ones a row-by-row evaluation gives.
+#[test]
+fn correlated_subqueries_use_the_outer_row_as_a_constant() {
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE o (id INT PRIMARY KEY, k INT NULL); CREATE TABLE i (id INT PRIMARY KEY, v INT)");
+    exec(&mut c, "INSERT o VALUES (1, 10), (2, 20), (3, NULL), (4, 99); INSERT i VALUES (10, 1), (20, 2), (30, 3)");
+    let ids = |c: &mut tsql_server::Connection, q: &str| -> Vec<String> { rows(c, q).into_iter().map(|r| r[0].clone()).collect() };
+    assert_eq!(ids(&mut c, "SELECT id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.id = o.k) ORDER BY id"), ["1", "2"]);
+    assert_eq!(ids(&mut c, "SELECT id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE o.k = i.id) ORDER BY id"), ["1", "2"]);
+    assert_eq!(ids(&mut c, "SELECT id FROM o WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.id = o.k) ORDER BY id"), ["3", "4"]);
+    assert_eq!(ids(&mut c, "SELECT id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.id < o.k) ORDER BY id"), ["2", "4"]);
+    assert_eq!(ids(&mut c, "SELECT id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.id >= o.k AND i.v > 1) ORDER BY id"), ["1", "2"]);
+    assert_eq!(rows(&mut c, "SELECT id, (SELECT v FROM i WHERE i.id = o.k) FROM o ORDER BY id").iter().map(|r| r[1].clone()).collect::<Vec<_>>(), ["1", "2", "NULL", "NULL"]);
+    // a column that exists in both the subquery's table and the outer row means the subquery's own
+    assert_eq!(ids(&mut c, "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE id = o.k) ORDER BY o.id"), ["1", "2"]);
+}

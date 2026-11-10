@@ -13,7 +13,7 @@ use crate::storage::lock::{KeyRange, LockManager, Mode, Res};
 use crate::storage::TxId;
 use crate::types::Value;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -254,6 +254,8 @@ pub struct QueryStat {
 }
 
 /// Clock, counters, running transactions and locks.
+const STAT_SHARDS: usize = 16;
+
 pub struct Core {
     clock: AtomicU64,
     next_tx: AtomicU64,
@@ -264,8 +266,11 @@ pub struct Core {
     commit: Mutex<()>,
     sessions: Mutex<BTreeMap<i32, SessionInfo>>,
     killed: Mutex<std::collections::HashSet<i32>>,
+    /// Number of sessions asked to stop (so the common case, none, costs no lock).
+    kill_pending: AtomicUsize,
     config: Mutex<Vec<ConfigOption>>,
-    stats: Mutex<std::collections::HashMap<u64, QueryStat>>,
+    /// Statement statistics, in shards by statement hash so sessions do not queue on one lock.
+    stats: Vec<Mutex<std::collections::HashMap<u64, QueryStat>>>,
     commits: Mutex<Commits>,
     group: Mutex<GroupSync>,
     group_cv: Condvar,
@@ -294,8 +299,9 @@ impl Core {
             commit: Mutex::new(()),
             sessions: Mutex::new(BTreeMap::new()),
             killed: Mutex::new(Default::default()),
+            kill_pending: AtomicUsize::new(0),
             config: Mutex::new(default_config()),
-            stats: Mutex::new(Default::default()),
+            stats: (0..STAT_SHARDS).map(|_| Mutex::new(Default::default())).collect(),
             commits: Mutex::new(Commits::default()),
             group: Mutex::new(GroupSync::default()),
             group_cv: Condvar::new(),
@@ -340,7 +346,7 @@ impl Core {
     }
     pub fn unregister_session(&self, spid: i32) {
         lock(&self.sessions).remove(&spid);
-        lock(&self.killed).remove(&spid);
+        self.unkill(spid);
     }
     pub fn update_session(&self, spid: i32, f: impl FnOnce(&mut SessionInfo)) {
         if let Some(s) = lock(&self.sessions).get_mut(&spid) {
@@ -355,15 +361,24 @@ impl Core {
     }
     /// Ask session `spid` to stop: its current statement ends with an error and its transaction rolls back.
     pub fn kill_session(&self, spid: i32) {
-        lock(&self.killed).insert(spid);
+        {
+            let mut k = lock(&self.killed);
+            k.insert(spid);
+            self.kill_pending.store(k.len(), Ordering::SeqCst);
+        }
         // wake it if it waits for a lock
         self.locks.wake_all();
     }
     pub fn is_killed(&self, spid: i32) -> bool {
-        lock(&self.killed).contains(&spid)
+        self.kill_pending.load(Ordering::SeqCst) != 0 && lock(&self.killed).contains(&spid)
     }
     pub fn clear_kill(&self, spid: i32) {
-        lock(&self.killed).remove(&spid);
+        self.unkill(spid);
+    }
+    fn unkill(&self, spid: i32) {
+        let mut k = lock(&self.killed);
+        k.remove(&spid);
+        self.kill_pending.store(k.len(), Ordering::SeqCst);
     }
 
     // ---- configuration (sp_configure)
@@ -394,8 +409,8 @@ impl Core {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         text.hash(&mut h);
         let now = chrono::Local::now().naive_local();
-        let mut m = lock(&self.stats);
-        if m.len() > 5000 && !m.contains_key(&h.finish()) {
+        let mut m = lock(&self.stats[(h.finish() % STAT_SHARDS as u64) as usize]);
+        if m.len() > 5000 / STAT_SHARDS && !m.contains_key(&h.finish()) {
             return;
         }
         let e = m.entry(h.finish()).or_insert_with(|| QueryStat { text: text.chars().take(4000).collect(), executions: 0, total_us: 0, last_us: 0, max_us: 0, rows: 0, created: now, last: now });
@@ -407,10 +422,12 @@ impl Core {
         e.last = now;
     }
     pub fn stats_list(&self) -> Vec<QueryStat> {
-        lock(&self.stats).values().cloned().collect()
+        self.stats.iter().flat_map(|m| lock(m).values().cloned().collect::<Vec<_>>()).collect()
     }
     pub fn clear_stats(&self) {
-        lock(&self.stats).clear();
+        for m in &self.stats {
+            lock(m).clear();
+        }
     }
 
     // ---- clock

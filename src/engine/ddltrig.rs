@@ -234,7 +234,7 @@ impl<'a> Engine<'a> {
         if !has_db && self.srv.security.server_triggers.is_empty() && !audited {
             return Ok(());
         }
-        let command = if self.ses.batch_text.is_empty() { format!("{:?}", st).chars().take_while(|c| c.is_alphanumeric()).collect() } else { self.ses.batch_text.clone() };
+        let command = if self.ses.batch_text.is_empty() { super::stmt_head(st) } else { self.ses.batch_text.clone() };
         let events = self.ddl_events(st);
         if audited {
             self.audit_ddl(&events);

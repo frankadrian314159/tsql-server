@@ -13,6 +13,14 @@ use super::spill::{Cmp, Entry, RowsWriter, Sorter, WorkMem};
 use super::*;
 use crate::convert::key_of;
 
+/// The identity string an entry is sorted on (its first key); no allocation, unlike `Value::to_string`.
+fn key0(e: &Entry) -> &str {
+    match e.keys.first() {
+        Some(Value::Str(s)) => s.as_str(),
+        _ => "",
+    }
+}
+
 /// Largest `TOP`/`OFFSET + FETCH` for which the best rows are kept in memory instead of sorting everything.
 const TOP_N_IN_MEMORY: usize = 200_000;
 
@@ -47,7 +55,7 @@ impl Sinks {
         let mut k = Sinks { work: work.clone(), order_desc, cap, dedupe: None, sorter: None, best: vec![], plain: vec![], use_top_n: false, has_order, out_colls, direct: None };
         if distinct {
             // sort by the row's identity, then by arrival, so the first arrival of each distinct row survives
-            let cmp: Cmp = Box::new(|a: &Entry, b: &Entry| a.keys[0].to_string().cmp(&b.keys[0].to_string()).then(a.seq.cmp(&b.seq)));
+            let cmp: Cmp = Box::new(|a: &Entry, b: &Entry| key0(a).cmp(key0(b)).then(a.seq.cmp(&b.seq)));
             k.dedupe = Some(Sorter::new(cmp, work));
         } else if has_order {
             if cap.is_some_and(|c| c <= TOP_N_IN_MEMORY) {
@@ -372,15 +380,15 @@ impl<'a> Engine<'a> {
             vec![]
         };
         let mut grouper: Option<Sorter> = if grouped {
-            Some(Sorter::new(Box::new(|a: &Entry, b: &Entry| a.keys[0].to_string().cmp(&b.keys[0].to_string()).then(a.seq.cmp(&b.seq))), self.srv.work.clone()))
+            Some(Sorter::new(Box::new(|a: &Entry, b: &Entry| key0(a).cmp(key0(b)).then(a.seq.cmp(&b.seq))), self.srv.work.clone()))
         } else {
             None
         };
         let mut wsorter: Option<Sorter> = win_over.as_ref().map(|o| {
             let desc: Vec<bool> = o.order.iter().map(|x| x.desc).collect();
             let cmp: Cmp = Box::new(move |a: &Entry, b: &Entry| {
-                let (ka, kb) = (a.keys[0].to_string(), b.keys[0].to_string());
-                ka.cmp(&kb).then_with(|| cmp_keys(&a.keys[1..], &b.keys[1..], &desc)).then(a.seq.cmp(&b.seq))
+                let (ka, kb) = (key0(a), key0(b));
+                ka.cmp(kb).then_with(|| cmp_keys(&a.keys[1..], &b.keys[1..], &desc)).then(a.seq.cmp(&b.seq))
             });
             Sorter::new(cmp, self.srv.work.clone())
         });

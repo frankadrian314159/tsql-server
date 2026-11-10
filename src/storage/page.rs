@@ -69,6 +69,15 @@ fn cmp_tk(k1: &KeyVals, r1: u64, k2: &KeyVals, r2: u64) -> Ordering {
 }
 
 // ------------------------------------------------------------------- nodes
+/// What `bt_modify` did.
+#[derive(Default, Clone, Copy)]
+struct ModOut {
+    found: bool,
+    created: bool,
+    removed: bool,
+    big: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct LeafEntry {
     pub key: KeyVals,
@@ -80,8 +89,8 @@ pub struct LeafEntry {
 
 impl LeafEntry {
     pub fn new(key: KeyVals, rid: u64, slot: Slot) -> LeafEntry {
-        let klen = postcard::to_allocvec(&key).map(|v| v.len()).unwrap_or(0) as u32;
-        let slen = postcard::to_allocvec(&slot).map(|v| v.len()).unwrap_or(0) as u32;
+        let klen = postcard::experimental::serialized_size(&key).unwrap_or(0) as u32;
+        let slen = postcard::experimental::serialized_size(&slot).unwrap_or(0) as u32;
         LeafEntry { key, rid, slot, klen, slen }
     }
     fn est(&self) -> usize {
@@ -135,6 +144,9 @@ struct Frame {
     refbit: bool,
     /// Overflow pages that back this leaf's on-disk image.
     chains: Vec<PageId>,
+    /// A leaf's estimated size, valid while the leaf still has this many entries (inserts and deletes keep it up to
+    /// date, so they need not add up every entry; any other change alters the entry count).
+    est: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Copy)]
@@ -312,7 +324,7 @@ impl Pool {
     fn frame(&mut self, id: PageId) -> R<&mut Frame> {
         if !self.frames.contains_key(&id) {
             let (node, chains) = self.decode(id)?;
-            self.frames.insert(id, Frame { node, dirty: false, refbit: true, chains });
+            self.frames.insert(id, Frame { node, dirty: false, refbit: true, chains, est: None });
             self.touch_new(id);
             self.pinned.push(id);
             if self.frames.len() > self.capacity {
@@ -331,7 +343,7 @@ impl Pool {
 
     fn new_frame(&mut self, node: Node) -> PageId {
         let id = self.alloc_id();
-        self.frames.insert(id, Frame { node, dirty: true, refbit: true, chains: vec![] });
+        self.frames.insert(id, Frame { node, dirty: true, refbit: true, chains: vec![], est: None });
         self.touch_new(id);
         self.pinned.push(id);
         id
@@ -473,32 +485,41 @@ impl Pool {
     }
 
     /// Insert or replace. Returns true when the entry is new.
-    fn bt_put(&mut self, root: PageId, key: KeyVals, rid: u64, slot: Slot) -> R<bool> {
+    fn bt_put(&mut self, root: PageId, key: KeyVals, rid: u64, slot: Slot) -> R<(bool, bool)> {
         let mut path = vec![];
         let leaf = self.find_leaf(root, &|k, r| cmp_tk(k, r, &key, rid) == Ordering::Greater, &mut path)?;
         let entry = LeafEntry::new(key, rid, slot);
+        let big = entry.slen as usize > SPILL_AT;
         let size;
         let existed;
         {
             let f = self.frame(leaf)?;
             f.dirty = true;
-            let entries = match &mut f.node {
+            let Frame { node, est, .. } = f;
+            let entries = match node {
                 Node::Leaf { entries, .. } => entries,
                 _ => return Err("tree corrupt: expected a leaf".into()),
             };
+            let base = match *est {
+                Some((n, s)) if n == entries.len() => s,
+                _ => entries.iter().map(|e| e.est()).sum::<usize>() + 16,
+            };
             let pos = entries.partition_point(|e| cmp_tk(&e.key, e.rid, &entry.key, entry.rid) == Ordering::Less);
             existed = pos < entries.len() && cmp_tk(&entries[pos].key, entries[pos].rid, &entry.key, entry.rid) == Ordering::Equal;
+            let added = entry.est();
             if existed {
+                size = base - entries[pos].est() + added;
                 entries[pos] = entry;
             } else {
+                size = base + added;
                 entries.insert(pos, entry);
             }
-            size = entries.iter().map(|e| e.est()).sum::<usize>() + 16;
+            *est = Some((entries.len(), size));
         }
         if size > NODE_MAX {
             self.split_leaf(root, leaf, path)?;
         }
-        Ok(!existed)
+        Ok((!existed, big))
     }
 
     fn split_leaf(&mut self, root: PageId, leaf: PageId, path: Vec<(PageId, usize)>) -> R<()> {
@@ -600,20 +621,80 @@ impl Pool {
         }
     }
 
+    /// Change the slot stored under `(key, rid)` in place (`create`: start from an empty slot when there is none).
+    /// `f` returns whether it changed the slot; a slot left without versions is removed.
+    fn bt_modify(&mut self, root: PageId, key: &KeyVals, rid: u64, create: bool, f: &mut dyn FnMut(&mut Slot) -> bool) -> R<ModOut> {
+        let mut path = vec![];
+        let leaf = self.find_leaf(root, &|k, r| cmp_tk(k, r, key, rid) == Ordering::Greater, &mut path)?;
+        let mut out = ModOut::default();
+        let size;
+        {
+            let fr = self.frame(leaf)?;
+            let Frame { node, est, dirty, .. } = fr;
+            let Node::Leaf { entries, .. } = node else { return Err("tree corrupt: expected a leaf".into()) };
+            let mut base = match *est {
+                Some((n, s)) if n == entries.len() => s,
+                _ => entries.iter().map(|e| e.est()).sum::<usize>() + 16,
+            };
+            let pos = entries.partition_point(|e| cmp_tk(&e.key, e.rid, key, rid) == Ordering::Less);
+            let existed = pos < entries.len() && cmp_tk(&entries[pos].key, entries[pos].rid, key, rid) == Ordering::Equal;
+            if !existed {
+                if !create {
+                    return Ok(out);
+                }
+                let e = LeafEntry::new(key.clone(), rid, Slot::default());
+                base += e.est();
+                entries.insert(pos, e);
+                out.created = true;
+            }
+            out.found = true;
+            let old_est = entries[pos].est();
+            let changed = f(&mut entries[pos].slot);
+            if !changed && !out.created {
+                *est = Some((entries.len(), base));
+                return Ok(out);
+            }
+            *dirty = true;
+            if entries[pos].slot.versions.is_empty() {
+                entries.remove(pos);
+                out.removed = true;
+                size = base - old_est;
+            } else {
+                let e = &mut entries[pos];
+                e.slen = postcard::experimental::serialized_size(&e.slot).unwrap_or(0) as u32;
+                out.big = e.slen as usize > SPILL_AT;
+                size = base - old_est + e.est();
+            }
+            *est = Some((entries.len(), size));
+        }
+        if size > NODE_MAX {
+            self.split_leaf(root, leaf, path)?;
+        } else if out.removed && leaf != root && size < MERGE_BELOW {
+            self.merge_leaf(root, leaf, path)?;
+        }
+        Ok(out)
+    }
+
     fn bt_remove(&mut self, root: PageId, key: &KeyVals, rid: u64) -> R<bool> {
         let mut path = vec![];
         let leaf = self.find_leaf(root, &|k, r| cmp_tk(k, r, key, rid) == Ordering::Greater, &mut path)?;
         let size;
         {
             let f = self.frame(leaf)?;
-            let Node::Leaf { entries, .. } = &mut f.node else { return Ok(false) };
+            let Frame { node, est, dirty, .. } = f;
+            let Node::Leaf { entries, .. } = node else { return Ok(false) };
             let pos = entries.partition_point(|e| cmp_tk(&e.key, e.rid, key, rid) == Ordering::Less);
             if !(pos < entries.len() && cmp_tk(&entries[pos].key, entries[pos].rid, key, rid) == Ordering::Equal) {
                 return Ok(false);
             }
-            entries.remove(pos);
-            f.dirty = true;
-            size = entries.iter().map(|e| e.est()).sum::<usize>() + 16;
+            let base = match *est {
+                Some((n, s)) if n == entries.len() => s,
+                _ => entries.iter().map(|e| e.est()).sum::<usize>() + 16,
+            };
+            let gone = entries.remove(pos);
+            *dirty = true;
+            size = base - gone.est();
+            *est = Some((entries.len(), size));
         }
         if leaf != root && size < MERGE_BELOW {
             self.merge_leaf(root, leaf, path)?;
@@ -1147,13 +1228,27 @@ impl Tree {
     }
 
     pub fn put(&self, key: KeyVals, rid: u64, slot: Slot) {
-        if postcard::to_allocvec(&slot).map(|v| v.len()).unwrap_or(0) > SPILL_AT {
+        let (new, big) = self.st().run(|p| p.bt_put(self.root, key, rid, slot));
+        if big {
             self.has_ovf.store(true, AtOrd::Relaxed);
         }
-        let new = self.st().run(|p| p.bt_put(self.root, key, rid, slot));
         if new {
             self.entries.fetch_add(1, AtOrd::Relaxed);
         }
+    }
+
+    /// Change a slot in place (see `bt_modify`); returns whether the slot existed (or was created).
+    pub fn modify(&self, key: &KeyVals, rid: u64, create: bool, mut f: impl FnMut(&mut Slot) -> bool) -> bool {
+        let out = self.st().run(|p| p.bt_modify(self.root, key, rid, create, &mut f));
+        if out.big {
+            self.has_ovf.store(true, AtOrd::Relaxed);
+        }
+        if out.created && !out.removed {
+            self.entries.fetch_add(1, AtOrd::Relaxed);
+        } else if out.removed && !out.created {
+            self.entries.fetch_sub(1, AtOrd::Relaxed);
+        }
+        out.found
     }
 
     pub fn remove(&self, key: &KeyVals, rid: u64) {

@@ -327,6 +327,7 @@ pub fn any_coll(colls: &[Option<Arc<crate::collation::Collation>>]) -> bool {
 impl<'a> Engine<'a> {
     // ------------------------------------------------------------- queries
     pub fn exec_query(&mut self, q: &Query, outer: Option<&Env<'_>>) -> Result<Rowset> {
+        crate::span!("exec_query");
         let pushed = !q.ctes.is_empty();
         if pushed {
             let mut m = HashMap::new();
@@ -522,11 +523,13 @@ impl<'a> Engine<'a> {
     }
 
     fn eval_from_list(&mut self, from: &[TableRef], where_: &Option<Expr>, outer: Option<&Env<'_>>) -> Result<Rowset> {
+        crate::span!("eval_from_list");
         self.eval_from_cluster(from, where_, outer)
     }
 
     // ------------------------------------------------------------- SELECT
     fn exec_select(&mut self, sel: &Select, order: &[OrderItem], offset: &Option<Expr>, fetch: &Option<Expr>, outer: Option<&Env<'_>>) -> Result<Rowset> {
+        crate::span!("exec_select");
         // only the outermost SELECT of a statement may stream; subqueries started from it must not
         let may_stream = std::mem::take(&mut self.ses.stream_ok);
         let to_buf = std::mem::take(&mut self.ses.stream_to_buf);
@@ -539,7 +542,7 @@ impl<'a> Engine<'a> {
         let src = if sel.from.is_empty() {
             Rowset::new(Schema::default(), vec![vec![]])
         } else {
-            let pushed = self.plan_pushdown(&sel.from, &sel.where_);
+            let pushed = self.plan_pushdown_outer(&sel.from, &sel.where_, outer);
             self.ses.pushdown.push(pushed);
             let saved_hint = (self.ses.order_hint.take(), self.ses.ordered_used);
             self.ses.ordered_used = false;
@@ -586,19 +589,22 @@ impl<'a> Engine<'a> {
             self.validate_columns(h, &schema, outer)?;
         }
         // WHERE
+        // (the rows are taken over, not copied, when nothing else holds the rowset)
         let mut rows: Vec<Row> = Vec::new();
         match &sel.where_ {
             Some(w) => {
-                for r in src.rows.iter() {
-                    let env = Env::new(&schema, r, outer);
-                    if matches!(self.ev(w, &env)?, Value::Bit(true)) {
-                        rows.push(r.clone());
+                for r in src.rows.into_vec() {
+                    let keep = {
+                        let env = Env::new(&schema, &r, outer);
+                        matches!(self.ev(w, &env)?, Value::Bit(true))
+                    };
+                    if keep {
+                        rows.push(r);
                     }
                 }
             }
-            None => rows = (*src.rows).clone(),
+            None => rows = src.rows.into_vec(),
         }
-        drop(src);
 
         let has_assign = sel.items.iter().any(|i| matches!(i, SelectItem::Assign { .. }));
         let item_exprs: Vec<&Expr> = sel.items.iter().filter_map(|i| if let SelectItem::Expr { e, .. } = i { Some(e) } else if let SelectItem::Assign { e, .. } = i { Some(e) } else { None }).collect();
@@ -762,6 +768,7 @@ impl<'a> Engine<'a> {
     }
 
     pub fn out_columns<'q>(&mut self, sel: &'q Select, schema: &Schema) -> Result<Vec<OutCol<'q>>> {
+        crate::span!("out_columns");
         let mut cols: Vec<OutCol> = vec![];
         let unmask = self.can_unmask();
         for it in &sel.items {
@@ -827,6 +834,7 @@ impl<'a> Engine<'a> {
 
     /// OFFSET / FETCH, TOP and SELECT INTO over rows that are already filtered, projected, distinct and ordered.
     pub fn finish_rows(&mut self, sel: &Select, order: &[OrderItem], offset: &Option<Expr>, fetch: &Option<Expr>, cols: &[OutCol<'_>], mut out: Vec<(Row, Vec<Value>)>, ident_counter: &[Option<(i64, i64, i64)>]) -> Result<Rowset> {
+        crate::span!("finish_rows");
         let desc: Vec<bool> = order.iter().map(|o| o.desc).collect();
         // OFFSET / FETCH
         if offset.is_some() || fetch.is_some() {
@@ -884,6 +892,7 @@ impl<'a> Engine<'a> {
 
     // --------------------------------------------------------- grouping
     fn group_units(&mut self, sel: &Select, schema: &Schema, rows: Vec<Row>, outer: Option<&Env<'_>>) -> Result<Vec<Unit>> {
+        crate::span!("group_units");
         // base expressions and grouping sets
         let mut base: Vec<&Expr> = vec![];
         let mut sets: Vec<Vec<usize>> = vec![vec![]];

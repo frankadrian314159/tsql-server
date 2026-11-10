@@ -39,11 +39,11 @@ impl<'a> Engine<'a> {
                 }
                 let stmt = stmt.ok_or_else(|| SqlError::new(214, "Procedure expects parameter '@statement' of type 'ntext/nchar/nvarchar'."))?;
                 let params = match &decl {
-                    Some(d) if !d.trim().is_empty() => parser::parse_param_decls(d).map_err(|mut e| {
+                    Some(d) if !d.trim().is_empty() => super::cached_param_decls(d).map_err(|mut e| {
                         e.abort_batch = false;
                         e
                     })?,
-                    _ => vec![],
+                    _ => std::rc::Rc::new(vec![]),
                 };
                 let mut frame = Frame::default();
                 let mut out_map: Vec<(String, String)> = vec![];
@@ -62,7 +62,7 @@ impl<'a> Engine<'a> {
                     };
                     frame.vars.insert(p.name.clone(), Var { ty: dt, val });
                 }
-                let stmts = parser::parse(&stmt).map_err(|mut e| {
+                let stmts = super::cached_parse(&stmt).map_err(|mut e| {
                     e.abort_batch = false;
                     e
                 })?;

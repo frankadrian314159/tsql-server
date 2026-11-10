@@ -47,8 +47,11 @@ pair of rows is tested against the whole condition), `FORCE ORDER` (join in the 
 
 The parsed form of every batch is cached per connection thread, keyed by the exact text (512 entries, least used evicted),
 so a statement a client sends repeatedly is parsed once; `sys.dm_exec_cached_plans` lists this thread's entries with their use
-counts and `DBCC FREEPROCCACHE` empties the cache. **Execution plans are not cached**: the optimizer's choices depend on the
-data, and there is no parameter sniffing. `sys.dm_exec_query_stats` is server-wide: per batch text, execution count, total / last /
+counts and `DBCC FREEPROCCACHE` empties the cache. The text inside `sp_executesql` and `EXEC (...)`, and the parameter
+declaration of an `sp_executesql` call (`N'@id INT, ...'`), go through the same kind of cache, so a driver that sends one
+parameterized statement with different values parses it once. **Execution plans are not cached**: the optimizer's choices depend on the
+data and on the parameter values, and there is no parameter sniffing; see [docs/performance.md](performance.md) for what
+caching them would and would not save. `sys.dm_exec_query_stats` is server-wide: per batch text, execution count, total / last /
 maximum elapsed microseconds, rows, first and last execution time.
 
 ## BULK INSERT

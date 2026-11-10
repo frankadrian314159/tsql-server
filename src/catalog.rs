@@ -119,19 +119,72 @@ pub struct DdlTrigger {
     pub object_id: i32,
 }
 
+/// A value shared between clones until one of them changes it (copy on write). Cloning a table for a statement
+/// copies a few reference counts instead of every column, key and constraint definition.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Shared<T>(Arc<T>);
+
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Shared(self.0.clone())
+    }
+}
+
+impl<T: Default> Default for Shared<T> {
+    fn default() -> Self {
+        Shared(Arc::new(T::default()))
+    }
+}
+
+impl<T> std::ops::Deref for Shared<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T: Clone> std::ops::DerefMut for Shared<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
+impl<T> From<T> for Shared<T> {
+    fn from(v: T) -> Self {
+        Shared(Arc::new(v))
+    }
+}
+
+impl<'a, X> IntoIterator for &'a Shared<Vec<X>> {
+    type Item = &'a X;
+    type IntoIter = std::slice::Iter<'a, X>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<'a, X: Clone> IntoIterator for &'a mut Shared<Vec<X>> {
+    type Item = &'a mut X;
+    type IntoIter = std::slice::IterMut<'a, X>;
+    fn into_iter(self) -> Self::IntoIter {
+        Arc::make_mut(&mut self.0).iter_mut()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Table {
     pub db: String,
     pub schema: String,
     pub name: String,
     pub object_id: i32,
-    pub columns: Vec<Column>,
+    pub columns: Shared<Vec<Column>>,
     pub data: Arc<TableData>,
     pub pk: Option<KeyDef>,
-    pub uniques: Vec<KeyDef>,
-    pub checks: Vec<CheckDef>,
-    pub fks: Vec<FkDef>,
-    pub indexes: Vec<IndexDef>,
+    pub uniques: Shared<Vec<KeyDef>>,
+    pub checks: Shared<Vec<CheckDef>>,
+    pub fks: Shared<Vec<FkDef>>,
+    pub indexes: Shared<Vec<IndexDef>>,
     pub identity_next: SharedCounter,
     pub triggers: Vec<Arc<Trigger>>,
     pub is_temp: bool,
@@ -183,13 +236,13 @@ impl Table {
             schema: schema.to_string(),
             name: name.to_string(),
             object_id: 0,
-            columns,
+            columns: columns.into(),
             data: Arc::new(TableData::new(store)),
             pk: None,
-            uniques: vec![],
-            checks: vec![],
-            fks: vec![],
-            indexes: vec![],
+            uniques: Shared::default(),
+            checks: Shared::default(),
+            fks: Shared::default(),
+            indexes: Shared::default(),
             identity_next: SharedCounter::new(identity_next),
             triggers: vec![],
             is_temp: false,

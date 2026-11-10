@@ -293,9 +293,10 @@ pub struct SrvGuard<'a> {
 }
 
 impl<'a> SrvGuard<'a> {
-    /// A guard that takes the catalog exclusively when first used.
+    /// A guard that takes the catalog shared when first used. Each statement then chooses its mode with
+    /// [`SrvGuard::set_intent`]; code that changes the catalog calls [`SrvGuard::cat_mut`].
     pub fn new(lock: &'a RwLock<ServerState>) -> SrvGuard<'a> {
-        SrvGuard { lock, write: true, r: OnceCell::new(), w: OnceCell::new() }
+        SrvGuard { lock, write: false, r: OnceCell::new(), w: OnceCell::new() }
     }
     /// Choose the mode for the next acquisition; a guard held in another mode is released.
     pub fn set_intent(&mut self, write: bool) {
@@ -316,8 +317,12 @@ impl<'a> SrvGuard<'a> {
     }
     /// Let other sessions run between statements.
     pub fn yield_lock(&mut self) {
+        // only a session that held the catalog exclusively needs to step aside for the others to get in
+        let was_exclusive = self.w.get().is_some();
         self.release();
-        std::thread::yield_now();
+        if was_exclusive {
+            std::thread::yield_now();
+        }
     }
     /// Exclusive access to the catalog.
     pub fn cat_mut(&mut self) -> &mut ServerState {
@@ -399,6 +404,29 @@ thread_local! {
     static PARSE_CACHE: std::cell::RefCell<HashMap<String, (std::rc::Rc<Vec<Stmt>>, u64)>> = std::cell::RefCell::new(HashMap::new());
 }
 
+thread_local! {
+    static PARAM_CACHE: std::cell::RefCell<HashMap<String, std::rc::Rc<Vec<Param>>>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// The parsed `@params` declaration of an `sp_executesql` call (`N'@id INT, @name VARCHAR(20) OUTPUT'`); clients send
+/// the same text with every call.
+pub fn cached_param_decls(decl: &str) -> std::result::Result<std::rc::Rc<Vec<Param>>, SqlError> {
+    if let Some(h) = PARAM_CACHE.with(|c| c.borrow().get(decl).cloned()) {
+        return Ok(h);
+    }
+    let parsed = std::rc::Rc::new(parser::parse_param_decls(decl)?);
+    if decl.len() <= 4096 {
+        PARAM_CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.len() >= 256 {
+                c.clear();
+            }
+            c.insert(decl.to_string(), parsed.clone());
+        });
+    }
+    Ok(parsed)
+}
+
 const PARSE_CACHE_ENTRIES: usize = 512;
 const PARSE_CACHE_MAX_TEXT: usize = 64 << 10;
 
@@ -414,7 +442,10 @@ pub fn cached_parse(sql: &str) -> std::result::Result<std::rc::Rc<Vec<Stmt>>, Sq
             return Ok(h);
         }
     }
-    let stmts = std::rc::Rc::new(parser::parse(sql)?);
+    let stmts = {
+        crate::span!("parse");
+        std::rc::Rc::new(parser::parse(sql)?)
+    };
     if sql.len() <= PARSE_CACHE_MAX_TEXT {
         PARSE_CACHE.with(|c| {
             let mut c = c.borrow_mut();
@@ -433,9 +464,31 @@ pub fn cached_parse(sql: &str) -> std::result::Result<std::rc::Rc<Vec<Stmt>>, Sq
 
 pub fn clear_parse_cache() {
     PARSE_CACHE.with(|c| c.borrow_mut().clear());
+    PARAM_CACHE.with(|c| c.borrow_mut().clear());
 }
 
 /// (batch text, times used) of this thread's cache.
+/// The name of a statement's kind (`Query`, `Insert`, ...): the head of its `Debug` text. The text is not built in
+/// full (for a big INSERT that would visit every value): the writer refuses everything after the first word.
+pub fn stmt_head(st: &Stmt) -> String {
+    use std::fmt::Write;
+    struct Head(String);
+    impl Write for Head {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            for ch in s.chars() {
+                if !ch.is_alphanumeric() {
+                    return Err(std::fmt::Error);
+                }
+                self.0.push(ch);
+            }
+            Ok(())
+        }
+    }
+    let mut h = Head(String::new());
+    let _ = write!(h, "{:?}", st);
+    h.0
+}
+
 pub fn parse_cache_entries() -> Vec<(String, u64)> {
     PARSE_CACHE.with(|c| c.borrow().iter().map(|(k, v)| (k.clone(), v.1)).collect())
 }
@@ -476,6 +529,7 @@ impl<'a> Engine<'a> {
 
     // --------------------------------------------------------- batch driver
     pub fn run_batch(&mut self, sql: &str) {
+        crate::span!("run_batch");
         let stmts = match cached_parse(sql) {
             Ok(s) => s,
             Err(e) => {
@@ -530,6 +584,7 @@ impl<'a> Engine<'a> {
     }
 
     pub fn exec_stmt(&mut self, st: &Stmt) -> Flow<()> {
+        crate::span!("exec_stmt");
         let leaf = !matches!(st, Stmt::If { .. } | Stmt::While { .. } | Stmt::Block(_) | Stmt::Try { .. } | Stmt::Exec(_) | Stmt::ExecStr(_));
         if !leaf {
             if self.ses.nest_level == 0 {
@@ -556,7 +611,7 @@ impl<'a> Engine<'a> {
                     return self.handle_error(e);
                 }
                 let (db, iso) = (self.ses.db.clone(), self.ses.isolation.level());
-                let cmd: String = format!("{:?}", st).chars().take_while(|c| c.is_alphanumeric()).collect();
+                let cmd: String = stmt_head(st);
                 self.srv.core.update_session(spid, |s| {
                     s.db = db;
                     s.status = "running";
@@ -686,6 +741,7 @@ impl<'a> Engine<'a> {
     }
 
     fn exec_inner(&mut self, st: &Stmt) -> Flow<()> {
+        crate::span!("exec_inner");
         // a database that is being restored cannot be used (only a few statements work in it)
         if self.srv.databases.get(&self.ses.db.to_lowercase()).is_some_and(|d| d.restoring)
             && !matches!(st, Stmt::Use(_) | Stmt::Backup(_) | Stmt::Restore(_) | Stmt::SetOpts(_) | Stmt::Set { .. } | Stmt::Declare(_) | Stmt::Print(_) | Stmt::Block(_) | Stmt::If { .. } | Stmt::Try { .. } | Stmt::Noop | Stmt::Rollback(_) | Stmt::Commit(_))
@@ -922,6 +978,7 @@ impl<'a> Engine<'a> {
 
     // ----------------------------------------------------------- helpers
     pub fn emit_rowset(&mut self, rs: query::Rowset) {
+        crate::span!("emit_rowset");
         let columns: Vec<String> = rs.schema.cols.iter().map(|c| c.name.clone()).collect();
         let types: Vec<DataType> = rs.schema.cols.iter().enumerate().map(|(i, c)| {
             c.ty.clone().unwrap_or_else(|| rs.rows.iter().map(|r| &r[i]).find(|v| !v.is_null()).map(|v| v.data_type()).unwrap_or(DataType::Int))
@@ -1630,7 +1687,7 @@ impl<'a> Engine<'a> {
     }
 
     pub fn exec_dynamic(&mut self, sql: &str) -> Flow<()> {
-        let stmts = parser::parse(sql).map_err(|mut e| {
+        let stmts = cached_parse(sql).map_err(|mut e| {
             e.abort_batch = false;
             e
         })?;

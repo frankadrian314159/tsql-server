@@ -21,6 +21,7 @@ pub mod lexer;
 pub mod mask;
 pub mod parser;
 pub mod persist;
+pub mod prof;
 pub mod security;
 pub mod storage;
 pub mod tds;
@@ -244,6 +245,7 @@ pub struct Connection {
 impl Connection {
     /// Execute a single batch (no `GO` handling).
     pub fn execute(&mut self, sql: &str) -> BatchResult {
+        crate::span!("execute");
         let shared = self.server.shared.clone();
         let guard = SrvGuard::new(&shared.state);
         let mut eng = Engine::new(guard, &mut self.session);

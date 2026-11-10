@@ -460,16 +460,50 @@ impl TableData {
 
     // ---- writes
     pub fn push_version(&self, rowid: RowId, row: Option<Row>, stamp: Stamp) {
-        let mut slot = self.slot(rowid).unwrap_or_default();
-        if let Some(r) = &row {
-            for (i, sp) in self.specs.iter().enumerate() {
-                if sp.admits(r) {
-                    self.indexes[i].put(extract(sp, r), rowid as u64, Slot::default());
+        // the index keys of the new version; an index already holding the key (an earlier version of the row has
+        // it, as in an update that leaves the key alone) needs no entry
+        let keys: Vec<Option<KeyVals>> = match &row {
+            Some(r) => self.specs.iter().map(|sp| sp.admits(r).then(|| extract(sp, r))).collect(),
+            None => vec![],
+        };
+        let mut present = vec![false; keys.len()];
+        let mut v = Some(Version { row, stamp });
+        self.heap.modify(&heap_key(), rowid as u64, true, |slot| {
+            for (i, k) in keys.iter().enumerate() {
+                if let Some(k) = k {
+                    let sp = &self.specs[i];
+                    present[i] = slot.versions.iter().any(|x| x.row.as_ref().is_some_and(|r| sp.admits(r) && extract(sp, r) == *k));
+                }
+            }
+            slot.versions.push(v.take().expect("version pushed once"));
+            true
+        });
+        for (i, k) in keys.into_iter().enumerate() {
+            if let Some(k) = k {
+                if !present[i] {
+                    self.indexes[i].put(k, rowid as u64, Slot::default());
                 }
             }
         }
-        slot.versions.push(Version { row, stamp });
-        self.write_slot(rowid, slot);
+    }
+
+    /// The index entries (index number, key) that only the `removed` versions needed, given the versions that remain.
+    fn unused_keys(&self, removed: &[Version], remaining: &Slot) -> Vec<(usize, KeyVals)> {
+        let mut out: Vec<(usize, KeyVals)> = vec![];
+        for v in removed {
+            let Some(row) = &v.row else { continue };
+            for (i, sp) in self.specs.iter().enumerate() {
+                if !sp.admits(row) {
+                    continue;
+                }
+                let key = extract(sp, row);
+                let still_used = remaining.versions.iter().any(|v| v.row.as_ref().map(|r| sp.admits(r) && extract(sp, r) == key).unwrap_or(false));
+                if !still_used && !out.iter().any(|(j, k)| *j == i && *k == key) {
+                    out.push((i, key));
+                }
+            }
+        }
+        out
     }
 
     fn unindex_unused(&self, rowid: RowId, row: &Row, remaining: &Slot) {
@@ -501,58 +535,54 @@ impl TableData {
 
     /// Stamp this transaction's versions on the slot as committed at `ts`.
     pub fn commit_slot(&self, rowid: RowId, tx: TxId, ts: u64) {
-        let mut slot = match self.slot(rowid) {
-            Some(s) => s,
-            None => return,
-        };
-        let n = slot.versions.len();
-        let mut k = 0;
-        while k < n && slot.versions[n - 1 - k].stamp == Stamp::Tx(tx) {
-            k += 1;
-        }
-        if k == 0 {
-            return;
-        }
-        let removed: Vec<Version> = if k > 1 { slot.versions.drain(n - k..n - 1).collect() } else { vec![] };
-        if let Some(last) = slot.versions.last_mut() {
-            last.stamp = Stamp::Ts(ts);
-        }
-        for v in removed {
-            if let Some(r) = v.row {
-                self.unindex_unused(rowid, &r, &slot);
+        let mut unused: Vec<(usize, KeyVals)> = vec![];
+        self.heap.modify(&heap_key(), rowid as u64, false, |slot| {
+            let n = slot.versions.len();
+            let mut k = 0;
+            while k < n && slot.versions[n - 1 - k].stamp == Stamp::Tx(tx) {
+                k += 1;
             }
+            if k == 0 {
+                return false;
+            }
+            let mut removed: Vec<Version> = vec![];
+            if k > 1 {
+                removed = slot.versions.drain(n - k..n - 1).collect();
+            }
+            if let Some(last) = slot.versions.last_mut() {
+                last.stamp = Stamp::Ts(ts);
+            }
+            if !removed.is_empty() {
+                unused = self.unused_keys(&removed, slot);
+            }
+            true
+        });
+        for (i, key) in unused {
+            self.indexes[i].remove(&key, rowid as u64);
         }
-        self.write_slot(rowid, slot);
     }
 
     /// Discard versions no snapshot at or after `horizon` can see.
     pub fn gc_slot(&self, rowid: RowId, horizon: u64) {
-        let mut slot = match self.slot(rowid) {
-            Some(s) => s,
-            None => return,
-        };
-        let keep_from = slot.versions.iter().rposition(|v| matches!(v.stamp, Stamp::Ts(t) if t <= horizon));
-        let k = match keep_from {
-            Some(k) => k,
-            None => return,
-        };
-        let mut changed = false;
-        if k > 0 {
-            let removed: Vec<Version> = slot.versions.drain(..k).collect();
-            for v in removed {
-                if let Some(r) = v.row {
-                    self.unindex_unused(rowid, &r, &slot);
-                }
+        let mut unused: Vec<(usize, KeyVals)> = vec![];
+        self.heap.modify(&heap_key(), rowid as u64, false, |slot| {
+            let keep_from = slot.versions.iter().rposition(|v| matches!(v.stamp, Stamp::Ts(t) if t <= horizon));
+            let Some(k) = keep_from else { return false };
+            let mut changed = false;
+            if k > 0 {
+                let removed: Vec<Version> = slot.versions.drain(..k).collect();
+                unused = self.unused_keys(&removed, slot);
+                changed = true;
             }
-            changed = true;
-        }
-        // a lone committed delete marker means the row is gone for everyone
-        if slot.versions.len() == 1 && slot.versions[0].row.is_none() {
-            slot.versions.clear();
-            changed = true;
-        }
-        if changed {
-            self.write_slot(rowid, slot);
+            // a lone committed delete marker means the row is gone for everyone
+            if slot.versions.len() == 1 && slot.versions[0].row.is_none() {
+                slot.versions.clear();
+                changed = true;
+            }
+            changed
+        });
+        for (i, key) in unused {
+            self.indexes[i].remove(&key, rowid as u64);
         }
     }
 

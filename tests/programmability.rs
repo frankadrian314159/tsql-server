@@ -336,3 +336,41 @@ GO");
     exec(&mut c, "DROP VIEW big");
     assert_eq!(err_no(&mut c, "SELECT * FROM big"), 208);
 }
+
+/// `sp_executesql` and dynamic SQL reuse the parsed statement and the parsed parameter declaration across calls; the
+/// results must still depend only on the parameter values, the current catalog and the caller's variables.
+#[test]
+fn repeated_sp_executesql_calls_reuse_parsed_text_but_not_results() {
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE sx (id INT PRIMARY KEY, v VARCHAR(10)); INSERT sx VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+    let q = "EXEC sp_executesql N'SELECT v FROM sx WHERE id = @id', N'@id INT', @id = ";
+    for (id, want) in [(1, "a"), (3, "c"), (2, "b"), (1, "a")] {
+        assert_eq!(scalar(&mut c, &format!("{q}{id}")), want);
+    }
+    // an OUTPUT parameter is bound afresh each time
+    for (id, want) in [(2, "b"), (3, "c")] {
+        exec(&mut c, &format!("DECLARE @o VARCHAR(10); EXEC sp_executesql N'SELECT @out = v FROM sx WHERE id = @id', N'@id INT, @out VARCHAR(10) OUTPUT', @id = {id}, @out = @o OUTPUT; SELECT @o AS got"));
+        let r = rows(&mut c, &format!("DECLARE @o VARCHAR(10); EXEC sp_executesql N'SELECT @out = v FROM sx WHERE id = @id', N'@id INT, @out VARCHAR(10) OUTPUT', @id = {id}, @out = @o OUTPUT; SELECT @o AS got"));
+        assert_eq!(r.last().unwrap()[0], want);
+    }
+    // a parameter that is not supplied is NULL, every time
+    assert_eq!(scalar(&mut c, "EXEC sp_executesql N'SELECT ISNULL(@x, -1)', N'@x INT'"), "-1");
+    assert_eq!(scalar(&mut c, "EXEC sp_executesql N'SELECT ISNULL(@x, -1)', N'@x INT', @x = 7"), "7");
+    assert_eq!(scalar(&mut c, "EXEC sp_executesql N'SELECT ISNULL(@x, -1)', N'@x INT'"), "-1");
+    // a change to the catalog between calls is seen by the cached statement
+    assert_eq!(scalar(&mut c, &format!("{q}1")), "a");
+    exec(&mut c, "DROP TABLE sx");
+    assert_eq!(err_no(&mut c, &format!("{q}1")), 208);
+    exec(&mut c, "CREATE TABLE sx (id INT PRIMARY KEY, v VARCHAR(10)); INSERT sx VALUES (1, 'z')");
+    assert_eq!(scalar(&mut c, &format!("{q}1")), "z");
+    // a wrong parameter type is reported on every call; cached text does not hide the error
+    assert_eq!(err_no(&mut c, "EXEC sp_executesql N'SELECT @n + 1', N'@n INT', @n = 'abc'"), 245);
+    assert_eq!(err_no(&mut c, "EXEC sp_executesql N'SELECT @n + 1', N'@n INT', @n = 'abc'"), 245);
+    // dynamic SQL
+    for k in 0..3 {
+        assert_eq!(scalar(&mut c, &format!("DECLARE @s NVARCHAR(50) = N'SELECT 40 + 2'; EXEC (@s)")), "42", "round {k}");
+    }
+    // emptying the cache changes nothing observable
+    exec(&mut c, "DBCC FREEPROCCACHE");
+    assert_eq!(scalar(&mut c, &format!("{q}1")), "z");
+}

@@ -450,7 +450,11 @@ impl<'a> Engine<'a> {
     /// Read one table: the best index for its pushed-down conditions (or `forced`), honouring
     /// ordered-read hints, recording the choice in the plan.
     pub fn scan_table_leaf(&mut self, loc: &Loc, t: &Table, alias: &str, name: &[String], pushed: &[Expr], forced: Option<Access>) -> Result<Rowset> {
-        let denied = self.select_denials(loc, name, t)?;
+        crate::span!("scan_table_leaf");
+        let denied = {
+            crate::span!("select_denials");
+            self.select_denials(loc, name, t)?
+        };
         // a table with unreadable columns is read plainly: an index seek or an ordered read must not be able to
         // test or order by a column the user may not see
         let guarded = denied.iter().any(|d| d.is_some());
@@ -458,7 +462,10 @@ impl<'a> Engine<'a> {
         let mut ap = match forced {
             _ if guarded => Access::Full,
             Some(a) => a,
-            None => self.choose_access(t, alias, &conj),
+            None => {
+                crate::span!("choose_access");
+                self.choose_access(t, alias, &conj)
+            }
         };
         let total = t.data.slot_count();
         let mut limit: Option<usize> = None;
@@ -488,7 +495,10 @@ impl<'a> Engine<'a> {
         }
         let ps = pushed.len();
         let desc = ap.describe();
-        let mut schema = super::dml::table_schema(t, alias);
+        let mut schema = {
+            crate::span!("table_schema");
+            super::dml::table_schema(t, alias)
+        };
         let mark = |s: &mut Schema| {
             for (c, d) in s.cols.iter_mut().zip(denied.iter()) {
                 c.denied = d.clone();
@@ -526,10 +536,12 @@ impl<'a> Engine<'a> {
                 out.into_iter().map(|r| r.1).collect()
             }
             None => {
+                crate::span!("scan_rows_flt");
                 let scanned = self.scan_rows_flt(loc, t, &ap, Some((&schema, pushed)))?;
                 scanned.into_iter().map(|r| r.1).collect()
             }
         };
+        crate::span!("plan_text_and_rowset");
         self.ses.plan.push(format!("scan {} [{} rows]: {}{} ({} condition(s) pushed down) -> {} rows", alias, total, desc, if ordered { ", read in index order" } else { "" }, ps, rows.len()));
         let mut rs = Rowset::table_rows(t, alias, rows);
         mark(&mut rs.schema);

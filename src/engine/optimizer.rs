@@ -359,6 +359,13 @@ impl<'a> Engine<'a> {
     /// For each table in a FROM clause, the conditions of `where_` that can be applied while
     /// the table is read (before any join). Outer joins' null-supplying sides get none.
     pub fn plan_pushdown(&mut self, from: &[TableRef], where_: &Option<Expr>) -> Vec<(String, Vec<Expr>)> {
+        self.plan_pushdown_outer(from, where_, None)
+    }
+
+    /// Like `plan_pushdown`; with `outer` (a correlated subquery's enclosing row), a comparison between a column of
+    /// the subquery's tables and a column of the outer row is pushed with the outer value as a constant, so
+    /// `WHERE d.id = t.grp` can seek on `d.id` instead of scanning `d` for every outer row.
+    pub fn plan_pushdown_outer(&mut self, from: &[TableRef], where_: &Option<Expr>, outer: Option<&Env<'_>>) -> Vec<(String, Vec<Expr>)> {
         let Some(w) = where_ else { return vec![] };
         if !self.ses.optimizer {
             return vec![];
@@ -398,6 +405,22 @@ impl<'a> Engine<'a> {
         split_conjuncts(w, &mut conj);
         let mut out: Vec<(String, Vec<Expr>)> = vec![];
         'next: for c in conj {
+            let bound: Option<Expr> = match outer {
+                Some(o) if !opaque => {
+                    let local = |p: &[String]| -> bool {
+                        if p.len() >= 2 {
+                            let q = p[p.len() - 2].to_lowercase();
+                            ls.iter().any(|l| l.alias == q)
+                        } else {
+                            let n = p[0].to_lowercase();
+                            ls.iter().any(|l| l.cols.contains(&n))
+                        }
+                    };
+                    bind_outer(c, &local, o)
+                }
+                _ => None,
+            };
+            let c: &Expr = bound.as_ref().unwrap_or(c);
             if !is_pushable(c) {
                 continue;
             }
@@ -547,4 +570,36 @@ impl<'a> Engine<'a> {
         let n_pushed: usize = pushed.iter().filter(|(x, _)| x.eq_ignore_ascii_case(&a)).map(|(_, e)| e.len()).sum();
         Some(OrderHint { alias: a, idx, forward: !desc, limit, all_pushed: n_pushed == conj.len() })
     }
+}
+
+/// A comparison `local_expr <op> outer_column` (either way round) with the outer column replaced by its value in
+/// `outer`; `None` when `c` is not of that form.
+fn bind_outer(c: &Expr, is_local: &dyn Fn(&[String]) -> bool, outer: &Env<'_>) -> Option<Expr> {
+    fn strip(e: &Expr) -> &Expr {
+        match e {
+            Expr::Paren(a) => strip(a),
+            _ => e,
+        }
+    }
+    let Expr::Binary(op, a, b) = c else { return None };
+    if !matches!(op, BinOp::Eq | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
+        return None;
+    }
+    let conv = |x: &Expr| -> Option<Expr> {
+        if let Expr::Col(p) = strip(x) {
+            if !is_local(p) {
+                if let Ok(v) = outer.lookup(p) {
+                    return Some(Expr::Lit(v));
+                }
+            }
+        }
+        None
+    };
+    if let Some(l) = conv(a) {
+        return Some(Expr::Binary(*op, Box::new(l), b.clone()));
+    }
+    if let Some(r) = conv(b) {
+        return Some(Expr::Binary(*op, a.clone(), Box::new(r)));
+    }
+    None
 }

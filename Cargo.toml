@@ -26,6 +26,8 @@ required-features = ["gui"]
 
 [features]
 default = []
+# span timing for finding hot spots (see src/prof.rs); `cargo run --release --features prof --example bench`
+prof = []
 gui = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:rfd"]
 
 [dependencies]
