@@ -1267,7 +1267,7 @@ impl<'a> Engine<'a> {
         fc: &FuncCall,
         over: &Over,
         sorted: &[usize],
-        skeys: &[&Vec<Value>],
+        _skeys: &[&Vec<Value>],
         units: &[Unit],
         schema: &Schema,
         outer: Option<&Env<'_>>,
@@ -1276,6 +1276,15 @@ impl<'a> Engine<'a> {
     ) -> Result<Vec<Value>> {
         let name = fc.name.as_str();
         let mut out = Vec::with_capacity(n);
+        // the first and last row of each row's group of peers (rows with equal ORDER BY keys), found once
+        let mut pstart = vec![0usize; n];
+        let mut pend = vec![0usize; n];
+        for p in 0..n {
+            pstart[p] = if p > 0 && peers_eq(p, p - 1) { pstart[p - 1] } else { p };
+        }
+        for p in (0..n).rev() {
+            pend[p] = if p + 1 < n && peers_eq(p + 1, p) { pend[p + 1] } else { p };
+        }
         match name {
             "ROW_NUMBER" => {
                 for p in 0..n {
@@ -1304,11 +1313,7 @@ impl<'a> Engine<'a> {
             }
             "CUME_DIST" => {
                 for p in 0..n {
-                    let mut e = p;
-                    while e + 1 < n && peers_eq(e + 1, p) {
-                        e += 1;
-                    }
-                    out.push(Value::Float((e + 1) as f64 / n as f64));
+                    out.push(Value::Float((pend[p] + 1) as f64 / n as f64));
                 }
             }
             "NTILE" => {
@@ -1375,8 +1380,23 @@ impl<'a> Engine<'a> {
             _ => {
                 // frame-based: aggregates, FIRST_VALUE, LAST_VALUE, NTH_VALUE
                 let env0 = Env::empty();
+                // SUM, AVG, COUNT, MIN and MAX over a frame are accumulated as the frame moves instead of being
+                // computed again from every row of it (a running total would otherwise be quadratic)
+                let incremental = matches!(name, "SUM" | "AVG" | "COUNT" | "COUNT_BIG" | "MIN" | "MAX") && !fc.distinct && fc.within.is_none() && !crate::collation::in_use();
+                let mut argv: Option<Vec<Value>> = None;
+                if incremental && !fc.star {
+                    let mut v = Vec::with_capacity(n);
+                    for p in 0..n {
+                        let env = todo_env(schema, &units[sorted[p]], outer);
+                        v.push(self.ev(&fc.args[0], &env)?);
+                    }
+                    argv = Some(v);
+                }
+                let mut last_frame: Option<(usize, usize)> = None;
+                let mut last_val: Option<Value> = None;
+                let mut run = RunningAgg::default();
                 for p in 0..n {
-                    let (s, e) = self.frame_range(over, p, n, peers_eq, skeys, &env0)?;
+                    let (s, e) = self.frame_range(over, p, n, (&pstart, &pend), &env0)?;
                     if matches!(name, "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE") {
                         if s > e || e >= n {
                             out.push(Value::Null);
@@ -1401,9 +1421,34 @@ impl<'a> Engine<'a> {
                             // empty frame
                             let empty: Vec<Env> = vec![];
                             out.push(self.agg_over(fc, &empty)?);
+                        } else if last_frame == Some((s, e)) {
+                            // the same frame as the previous row (a whole partition, or a group of peers)
+                            out.push(last_val.clone().unwrap());
+                        } else if incremental {
+                            if name == "COUNT" && fc.star || name == "COUNT_BIG" && fc.star {
+                                let c = e - s + 1;
+                                last_val = Some(if name == "COUNT" { Value::Int(c as i32) } else { Value::BigInt(c as i64) });
+                            } else {
+                                let argv = argv.as_ref().unwrap();
+                                // a frame that only grew at its end extends the running state; anything else restarts it
+                                let grew = matches!(last_frame, Some((ls, le)) if ls == s && le < e);
+                                let from = if grew { last_frame.unwrap().1 + 1 } else { s };
+                                if !grew {
+                                    run = RunningAgg::default();
+                                }
+                                for v in &argv[from..=e] {
+                                    run.add(name, v)?;
+                                }
+                                last_val = Some(run.result(name)?);
+                            }
+                            last_frame = Some((s, e));
+                            out.push(last_val.clone().unwrap());
                         } else {
                             let envs: Vec<Env> = (s..=e).map(|k| todo_env(schema, &units[sorted[k]], outer)).collect();
-                            out.push(self.agg_over(fc, &envs)?);
+                            let v = self.agg_over(fc, &envs)?;
+                            last_frame = Some((s, e));
+                            last_val = Some(v.clone());
+                            out.push(v);
                         }
                     } else {
                         return Err(SqlError::new(10753, format!("The function '{}' may not have a window frame.", name)));
@@ -1414,7 +1459,7 @@ impl<'a> Engine<'a> {
         Ok(out)
     }
 
-    fn frame_range(&mut self, over: &Over, p: usize, n: usize, peers_eq: &dyn Fn(usize, usize) -> bool, _skeys: &[&Vec<Value>], env0: &Env<'_>) -> Result<(usize, usize)> {
+    fn frame_range(&mut self, over: &Over, p: usize, n: usize, peers: (&[usize], &[usize]), env0: &Env<'_>) -> Result<(usize, usize)> {
         let frame = match &over.frame {
             Some(f) => f.clone(),
             None => {
@@ -1452,14 +1497,7 @@ impl<'a> Engine<'a> {
             };
         } else {
             // RANGE: peers of current row for CURRENT ROW bounds
-            let mut ps = p;
-            while ps > 0 && peers_eq(ps - 1, p) {
-                ps -= 1;
-            }
-            let mut pe = p;
-            while pe + 1 < n && peers_eq(pe + 1, p) {
-                pe += 1;
-            }
+            let (ps, pe) = (peers.0[p], peers.1[p]);
             s = match frame.start {
                 Bound::UnboundedPreceding => 0,
                 Bound::CurrentRow => ps as i64,
@@ -2148,5 +2186,74 @@ impl<'a> Env<'a> {
     /// Helper: shrink/extend lifetime of the empty env (it holds only 'static data).
     pub fn into_static_like<'b>(self) -> Env<'b> {
         Env { schema: &EMPTY_SCHEMA, row: &[], parent: None, group: None, win: None }
+    }
+}
+
+
+/// The state of SUM / AVG / COUNT / MIN / MAX while a window frame grows (see `window_values`). `result` gives what
+/// `Engine::agg_over` gives for the values added so far.
+#[derive(Default)]
+struct RunningAgg {
+    sum: Option<Value>,
+    count: usize,
+    best: Option<Value>,
+}
+
+impl RunningAgg {
+    fn add(&mut self, name: &str, v: &Value) -> Result<()> {
+        if v.is_null() {
+            return Ok(());
+        }
+        self.count += 1;
+        match name {
+            "SUM" | "AVG" => {
+                self.sum = Some(match self.sum.take() {
+                    None => match v {
+                        Value::Str(_) => return Err(SqlError::new(8117, "Operand data type varchar is invalid for sum operator.")),
+                        Value::Bit(b) => Value::Int(*b as i32),
+                        other => other.clone(),
+                    },
+                    Some(acc) => arith(BinOp::Add, &acc, v)?,
+                });
+            }
+            "MIN" | "MAX" => {
+                self.best = Some(match self.best.take() {
+                    None => v.clone(),
+                    Some(b) => {
+                        let o = compare(v, &b)?.unwrap_or(Ordering::Equal);
+                        if (name == "MIN" && o == Ordering::Less) || (name == "MAX" && o == Ordering::Greater) {
+                            v.clone()
+                        } else {
+                            b
+                        }
+                    }
+                });
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn result(&self, name: &str) -> Result<Value> {
+        match name {
+            "COUNT" => Ok(Value::Int(self.count as i32)),
+            "COUNT_BIG" => Ok(Value::BigInt(self.count as i64)),
+            "SUM" | "AVG" => {
+                let Some(mut acc) = self.sum.clone() else { return Ok(Value::Null) };
+                if name == "AVG" {
+                    let cnt = match acc {
+                        Value::BigInt(_) => Value::BigInt(self.count as i64),
+                        _ => Value::Int(self.count as i32),
+                    };
+                    let scale = if let Value::Dec(d) = &acc { Some(d.s) } else { None };
+                    acc = arith(BinOp::Div, &acc, &cnt)?;
+                    if let (Some(sc), Value::Dec(d)) = (scale, &acc) {
+                        acc = Value::Dec(d.rescale(sc).unwrap_or(*d));
+                    }
+                }
+                Ok(acc)
+            }
+            _ => Ok(self.best.clone().unwrap_or(Value::Null)),
+        }
     }
 }

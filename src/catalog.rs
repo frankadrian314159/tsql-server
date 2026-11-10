@@ -358,6 +358,9 @@ pub struct ViewDef {
     pub text: String,
     pub object_id: i32,
     pub triggers: Vec<Arc<Trigger>>,
+    /// WITH CHECK OPTION: rows written through the view must satisfy its WHERE clause.
+    #[serde(default)]
+    pub check_option: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -392,6 +395,16 @@ pub struct Sequence {
     pub object_id: i32,
 }
 
+/// An alternative name for another object (`CREATE SYNONYM`); names are resolved through it to the target.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SynonymDef {
+    pub schema: String,
+    pub name: String,
+    /// The name it stands for, as written (one to four parts).
+    pub target: Vec<String>,
+    pub object_id: i32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Object {
     Table(Table),
@@ -399,6 +412,7 @@ pub enum Object {
     Proc(ProcDef),
     Func(FuncDef),
     Seq(Sequence),
+    Synonym(SynonymDef),
 }
 
 impl Object {
@@ -417,6 +431,7 @@ impl Object {
                 }
             }
             Object::Seq(_) => "SO",
+            Object::Synonym(_) => "SN",
         }
     }
     pub fn type_desc(&self) -> &'static str {
@@ -427,6 +442,7 @@ impl Object {
             "IF" => "SQL_INLINE_TABLE_VALUED_FUNCTION",
             "TF" => "SQL_TABLE_VALUED_FUNCTION",
             "FN" => "SQL_SCALAR_FUNCTION",
+            "SN" => "SYNONYM",
             _ => "SEQUENCE_OBJECT",
         }
     }
@@ -437,6 +453,7 @@ impl Object {
             Object::Proc(p) => p.object_id,
             Object::Func(f) => f.object_id,
             Object::Seq(s) => s.object_id,
+            Object::Synonym(s) => s.object_id,
         }
     }
     pub fn schema(&self) -> &str {
@@ -446,6 +463,7 @@ impl Object {
             Object::Proc(p) => &p.schema,
             Object::Func(f) => &f.schema,
             Object::Seq(s) => &s.schema,
+            Object::Synonym(s) => &s.schema,
         }
     }
     pub fn name(&self) -> &str {
@@ -455,6 +473,7 @@ impl Object {
             Object::Proc(p) => &p.name,
             Object::Func(f) => &f.name,
             Object::Seq(s) => &s.name,
+            Object::Synonym(s) => &s.name,
         }
     }
 }

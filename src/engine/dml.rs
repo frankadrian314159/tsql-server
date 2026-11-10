@@ -91,7 +91,9 @@ impl<'a> Engine<'a> {
     pub fn exec_insert(&mut self, ins: &Insert) -> Result<()> {
         crate::span!("exec_insert");
         let mut ins = ins.clone();
-        self.rewrite_insert_target(&mut ins);
+        if let Some((base, filter)) = self.rewrite_insert_target(&mut ins) {
+            self.set_view_check(&base, filter);
+        }
         let ins = &ins;
         self.with_ctes(&ins.ctes, |s| s.exec_insert_inner(ins))
     }
@@ -622,10 +624,10 @@ impl<'a> Engine<'a> {
 
     fn key_error(t: &Table, name: &str, is_index: bool, vals: &[&Value]) -> SqlError {
         if is_index {
-            SqlError::new(2601, format!("Cannot insert duplicate key row in object '{}.{}' with unique index '{}'. The duplicate key value is ({}).", t.schema, t.name, name, fmt_key(vals)))
+            SqlError::with(2601, 14, 1, format!("Cannot insert duplicate key row in object '{}.{}' with unique index '{}'. The duplicate key value is ({}).", t.schema, t.name, name, fmt_key(vals)))
         } else {
             let kind = if t.pk.as_ref().map(|p| p.name == name).unwrap_or(false) { "PRIMARY KEY" } else { "UNIQUE KEY" };
-            SqlError::new(2627, format!("Violation of {} constraint '{}'. Cannot insert duplicate key in object '{}.{}'. The duplicate key value is ({}).", kind, name, t.schema, t.name, fmt_key(vals)))
+            SqlError::with(2627, 14, 1, format!("Violation of {} constraint '{}'. Cannot insert duplicate key in object '{}.{}'. The duplicate key value is ({}).", kind, name, t.schema, t.name, fmt_key(vals)))
         }
     }
 
@@ -675,6 +677,18 @@ impl<'a> Engine<'a> {
 
     fn check_constraints(&mut self, t: &Table, rows: &[&Row], verb: &str) -> Result<()> {
         crate::span!("check_constraints");
+        // a view WITH CHECK OPTION: the rows written through it must still be in it
+        if let Some((key, filter, level)) = self.ses.view_check.clone() {
+            if key == t.key() && level == self.ses.nest_level {
+                let schema = table_schema(t, &t.name);
+                for r in rows {
+                    let env = Env::new(&schema, r, None);
+                    if !matches!(self.ev(&filter, &env)?, Value::Bit(true)) {
+                        return Err(SqlError::new(550, "The attempted insert or update failed because the target view either specifies WITH CHECK OPTION or spans a view that specifies WITH CHECK OPTION and one or more rows resulting from the operation did not qualify under the CHECK OPTION constraint."));
+                    }
+                }
+            }
+        }
         if t.checks.is_empty() {
             return Ok(());
         }
@@ -1188,11 +1202,18 @@ impl<'a> Engine<'a> {
     pub fn exec_update(&mut self, u: &Update) -> Result<()> {
         crate::span!("exec_update");
         let mut u = u.clone();
+        let mut check: Option<(Vec<String>, Expr)> = None;
         if let (Target::Table(name), true) = (&u.target, u.from.is_empty()) {
             if let Some((base, filter, _)) = self.updatable_source(name, &u.ctes) {
+                if self.is_check_view(name) {
+                    check = filter.clone().map(|f| (base.clone(), f));
+                }
                 u.target = Target::Table(base);
                 u.where_ = and_filter(&u.where_, filter);
             }
+        }
+        if let Some((base, filter)) = check {
+            self.set_view_check(&base, filter);
         }
         let u = &u;
         self.with_ctes(&u.ctes, |s| s.exec_update_inner(u))
@@ -1852,14 +1873,29 @@ impl<'a> Engine<'a> {
         None
     }
 
-    fn rewrite_insert_target(&self, ins: &mut Insert) {
+    /// Point an INSERT through a view at its base table. For a view WITH CHECK OPTION, returns the base table and the
+    /// filter of the view, which the rows written must satisfy.
+    fn rewrite_insert_target(&self, ins: &mut Insert) -> Option<(Vec<String>, Expr)> {
         if let Target::Table(name) = &ins.target {
-            if let Some((base, _filter, cols)) = self.updatable_source(name, &ins.ctes) {
+            if let Some((base, filter, cols)) = self.updatable_source(name, &ins.ctes) {
+                let check = if self.is_check_view(name) { filter.map(|f| (base.clone(), f)) } else { None };
                 ins.target = Target::Table(base);
                 if ins.cols.is_none() && !cols.iter().any(|c| c == "*") {
                     ins.cols = Some(cols);
                 }
+                return check;
             }
+        }
+        None
+    }
+
+    fn is_check_view(&self, name: &[String]) -> bool {
+        matches!(self.object_ref(&self.locate(name)), Some(Object::View(v)) if v.check_option)
+    }
+
+    fn set_view_check(&mut self, base: &[String], filter: Expr) {
+        if let Some(key) = self.table_ref(&self.locate(base)).map(|t| t.key()) {
+            self.ses.view_check = Some((key, filter, self.ses.nest_level));
         }
     }
 }

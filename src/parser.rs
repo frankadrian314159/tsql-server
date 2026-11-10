@@ -41,6 +41,19 @@ pub struct Parser {
     toks: Vec<Token>,
     i: usize,
     src: String,
+    /// How deeply expressions and queries are nested at this point (see `MAX_NEST`).
+    depth: usize,
+}
+
+/// Limits on the shape of an expression. The evaluator recurses once per level of the tree, so a deeply nested or very
+/// long left-deep chain (`1+1+1+...`, `a OR b OR ...`) would overflow the stack and take the process down; SQL
+/// Server refuses such statements with error 8632 too.
+/// (Debug builds use far more stack per level, so their limits are lower.)
+const MAX_NEST: usize = if cfg!(debug_assertions) { 25 } else { 100 };
+const MAX_CHAIN: usize = if cfg!(debug_assertions) { 60 } else { 700 };
+
+fn complexity_error() -> SqlError {
+    SqlError::new(8632, "Internal error: An expression services limit has been reached. Please look for potentially complex expressions in your query, and try to simplify them.")
 }
 
 type R<T> = Result<T>;
@@ -91,7 +104,7 @@ pub fn parse_expr_str(sql: &str) -> R<Expr> {
 
 impl Parser {
     pub fn new(sql: &str) -> R<Parser> {
-        Ok(Parser { toks: tokenize(sql)?, i: 0, src: sql.to_string() })
+        Ok(Parser { toks: tokenize(sql)?, i: 0, src: sql.to_string(), depth: 0 })
     }
 
     // ---------------------------------------------------------------- helpers
@@ -394,7 +407,13 @@ impl Parser {
 
     // ------------------------------------------------------------ expressions
     pub fn expr(&mut self) -> R<Expr> {
-        self.or_expr()
+        self.depth += 1;
+        if self.depth > MAX_NEST {
+            return Err(complexity_error());
+        }
+        let r = self.or_expr();
+        self.depth -= 1;
+        r
     }
     /// An expression together with its source text.
     fn expr_text(&mut self) -> R<(Expr, String)> {
@@ -405,7 +424,12 @@ impl Parser {
     }
     fn or_expr(&mut self) -> R<Expr> {
         let mut l = self.and_expr()?;
+        let mut terms = 1;
         while self.accept_kw("OR") {
+            terms += 1;
+            if terms > MAX_CHAIN {
+                return Err(complexity_error());
+            }
             let r = self.and_expr()?;
             l = Expr::Or(Box::new(l), Box::new(r));
         }
@@ -413,7 +437,12 @@ impl Parser {
     }
     fn and_expr(&mut self) -> R<Expr> {
         let mut l = self.not_expr()?;
+        let mut terms = 1;
         while self.accept_kw("AND") {
+            terms += 1;
+            if terms > MAX_CHAIN {
+                return Err(complexity_error());
+            }
             let r = self.not_expr()?;
             l = Expr::And(Box::new(l), Box::new(r));
         }
@@ -509,6 +538,7 @@ impl Parser {
 
     fn add_expr(&mut self) -> R<Expr> {
         let mut l = self.mul_expr()?;
+        let mut terms = 1;
         loop {
             let op = match &self.tok().tok {
                 Tok::Op("+") => BinOp::Add,
@@ -519,12 +549,17 @@ impl Parser {
                 _ => return Ok(l),
             };
             self.i += 1;
+            terms += 1;
+            if terms > MAX_CHAIN {
+                return Err(complexity_error());
+            }
             let r = self.mul_expr()?;
             l = Expr::Binary(op, Box::new(l), Box::new(r));
         }
     }
     fn mul_expr(&mut self) -> R<Expr> {
         let mut l = self.unary()?;
+        let mut terms = 1;
         loop {
             let op = match &self.tok().tok {
                 Tok::Op("*") => BinOp::Mul,
@@ -533,6 +568,10 @@ impl Parser {
                 _ => return Ok(l),
             };
             self.i += 1;
+            terms += 1;
+            if terms > MAX_CHAIN {
+                return Err(complexity_error());
+            }
             let r = self.unary()?;
             l = Expr::Binary(op, Box::new(l), Box::new(r));
         }
@@ -947,6 +986,16 @@ impl Parser {
 
     // ---------------------------------------------------------------- queries
     pub fn query(&mut self) -> R<Query> {
+        self.depth += 1;
+        if self.depth > MAX_NEST {
+            return Err(complexity_error());
+        }
+        let q = self.query_inner();
+        self.depth -= 1;
+        q
+    }
+
+    fn query_inner(&mut self) -> R<Query> {
         let ctes = if self.is_kw("WITH") { self.cte_list()? } else { vec![] };
         let body = self.query_expr()?;
         let mut order = vec![];
@@ -1153,7 +1202,7 @@ impl Parser {
                 from.push(self.table_source()?);
             }
         }
-        let where_ = if self.accept_kw("WHERE") { Some(self.expr()?) } else { None };
+        let where_ = if self.accept_kw("WHERE") { Some(self.expr()?.factor_common()) } else { None };
         let mut group = None;
         if self.is_kw("GROUP") && self.peek_kw(1, &["BY"]) {
             self.i += 2;
@@ -1332,7 +1381,7 @@ impl Parser {
             let right = self.table_primary()?;
             let on = if matches!(kind, JoinKind::Inner | JoinKind::Left | JoinKind::Right | JoinKind::Full) {
                 self.expect_kw("ON")?;
-                Some(self.expr()?)
+                Some(self.expr()?.factor_common())
             } else {
                 None
             };
@@ -1387,7 +1436,12 @@ impl Parser {
         let mut node;
         if self.is_op("(") {
             self.i += 1;
-            if self.is_kw_any(&["SELECT", "WITH"]) {
+            // a derived table may start with parenthesised queries: ((SELECT ...) EXCEPT (SELECT ...)) AS x
+            let mut depth = 0;
+            while self.peek_is_op(depth, "(") {
+                depth += 1;
+            }
+            if self.is_kw_any(&["SELECT", "WITH"]) || (depth > 0 && self.peek_kw(depth, &["SELECT", "WITH"])) {
                 let q = self.query()?;
                 self.expect_op(")")?;
                 let (alias, cols) = self.opt_alias()?;
@@ -2233,7 +2287,7 @@ impl Parser {
                 self.i += 2;
                 return Ok((None, Some(self.ident()?.to_lowercase())));
             }
-            return Ok((Some(self.expr()?), None));
+            return Ok((Some(self.expr()?.factor_common()), None));
         }
         Ok((None, None))
     }
@@ -2418,7 +2472,17 @@ impl Parser {
                     opts.push(SetOpt::Flag("STATISTICS".into(), v));
                 }
                 "ROWCOUNT" | "DATEFIRST" | "TEXTSIZE" | "LOCK_TIMEOUT" | "DEADLOCK_PRIORITY" | "LANGUAGE" | "DATEFORMAT" | "CONTEXT_INFO" => {
-                    let e = self.expr()?;
+                    // SET LANGUAGE british and SET DATEFORMAT dmy take a bare name as well as a string or variable
+                    let bare = matches!(name.as_str(), "LANGUAGE" | "DATEFORMAT") && matches!(self.tok().tok, Tok::Id(_)) && !self.is_kw_any(&["NULL", "N"]);
+                    let e = if bare {
+                        let word = match self.advance().tok {
+                            Tok::Id(w) => w.to_string(),
+                            _ => String::new(),
+                        };
+                        Expr::Lit(Value::Str(word))
+                    } else {
+                        self.expr()?
+                    };
                     opts.push(SetOpt::Expr(name, e));
                 }
                 _ => {
@@ -2972,7 +3036,11 @@ impl Parser {
                 self.skip_with_options();
                 self.expect_kw("AS")?;
                 let q = self.query()?;
-                Ok(Stmt::CreateView { name, cols, query: Rc::new(q), text: self.src[start..].trim_end_matches(|c: char| c == ';' || c.is_whitespace()).to_string(), or_alter, alter })
+                let check_option = self.is_kw("WITH") && self.peek_kw(1, &["CHECK"]) && self.peek_kw(2, &["OPTION"]);
+                if check_option {
+                    self.i += 3;
+                }
+                Ok(Stmt::CreateView { name, cols, query: Rc::new(q), text: self.src[start..].trim_end_matches(|c: char| c == ';' || c.is_whitespace()).to_string(), or_alter, alter, check_option })
             }
             "PROC" | "PROCEDURE" => {
                 let name = self.name_parts()?;
@@ -3121,7 +3189,13 @@ impl Parser {
                 }
                 Ok(Stmt::Security(Box::new(SecStmt::CreateRole { name })))
             }
-            "SYNONYM" | "STATISTICS" | "STATS" => {
+            "SYNONYM" => {
+                let name = self.name_parts()?;
+                self.expect_kw("FOR")?;
+                let target = self.name_parts()?;
+                Ok(Stmt::CreateSynonym { name, target })
+            }
+            "STATISTICS" | "STATS" => {
                 while !self.at_eos() && !self.is_stmt_start() {
                     self.i += 1;
                 }
@@ -3399,7 +3473,11 @@ impl Parser {
                 let (e, t) = self.expr_text()?;
                 self.expect_op(")")?;
                 col.checks.push((cname, e, t));
-            } else if self.is_kw("REFERENCES") {
+            } else if self.is_kw("REFERENCES") || (self.is_kw("FOREIGN") && self.peek_kw(1, &["KEY"]) && self.peek_kw(2, &["REFERENCES"])) {
+                // a column-level foreign key may be written with or without FOREIGN KEY
+                if self.is_kw("FOREIGN") {
+                    self.i += 2;
+                }
                 let mut fk = self.references()?;
                 fk.name = cname;
                 col.fk = Some(fk);

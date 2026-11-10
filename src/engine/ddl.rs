@@ -39,7 +39,12 @@ impl<'a> Engine<'a> {
                     }
                     None => None,
                 };
-                let mut nullable = c.nullable.unwrap_or(true);
+                // a column takes the nullability of its alias type (CREATE TYPE ... NOT NULL) unless it says otherwise
+                let alias_nullable = c.ty.as_ref().and_then(|tr| {
+                    let (sch, nm) = if tr.parts.len() == 1 { ("dbo".to_string(), tr.parts[0].clone()) } else { (tr.parts[tr.parts.len() - 2].clone(), tr.parts[tr.parts.len() - 1].clone()) };
+                    self.srv.databases.get(&db.to_lowercase()).and_then(|d| d.types.get(&obj_key(&sch, &nm))).and_then(|u| if let UserTypeKind::Alias(_, n) = &u.kind { Some(*n) } else { None })
+                });
+                let mut nullable = c.nullable.or(alias_nullable).unwrap_or(true);
                 if c.pk.is_some() || identity.is_some() {
                     nullable = false; // PRIMARY KEY and IDENTITY columns are never nullable
                 }
@@ -387,7 +392,7 @@ impl<'a> Engine<'a> {
                 self.put_table(&loc, t);
                 r?;
             }
-            Stmt::CreateView { name, cols, query, text, or_alter, alter } => {
+            Stmt::CreateView { name, cols, query, text, or_alter, alter, check_option } => {
                 let (db, schema, n) = self.ddl_names(name);
                 self.check_schema(&db, &schema)?;
                 self.check_create("CREATE VIEW", &schema)?;
@@ -413,7 +418,7 @@ impl<'a> Engine<'a> {
                 }
                 let dbname = self.srv.databases[&db].name.clone();
                 let oid = if exists { self.srv.databases[&db].objects[&key].object_id() } else { self.srv.new_object_id() };
-                let v = ViewDef { db: dbname, schema, name: n, query: query.clone(), cols: cols.clone(), text: text.clone(), object_id: oid, triggers: vec![] };
+                let v = ViewDef { db: dbname, schema, name: n, query: query.clone(), cols: cols.clone(), text: text.clone(), object_id: oid, triggers: vec![], check_option: *check_option };
                 self.ensure_tx()?;
                 self.undo_object(&db, &key);
                 self.srv.cat_mut().databases.get_mut(&db).unwrap().objects.insert(key, Object::View(v));
@@ -527,6 +532,20 @@ impl<'a> Engine<'a> {
                 self.ensure_tx()?;
                 self.push_undo(Undo::Type { db: db.clone(), key: key.clone(), prev: None });
                 self.srv.cat_mut().databases.get_mut(&db).unwrap().types.insert(key, UserType { schema, name: n, kind, type_id: id });
+            }
+            Stmt::CreateSynonym { name, target } => {
+                let (db, schema, n) = self.ddl_names(name);
+                self.check_schema(&db, &schema)?;
+                self.check_create("CREATE SYNONYM", &schema)?;
+                let key = obj_key(&schema, &n);
+                if self.srv.databases[&db].objects.contains_key(&key) {
+                    return Err(self.object_exists_err(&n));
+                }
+                let oid = self.srv.new_object_id();
+                self.ensure_tx()?;
+                self.undo_object(&db, &key);
+                let def = SynonymDef { schema, name: n, target: target.clone(), object_id: oid };
+                self.srv.cat_mut().databases.get_mut(&db).unwrap().objects.insert(key, Object::Synonym(def));
             }
             Stmt::CreateSequence { name, opts } => {
                 let (db, schema, n) = self.ddl_names(name);
@@ -727,13 +746,14 @@ impl<'a> Engine<'a> {
                 d.objects.remove(&key);
                 d.triggers.retain(|_, (tk2, _)| *tk2 != tk);
             }
-            "VIEW" | "PROCEDURE" | "FUNCTION" | "SEQUENCE" => {
+            "VIEW" | "PROCEDURE" | "FUNCTION" | "SEQUENCE" | "SYNONYM" => {
                 let d = self.srv.cat_mut().databases.get_mut(&db).ok_or_else(|| SqlError::new(911, "Database does not exist."))?;
                 let ok = match d.objects.get(&key) {
                     Some(Object::View(_)) => what == "VIEW",
                     Some(Object::Proc(_)) => what == "PROCEDURE",
                     Some(Object::Func(_)) => what == "FUNCTION",
                     Some(Object::Seq(_)) => what == "SEQUENCE",
+                    Some(Object::Synonym(_)) => what == "SYNONYM",
                     _ => false,
                 };
                 if ok {

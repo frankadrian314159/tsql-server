@@ -160,6 +160,11 @@ impl<'a> Engine<'a> {
         }
         // which leaves does a condition touch? (None = refers to something outside the cluster)
         let refs_of = |e: &Expr, leaves: &[Leaf]| -> Option<HashSet<usize>> {
+            // a condition with a subquery may refer, inside the subquery, to any of the tables (the columns found here
+            // are only those outside it): it is applied once everything is joined
+            if !super::optimizer::is_pushable(e) {
+                return None;
+            }
             let mut refs = vec![];
             col_refs(e, &mut refs);
             let mut set = HashSet::new();
@@ -186,9 +191,40 @@ impl<'a> Engine<'a> {
             }
             Some(set)
         };
+        // A WHERE conjunct that touches only one leaf that is already materialised (a derived table, CTE, view or outer
+        // join) is applied to that leaf's rows now, before they are joined; without this, `x.year = 2001` on a CTE
+        // reference would only filter the result of joining the whole CTE.
+        let mut rest_where: Vec<Expr> = vec![];
+        let mut per_leaf: Vec<(usize, Expr)> = vec![];
+        for w in where_conds {
+            match refs_of(&w, &leaves) {
+                Some(s) if s.len() == 1 && leaves[*s.iter().next().unwrap()].rs.is_some() => per_leaf.push((*s.iter().next().unwrap(), w)),
+                _ => rest_where.push(w),
+            }
+        }
+        for i in 0..leaves.len() {
+            let es: Vec<&Expr> = per_leaf.iter().filter(|(l, _)| *l == i).map(|(_, e)| e).collect();
+            if es.is_empty() {
+                continue;
+            }
+            let rs = leaves[i].rs.take().unwrap();
+            let Rowset { schema, rows, suppress, report_count } = rs;
+            let mut kept: Vec<Row> = Vec::new();
+            'rows: for row in rows.into_vec() {
+                let env = Env::new(&schema, &row, outer);
+                for e in &es {
+                    if !matches!(self.ev(e, &env)?, Value::Bit(true)) {
+                        continue 'rows;
+                    }
+                }
+                kept.push(row);
+            }
+            leaves[i].est = kept.len() as f64;
+            leaves[i].rs = Some(Rowset { schema, rows: kept.into(), suppress, report_count });
+        }
         // WHERE conjuncts that touch a single table are applied while that table is read
         let mut conds: Vec<Expr> = on_conds;
-        for w in where_conds {
+        for w in rest_where {
             if let Some(s) = refs_of(&w, &leaves) {
                 if s.len() >= 2 {
                     conds.push(w);
@@ -221,7 +257,38 @@ impl<'a> Engine<'a> {
                 })
                 .collect();
             let pool = if connected.is_empty() { &remaining } else { &connected };
-            let next = *pool.iter().min_by(|&&a, &&b| leaves[a].est.partial_cmp(&leaves[b].est).unwrap_or(std::cmp::Ordering::Equal)).unwrap();
+            // a leaf that joins what is already placed on all the columns of one of its unique keys matches at most one
+            // row per row, so it cannot multiply them; a join on a non-unique column can (and is placed later)
+            let unique_link = |c: usize| -> bool {
+                let Some(tl) = &leaves[c].tbl else { return false };
+                let mut cols: HashSet<usize> = HashSet::new();
+                for (ci, cond) in conds.iter().enumerate() {
+                    let Some(s) = &cond_refs[ci] else { continue };
+                    if !s.contains(&c) || !s.iter().any(|x| joined.contains(x)) {
+                        continue;
+                    }
+                    if let Expr::Binary(BinOp::Eq, l, r) = cond {
+                        for side in [l, r] {
+                            if let Expr::Col(p) = &**side {
+                                let mine = p.len() < 2 || leaves[c].aliases.contains(&p[p.len() - 2].to_lowercase());
+                                if mine {
+                                    if let Some(ix) = tl.t.columns.iter().position(|col| col.name.eq_ignore_ascii_case(p.last().unwrap())) {
+                                        cols.insert(ix);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                tl.t.data.specs.iter().any(|sp| (sp.unique || sp.pk) && sp.filter.is_none() && !sp.cols.is_empty() && sp.cols.iter().all(|c| cols.contains(c)))
+            };
+            let next = *pool
+                .iter()
+                .min_by(|&&a, &&b| {
+                    let (ka, kb) = (!connected.is_empty() && !unique_link(a), !connected.is_empty() && !unique_link(b));
+                    ka.cmp(&kb).then(leaves[a].est.partial_cmp(&leaves[b].est).unwrap_or(std::cmp::Ordering::Equal))
+                })
+                .unwrap();
             order.push(next);
             remaining.retain(|&x| x != next);
         }

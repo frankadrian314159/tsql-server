@@ -1,7 +1,6 @@
 //! Built-in system stored procedures.
 use super::query::Rowset;
 use super::*;
-use crate::parser;
 
 pub type SysArg = (Option<String>, Value, Option<String>);
 
@@ -58,7 +57,17 @@ impl<'a> Engine<'a> {
                             }
                             convert::cast(&a.1, &dt, None)?
                         }
-                        None => Value::Null,
+                        // a declared parameter that is not supplied takes its default, or it is an error
+                        None => match &p.default {
+                            Some(e) => {
+                                let v = self.ev(e, &super::query::Env::empty())?;
+                                convert::cast(&v, &dt, None)?
+                            }
+                            None => {
+                                let shown: Vec<String> = params.iter().map(|q| format!("{} {}", q.name, q.ty.parts.join(".").to_lowercase())).collect();
+                                return Err(SqlError::new(8178, format!("The parameterized query '({}){}' expects the parameter '{}', which was not supplied.", shown.join(","), stmt, p.name)).into());
+                            }
+                        },
                     };
                     frame.vars.insert(p.name.clone(), Var { ty: dt, val });
                 }
@@ -70,7 +79,9 @@ impl<'a> Engine<'a> {
                 self.ses.nest_level += 1;
                 self.ses.module_owner.push(String::new());
                 self.ses.ret = Value::Null;
+                let scope = self.enter_module();
                 let r = self.exec_stmts(&stmts);
+                self.leave_module(scope);
                 self.ses.module_owner.pop();
                 self.ses.nest_level -= 1;
                 let callee = self.ses.frames.pop().unwrap();
@@ -104,6 +115,11 @@ impl<'a> Engine<'a> {
                     }
                     let tparts = &parts[..parts.len() - 1];
                     let loc = self.locate(tparts);
+                    if let Loc::Db(d, k) = &loc {
+                        // renaming is DDL: a rollback puts the old column name back
+                        self.ensure_tx()?;
+                        self.undo_object(d, k);
+                    }
                     let mut t = self.take_table(&loc).ok_or_else(|| self.invalid_object(tparts))?;
                     let ci = t.col_index(&parts[parts.len() - 1]);
                     let r = match ci {
@@ -119,15 +135,27 @@ impl<'a> Engine<'a> {
                     let loc = self.locate(&parts);
                     match &loc {
                         Loc::Db(d, k) => {
+                            let schema = match self.srv.databases.get(d).and_then(|db| db.objects.get(k)) {
+                                Some(o) => o.schema().to_string(),
+                                None => return Err(SqlError::new(15225, format!("No item by the name of '{}' could be found in the current database '{}', given that @itemtype was input as '{}'.", objname, self.ses.db, objtype)).into()),
+                            };
+                            let new_key = obj_key(&schema, &newname);
+                            if new_key != *k && self.srv.databases.get(d).is_some_and(|db| db.objects.contains_key(&new_key)) {
+                                return Err(SqlError::new(15335, format!("Error: The new name '{}' is already in use as a OBJECT name and will cause a duplicate that is not permitted.", newname)).into());
+                            }
+                            // renaming is DDL: a rollback restores the old name and removes the new one
+                            self.ensure_tx()?;
+                            self.undo_object(d, k);
+                            self.undo_object(d, &new_key);
                             let db = self.srv.cat_mut().databases.get_mut(d).unwrap();
                             let mut o = db.objects.remove(k).ok_or_else(|| SqlError::new(15225, format!("No item by the name of '{}' could be found in the current database '{}', given that @itemtype was input as '{}'.", objname, self.ses.db, objtype)))?;
-                            let schema = o.schema().to_string();
                             match &mut o {
                                 Object::Table(t) => t.name = newname.clone(),
                                 Object::View(v) => v.name = newname.clone(),
                                 Object::Proc(p) => p.name = newname.clone(),
                                 Object::Func(f) => f.name = newname.clone(),
                                 Object::Seq(s) => s.name = newname.clone(),
+                                Object::Synonym(s) => s.name = newname.clone(),
                             }
                             db.objects.insert(obj_key(&schema, &newname), o);
                         }

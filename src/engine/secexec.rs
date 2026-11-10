@@ -462,7 +462,8 @@ impl<'a> Engine<'a> {
                     self.ses.imp_stack.push((name.clone(), None));
                 } else {
                     let p = self.srv.databases[&dbk].security.principal(name).filter(|p| !p.is_role).cloned().ok_or_else(|| SqlError::with(15517, 14, 1, "Cannot execute as the database principal because the principal does not exist, this type of principal cannot be impersonated, or you do not have permission."))?;
-                    let l = p.login.clone().unwrap_or_else(|| self.eff_login());
+                    // a user without a login has only its own permissions: a sysadmin caller does not carry its rights into it
+                    let l = p.login.clone().unwrap_or_default();
                     self.ses.imp_stack.push((l, Some(p.name.clone())));
                 }
             }

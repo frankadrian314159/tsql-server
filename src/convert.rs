@@ -479,9 +479,22 @@ fn to_int(v: &Value, t: &DataType) -> Result<Value> {
             }
         }
         Value::Bin(b) => {
-            let mut x: i64 = if b.first().map(|c| c & 0x80 != 0).unwrap_or(false) && b.len() < 8 { -1 } else { 0 };
-            for c in b.iter().rev().take(8).rev() {
+            // the bytes, big-endian, padded with zeros on the left (or cut on the left) to the width of the target
+            // type, read as a two's complement number of that width: 0xFF is 255 as an INT and -1 as a SMALLINT's 0x00FF
+            // is 255, while 0xFFFFFFFF is -1
+            let width = match t {
+                DataType::TinyInt => 1,
+                DataType::SmallInt => 2,
+                DataType::Int => 4,
+                _ => 8,
+            };
+            let mut x: i64 = 0;
+            let tail: Vec<u8> = b.iter().rev().take(width).rev().copied().collect();
+            for c in tail.iter() {
                 x = (x << 8) | *c as i64;
+            }
+            if width < 8 && !matches!(t, DataType::TinyInt) && width > 0 && tail.len() == width && tail[0] & 0x80 != 0 {
+                x -= 1i64 << (8 * width);
             }
             x
         }
@@ -676,6 +689,9 @@ fn to_binary(v: &Value, t: &DataType, style: Option<i32>, strict: bool) -> Resul
         Value::Guid(g) => g.to_bytes_le().to_vec(),
         other => to_str(other).bytes().collect(),
     };
+    // integers are right-aligned: a shorter target keeps their low bytes (CAST(255 AS BINARY(2)) is 0x00FF) and a
+    // longer fixed-length one is padded with zeros on the left; strings and binary values are left-aligned
+    let right = matches!(v, Value::Int(_) | Value::BigInt(_) | Value::Dec(_));
     if let Some(n) = t.length() {
         if n != MAX {
             let n = n as usize;
@@ -683,9 +699,19 @@ fn to_binary(v: &Value, t: &DataType, style: Option<i32>, strict: bool) -> Resul
                 if strict {
                     return Err(SqlError::new(8152, "String or binary data would be truncated."));
                 }
-                b.truncate(n);
+                if right {
+                    b.drain(..b.len() - n);
+                } else {
+                    b.truncate(n);
+                }
             } else if matches!(t, DataType::Binary(_)) {
-                b.resize(n, 0);
+                if right {
+                    let mut padded = vec![0u8; n - b.len()];
+                    padded.extend_from_slice(&b);
+                    b = padded;
+                } else {
+                    b.resize(n, 0);
+                }
             }
         }
     }

@@ -28,6 +28,7 @@ statement-terminating vs batch-aborting errors, blocking and deadlocks, permissi
 | **Query optimizer** | Predicate pushdown, index selection (seek / range / IN-list), cost-based join ordering, index nested-loop and hash joins, ordered index reads that stop early for `TOP … ORDER BY`, `SET SHOWPLAN_TEXT`. | [docs/optimizer.md](docs/optimizer.md) |
 | **Temporal tables** | `PERIOD FOR SYSTEM_TIME`, `SYSTEM_VERSIONING = ON` with an automatic or named history table, `FOR SYSTEM_TIME AS OF / FROM..TO / BETWEEN / CONTAINED IN / ALL`, `HIDDEN` period columns. | [docs/temporal.md](docs/temporal.md) |
 | **Performance** | A benchmark (`cargo run --release --example bench`) and a span profiler (`--features prof`) to find hot spots; index seeks for correlated subqueries, in-place B+tree updates, no global catalog lock for reads, per-session bookkeeping and a reader-writer page store so read throughput scales with cores. | [docs/performance.md](docs/performance.md) |
+| **Benchmarks and tests in T-SQL** | TPC-H (22 queries) and a TPC-DS subset, TPC-C and a reduced TPC-E (concurrent terminals with the benchmark's consistency conditions), a SQLsmith-style fuzzer with differential, ternary-logic and NoREC oracles, and about 195 tSQLt-style unit tests written in T-SQL (`cargo run --release --example tpc`, `--example tpc_oltp`, `--example sqlsmith`, `cargo test --test tsqlt`). | [docs/benchmarks.md](docs/benchmarks.md), [docs/tsqlt.md](docs/tsqlt.md) |
 | **Shell and desktop app** | `tsql`: an interactive shell with `GO` batches, grids, dot-commands (`.tables`, `.schema`, `.import`, `.export`, `.plan`, `.storage`, …) and script/exit-code support. `tsql-gui`: an egui app with a navigation pane, editable datasheets, a table designer, a query editor with plans, CSV import/export, transactions and live storage statistics. | [docs/shell-and-gui.md](docs/shell-and-gui.md) |
 | **TDS server** | `tsql-serve` listens on a TCP port and speaks TDS 7.4: SQL logins, batches, `sp_executesql`, prepared statements and procedure calls with OUTPUT parameters and return status, transactions, attention, all the data types. Checked against `System.Data.SqlClient` and tiberius. TLS supported. | [docs/tds.md](docs/tds.md) |
 | **T-SQL language** | Queries, DML, DDL, procedural code, cursors, dynamic SQL, JSON, windows, CTEs, MERGE, triggers, … | [Coverage](#t-sql-coverage) |
@@ -136,11 +137,13 @@ window functions, JSON (`JSON_VALUE JSON_QUERY JSON_MODIFY OPENJSON ISJSON`), `H
 ## Behaviour notes
 
 * Strings compare case-insensitively and ignore trailing spaces (`SQL_Latin1_General_CP1_CI_AS`-like).
-* Integer arithmetic overflows raise error 8115; decimal division follows SQL Server's scale rules.
+* Integer arithmetic overflows raise error 8115. A decimal division's scale comes from the values' scales, not from SQL Server's rule for the operands' declared precision, so it can have fewer decimals.
 * A runtime error ends the current statement and the batch continues, unless inside `TRY`, under `XACT_ABORT ON`, or the
   error is batch-aborting (`THROW`, syntax errors, deadlock victims, …). A failed statement inside a transaction undoes
   only that statement.
 * Autocommit: a statement outside `BEGIN TRAN` is its own transaction under the session's isolation level.
+* Local temporary tables created in a stored procedure or a dynamic batch (`EXEC (...)`, `sp_executesql`) are dropped when it ends, and the `SET` options it changed (`NOCOUNT`, `DATEFIRST`, `LANGUAGE`, `XACT_ABORT`, ...) return to the caller's.
+* Expressions nested more than 100 levels deep, or chains of more than 700 terms, are refused with error 8632 instead of overflowing the stack.
 * Without an `ORDER BY`, row order is whatever the chosen access path produces (as in SQL Server).
 
 ## Limitations
@@ -172,8 +175,9 @@ Things that are **not** implemented, so you are not surprised:
 * **Optimizer** — heuristic and statistics-on-demand (distinct counts come from the indexes, exact for small ones and
   sampled for large ones);
   no histograms on unindexed columns, `OPTION (HASH JOIN | LOOP JOIN | FORCE ORDER)` and table hints are honoured (see
-  [docs/administration.md](docs/administration.md)), outer joins are not reordered, subqueries are executed per row rather than
-  rewritten to semi-joins, and only parsed batches (not execution plans) are cached.
+  [docs/administration.md](docs/administration.md)), outer joins are not reordered, a correlated subquery is executed per outer row (an uncorrelated one once per statement)
+  rather than being rewritten to a semi-join or a grouped join, and only parsed batches (not execution plans) are cached.
+* **Triggers on views** — `INSTEAD OF` triggers on views are not supported (`AFTER` triggers on tables are; a view that maps onto one table is updatable, with `WITH CHECK OPTION`).
 * **Tools** — the shell and the desktop app use one session each (see [docs/shell-and-gui.md](docs/shell-and-gui.md)).
 * **XML / spatial / hierarchy** — `xml` is stored as text; `.value()`, `.exist()` and `.query()` handle simple XPath only, with no `.nodes()`, `.modify()` or `OPENXML` (see [docs/triggers.md](docs/triggers.md));
   `geography`, `geometry`, `hierarchyid` are not functional. No full-text search, Service Broker, CLR, SQL Agent,

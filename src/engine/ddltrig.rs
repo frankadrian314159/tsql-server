@@ -91,6 +91,7 @@ pub fn is_ddl_stmt(st: &Stmt) -> bool {
         | Stmt::CreateDatabase(..)
         | Stmt::CreateType { .. }
         | Stmt::CreateSequence { .. }
+        | Stmt::CreateSynonym { .. }
         | Stmt::AlterSequence { .. }
         | Stmt::AlterTable { .. }
         | Stmt::AlterDatabase { .. }
@@ -145,6 +146,7 @@ impl<'a> Engine<'a> {
             Stmt::CreateSchema(n, _) => vec![ev("CREATE_SCHEMA", "SCHEMA", n.clone(), n.clone(), false)],
             Stmt::CreateType { name, .. } => vec![simple("CREATE_TYPE", "TYPE", name)],
             Stmt::CreateSequence { name, .. } => vec![simple("CREATE_SEQUENCE", "SEQUENCE", name)],
+            Stmt::CreateSynonym { name, .. } => vec![simple("CREATE_SYNONYM", "SYNONYM", name)],
             Stmt::AlterSequence { name, .. } => vec![simple("ALTER_SEQUENCE", "SEQUENCE", name)],
             Stmt::CreateDatabase(n, _) => vec![DdlEvent { name: "CREATE_DATABASE", object_type: "DATABASE", schema: String::new(), object: n.clone(), database: n.clone(), server_only: true }],
             Stmt::AlterDatabase { db: d, .. } => vec![DdlEvent { name: "ALTER_DATABASE", object_type: "DATABASE", schema: String::new(), object: d.clone(), database: d.clone(), server_only: false }],

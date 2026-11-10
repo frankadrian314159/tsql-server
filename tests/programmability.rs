@@ -353,10 +353,13 @@ fn repeated_sp_executesql_calls_reuse_parsed_text_but_not_results() {
         let r = rows(&mut c, &format!("DECLARE @o VARCHAR(10); EXEC sp_executesql N'SELECT @out = v FROM sx WHERE id = @id', N'@id INT, @out VARCHAR(10) OUTPUT', @id = {id}, @out = @o OUTPUT; SELECT @o AS got"));
         assert_eq!(r.last().unwrap()[0], want);
     }
-    // a parameter that is not supplied is NULL, every time
-    assert_eq!(scalar(&mut c, "EXEC sp_executesql N'SELECT ISNULL(@x, -1)', N'@x INT'"), "-1");
+    // a declared parameter that is not supplied is an error (8178) every time, unless it has a default
+    assert_eq!(err_no(&mut c, "EXEC sp_executesql N'SELECT ISNULL(@x, -1)', N'@x INT'"), 8178);
     assert_eq!(scalar(&mut c, "EXEC sp_executesql N'SELECT ISNULL(@x, -1)', N'@x INT', @x = 7"), "7");
-    assert_eq!(scalar(&mut c, "EXEC sp_executesql N'SELECT ISNULL(@x, -1)', N'@x INT'"), "-1");
+    assert_eq!(err_no(&mut c, "EXEC sp_executesql N'SELECT ISNULL(@x, -1)', N'@x INT'"), 8178);
+    assert_eq!(scalar(&mut c, "EXEC sp_executesql N'SELECT ISNULL(@x, -1)', N'@x INT = NULL'"), "-1");
+    assert_eq!(scalar(&mut c, "EXEC sp_executesql N'SELECT @x', N'@x INT = 5'"), "5");
+    assert_eq!(scalar(&mut c, "EXEC sp_executesql N'SELECT @x', N'@x INT = 5', @x = 6"), "6");
     // a change to the catalog between calls is seen by the cached statement
     assert_eq!(scalar(&mut c, &format!("{q}1")), "a");
     exec(&mut c, "DROP TABLE sx");

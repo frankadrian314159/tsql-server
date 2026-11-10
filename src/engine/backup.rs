@@ -206,6 +206,7 @@ fn set_object_id(o: &mut Object, id: i32) {
         Object::Proc(p) => p.object_id = id,
         Object::Func(f) => f.object_id = id,
         Object::Seq(s) => s.object_id = id,
+        Object::Synonym(s) => s.object_id = id,
     }
 }
 

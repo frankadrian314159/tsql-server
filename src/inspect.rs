@@ -12,6 +12,7 @@ pub enum ObjectKind {
     Procedure,
     Function,
     Sequence,
+    Synonym,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -230,6 +231,7 @@ impl Connection {
                         Object::Proc(_) => ObjectKind::Procedure,
                         Object::Func(_) => ObjectKind::Function,
                         Object::Seq(_) => ObjectKind::Sequence,
+                        Object::Synonym(_) => ObjectKind::Synonym,
                     },
                 })
                 .collect();

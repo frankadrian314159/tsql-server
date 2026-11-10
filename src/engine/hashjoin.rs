@@ -45,7 +45,38 @@ fn part_of(key: &str) -> usize {
     (h.finish() % PARTS as u64) as usize
 }
 
-fn key_for(eng: &mut Engine<'_>, keys: &[Expr], colls: &super::query::Colls, schema: &Schema, row: &[Value], outer: Option<&Env<'_>>) -> Result<Option<String>> {
+/// The positions of the key columns when every key is a plain column of `schema` (so a row's key can be read by
+/// position instead of by evaluating an expression that looks the column up by name).
+fn simple_cols(keys: &[Expr], schema: &Schema) -> Option<Vec<usize>> {
+    fn strip(e: &Expr) -> &Expr {
+        match e {
+            Expr::Paren(x) => strip(x),
+            _ => e,
+        }
+    }
+    keys.iter()
+        .map(|k| match strip(k) {
+            Expr::Col(parts) => match schema.find_parts(parts) {
+                Found::One(i) if schema.cols[i].denied.is_none() => Some(i),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+fn key_for(eng: &mut Engine<'_>, keys: &[Expr], idx: Option<&[usize]>, colls: &super::query::Colls, schema: &Schema, row: &[Value], outer: Option<&Env<'_>>) -> Result<Option<String>> {
+    if let Some(ix) = idx {
+        let mut kv = Vec::with_capacity(ix.len());
+        for &i in ix {
+            let v = &row[i];
+            if v.is_null() {
+                return Ok(None);
+            }
+            kv.push(v.clone());
+        }
+        return Ok(Some(if colls.is_empty() { key_of(&kv) } else { key_of(&super::query::keyed(&kv, colls)) }));
+    }
     let env = Env::new(schema, row, outer);
     let mut kv = Vec::with_capacity(keys.len());
     for k in keys {
@@ -80,6 +111,8 @@ pub struct HashJoin {
     mem: usize,
     grace: Option<Grace>,
     right_cols: usize,
+    left_idx: Option<Vec<usize>>,
+    right_idx: Option<Vec<usize>>,
     /// Rows read into the build side, probe rows seen, and partitions that went through files (statistics).
     pub built: usize,
     pub probed: usize,
@@ -92,7 +125,9 @@ type Emit<'e> = &'e mut dyn FnMut(&mut Engine<'_>, Row) -> Result<bool>;
 impl HashJoin {
     pub fn new(spec: JoinSpec, budget: usize, work: WorkMem) -> HashJoin {
         let right_cols = spec.right_schema.cols.len();
-        HashJoin { spec, budget: budget.max(1), work, map: HashMap::new(), flags: HashMap::new(), null_build: None, mem: 0, grace: None, right_cols, built: 0, probed: 0, spilled_partitions: 0, extra_passes: 0 }
+        let left_idx = simple_cols(&spec.left_keys, &spec.left_schema);
+        let right_idx = simple_cols(&spec.right_keys, &spec.right_schema);
+        HashJoin { spec, budget: budget.max(1), work, map: HashMap::new(), flags: HashMap::new(), null_build: None, mem: 0, grace: None, right_cols, left_idx, right_idx, built: 0, probed: 0, spilled_partitions: 0, extra_passes: 0 }
     }
 
     /// Did the build side overflow into partition files?
@@ -123,7 +158,7 @@ impl HashJoin {
     /// Add one row of the build side.
     pub fn add_build(&mut self, eng: &mut Engine<'_>, row: Row, outer: Option<&Env<'_>>) -> Result<()> {
         self.built += 1;
-        let Some(k) = key_for(eng, &self.spec.right_keys, &self.spec.colls, &self.spec.right_schema, &row, outer)? else {
+        let Some(k) = key_for(eng, &self.spec.right_keys, self.right_idx.as_deref(), &self.spec.colls, &self.spec.right_schema, &row, outer)? else {
             if self.spec.right {
                 if self.null_build.is_none() {
                     self.null_build = Some(PartWriter::create(&self.work.dir)?);
@@ -178,7 +213,7 @@ impl HashJoin {
     /// Push one probe row. Returns false when the consumer wants no more rows.
     pub fn probe(&mut self, eng: &mut Engine<'_>, lrow: Row, outer: Option<&Env<'_>>, emit: Emit<'_>) -> Result<bool> {
         self.probed += 1;
-        let key = key_for(eng, &self.spec.left_keys, &self.spec.colls, &self.spec.left_schema, &lrow, outer)?;
+        let key = key_for(eng, &self.spec.left_keys, self.left_idx.as_deref(), &self.spec.colls, &self.spec.left_schema, &lrow, outer)?;
         if self.grace.is_some() {
             match key {
                 None => {
@@ -203,12 +238,18 @@ impl HashJoin {
             return Ok(true);
         }
         let mut matched = false;
+        let lrow_back: Option<Row>;
         if let Some(k) = key {
             let mut hits: Vec<usize> = vec![];
             let mut stop = false;
             if let Some(cands) = self.map.get(&k) {
+                // the probe row is moved into the last candidate's output row instead of copied (and handed back if a
+                // residual condition rejects it, so a left join can still extend it)
+                let n = lrow.len();
+                let mut keep = Some(lrow);
                 for (i, r) in cands.iter().enumerate() {
-                    let mut row = lrow.clone();
+                    let last = i + 1 == cands.len();
+                    let mut row = if last { keep.take().unwrap() } else { keep.as_ref().unwrap().clone() };
                     row.extend(r.iter().cloned());
                     if self.residual_ok(eng, &row, outer)? {
                         matched = true;
@@ -217,8 +258,14 @@ impl HashJoin {
                             stop = true;
                             break;
                         }
+                    } else if last {
+                        row.truncate(n);
+                        keep = Some(row);
                     }
                 }
+                lrow_back = keep;
+            } else {
+                lrow_back = Some(lrow);
             }
             if self.spec.right {
                 if let Some(f) = self.flags.get_mut(&k) {
@@ -230,9 +277,11 @@ impl HashJoin {
             if stop {
                 return Ok(false);
             }
+        } else {
+            lrow_back = Some(lrow);
         }
         if !matched && self.spec.left {
-            let row = self.null_extended(&lrow);
+            let row = self.null_extended(&lrow_back.expect("an unmatched probe row is kept"));
             return emit(eng, row);
         }
         Ok(true)
@@ -575,14 +624,15 @@ impl<'a> Engine<'a> {
         let schemas: Vec<&Schema> = leaves.iter().map(|l| &l.schema).collect();
 
         // ---- conditions: (conjunct, leaves it needs, the leaf of the LEFT JOIN it belongs to)
-        let mut conds: Vec<(Expr, HashSet<usize>, Option<usize>)> = vec![];
+        // (conjunct, leaves it needs, the leaf of the outer join it belongs to, the leaf whose join's ON clause it came from)
+        let mut conds: Vec<(Expr, HashSet<usize>, Option<usize>, Option<usize>)> = vec![];
         for (i, e) in entries.iter().enumerate() {
             if let Some(on) = e.on {
                 let mut parts = vec![];
                 split_and(on, &mut parts);
                 for c in parts {
                     let Some(refs) = leaves_of(c, &schemas) else { return Ok(None) };
-                    conds.push((c.clone(), refs, if e.left || e.right { Some(i) } else { None }));
+                    conds.push((c.clone(), refs, if e.left || e.right { Some(i) } else { None }, Some(i)));
                 }
             }
         }
@@ -593,14 +643,14 @@ impl<'a> Engine<'a> {
                 for c in parts {
                     if let Some(refs) = leaves_of(c, &schemas) {
                         if refs.len() >= 2 {
-                            conds.push((c.clone(), refs, None));
+                            conds.push((c.clone(), refs, None, None));
                         }
                     }
                 }
             }
         }
         // a condition that is a plain equality between columns of two different leaves can be a join key
-        let connects = |c: &(Expr, HashSet<usize>, Option<usize>), a: usize, b: usize| -> bool { matches!(&c.0, Expr::Binary(BinOp::Eq, ..)) && c.1.contains(&a) && c.1.contains(&b) };
+        let connects = |c: &(Expr, HashSet<usize>, Option<usize>, Option<usize>), a: usize, b: usize| -> bool { matches!(&c.0, Expr::Binary(BinOp::Eq, ..)) && c.1.contains(&a) && c.1.contains(&b) };
 
         // ---- execution order
         let est: Vec<f64> = {
@@ -619,8 +669,31 @@ impl<'a> Engine<'a> {
             // probe the biggest table, build the others (smallest connected one first)
             let first = (0..n).max_by(|&a, &b| est[a].partial_cmp(&est[b]).unwrap_or(std::cmp::Ordering::Equal)).unwrap();
             order.push(first);
+            // does leaf `i` join the leaves already placed on all the columns of one of its unique keys? Then each row
+            // matches at most one of its rows, so the join cannot multiply rows; a join on a non-unique column can.
+            let unique_link = |i: usize, placed: &Vec<usize>| -> bool {
+                let mut cols: HashSet<usize> = HashSet::new();
+                for c in &conds {
+                    if !c.1.contains(&i) || !placed.iter().any(|j| c.1.contains(j)) {
+                        continue;
+                    }
+                    if let Expr::Binary(BinOp::Eq, a, b) = &c.0 {
+                        for side in [a, b] {
+                            if let Expr::Col(p) = &**side {
+                                if let Found::One(ci) = leaves[i].schema.find_parts(p) {
+                                    cols.insert(ci);
+                                }
+                            }
+                        }
+                    }
+                }
+                leaves[i].t.data.specs.iter().any(|sp| (sp.unique || sp.pk) && sp.filter.is_none() && !sp.cols.is_empty() && sp.cols.iter().all(|c| cols.contains(c)))
+            };
             while order.len() < n {
-                let next = (0..n).filter(|i| !order.contains(i)).filter(|&i| order.iter().any(|&j| conds.iter().any(|c| connects(c, i, j)))).min_by(|&a, &b| est[a].partial_cmp(&est[b]).unwrap_or(std::cmp::Ordering::Equal));
+                let next = (0..n).filter(|i| !order.contains(i)).filter(|&i| order.iter().any(|&j| conds.iter().any(|c| connects(c, i, j)))).min_by(|&a, &b| {
+                    let (ka, kb) = (!unique_link(a, &order), !unique_link(b, &order));
+                    ka.cmp(&kb).then(est[a].partial_cmp(&est[b]).unwrap_or(std::cmp::Ordering::Equal))
+                });
                 match next {
                     Some(i) => order.push(i),
                     None => return Ok(None), // a leaf with no equality to the rest would be a cross product
@@ -662,9 +735,14 @@ impl<'a> Engine<'a> {
                     continue;
                 }
                 // a LEFT JOIN's own conditions belong to its stage; others go to the first stage where they can be evaluated
+                // (with outer joins the order is the written one, and a condition of an inner join's ON clause is that
+                // join's, whatever it mentions: placed in an earlier outer join's stage it would not remove rows there)
                 let mine = match c.2 {
                     Some(owner) => owner == li,
-                    None => c.1.contains(&li) || c.1.is_empty(),
+                    None => match (has_left, c.3) {
+                        (true, Some(o)) => o == li,
+                        _ => c.1.contains(&li) || c.1.is_empty(),
+                    },
                 };
                 let ready = c.1.iter().all(|x| *x == li || joined_set.contains(x));
                 if !mine || !ready {
@@ -725,6 +803,23 @@ impl<'a> Engine<'a> {
             stages.push(StagePlan { leaf: li, spec: JoinSpec { left: entries[li].left, right: entries[li].right, left_keys, right_keys, colls, residual, left_schema: acc_schema.clone(), right_schema, joined: joined.clone() } });
             acc_schema = joined;
             joined_set.insert(li);
+        }
+        // A condition that mentions only the probe table (the first one) was claimed by no stage, since a stage takes the
+        // conditions that mention its own table. It must still filter: as a residual of the first stage when that is an
+        // inner join (where it removes the probe row either way), otherwise the general executor takes the query.
+        for (ci, c) in conds.iter().enumerate() {
+            if !used[ci] && c.2.is_none() {
+                if has_left {
+                    return Ok(None);
+                }
+                match stages.first_mut() {
+                    Some(st) if !st.spec.left && !st.spec.right => {
+                        st.spec.residual.push(c.0.clone());
+                        used[ci] = true;
+                    }
+                    _ => return Ok(None),
+                }
+            }
         }
         if conds.iter().enumerate().any(|(i, c)| !used[i] && c.2.is_some()) {
             return Ok(None);

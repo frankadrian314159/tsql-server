@@ -238,8 +238,10 @@ pub fn split_batches(script: &str) -> Vec<(String, usize)> {
     let mut cur: Vec<&str> = Vec::new();
     let mut in_block = 0i32;
     let mut in_str = false;
+    // inside a [bracketed] or "quoted" identifier, where an apostrophe or a comment marker is just a character
+    let mut in_ident: Option<char> = None;
     for line in script.lines() {
-        if in_block == 0 && !in_str {
+        if in_block == 0 && !in_str && in_ident.is_none() {
             let t = line.trim();
             let tl = t.to_ascii_uppercase();
             if tl == "GO" || (tl.starts_with("GO ") && tl[3..].trim().chars().all(|c| c.is_ascii_digit()) && !tl[3..].trim().is_empty()) || (tl.starts_with("GO") && tl[2..].trim_start().starts_with("--")) {
@@ -267,6 +269,18 @@ pub fn split_batches(script: &str) -> Vec<(String, usize)> {
                 if b[i] == '\'' {
                     in_str = false;
                 }
+                i += 1;
+            } else if let Some(close) = in_ident {
+                if b[i] == close {
+                    if i + 1 < b.len() && b[i + 1] == close {
+                        i += 2; // ]] or "" is a literal closing character
+                        continue;
+                    }
+                    in_ident = None;
+                }
+                i += 1;
+            } else if b[i] == '[' || b[i] == '"' {
+                in_ident = Some(if b[i] == '[' { ']' } else { '"' });
                 i += 1;
             } else if b[i] == '-' && i + 1 < b.len() && b[i + 1] == '-' {
                 break;

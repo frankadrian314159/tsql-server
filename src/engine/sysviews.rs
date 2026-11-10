@@ -108,6 +108,25 @@ pub fn audit_rowset(events: Vec<(String, crate::audit::AuditEvent)>) -> Rowset {
 }
 
 impl<'a> Engine<'a> {
+    /// The schemas of the current database with the ids `sys.schemas` gives them.
+    pub fn user_schema_names(&self) -> Vec<(i32, String)> {
+        let Some(db) = self.srv.databases.get(&self.ses.db.to_lowercase()) else { return vec![] };
+        db.schemas
+            .iter()
+            .enumerate()
+            .map(|(i, (k, v))| {
+                let id = match k.as_str() {
+                    "dbo" => 1,
+                    "guest" => 2,
+                    "information_schema" => 3,
+                    "sys" => 4,
+                    _ => 5 + i as i32,
+                };
+                (id, v.clone())
+            })
+            .collect()
+    }
+
     pub fn sysview(&self, schema: &str, name: &str) -> Option<Rowset> {
         let db = self.srv.databases.get(&self.ses.db.to_lowercase())?;
         let dbname = db.name.clone();
@@ -186,6 +205,24 @@ impl<'a> Engine<'a> {
                         }
                     }
                     Some(rs(&[("object_id", DataType::Int), ("name", nv()), ("column_id", DataType::Int), ("system_type_id", DataType::Int), ("user_type_id", DataType::Int), ("max_length", DataType::SmallInt), ("precision", DataType::TinyInt), ("scale", DataType::TinyInt), ("is_nullable", DataType::Bit), ("is_identity", DataType::Bit), ("is_computed", DataType::Bit), ("collation_name", nv())], rows))
+                }
+                "parameters" | "all_parameters" => {
+                    // the parameters of procedures and functions (the return value of a function is not listed)
+                    let mut rows = vec![];
+                    for o in db.objects.values() {
+                        let (oid, params): (i32, &[crate::ast::Param]) = match o {
+                            Object::Proc(p) => (p.object_id, &p.params[..]),
+                            Object::Func(f) => (f.object_id, &f.def.params[..]),
+                            _ => continue,
+                        };
+                        for (i, p) in params.iter().enumerate() {
+                            let dt = p.ty.parts.last().and_then(|n| DataType::from_name(n, &p.ty.args, false).ok());
+                            let (st, ml, pr, sc) = dt.as_ref().map(type_info).unwrap_or((0, 0, 0, 0));
+                            let nm = if p.name.starts_with('@') { p.name.clone() } else { format!("@{}", p.name) };
+                            rows.push(vec![Value::Int(oid), sv(&nm), Value::Int(i as i32 + 1), Value::Int(st), Value::Int(st), Value::Int(ml), Value::Int(pr), Value::Int(sc), Value::Bit(p.out), Value::Bit(p.default.is_some()), Value::Bit(p.readonly)]);
+                        }
+                    }
+                    Some(rs(&[("object_id", DataType::Int), ("name", nv()), ("parameter_id", DataType::Int), ("system_type_id", DataType::Int), ("user_type_id", DataType::Int), ("max_length", DataType::SmallInt), ("precision", DataType::TinyInt), ("scale", DataType::TinyInt), ("is_output", DataType::Bit), ("has_default_value", DataType::Bit), ("is_readonly", DataType::Bit)], rows))
                 }
                 "security_policies" => {
                     let rows = db.policies.iter().map(|p| vec![sv(&p.name), Value::Int(p.object_id), Value::Bit(p.enabled), sv(&p.schema)]).collect();

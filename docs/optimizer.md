@@ -68,3 +68,19 @@ the rows it contains, and a row enters or leaves it as its columns change. The o
 query's own conditions imply the filter (`amount > 600` implies `amount > 500`; `amount >= 500` does not), and foreign keys, joins
 and ordered reads never rely on one. `INCLUDE` columns are recorded (`sys.index_columns.is_included_column`, scripts) but, with
 no covering-index reads, they change nothing at run time. `sys.indexes` shows `has_filter` and `filter_definition`.
+
+## Rewrites found by running the TPC queries
+
+* **Subqueries that do not use the outer row are evaluated once per statement.** Whether a subquery is correlated is
+  found by running it once without the outer row: if that works, no outer column was needed and its rows are kept for
+  the rest of the statement; if it fails because a column is unknown, it runs per row as before. The cache is dropped
+  at the end of each statement and is off while an `IF` or `WHILE` condition is evaluated.
+* **Common conjuncts of an OR are factored out** when the statement is parsed: `(a AND b) OR (a AND c)` is
+  `a AND (b OR c)`, so a join condition repeated in each branch (TPC-H Q19) is a join condition.
+* **A condition on a CTE, derived table or view reference is applied to its rows before they are joined.**
+* **Join order prefers a unique-key join.** Among the tables that connect to those already placed, one joined on all the
+  columns of one of its unique keys (so each row matches at most one) goes before one joined on a non-unique column
+  that can multiply rows, whatever their sizes.
+* **Window aggregates are accumulated as the frame moves**, and peer groups are found once, so a running total or a
+  whole-partition aggregate is linear in the partition.
+

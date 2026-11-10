@@ -203,7 +203,7 @@ impl<'a> Engine<'a> {
             }
             Expr::InQuery(a, q, neg) => {
                 let l = self.ev(a, env)?;
-                let rs = self.exec_query(q, Some(env))?;
+                let rs = self.sub_rows(q, env)?;
                 if rs.schema.cols.len() != 1 {
                     return Err(SqlError::new(116, "Only one expression can be specified in the select list when the subquery is not introduced with EXISTS."));
                 }
@@ -259,7 +259,7 @@ impl<'a> Engine<'a> {
             }
             Expr::CmpQuant(op, all, a, q) => {
                 let l = self.ev(a, env)?;
-                let rs = self.exec_query(q, Some(env))?;
+                let rs = self.sub_rows(q, env)?;
                 if rs.rows.is_empty() {
                     return Ok(Value::Bit(*all));
                 }
@@ -292,11 +292,11 @@ impl<'a> Engine<'a> {
                 }
             }
             Expr::Exists(q) => {
-                let rs = self.exec_query(q, Some(env))?;
+                let rs = self.sub_rows(q, env)?;
                 Ok(Value::Bit(!rs.rows.is_empty()))
             }
             Expr::Subquery(q) => {
-                let rs = self.exec_query(q, Some(env))?;
+                let rs = self.sub_rows(q, env)?;
                 if rs.schema.cols.len() != 1 {
                     return Err(SqlError::new(116, "Only one expression can be specified in the select list when the subquery is not introduced with EXISTS."));
                 }
@@ -362,6 +362,61 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Run a subquery for the row in `env`. One that does not use the enclosing row gives the same rows every time
+    /// within a statement, so its result is kept (a correlated subquery would otherwise be run once per outer row, and
+    /// an uncorrelated one is as likely as not to be a full scan). Whether it is correlated is found by running it
+    /// once without the enclosing row: if that works, no outer column was evaluated; if it fails because a column is
+    /// unknown, it is correlated and runs per row as before.
+    fn sub_rows(&mut self, q: &Query, env: &Env<'_>) -> Result<super::query::Rowset> {
+        let key = q as *const Query as usize;
+        if self.ses.sub_cache.is_none() {
+            return self.exec_query(q, Some(env));
+        }
+        match self.ses.sub_cache.as_ref().and_then(|c| c.get(&key)) {
+            Some(Some(rs)) => return Ok(rs.clone()),
+            Some(None) => return self.exec_query(q, Some(env)),
+            None => {}
+        }
+        match self.exec_query(q, None) {
+            Ok(rs) => {
+                if let Some(c) = self.ses.sub_cache.as_mut() {
+                    c.insert(key, Some(rs.clone()));
+                }
+                Ok(rs)
+            }
+            Err(e) if e.number == 207 || e.number == 4104 => {
+                if let Some(c) = self.ses.sub_cache.as_mut() {
+                    c.insert(key, None);
+                }
+                self.exec_query(q, Some(env))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Is this expression known to be NCHAR / NVARCHAR (a column, variable or CAST of that type, or a string function of one)?
+    fn is_unicode_expr(&self, e: &Expr, env: &Env<'_>) -> bool {
+        let wide_type = |t: &DataType| matches!(t, DataType::NChar(_) | DataType::NVarChar(_) | DataType::NText);
+        match e {
+            Expr::Paren(x) => self.is_unicode_expr(x, env),
+            Expr::Col(p) => match env.schema.find_parts(p) {
+                super::query::Found::One(i) => env.schema.cols[i].ty.as_ref().map(wide_type).unwrap_or(false),
+                _ => match env.parent {
+                    Some(par) => self.is_unicode_expr(e, par),
+                    None => false,
+                },
+            },
+            Expr::Var(n) => self.ses.frames.last().and_then(|f| f.vars.get(n)).map(|v| wide_type(&v.ty)).unwrap_or(false),
+            Expr::Cast { ty, .. } => ty.parts.last().and_then(|n| DataType::from_name(n, &ty.args, false).ok()).map(|t| wide_type(&t)).unwrap_or(false),
+            Expr::Func(fc) => match fc.name.as_str() {
+                "NCHAR" | "QUOTENAME" => true,
+                "UPPER" | "LOWER" | "LTRIM" | "RTRIM" | "TRIM" | "REPLACE" | "SUBSTRING" | "LEFT" | "RIGHT" | "REVERSE" | "STUFF" | "REPLICATE" | "ISNULL" | "COALESCE" => fc.args.first().map(|a| self.is_unicode_expr(a, env)).unwrap_or(false),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     fn eval_func(&mut self, fc: &FuncCall, env: &Env<'_>) -> Result<Value> {
         if fc.over.is_some() {
             let key = fc as *const FuncCall as usize;
@@ -371,6 +426,16 @@ impl<'a> Engine<'a> {
             };
         }
         let name = fc.name.as_str();
+        if name == "DATALENGTH" && fc.args.len() == 1 && fc.schema.is_none() {
+            // the bytes of a string depend on its type (two per character for NCHAR / NVARCHAR), which the value does not carry
+            let v = self.ev(&fc.args[0], env)?;
+            if let Value::Str(t) = &v {
+                let wide = t.chars().any(|c| c as u32 > 0xFF) || self.is_unicode_expr(&fc.args[0], env);
+                let units = t.encode_utf16().count() as i32;
+                return Ok(Value::Int(if wide { units * 2 } else { t.chars().count() as i32 }));
+            }
+            return Ok(self.builtin("DATALENGTH", vec![v], fc)?.unwrap_or(Value::Null));
+        }
         if fc.schema.is_none() || fc.schema.as_deref().map(|s| s.eq_ignore_ascii_case("sys")).unwrap_or(false) {
             if is_agg_name(name) {
                 return self.eval_aggregate(fc, env);

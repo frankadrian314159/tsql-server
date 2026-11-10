@@ -466,7 +466,7 @@ pub enum Stmt {
     Reconfigure,
     CreateTable { name: Name, defs: Vec<TableDef>, versioning: Option<Versioning> },
     CreateIndex { name: String, table: Name, cols: Vec<(String, bool)>, unique: bool, include: Vec<String>, filter: Option<(Expr, String)> },
-    CreateView { name: Name, cols: Option<Vec<String>>, query: Rc<Query>, text: String, or_alter: bool, alter: bool },
+    CreateView { name: Name, cols: Option<Vec<String>>, query: Rc<Query>, text: String, or_alter: bool, alter: bool, check_option: bool },
     CreateProc { name: Name, params: Vec<Param>, body: Rc<Vec<Stmt>>, text: String, or_alter: bool, alter: bool },
     CreateFunction(Box<CreateFunction>),
     CreateTrigger { name: Name, table: Name, events: Vec<String>, instead: bool, body: Rc<Vec<Stmt>>, or_alter: bool, text: String },
@@ -474,6 +474,8 @@ pub enum Stmt {
     CreateDatabase(String, Option<String>),
     CreateType { name: Name, base: Option<TypeRef>, nullable: Option<bool>, table: Option<Vec<TableDef>> },
     CreateSequence { name: Name, opts: SequenceOpts },
+    /// CREATE SYNONYM name FOR target
+    CreateSynonym { name: Name, target: Name },
     AlterSequence { name: Name, opts: SequenceOpts },
     AlterDatabase { db: String, options: Vec<(String, String)> },
     Security(Box<SecStmt>),
@@ -626,4 +628,91 @@ pub enum AuditStmt {
     CreateSpec { server: bool, name: String, audit: String, items: Vec<crate::audit::AuditItem>, state_on: bool },
     AlterSpec { server: bool, name: String, add: Vec<crate::audit::AuditItem>, drop: Vec<crate::audit::AuditItem>, state: Option<bool> },
     DropSpec { server: bool, name: String },
+}
+
+impl Expr {
+    /// Pull the conjuncts common to every branch of an OR out of it: `(a AND b) OR (a AND c)` becomes
+    /// `a AND (b OR c)`. The two are equal in three-valued logic, and the second lets the optimizer see `a` (typically
+    /// a join condition repeated in each branch, as in TPC-H query 19) as a predicate of its own.
+    pub fn factor_common(self) -> Expr {
+        fn flat_or(e: Expr, out: &mut Vec<Expr>) {
+            match e {
+                Expr::Or(a, b) => {
+                    flat_or(*a, out);
+                    flat_or(*b, out);
+                }
+                Expr::Paren(x) if matches!(*x, Expr::Or(..)) => flat_or(*x, out),
+                other => out.push(other),
+            }
+        }
+        fn flat_and(e: Expr, out: &mut Vec<Expr>) {
+            match e {
+                Expr::And(a, b) => {
+                    flat_and(*a, out);
+                    flat_and(*b, out);
+                }
+                Expr::Paren(x) if matches!(*x, Expr::And(..)) => flat_and(*x, out),
+                other => out.push(other),
+            }
+        }
+        fn and_all(mut v: Vec<Expr>) -> Expr {
+            let mut e = v.remove(0);
+            for x in v {
+                e = Expr::And(Box::new(e), Box::new(x));
+            }
+            e
+        }
+        fn or_all(mut v: Vec<Expr>) -> Expr {
+            let mut e = v.remove(0);
+            for x in v {
+                e = Expr::Or(Box::new(e), Box::new(x));
+            }
+            e
+        }
+        match self {
+            Expr::And(a, b) => Expr::And(Box::new(a.factor_common()), Box::new(b.factor_common())),
+            Expr::Paren(x) => Expr::Paren(Box::new(x.factor_common())),
+            Expr::Or(a, b) => {
+                let mut branches = vec![];
+                flat_or(Expr::Or(a, b), &mut branches);
+                let mut lists: Vec<Vec<Expr>> = branches
+                    .into_iter()
+                    .map(|b| {
+                        let mut v = vec![];
+                        flat_and(b, &mut v);
+                        v
+                    })
+                    .collect();
+                let keys: Vec<Vec<String>> = lists.iter().map(|l| l.iter().map(|e| format!("{:?}", e)).collect()).collect();
+                let mut common: Vec<Expr> = vec![];
+                for (i, k) in keys[0].iter().enumerate() {
+                    if keys[1..].iter().all(|ks| ks.contains(k)) && !common.iter().any(|c| format!("{:?}", c) == *k) {
+                        common.push(lists[0][i].clone());
+                    }
+                }
+                if common.is_empty() {
+                    return or_all(lists.into_iter().map(|l| and_all(l).factor_common_inner()).collect());
+                }
+                let ck: Vec<String> = common.iter().map(|e| format!("{:?}", e)).collect();
+                let mut rest: Vec<Vec<Expr>> = vec![];
+                for l in lists.drain(..) {
+                    rest.push(l.into_iter().filter(|e| !ck.contains(&format!("{:?}", e))).collect());
+                }
+                let mut out = common;
+                if rest.iter().all(|r| !r.is_empty()) {
+                    out.push(Expr::Paren(Box::new(or_all(rest.into_iter().map(|r| and_all(r).factor_common_inner()).collect()))));
+                }
+                and_all(out)
+            }
+            other => other,
+        }
+    }
+
+    /// `factor_common` for a branch that is not itself an OR (so only nested ANDs and parentheses are visited).
+    fn factor_common_inner(self) -> Expr {
+        match self {
+            Expr::Or(..) | Expr::And(..) | Expr::Paren(..) => self.factor_common(),
+            other => other,
+        }
+    }
 }

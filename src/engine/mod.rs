@@ -101,6 +101,21 @@ pub struct Frame {
     pub vars: HashMap<String, Var>,
     pub tables: HashMap<String, Table>,
     pub cursor_vars: HashMap<String, String>,
+    /// The DECLARE statement that declared each variable: running the same one again (in a loop) redeclares it, while a
+    /// different one for the same name is error 134.
+    pub decl_sites: HashMap<String, usize>,
+}
+
+/// See [`Engine::enter_module`].
+pub struct ModuleScope {
+    temps: std::collections::HashSet<String>,
+    nocount: bool,
+    xact_abort: bool,
+    rowcount_limit: i64,
+    datefirst: i32,
+    language: String,
+    lock_timeout: i64,
+    isolation: Isolation,
 }
 
 pub struct Cursor {
@@ -167,6 +182,11 @@ pub struct SessionState {
     pub stream_to_buf: bool,
     /// A FROM source the streaming executor evaluated and then declined: (address of its TableRef, rows).
     pub preeval: Option<(usize, query::Rowset)>,
+    /// Results of subqueries that do not depend on the enclosing row, for the statement being run (see `Engine::sub_rows`).
+    /// `None` where caching is not safe: outside a statement, and while an IF or WHILE condition is evaluated.
+    pub sub_cache: Option<HashMap<usize, Option<query::Rowset>>>,
+    /// While a statement writes through a view WITH CHECK OPTION: the base table, the filter of the view and the nesting level.
+    pub view_check: Option<(String, Expr, i32)>,
     /// Table hints of the statement being run, by table object id (see `Engine::collect_hints`).
     pub hints: HashMap<i32, Vec<String>>,
     /// A NOWAIT table hint is in effect: a lock that cannot be granted at once is error 1222.
@@ -240,6 +260,8 @@ impl SessionState {
             stream_ok: false,
             stream_to_buf: false,
             preeval: None,
+            sub_cache: None,
+            view_check: None,
             hints: HashMap::new(),
             nowait: false,
             in_rls: false,
@@ -601,7 +623,11 @@ impl<'a> Engine<'a> {
             if self.ses.nest_level == 0 {
                 self.srv.set_intent(!SHARED_READS);
             }
-            return match self.exec_inner(st) {
+            // a condition may change from one iteration to the next: no cached subquery results
+            let saved = self.ses.sub_cache.take();
+            let r = self.exec_inner(st);
+            self.ses.sub_cache = saved;
+            return match r {
                 Err(Interrupt::Error(e)) => self.handle_error(e),
                 other => other,
             };
@@ -646,7 +672,10 @@ impl<'a> Engine<'a> {
                 self.ses.nowait = false;
             }
             self.ses.audit_seen.borrow_mut().clear();
+            let saved = self.ses.sub_cache.replace(HashMap::new());
             let mut r = self.exec_inner(st);
+            self.ses.sub_cache = saved;
+            self.ses.view_check = None;
             if r.is_ok() && ddltrig::is_ddl_stmt(st) {
                 r = self.fire_ddl_triggers(st);
             }
@@ -981,6 +1010,7 @@ impl<'a> Engine<'a> {
             | Stmt::CreateDatabase(..)
             | Stmt::CreateType { .. }
             | Stmt::CreateSequence { .. }
+            | Stmt::CreateSynonym { .. }
             | Stmt::AlterSequence { .. }
             | Stmt::AlterTable { .. }
             | Stmt::Drop { .. }
@@ -1093,8 +1123,12 @@ impl<'a> Engine<'a> {
                         continue;
                     }
                     let dt = self.resolve_type(ty)?;
-                    if self.ses.frames.last().unwrap().vars.contains_key(name) || self.ses.frames.last().unwrap().tables.contains_key(name) {
-                        return Err(SqlError::new(134, format!("The variable name '{}' has already been declared. Variable names must be unique within a query batch or stored procedure.", name)).into());
+                    let site = d as *const Decl as usize;
+                    {
+                        let f = self.ses.frames.last().unwrap();
+                        if (f.vars.contains_key(name) || f.tables.contains_key(name)) && f.decl_sites.get(name) != Some(&site) {
+                            return Err(SqlError::new(134, format!("The variable name '{}' has already been declared. Variable names must be unique within a query batch or stored procedure.", name)).into());
+                        }
                     }
                     let val = match default {
                         Some(e) => {
@@ -1104,7 +1138,9 @@ impl<'a> Engine<'a> {
                         }
                         None => Value::Null,
                     };
-                    self.ses.frames.last_mut().unwrap().vars.insert(name.clone(), Var { ty: dt, val });
+                    let f = self.ses.frames.last_mut().unwrap();
+                    f.vars.insert(name.clone(), Var { ty: dt, val });
+                    f.decl_sites.insert(name.clone(), site);
                 }
                 Decl::Table { name, defs } => {
                     let t = self.build_table(&self.ses.db.clone(), "dbo", name, defs, true)?;
@@ -1271,6 +1307,11 @@ impl<'a> Engine<'a> {
     }
 
     pub fn locate(&self, parts: &[String]) -> Loc {
+        self.locate_via(parts, 0)
+    }
+
+    /// `locate`, following synonyms to the object they stand for (a chain of them is followed a few steps).
+    fn locate_via(&self, parts: &[String], depth: usize) -> Loc {
         let (db, schema, name) = self.split_name(parts);
         if name.starts_with("##") {
             return Loc::GTemp(name.to_lowercase());
@@ -1282,7 +1323,13 @@ impl<'a> Engine<'a> {
             return Loc::Var(name.to_lowercase());
         }
         let dbn = db.unwrap_or_else(|| self.ses.db.clone()).to_lowercase();
-        Loc::Db(dbn, obj_key(&schema.unwrap_or_else(|| "dbo".to_string()), &name))
+        let key = obj_key(&schema.unwrap_or_else(|| "dbo".to_string()), &name);
+        if depth < 8 {
+            if let Some(Object::Synonym(s)) = self.srv.databases.get(&dbn).and_then(|d| d.objects.get(&key)) {
+                return self.locate_via(&s.target.clone(), depth + 1);
+            }
+        }
+        Loc::Db(dbn, key)
     }
 
     pub fn table_ref(&self, loc: &Loc) -> Option<&Table> {
@@ -1657,7 +1704,17 @@ impl<'a> Engine<'a> {
             allowed?;
             let owner = self.schema_owner_of(&pdb, &p.schema);
             self.ses.module_owner.push(owner);
+            let scope = self.enter_module();
             let r = self.run_proc_body(&p.body, frame, &mut out_map);
+            // an error raised inside the procedure (and not already attributed to a deeper one) is the procedure's
+            let r = match r {
+                Err(Interrupt::Error(mut e)) if e.procedure.is_none() => {
+                    e.procedure = Some(p.name.clone());
+                    Err(Interrupt::Error(e))
+                }
+                other => other,
+            };
+            self.leave_module(scope);
             self.ses.module_owner.pop();
             rc = r?;
         } else if let Some(v) = self.exec_sysproc(&lname, &bound.iter().map(|b| (b.name.clone(), b.val.clone(), b.out_var.clone())).collect::<Vec<_>>())? {
@@ -1702,6 +1759,35 @@ impl<'a> Engine<'a> {
         Ok(rv)
     }
 
+    /// What a module (a stored procedure, a dynamic batch) gives back when it ends: the local temporary tables it
+    /// created are dropped and the SET options it changed return to what the caller had.
+    pub fn enter_module(&self) -> ModuleScope {
+        ModuleScope {
+            temps: self.ses.temp.keys().cloned().collect(),
+            nocount: self.ses.nocount,
+            xact_abort: self.ses.xact_abort,
+            rowcount_limit: self.ses.rowcount_limit,
+            datefirst: self.ses.datefirst,
+            language: self.ses.language.clone(),
+            lock_timeout: self.ses.lock_timeout,
+            isolation: self.ses.isolation,
+        }
+    }
+
+    pub fn leave_module(&mut self, s: ModuleScope) {
+        let made: Vec<String> = self.ses.temp.keys().filter(|k| !s.temps.contains(*k)).cloned().collect();
+        for k in made {
+            self.ses.temp.remove(&k);
+        }
+        self.ses.nocount = s.nocount;
+        self.ses.xact_abort = s.xact_abort;
+        self.ses.rowcount_limit = s.rowcount_limit;
+        self.ses.datefirst = s.datefirst;
+        self.ses.language = s.language;
+        self.ses.lock_timeout = s.lock_timeout;
+        self.ses.isolation = s.isolation;
+    }
+
     pub fn exec_dynamic(&mut self, sql: &str) -> Flow<()> {
         let stmts = cached_parse(sql).map_err(|mut e| {
             e.abort_batch = false;
@@ -1710,7 +1796,9 @@ impl<'a> Engine<'a> {
         self.ses.frames.push(Frame::default());
         self.ses.nest_level += 1;
         self.ses.module_owner.push(String::new()); // dynamic SQL breaks the ownership chain
+        let scope = self.enter_module();
         let r = self.exec_stmts(&stmts);
+        self.leave_module(scope);
         self.ses.module_owner.pop();
         self.ses.nest_level -= 1;
         self.ses.frames.pop();

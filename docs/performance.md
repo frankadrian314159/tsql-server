@@ -70,6 +70,24 @@ column schema 0.4, plan text 0.7, and about 4 of set-up in `exec_select` and `ev
 epoch checked on every use, because permissions, definitions and statistics all change plans, and the access path depends
 on parameter values. That is more risk than the gain justifies; the cheap, safe part (parsed text) is cached.
 
+## Findings from the TPC benchmarks
+
+Running TPC-H, TPC-DS and the fuzzer ([benchmarks.md](benchmarks.md)) found performance problems that the micro-benchmark
+did not (times at scale factor 0.01):
+
+| Query | Before | After | Cause |
+| --- | ---: | ---: | --- |
+| TPC-H Q18 | did not finish in 10 minutes | 0.38 s | an uncorrelated `IN (SELECT ... HAVING ...)` was re-run for every order |
+| TPC-H Q19 | 160 s | 0.11 s | the join condition was repeated inside each branch of an `OR`, so lineitem was cross-joined with part |
+| TPC-H Q5 | 1.2 s | 0.12 s | customer was joined on nation alone (many-to-many) before orders was joined on its key |
+| TPC-H Q11, Q15, Q16 | 0.67, 1.6, 0.26 s | 0.004, 0.03, 0.013 s | uncorrelated scalar and `NOT IN` subqueries re-run per row |
+| TPC-DS Q11 | 4.1 s | 0.64 s | `WHERE x.year = 2001` on a CTE reference was applied after the self-join of the CTE |
+| `SUM(..) OVER ()` over 35,000 rows | over a minute | milliseconds | the frame was re-aggregated for every row |
+
+The hash join also reads its key columns by position when they are plain columns (it used to evaluate an expression that
+looked each column up by name for every row) and moves the probe row into its last output row instead of copying it.
+All TPC-H and TPC-DS answers are the same on the default executors and on the spilling ones.
+
 ## Concurrency: what stopped sessions scaling
 
 Even `SELECT 1`, which touches no data, stopped scaling at four sessions: eight sessions ran slower than four. The

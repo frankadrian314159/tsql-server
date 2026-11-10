@@ -40,7 +40,7 @@ pub struct LockTable {
 impl LockTable {
     /// Sleep until `done()` is true; returns true when `timeout` elapsed first.
     pub fn wait_until(&self, done: impl Fn() -> bool, timeout: Option<Duration>) -> bool {
-        let mut g = lock(&self.m);
+        let g = lock(&self.m);
         self.waiters.fetch_add(1, Ordering::SeqCst);
         std::sync::atomic::fence(Ordering::SeqCst);
         let r = self.wait_loop(g, &done, timeout);

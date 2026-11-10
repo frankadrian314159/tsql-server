@@ -1140,6 +1140,42 @@ impl<'a> Engine<'a> {
                     if let Value::Str(x) = &a[0] { if x.chars().count() > 2_147_483_647 { Value::BigInt(n as i64) } else { Value::Int(n as i32) } } else { Value::Int(n as i32) }
                 }
             }
+            "SQL_VARIANT_PROPERTY" => {
+                need(name, &a, 2)?;
+                if a[0].is_null() || a[1].is_null() {
+                    Value::Null
+                } else {
+                    let prop = s(&a[1]).to_lowercase();
+                    let v = &a[0];
+                    // the base type is read off the value: this engine keeps no separate declared type for a value
+                    let (base, prec, scale, bytes): (&str, i32, i32, i32) = match v {
+                        Value::Bit(_) => ("bit", 1, 0, 1),
+                        Value::Int(_) => ("int", 10, 0, 4),
+                        Value::BigInt(_) => ("bigint", 19, 0, 8),
+                        Value::Dec(d) => ("numeric", d.precision() as i32, d.s as i32, match d.precision() { 1..=9 => 5, 10..=19 => 9, 20..=28 => 13, _ => 17 }),
+                        Value::Float(_) => ("float", 53, 0, 8),
+                        Value::Str(t) => (if t.chars().any(|c| c as u32 > 0xFF) { "nvarchar" } else { "varchar" }, 0, 0, t.chars().count() as i32),
+                        Value::Bin(b) => ("varbinary", 0, 0, b.len() as i32),
+                        Value::Date(_) => ("date", 10, 0, 3),
+                        Value::Time(_) => ("time", 16, 7, 5),
+                        Value::DateTime(_, DtKind::DateTime) => ("datetime", 23, 3, 8),
+                        Value::DateTime(_, DtKind::SmallDateTime) => ("smalldatetime", 16, 0, 4),
+                        Value::DateTime(..) => ("datetime2", 27, 7, 8),
+                        Value::Dto(_) => ("datetimeoffset", 34, 7, 10),
+                        Value::Guid(_) => ("uniqueidentifier", 0, 0, 16),
+                        Value::Null => ("", 0, 0, 0),
+                    };
+                    match prop.as_str() {
+                        "basetype" => Value::Str(base.to_string()),
+                        "precision" => Value::Int(prec),
+                        "scale" => Value::Int(scale),
+                        "totalbytes" => Value::Int(bytes + 2),
+                        "maxlength" => Value::Int(if base == "nvarchar" { bytes * 2 } else { bytes }),
+                        "collation" => if matches!(v, Value::Str(_)) { Value::Str("SQL_Latin1_General_CP1_CI_AS".to_string()) } else { Value::Null },
+                        _ => Value::Null,
+                    }
+                }
+            }
             "DATALENGTH" => {
                 need(name, &a, 1)?;
                 match &a[0] {
@@ -1670,12 +1706,25 @@ impl<'a> Engine<'a> {
             }
             "SCHEMA_NAME" => {
                 if a.is_empty() { Value::Str("dbo".into()) } else if a[0].is_null() { Value::Null } else {
-                    match int(&a[0])? { 1 => Value::Str("dbo".into()), 2 => Value::Str("guest".into()), 3 => Value::Str("INFORMATION_SCHEMA".into()), 4 => Value::Str("sys".into()), _ => Value::Null }
+                    match int(&a[0])? {
+                        1 => Value::Str("dbo".into()),
+                        2 => Value::Str("guest".into()),
+                        3 => Value::Str("INFORMATION_SCHEMA".into()),
+                        4 => Value::Str("sys".into()),
+                        id => self.user_schema_names().into_iter().find(|(i, _)| *i as i64 == id).map(|(_, n)| Value::Str(n.into())).unwrap_or(Value::Null),
+                    }
                 }
             }
             "SCHEMA_ID" => {
                 if a.is_empty() { Value::Int(1) } else {
-                    match s(&a[0]).to_lowercase().as_str() { "dbo" => Value::Int(1), "guest" => Value::Int(2), "information_schema" => Value::Int(3), "sys" => Value::Int(4), _ => Value::Null }
+                    let nm = s(&a[0]).to_lowercase();
+                    match nm.as_str() {
+                        "dbo" => Value::Int(1),
+                        "guest" => Value::Int(2),
+                        "information_schema" => Value::Int(3),
+                        "sys" => Value::Int(4),
+                        other => self.user_schema_names().into_iter().find(|(_, n)| n.to_lowercase() == other).map(|(i, _)| Value::Int(i)).unwrap_or(Value::Null),
+                    }
                 }
             }
             "OBJECT_ID" => {
@@ -1912,7 +1961,22 @@ impl<'a> Engine<'a> {
                 }
                 r
             }
-            "TYPE_NAME" => Value::Null,
+            "TYPE_NAME" | "TYPE_ID" => {
+                need_range(name, &a, 1, 1)?;
+                // the system types as sys.types lists them, then the database's own
+                const SYS_TYPES: [(&str, i64); 30] = [("int", 56), ("bigint", 127), ("smallint", 52), ("tinyint", 48), ("bit", 104), ("decimal", 106), ("numeric", 108), ("money", 60), ("smallmoney", 122), ("float", 62), ("real", 59), ("char", 175), ("varchar", 167), ("nchar", 239), ("nvarchar", 231), ("text", 35), ("ntext", 99), ("binary", 173), ("varbinary", 165), ("image", 34), ("date", 40), ("time", 41), ("datetime", 61), ("smalldatetime", 58), ("datetime2", 42), ("datetimeoffset", 43), ("uniqueidentifier", 36), ("xml", 241), ("sql_variant", 98), ("timestamp", 189)];
+                let user: Vec<(String, i64)> = self.srv.databases.get(&self.ses.db.to_lowercase()).map(|d| d.types.values().map(|u| (u.name.clone(), u.type_id as i64)).collect()).unwrap_or_default();
+                if a[0].is_null() {
+                    Value::Null
+                } else if name == "TYPE_NAME" {
+                    let id = int(&a[0])?;
+                    SYS_TYPES.iter().find(|(_, i)| *i == id).map(|(n, _)| n.to_string()).or_else(|| user.iter().find(|(_, i)| *i == id).map(|(n, _)| n.clone())).map(Value::Str).unwrap_or(Value::Null)
+                } else {
+                    let want = s(&a[0]).to_lowercase();
+                    let want = want.rsplit('.').next().unwrap_or("").trim_matches(|c| c == '[' || c == ']').to_string();
+                    SYS_TYPES.iter().find(|(n, _)| *n == want).map(|(_, i)| *i).or_else(|| user.iter().find(|(n, _)| n.to_lowercase() == want).map(|(_, i)| *i)).map(|i| Value::Int(i as i32)).unwrap_or(Value::Null)
+                }
+            }
             "CONTEXT_INFO" => Value::Bin(self.ses.context_info.clone()),
             "CURRENT_TRANSACTION_ID" => Value::BigInt(self.ses.trancount as i64),
             "GETANSINULL" => Value::Int(1),

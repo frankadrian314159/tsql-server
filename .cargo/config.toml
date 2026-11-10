@@ -1,0 +1,5 @@
+# Threads (and so every test) get a 64 MB stack. A debug build uses tens of kilobytes of stack per level of nesting
+# (procedures calling procedures, subqueries inside subqueries), so the default 2 MB cannot hold even the nesting
+# limits that SQL Server allows (32 levels of procedure calls).
+[env]
+RUST_MIN_STACK = "67108864"
