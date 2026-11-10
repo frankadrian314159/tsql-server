@@ -24,6 +24,8 @@ pub struct Token {
     pub end: usize,
     /// uppercased text for Id tokens
     pub up: String,
+    /// a string written N'...' (a Unicode literal)
+    pub unicode: bool,
 }
 
 const OPS2: [&str; 14] = ["<>", "<=", ">=", "!=", "!<", "!>", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^="];
@@ -75,7 +77,7 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token>> {
         }
         let push = |toks: &mut Vec<Token>, tok: Tok, s: usize, e: usize| {
             let up = if let Tok::Id(ref x) = tok { x.to_uppercase() } else { String::new() };
-            toks.push(Token { tok, pos: s, end: e, up });
+            toks.push(Token { tok, pos: s, end: e, up, unicode: false });
         };
         if c == '\'' || ((c == 'N' || c == 'n') && i + 1 < n && ch[i + 1].1 == '\'') {
             let mut j = if c == '\'' { i + 1 } else { i + 2 };
@@ -96,6 +98,9 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token>> {
                 j += 1;
             }
             push(&mut toks, Tok::Str(buf), pos, byte(j + 1));
+            if c != '\'' {
+                toks.last_mut().unwrap().unicode = true;
+            }
             i = j + 1;
             continue;
         }
@@ -228,7 +233,7 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token>> {
         }
         return Err(SqlError::syntax(&c.to_string()));
     }
-    toks.push(Token { tok: Tok::Eof, pos: sql.len(), end: sql.len(), up: String::new() });
+    toks.push(Token { tok: Tok::Eof, pos: sql.len(), end: sql.len(), up: String::new(), unicode: false });
     Ok(toks)
 }
 

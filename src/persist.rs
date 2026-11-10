@@ -365,6 +365,7 @@ pub fn apply_record(srv: &mut ServerState, rec: &WalRecord) {
             LogOp::PutSchema { db, key, name } => {
                 if let Some(d) = srv.databases.get_mut(db) {
                     d.schemas.insert(key.clone(), name.clone());
+                    d.assign_schema_id(key);
                 }
             }
             LogOp::DropSchema { db, key } => {

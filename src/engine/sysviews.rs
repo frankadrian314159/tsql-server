@@ -111,34 +111,13 @@ impl<'a> Engine<'a> {
     /// The schemas of the current database with the ids `sys.schemas` gives them.
     pub fn user_schema_names(&self) -> Vec<(i32, String)> {
         let Some(db) = self.srv.databases.get(&self.ses.db.to_lowercase()) else { return vec![] };
-        db.schemas
-            .iter()
-            .enumerate()
-            .map(|(i, (k, v))| {
-                let id = match k.as_str() {
-                    "dbo" => 1,
-                    "guest" => 2,
-                    "information_schema" => 3,
-                    "sys" => 4,
-                    _ => 5 + i as i32,
-                };
-                (id, v.clone())
-            })
-            .collect()
+        db.schemas.iter().map(|(k, v)| (db.schema_id(k), v.clone())).collect()
     }
 
     pub fn sysview(&self, schema: &str, name: &str) -> Option<Rowset> {
         let db = self.srv.databases.get(&self.ses.db.to_lowercase())?;
         let dbname = db.name.clone();
-        let sid = |s: &str| -> i32 {
-            match s.to_lowercase().as_str() {
-                "dbo" => 1,
-                "guest" => 2,
-                "information_schema" => 3,
-                "sys" => 4,
-                _ => 5 + db.schemas.keys().position(|k| *k == s.to_lowercase()).unwrap_or(0) as i32,
-            }
-        };
+        let sid = |s: &str| -> i32 { db.schema_id(&s.to_lowercase()) };
         let date = |d: chrono::NaiveDateTime| Value::DateTime(d, DtKind::DateTime);
         let lname = name.to_lowercase();
         if schema.eq_ignore_ascii_case("sys") {

@@ -130,6 +130,11 @@ impl LockTable {
     pub fn clear_wait(&self, tx: TxId) {
         lock(&self.m).clear_wait(tx)
     }
+    pub fn cancel_pending(&self, tx: TxId) {
+        if self.is_busy() {
+            lock(&self.m).cancel_pending(tx)
+        }
+    }
     pub fn lock_count(&self, tx: TxId) -> usize {
         lock(&self.m).lock_count(tx)
     }
@@ -688,7 +693,9 @@ impl Core {
     /// follows the removal the test looks for.
     pub fn wait_for_end(&self, txs: &[TxId], timeout: Option<Duration>, spid: i32) -> bool {
         if txs.is_empty() {
-            std::thread::sleep(Duration::from_millis(1));
+            // nobody to wait for (the statement only has to be run again with a fresh view): do not sleep, which on
+            // Windows takes up to 15 ms a time unless something has raised the timer resolution
+            std::thread::yield_now();
             return false;
         }
         self.locks.wait_until(|| self.is_killed(spid) || !txs.iter().any(|t| self.is_active(*t)), timeout)

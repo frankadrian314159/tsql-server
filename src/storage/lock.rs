@@ -107,6 +107,11 @@ pub struct LockManager {
     by_tx: HashMap<TxId, Vec<Res>>,
     waits: HashMap<TxId, Vec<TxId>>,
     ranges: Vec<KeyRange>,
+    /// Requests that had to wait, by resource. A transaction that does not hold the resource yet queues behind an
+    /// incompatible request in here instead of jumping ahead of it; without that, a transaction waiting to upgrade a
+    /// shared lock is starved by readers that keep taking new shared locks (they are rolled back as deadlock victims and
+    /// retake the lock at once, and the upgrade never gets in).
+    pending: HashMap<Res, Vec<(TxId, Mode)>>,
 }
 
 impl LockManager {
@@ -116,10 +121,25 @@ impl LockManager {
             Some(m) => m.sup(mode),
             None => mode,
         };
-        match self.held.get(res) {
+        let mut out: Vec<TxId> = match self.held.get(res) {
             None => vec![],
             Some(hs) => hs.iter().filter(|(t, m)| *t != tx && !m.compatible(want)).map(|(t, _)| *t).collect(),
+        };
+        // a new request (not the conversion of a lock already held) waits for the requests ahead of it in the queue that
+        // it is incompatible with; a request already in the queue is only held back by those in front of it
+        if self.mode_of(tx, res).is_none() {
+            if let Some(ps) = self.pending.get(res) {
+                for (t, m) in ps {
+                    if *t == tx {
+                        break;
+                    }
+                    if !m.compatible(mode) && !out.contains(t) {
+                        out.push(*t);
+                    }
+                }
+            }
         }
+        out
     }
 
     pub fn mode_of(&self, tx: TxId, res: &Res) -> Option<Mode> {
@@ -130,8 +150,14 @@ impl LockManager {
     pub fn acquire(&mut self, tx: TxId, res: &Res, mode: Mode) -> Result<(), Vec<TxId>> {
         let blockers = self.conflicts(tx, res, mode);
         if !blockers.is_empty() {
+            let ps = self.pending.entry(res.clone()).or_default();
+            match ps.iter_mut().find(|(t, _)| *t == tx) {
+                Some(p) => p.1 = p.1.sup(mode),
+                None => ps.push((tx, mode)),
+            }
             return Err(blockers);
         }
+        self.drop_pending(tx, Some(res));
         let hs = self.held.entry(res.clone()).or_default();
         match hs.iter_mut().find(|(t, _)| *t == tx) {
             Some(h) => h.1 = h.1.sup(mode),
@@ -171,10 +197,35 @@ impl LockManager {
 
     /// Does nobody hold any lock or key range?
     pub fn is_idle(&self) -> bool {
-        self.held.is_empty() && self.ranges.is_empty()
+        // (a request that is waiting counts: its transaction must still be able to take it back when it ends)
+        self.held.is_empty() && self.ranges.is_empty() && self.pending.is_empty()
+    }
+
+    /// Forget `tx`'s waiting requests (for one resource, or all of them).
+    fn drop_pending(&mut self, tx: TxId, res: Option<&Res>) {
+        if self.pending.is_empty() {
+            return;
+        }
+        match res {
+            Some(r) => {
+                if let Some(v) = self.pending.get_mut(r) {
+                    v.retain(|(t, _)| *t != tx);
+                    if v.is_empty() {
+                        self.pending.remove(r);
+                    }
+                }
+            }
+            None => {
+                self.pending.retain(|_, v| {
+                    v.retain(|(t, _)| *t != tx);
+                    !v.is_empty()
+                });
+            }
+        }
     }
 
     pub fn release_all(&mut self, tx: TxId) {
+        self.drop_pending(tx, None);
         self.ranges.retain(|r| r.tx != tx);
         if let Some(rs) = self.by_tx.remove(&tx) {
             for r in rs {
@@ -195,6 +246,11 @@ impl LockManager {
 
     pub fn clear_wait(&mut self, tx: TxId) {
         self.waits.remove(&tx);
+    }
+
+    /// `tx` has given up waiting for what it asked for (a lock timeout, NOWAIT): later requests need not queue behind it.
+    pub fn cancel_pending(&mut self, tx: TxId) {
+        self.drop_pending(tx, None);
     }
 
     /// Would `tx` waiting on its recorded blockers close a cycle?

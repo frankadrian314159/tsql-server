@@ -135,6 +135,10 @@ impl<'a> Engine<'a> {
                             }),
                         })
                     }
+                    BinOp::Div if matches!(l, Value::Dec(_)) || matches!(r, Value::Dec(_)) => {
+                        let (p1, p2) = (self.static_pscale(a, env).map(|t| t.0), self.static_pscale(b, env).map(|t| t.0));
+                        convert::arith_with(*op, &l, &r, p1, p2)
+                    }
                     _ => arith(*op, &l, &r),
                 }
             }
@@ -394,11 +398,83 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The declared (precision, scale) of a numeric expression, worked out as SQL Server does from the types of columns,
+    /// variables, casts and literals and the rules for the result of `+ - * / %`; `None` when it cannot be told.
+    fn static_pscale(&self, e: &Expr, env: &Env<'_>) -> Option<(u32, u32)> {
+        fn of_type(t: &DataType) -> Option<(u32, u32)> {
+            match t {
+                DataType::Decimal(p, s) => Some((*p as u32, *s as u32)),
+                DataType::Int => Some((10, 0)),
+                DataType::BigInt => Some((19, 0)),
+                DataType::SmallInt => Some((5, 0)),
+                DataType::TinyInt => Some((3, 0)),
+                DataType::Bit => Some((1, 0)),
+                DataType::Money => Some((19, 4)),
+                DataType::SmallMoney => Some((10, 4)),
+                _ => None,
+            }
+        }
+        // a result wider than 38 digits keeps the integer digits and gives up scale (down to 6)
+        fn cap(p: u32, s: u32) -> (u32, u32) {
+            if p > 38 {
+                (38, s.saturating_sub(p - 38).max(s.min(6)))
+            } else {
+                (p, s)
+            }
+        }
+        match e {
+            Expr::Paren(x) | Expr::Neg(x) => self.static_pscale(x, env),
+            Expr::Lit(Value::Dec(d)) => Some((d.precision().max(d.s as u32), d.s as u32)),
+            Expr::Lit(Value::Int(_)) => Some((10, 0)),
+            Expr::Lit(Value::BigInt(_)) => Some((19, 0)),
+            Expr::Col(p) => match env.schema.find_parts(p) {
+                super::query::Found::One(i) => env.schema.cols[i].ty.as_ref().and_then(of_type),
+                _ => env.parent.and_then(|par| self.static_pscale(e, par)),
+            },
+            Expr::Var(n) => self.ses.frames.last().and_then(|f| f.vars.get(n)).and_then(|v| of_type(&v.ty)),
+            Expr::Cast { ty, .. } => ty.parts.last().and_then(|n| DataType::from_name(n, &ty.args, false).ok()).and_then(|t| of_type(&t)),
+            Expr::Func(fc) if fc.name == "ROUND" || fc.name == "ABS" || fc.name == "CEILING" || fc.name == "FLOOR" => fc.args.first().and_then(|a| self.static_pscale(a, env)),
+            Expr::Binary(op, l, r) => {
+                let ((p1, s1), (p2, s2)) = (self.static_pscale(l, env)?, self.static_pscale(r, env)?);
+                Some(match op {
+                    BinOp::Add | BinOp::Sub => {
+                        let s = s1.max(s2);
+                        cap(((p1 - s1).max(p2 - s2)) + s + 1, s)
+                    }
+                    BinOp::Mul => cap(p1 + p2 + 1, s1 + s2),
+                    BinOp::Div => {
+                        let s = 6.max(s1 + p2 + 1);
+                        cap(p1 - s1 + s2 + s, s)
+                    }
+                    BinOp::Mod => {
+                        let s = s1.max(s2);
+                        ((p1 - s1).min(p2 - s2) + s, s)
+                    }
+                    _ => return None,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Is every leaf of this expression a literal (so a decimal in it is `numeric`, as SQL Server types a number written
+    /// out, not `decimal`)?
+    fn only_literals(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Lit(_) => true,
+            Expr::Paren(x) | Expr::Neg(x) => self.only_literals(x),
+            Expr::Binary(_, l, r) => self.only_literals(l) && self.only_literals(r),
+            Expr::Cast { ty, .. } => ty.parts.last().map(|n| n.eq_ignore_ascii_case("numeric")).unwrap_or(false),
+            _ => false,
+        }
+    }
+
     /// Is this expression known to be NCHAR / NVARCHAR (a column, variable or CAST of that type, or a string function of one)?
     fn is_unicode_expr(&self, e: &Expr, env: &Env<'_>) -> bool {
         let wide_type = |t: &DataType| matches!(t, DataType::NChar(_) | DataType::NVarChar(_) | DataType::NText);
         match e {
             Expr::Paren(x) => self.is_unicode_expr(x, env),
+            Expr::Binary(BinOp::Add, l, r) => self.is_unicode_expr(l, env) || self.is_unicode_expr(r, env),
             Expr::Col(p) => match env.schema.find_parts(p) {
                 super::query::Found::One(i) => env.schema.cols[i].ty.as_ref().map(wide_type).unwrap_or(false),
                 _ => match env.parent {
@@ -426,6 +502,27 @@ impl<'a> Engine<'a> {
             };
         }
         let name = fc.name.as_str();
+        if name == "SQL_VARIANT_PROPERTY" && fc.args.len() == 2 && fc.schema.is_none() {
+            let v = self.ev(&fc.args[0], env)?;
+            let prop = self.ev(&fc.args[1], env)?;
+            let prop_name = convert::to_str(&prop).to_lowercase();
+            match (&v, prop_name.as_str()) {
+                (Value::Str(_), "basetype") => return Ok(Value::Str(if self.is_unicode_expr(&fc.args[0], env) { "nvarchar" } else { "varchar" }.to_string())),
+                (Value::Dec(_), "basetype") => return Ok(Value::Str(if self.only_literals(&fc.args[0]) { "numeric" } else { "decimal" }.to_string())),
+                (Value::Dec(_), "precision") => {
+                    if let Some((p, _)) = self.static_pscale(&fc.args[0], env) {
+                        return Ok(Value::Int(p as i32));
+                    }
+                }
+                (Value::Dec(_), "scale") => {
+                    if let Some((_, s)) = self.static_pscale(&fc.args[0], env) {
+                        return Ok(Value::Int(s as i32));
+                    }
+                }
+                _ => {}
+            }
+            return Ok(self.builtin("SQL_VARIANT_PROPERTY", vec![v, prop], fc)?.unwrap_or(Value::Null));
+        }
         if name == "DATALENGTH" && fc.args.len() == 1 && fc.schema.is_none() {
             // the bytes of a string depend on its type (two per character for NCHAR / NVARCHAR), which the value does not carry
             let v = self.ev(&fc.args[0], env)?;

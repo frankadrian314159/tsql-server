@@ -137,7 +137,7 @@ window functions, JSON (`JSON_VALUE JSON_QUERY JSON_MODIFY OPENJSON ISJSON`), `H
 ## Behaviour notes
 
 * Strings compare case-insensitively and ignore trailing spaces (`SQL_Latin1_General_CP1_CI_AS`-like).
-* Integer arithmetic overflows raise error 8115. A decimal division's scale comes from the values' scales, not from SQL Server's rule for the operands' declared precision, so it can have fewer decimals.
+* Integer arithmetic overflows raise error 8115. A decimal division's scale follows SQL Server's rule, from the *declared* precision and scale of the operands (found statically from columns, variables, casts, literals and the arithmetic between them).
 * A runtime error ends the current statement and the batch continues, unless inside `TRY`, under `XACT_ABORT ON`, or the
   error is batch-aborting (`THROW`, syntax errors, deadlock victims, …). A failed statement inside a transaction undoes
   only that statement.
@@ -185,8 +185,7 @@ Things that are **not** implemented, so you are not surprised:
   backup compression (full, differential and log backups, restore and point-in-time recovery exist; see [docs/backup.md](docs/backup.md)).
 * **Collations** — case, accent and binary sensitivity (`CI`/`CS`, `AI`/`AS`, `BIN`/`BIN2`) per database, column and expression, in
   comparisons, sorting, grouping, joins, indexes and constraints; language-specific alphabetical orders and kana/width
-  sensitivity are not implemented (see [docs/collations.md](docs/collations.md)). `RANGE` frames with numeric offsets treat
-  the bound as `CURRENT ROW`.
+  sensitivity are not implemented (see [docs/collations.md](docs/collations.md)). `RANGE` frames take only `UNBOUNDED` and `CURRENT ROW` bounds, as in SQL Server (error 4194 otherwise).
 * Cultures other than `en-US` for `FORMAT`/`PARSE`; `CHECKSUM`/`BINARY_CHECKSUM` values differ from SQL Server's.
 
 ## Development

@@ -253,19 +253,28 @@ fn queries_run_while_other_sessions_write() {
     exec(&mut c, "CREATE TABLE w (id INT PRIMARY KEY, v INT)");
     exec(&mut c, "INSERT w VALUES (1, 0)");
     let stop = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(AtomicUsize::new(0));
     let mut readers = vec![];
     for _ in 0..4 {
         let mut conn = s.connect();
-        let stop = stop.clone();
+        let (stop, started) = (stop.clone(), started.clone());
         readers.push(thread::spawn(move || {
             let mut n = 0;
             while !stop.load(Ordering::SeqCst) {
                 let r = conn.execute("SELECT v FROM w WHERE id = 1");
                 assert!(r.first_error().is_none());
                 n += 1;
+                if n == 1 {
+                    started.fetch_add(1, Ordering::SeqCst);
+                }
             }
             n
         }));
+    }
+    // the writer starts once every reader has read at least once (on a loaded machine the threads may not run at once)
+    let waited = std::time::Instant::now();
+    while started.load(Ordering::SeqCst) < 4 && waited.elapsed().as_secs() < 30 {
+        thread::yield_now();
     }
     let mut w = s.connect();
     for _ in 0..200 {

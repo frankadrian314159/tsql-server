@@ -45,6 +45,13 @@ writer holding row 1 does not block a reader of row 3; a table scan, which must 
 ## Waiting, timeouts and deadlocks
 
 * `SET LOCK_TIMEOUT n` (milliseconds; `0` = do not wait; default `-1` = wait forever). Expiry is error 1222.
+* Lock requests queue fairly. A request that has to wait is remembered, and a transaction that does not yet hold the
+  resource waits behind an earlier incompatible request instead of jumping ahead of it (the conversion of a lock a
+  transaction already holds is not held back). Without this, three transactions that each read a row under
+  `REPEATABLE READ` and then update it livelock: they deadlock, the victims retry at once and retake their shared
+  locks, and the update that is waiting for the shared locks to go is never let in. The queue is kept for a
+  transaction that stays open while it waits; an autocommit statement that is blocked rolls back and starts over, so
+  it keeps no place in it.
 * Waits form a graph. When a wait would close a cycle the session that detects it is chosen as the deadlock
   victim: its transaction is rolled back and it receives error 1205 ("…deadlocked on lock resources…"),
   the rest of its batch is abandoned, and the others proceed. Retry the transaction.

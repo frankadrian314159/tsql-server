@@ -23,6 +23,12 @@ BEGIN
     SET @s = CAST(SQL_VARIANT_PROPERTY(CAST(1.5 AS DECIMAL(10,2)) * CAST(2.25 AS DECIMAL(10,2)), 'Scale') AS INT);
     EXEC tSQLt.AssertEquals 4, @s;
     EXEC tSQLt.AssertEquals 3.375, @m;
+    DECLARE @p INT = CAST(SQL_VARIANT_PROPERTY(CAST(1.5 AS DECIMAL(10,2)) * CAST(2.25 AS DECIMAL(10,2)), 'Precision') AS INT);
+    EXEC tSQLt.AssertEquals 21, @p;
+    DECLARE @r DECIMAL(20,13) = CAST(1 AS DECIMAL(10,2)) / CAST(3 AS DECIMAL(10,2));
+    EXEC tSQLt.AssertEquals 0.3333333333333, @r;
+    DECLARE @q DECIMAL(20,13) = 1.0 / 3;
+    EXEC tSQLt.AssertEquals 0.3333333333330, @q;
 END;
 GO
 CREATE PROCEDURE TypeTests.[test casting a decimal to an integer truncates and ROUND rounds half away from zero]
@@ -179,6 +185,8 @@ BEGIN
     SET @tsqlt_v = LEN('abc   ');
     EXEC tSQLt.AssertEquals 3, @tsqlt_v;
     SET @tsqlt_v = DATALENGTH('abc   ');
+    EXEC tSQLt.AssertEquals 6, @tsqlt_v;
+    SET @tsqlt_v = DATALENGTH(N'abc');
     EXEC tSQLt.AssertEquals 6, @tsqlt_v;
     DECLARE @n NVARCHAR(10) = N'abc';
     SET @tsqlt_v = DATALENGTH(@n);

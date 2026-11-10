@@ -647,7 +647,12 @@ impl Parser {
                 Ok(Expr::Lit(Value::Float(*f)))
             }
             Tok::Str(s) => {
+                let unicode = self.tok().unicode;
                 self.i += 1;
+                if unicode {
+                    // N'...' is an nvarchar value: casting it says so, and later code can tell it from a varchar literal
+                    return Ok(Expr::Cast { e: Box::new(Expr::Lit(Value::Str(s.clone()))), ty: TypeRef { parts: vec!["nvarchar".to_string()], args: vec![-1] }, try_: false, style: None });
+                }
                 Ok(Expr::Lit(Value::Str(s.clone())))
             }
             Tok::Hex(b) => {
@@ -945,6 +950,10 @@ impl Parser {
             } else {
                 start = self.frame_bound()?;
                 end = Bound::CurrentRow;
+            }
+            // SQL Server (through 2022) only has RANGE with UNBOUNDED and CURRENT ROW bounds
+            if !rows && matches!(start, Bound::Preceding(_) | Bound::Following(_)) || !rows && matches!(end, Bound::Preceding(_) | Bound::Following(_)) {
+                return Err(SqlError::new(4194, "RANGE is only supported with UNBOUNDED and CURRENT ROW window frame delimiters."));
             }
             frame = Some(Frame { rows, start, end });
         }
@@ -2613,7 +2622,21 @@ impl Parser {
                     self.i += 2;
                 }
             }
+            let start_tok = self.tok().clone();
+            let start_idx = self.i;
             let e = if self.accept_kw("DEFAULT") { Expr::Default } else { self.expr()? };
+            // N'...' is parsed as a cast of the literal, but is still just a constant
+            let n_literal = matches!(start_tok.tok, Tok::Str(_)) && start_tok.unicode && self.i == start_idx + 1;
+            // as in SQL Server, an argument is a constant, a variable, DEFAULT or a bare word: not an expression or a function call
+            let allowed = n_literal || match &e {
+                Expr::Lit(_) | Expr::Var(_) | Expr::SysVar(_) | Expr::Default => true,
+                Expr::Col(p) => p.len() == 1,
+                Expr::Neg(x) => matches!(**x, Expr::Lit(_)),
+                _ => false,
+            };
+            if !allowed {
+                return Err(self.err_at(&start_tok));
+            }
             let out = self.accept_kw("OUTPUT") || self.accept_kw("OUT");
             args.push(ExecArg { name: aname, e, out });
             if !self.accept_op(",") {

@@ -492,6 +492,7 @@ impl<'a> Engine<'a> {
                 self.push_undo(Undo::Schema { db: dbk.clone(), key: n.to_lowercase(), prev: None });
                 let owner = owner.clone().unwrap_or_else(|| self.current_user_name()).to_lowercase();
                 self.current_db().schemas.insert(n.to_lowercase(), n.clone());
+                self.current_db().assign_schema_id(&n.to_lowercase());
                 self.current_db().schema_owner.insert(n.to_lowercase(), owner);
             }
             Stmt::CreateDatabase(n, coll) => {

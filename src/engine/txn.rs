@@ -670,6 +670,9 @@ impl<'a> Engine<'a> {
         let me = self.cur_tx();
         let timeout = self.ses.lock_timeout;
         if timeout == 0 || self.ses.nowait {
+            if me != 0 {
+                self.srv.core.locks.cancel_pending(me);
+            }
             return Err(SqlError::new(1222, "Lock request time out period exceeded."));
         }
         if me != 0 {
@@ -693,6 +696,9 @@ impl<'a> Engine<'a> {
             self.srv.core.locks.clear_wait(me);
         }
         if timed_out {
+            if me != 0 {
+                self.srv.core.locks.cancel_pending(me);
+            }
             let _ = started;
             return Err(SqlError::new(1222, "Lock request time out period exceeded."));
         }

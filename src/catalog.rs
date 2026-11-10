@@ -499,6 +499,9 @@ pub struct Database {
     pub objects: BTreeMap<String, Object>,
     pub types: HashMap<String, UserType>,
     pub schemas: BTreeMap<String, String>, // lower -> display
+    /// The id each user schema was given when it was created (`sys.schemas.schema_id`); never reused or renumbered.
+    #[serde(default)]
+    pub schema_ids: BTreeMap<String, i32>,
     pub triggers: HashMap<String, (String, Arc<Trigger>)>, // trigger key -> (table key, trigger)
     pub created: chrono::NaiveDateTime,
     pub allow_snapshot: bool,
@@ -572,6 +575,28 @@ pub struct SecurityPolicy {
 }
 
 impl Database {
+    /// The id of a schema: fixed for the built-in ones, the assigned one for the others (a database from before ids were
+    /// kept numbers its schemas by position, as it always did).
+    pub fn schema_id(&self, lname: &str) -> i32 {
+        match lname {
+            "dbo" => 1,
+            "guest" => 2,
+            "information_schema" => 3,
+            "sys" => 4,
+            _ => self.schema_ids.get(lname).copied().unwrap_or_else(|| 5 + self.schemas.keys().position(|k| k == lname).unwrap_or(0) as i32),
+        }
+    }
+
+    /// Give a newly created schema its id (call after adding it to `schemas`).
+    pub fn assign_schema_id(&mut self, lname: &str) {
+        if matches!(lname, "dbo" | "guest" | "information_schema" | "sys") || self.schema_ids.contains_key(lname) {
+            return;
+        }
+        let legacy_max = 4 + self.schemas.len() as i32;
+        let next = self.schema_ids.values().copied().max().unwrap_or(4).max(legacy_max) + 1;
+        self.schema_ids.insert(lname.to_string(), next);
+    }
+
     /// The default collation's name for columns that store none (the built-in one: the database default may have changed since).
     pub fn collation_or_default(&self) -> String {
         crate::collation::DEFAULT_NAME.to_string()
@@ -601,6 +626,7 @@ impl Database {
             objects: BTreeMap::new(),
             types: HashMap::new(),
             schemas,
+            schema_ids: BTreeMap::new(),
             triggers: HashMap::new(),
             created: chrono::Local::now().naive_local(),
             allow_snapshot: false,

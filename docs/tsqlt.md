@@ -44,13 +44,8 @@ These are behaviours of SQL Server that the engine does not reproduce, so no tes
 
 * **`INSTEAD OF` triggers on views** are not supported (`CREATE TRIGGER ... ON view` fails with error 8197). Views that map
   onto one table are updatable by rewriting the statement, with `WITH CHECK OPTION` enforced.
-* **Declared types of values.** A value carries its kind but not the declared type, so `DATALENGTH(N'abc')` of a Unicode
-  *literal* cannot tell nvarchar from varchar (columns, variables and casts can), `SQL_VARIANT_PROPERTY` reports a
-  decimal as `numeric`, and the scale of a decimal division comes from the values, not from SQL Server's rule for the
-  operands' declared precision (`CAST(1 AS DECIMAL(10,2)) / CAST(3 AS DECIMAL(10,2))` has 6 decimal digits, SQL Server's
-  has 13).
-* **`EXEC` arguments.** The engine accepts expressions and function calls as procedure arguments (`EXEC p dbo.f(1) + 1`);
-  SQL Server accepts only constants and variables.
+* **Declared types of some values.** `SQL_VARIANT_PROPERTY` reports `decimal` for a decimal from a column, variable or cast and
+  `numeric` for a literal or `CAST(.. AS NUMERIC(..))`, but a `NUMERIC` *column* or *variable* is reported as `decimal` (the two are one type here).
 * **Expression limits.** Expressions nested more than 100 levels deep, or chains of more than 700 terms (`a OR b OR ...`),
   are refused with error 8632 (25 and 60 in a debug build, whose frames are much larger); SQL Server accepts deeper ones.
   Debug-build tests run on 64 MB thread stacks (`.cargo/config.toml`) so that procedure nesting to the limit of 32 works.

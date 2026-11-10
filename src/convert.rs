@@ -1038,6 +1038,12 @@ fn prec_of(v: &Value) -> u32 {
 }
 
 pub fn arith(op: BinOp, a: &Value, b: &Value) -> Result<Value> {
+    arith_with(op, a, b, None, None)
+}
+
+/// `arith`, with the declared precisions of the two operands (SQL Server's result scale of a division depends on them,
+/// while a value only knows its own digits).
+pub fn arith_with(op: BinOp, a: &Value, b: &Value, p1: Option<u32>, p2: Option<u32>) -> Result<Value> {
     if a.is_null() || b.is_null() {
         return Ok(Value::Null);
     }
@@ -1140,7 +1146,7 @@ pub fn arith(op: BinOp, a: &Value, b: &Value) -> Result<Value> {
                     if q.is_zero() {
                         return Err(div0());
                     }
-                    p.div(&q, prec_of(a), prec_of(b))
+                    p.div(&q, p1.unwrap_or_else(|| prec_of(a)), p2.unwrap_or_else(|| prec_of(b)))
                 }
                 BinOp::Mod => {
                     if q.is_zero() {

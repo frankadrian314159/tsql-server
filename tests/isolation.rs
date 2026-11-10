@@ -459,3 +459,73 @@ fn two_serializable_transactions_that_insert_into_each_others_ranges_deadlock() 
     let _ = (a.execute("ROLLBACK"), b.execute("ROLLBACK"));
     drop(s);
 }
+
+#[test]
+fn a_waiting_upgrade_is_not_starved_by_readers_that_keep_retaking_shared_locks() {
+    // three transactions each read the row under REPEATABLE READ and then update it: every one holds a shared lock the
+    // others' updates wait for, so they deadlock and the victims retry at once. Without a fair queue the readers' new
+    // shared locks keep the waiting update out forever (this once took minutes and tens of thousands of victims).
+    let s = common::server();
+    let mut c = s.connect();
+    exec(&mut c, "CREATE TABLE ctr (id INT PRIMARY KEY, n INT)");
+    exec(&mut c, "INSERT ctr VALUES (1, 0)");
+    let started = std::time::Instant::now();
+    let victims = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut handles = vec![];
+    for _ in 0..3 {
+        let mut conn = s.connect();
+        let victims = victims.clone();
+        handles.push(thread::spawn(move || {
+            let mut done = 0;
+            while done < 5 {
+                let r = conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ; BEGIN TRAN; DECLARE @v INT; SELECT @v = n FROM ctr WHERE id = 1; UPDATE ctr SET n = @v + 1 WHERE id = 1; COMMIT");
+                match r.first_error() {
+                    None => done += 1,
+                    Some(e) if e.number == 1205 => {
+                        victims.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Some(e) => panic!("{}", e),
+                }
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    assert_eq!(scalar(&mut c, "SELECT n FROM ctr"), "15");
+    let v = victims.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(started.elapsed().as_secs() < 30 && v < 100_000, "took {:?} with {} deadlock victims", started.elapsed(), v);
+}
+
+#[test]
+fn a_new_shared_lock_queues_behind_a_waiting_exclusive_request() {
+    let s = common::server();
+    let mut a = s.connect();
+    exec(&mut a, "CREATE TABLE q (id INT PRIMARY KEY, v INT)");
+    exec(&mut a, "INSERT q VALUES (1, 0)");
+    exec(&mut a, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ; BEGIN TRAN");
+    exec(&mut a, "SELECT v FROM q WHERE id = 1");
+    // B wants to write the row A has read, and waits
+    let mut b = s.connect();
+    let writer = thread::spawn(move || {
+        // (in an explicit transaction: a blocked autocommit statement rolls back and starts over, so it holds no place in the queue)
+        exec(&mut b, "BEGIN TRAN; UPDATE q SET v = 1 WHERE id = 1; COMMIT");
+        b
+    });
+    thread::sleep(std::time::Duration::from_millis(300));
+    // C asks for a new shared lock on the same row: it queues behind B's request, so with a short lock timeout it fails
+    let mut c = s.connect();
+    exec(&mut c, "SET LOCK_TIMEOUT 200; SET TRANSACTION ISOLATION LEVEL REPEATABLE READ; BEGIN TRAN");
+    assert_eq!(err_no(&mut c, "SELECT v FROM q WHERE id = 1"), 1222);
+    exec(&mut c, "ROLLBACK");
+    // a read committed reader is not affected (it takes no row lock), and A's own further reads still work
+    let mut d = s.connect();
+    assert_eq!(scalar(&mut d, "SELECT v FROM q WHERE id = 1"), "0");
+    assert_eq!(scalar(&mut a, "SELECT v FROM q WHERE id = 1"), "0");
+    // when A ends, B's update goes through, and then a new reader gets in
+    exec(&mut a, "COMMIT");
+    let mut b = writer.join().unwrap();
+    exec(&mut c, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+    assert_eq!(scalar(&mut c, "SELECT v FROM q WHERE id = 1"), "1");
+    drop(&mut b);
+}
