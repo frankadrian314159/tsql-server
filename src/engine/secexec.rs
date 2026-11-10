@@ -94,6 +94,16 @@ impl<'a> Engine<'a> {
     pub fn select_denials(&self, loc: &Loc, name: &[String], t: &Table) -> Result<Vec<Option<Arc<String>>>> {
         let shown = name.last().map(|s| s.as_str()).unwrap_or("");
         let table_wide = self.check_object_perm(loc, "SELECT", shown);
+        if self.srv.core.audit.is_active() {
+            let res = self.select_denials_inner(loc, name, t, table_wide.clone());
+            self.audit_access("SELECT", loc, res.is_ok());
+            return res;
+        }
+        self.select_denials_inner(loc, name, t, table_wide)
+    }
+
+    fn select_denials_inner(&self, loc: &Loc, name: &[String], t: &Table, table_wide: Result<()>) -> Result<Vec<Option<Arc<String>>>> {
+        let shown = name.last().map(|s| s.as_str()).unwrap_or("");
         let Loc::Db(d, k) = loc else { return table_wide.map(|_| vec![]) };
         let (schema, obj) = Self::split_key(k);
         let Some(db) = self.srv.databases.get(d) else { return table_wide.map(|_| vec![]) };
@@ -205,7 +215,7 @@ impl<'a> Engine<'a> {
         Err(SqlError::with(15247, 16, 1, format!("User does not have permission to perform this action. ({})", what)))
     }
 
-    fn log_security(&mut self) {
+    pub(crate) fn log_security(&mut self) {
         let sec = self.srv.security.clone();
         self.log_nowait(vec![crate::persist::LogOp::Security(sec)]);
     }
@@ -221,7 +231,7 @@ impl<'a> Engine<'a> {
     pub fn exec_security(&mut self, st: &SecStmt) -> Result<()> {
         let dbk = self.ses.db.to_lowercase();
         match st {
-            SecStmt::CreateLogin { name, password, default_db } => {
+            SecStmt::CreateLogin { name, password, default_db, opts } => {
                 if !self.is_sysadmin() {
                     return Err(SqlError::with(15247, 16, 1, "User does not have permission to perform this action."));
                 }
@@ -229,21 +239,63 @@ impl<'a> Engine<'a> {
                 if self.srv.security.logins.contains_key(&k) {
                     return Err(SqlError::new(15025, format!("The server principal '{}' already exists.", name)));
                 }
+                let default_policy = self.srv.core.run_value("default login check_policy") != 0;
+                let policy = opts.check_policy.unwrap_or(default_policy);
+                if policy {
+                    if let Some(why) = password.as_deref().and_then(|p| crate::security::password_problem(name, p)) {
+                        return Err(SqlError::with(15118, 16, 1, format!("Password validation failed. The password does not meet Windows policy requirements because {}.", why)));
+                    }
+                }
                 let mut l = Login::new(name, password.as_deref());
+                l.check_policy = policy;
+                l.check_expiration = opts.check_expiration.unwrap_or(policy);
+                l.must_change = opts.must_change;
                 if let Some(d) = default_db {
                     l.default_db = d.clone();
                 }
                 self.srv.cat_mut().security.logins.insert(k, l);
                 self.log_security();
             }
-            SecStmt::AlterLogin { name, password, disabled, default_db } => {
+            SecStmt::AlterLogin { name, password, disabled, default_db, opts } => {
                 let own = self.eff_login().eq_ignore_ascii_case(name);
-                if !self.is_sysadmin() && !(own && password.is_some()) {
+                let admin = self.is_sysadmin();
+                if !admin && !(own && password.is_some()) {
                     return Err(SqlError::with(15247, 16, 1, "User does not have permission to perform this action."));
                 }
-                let l = self.srv.cat_mut().security.logins.get_mut(&name.to_lowercase()).ok_or_else(|| SqlError::new(15151, format!("Cannot alter the login '{}', because it does not exist or you do not have permission.", name)))?;
+                let (old_hash_ok, policy_now) = match self.srv.security.logins.get(&name.to_lowercase()) {
+                    Some(l) => (opts.old_password.as_deref().is_some_and(|o| l.check_password(o)), opts.check_policy.unwrap_or(l.check_policy)),
+                    None => return Err(SqlError::new(15151, format!("Cannot alter the login '{}', because it does not exist or you do not have permission.", name))),
+                };
+                // a user changing their own password must give the old one (an administrator need not)
+                if !admin && !old_hash_ok {
+                    return Err(SqlError::with(15151, 16, 1, "Cannot alter the login: the old password must be given (OLD_PASSWORD) when changing your own password."));
+                }
+                if policy_now {
+                    if let Some(why) = password.as_deref().and_then(|p| crate::security::password_problem(name, p)) {
+                        return Err(SqlError::with(15118, 16, 1, format!("Password validation failed. The password does not meet Windows policy requirements because {}.", why)));
+                    }
+                }
+                let l = self.srv.cat_mut().security.logins.get_mut(&name.to_lowercase()).unwrap();
                 if let Some(p) = password {
                     l.set_password(p);
+                    l.bad_count = 0;
+                    l.locked_until = None;
+                }
+                if let Some(c) = opts.check_policy {
+                    l.check_policy = c;
+                    if !c {
+                        l.check_expiration = false;
+                    }
+                }
+                if let Some(c) = opts.check_expiration {
+                    l.check_expiration = c;
+                }
+                if opts.must_change && admin {
+                    l.must_change = true;
+                }
+                if opts.unlock && admin {
+                    l.bad_count = 0;
+                    l.locked_until = None;
                 }
                 if let Some(d) = disabled {
                     l.disabled = *d;

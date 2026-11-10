@@ -28,7 +28,7 @@ pub struct Applied {
 }
 
 pub fn table_schema(t: &Table, alias: &str) -> Schema {
-    Schema::new(t.columns.iter().map(|c| ColMeta { qual: Some(alias.to_string()), name: c.name.clone(), ty: Some(c.ty.clone()), denied: None, coll: c.collation.as_deref().and_then(crate::collation::get), mask: c.mask.as_deref().and_then(|m| crate::mask::Mask::parse(m).ok()).map(Arc::new) }).collect())
+    Schema::new(t.columns.iter().map(|c| ColMeta { qual: Some(alias.to_string()), name: c.name.clone(), ty: Some(c.ty.clone()), denied: None, hidden: c.hidden, coll: c.collation.as_deref().and_then(crate::collation::get), mask: c.mask.as_deref().and_then(|m| crate::mask::Mask::parse(m).ok()).map(Arc::new) }).collect())
 }
 
 fn fmt_key(vals: &[&Value]) -> String {
@@ -97,7 +97,9 @@ impl<'a> Engine<'a> {
 
     fn exec_insert_inner(&mut self, ins: &Insert) -> Result<()> {
         let (loc, name) = self.dml_target(&ins.target, &[], "")?;
-        self.check_insert_permission(&loc, &name, ins)?;
+        let allowed = self.check_insert_permission(&loc, &name, ins);
+        self.audit_access("INSERT", &loc, allowed.is_ok());
+        allowed?;
         let mut src_rows: Vec<Vec<Option<Value>>> = vec![];
         let mut src_ncols = 0usize;
         match &ins.src {
@@ -194,7 +196,7 @@ impl<'a> Engine<'a> {
             None => (0..t.columns.len())
                 .filter(|&i| {
                     let c = &t.columns[i];
-                    c.computed.is_none() && !matches!(c.ty, DataType::Timestamp) && (c.identity.is_none() || ident_on)
+                    c.computed.is_none() && !matches!(c.ty, DataType::Timestamp) && (c.identity.is_none() || ident_on) && !t.temporal.as_ref().is_some_and(|p| !Self::is_history(t) && (p.start.eq_ignore_ascii_case(&c.name) || p.end.eq_ignore_ascii_case(&c.name)))
                 })
                 .collect(),
         };
@@ -308,6 +310,7 @@ impl<'a> Engine<'a> {
 
     /// Compute computed columns and enforce NOT NULL.
     fn finish_row(&mut self, t: &Table, row: &mut Row, verb: &str) -> Result<()> {
+        Self::fill_period(t, row);
         if t.columns.iter().any(|c| c.computed.is_some()) {
             let schema = table_schema(t, &t.name);
             for ci in 0..t.columns.len() {
@@ -334,6 +337,11 @@ impl<'a> Engine<'a> {
         if ch.is_empty() {
             return Ok(Applied { old_updated: vec![], new_updated: vec![], deleted: vec![], inserted: vec![] });
         }
+        if Self::is_history(t) && verb != "HISTORY" {
+            let (code, what) = if !ch.inserts.is_empty() { (13559, "insert rows in") } else if !ch.updates.is_empty() { (13561, "update rows in") } else { (13560, "delete rows from") };
+            return Err(SqlError::new(code, format!("Cannot {} a temporal history table '{}.{}.{}'.", what, t.db, t.schema, t.name)));
+        }
+        self.ses.period_now = if Self::is_versioned(t) { Some(super::temporal::utc_now()) } else { None };
         // The checks and writes below must not interleave with another session's where that could break a rule:
         //
         // * Most tables are latched shared (writers to one table run side by side) plus *stripes* for the key values
@@ -369,7 +377,14 @@ impl<'a> Engine<'a> {
         if let Some((_set, oids)) = latch {
             self.ses.latched.retain(|o| !oids.contains(o));
         }
-        r
+        let now = self.ses.period_now.take();
+        match (r, now) {
+            (Ok(ap), Some(now)) => {
+                self.write_history(t, &ap, now)?;
+                Ok(ap)
+            }
+            (r, _) => r,
+        }
     }
 
     /// The latch stripes a write of `ch` to `t` needs (see `apply_changes`).
@@ -532,6 +547,9 @@ impl<'a> Engine<'a> {
             self.rls_check(loc, t, PredKind::BlockBeforeDelete, &old_del)?;
             self.rls_check(loc, t, PredKind::BlockAfterUpdate, &new_upd)?;
             self.rls_check(loc, t, PredKind::BlockAfterInsert, &new_ins)?;
+        }
+        if let Some(now) = self.ses.period_now {
+            Self::stamp_period(t, &mut ch, now);
         }
         // ---- writes
         let stamp = if is_var { Stamp::Ts(0) } else { Stamp::Tx(tx) };
@@ -994,7 +1012,7 @@ impl<'a> Engine<'a> {
     // ------------------------------------------------------------ triggers
     /// The INSTEAD OF trigger to run for this event, unless that trigger is already executing.
     pub fn instead_trigger(&self, t: &Table, event: &str) -> Option<Arc<Trigger>> {
-        let trg = t.triggers.iter().find(|g| g.instead && g.events.iter().any(|e| e == event)).cloned()?;
+        let trg = t.triggers.iter().find(|g| !g.disabled && g.instead && g.events.iter().any(|e| e == event)).cloned()?;
         let key = t.key();
         if self.ses.trigger_stack.iter().any(|c| c.instead_of && c.event == event && c.table.key() == key) {
             return None;
@@ -1012,6 +1030,11 @@ impl<'a> Engine<'a> {
         self.ses.strict += 1;
         self.ses.nest_level += 1;
         let had_tx = self.ses.tx.is_some();
+        // a trigger runs inside the statement's transaction (@@TRANCOUNT >= 1), so ROLLBACK is legal in an autocommit statement
+        let outer_trancount = self.ses.trancount;
+        if had_tx && outer_trancount == 0 {
+            self.ses.trancount = 1;
+        }
         let owner = self.schema_owner_of(&t.db.to_lowercase(), &t.schema);
         self.ses.module_owner.push(owner);
         let r = self.exec_stmts(&trg.body);
@@ -1020,6 +1043,9 @@ impl<'a> Engine<'a> {
         self.ses.strict -= 1;
         self.ses.frames.pop();
         self.ses.trigger_stack.pop();
+        if had_tx && outer_trancount == 0 && self.ses.tx.is_some() {
+            self.ses.trancount = 0;
+        }
         match r {
             Ok(()) | Err(Interrupt::Return) => {}
             Err(Interrupt::Error(e)) => return Err(e),
@@ -1043,7 +1069,7 @@ impl<'a> Engine<'a> {
             };
             self.emit_output(o, t, &ins, &del, None)?;
         }
-        let trgs: Vec<Arc<Trigger>> = t.triggers.iter().filter(|g| !g.instead && g.events.iter().any(|e| e == event)).cloned().collect();
+        let trgs: Vec<Arc<Trigger>> = t.triggers.iter().filter(|g| !g.disabled && !g.instead && g.events.iter().any(|e| e == event)).cloned().collect();
         if !trgs.is_empty() {
             let (ins, del) = match event {
                 "INSERT" => (ap.inserted.clone(), vec![]),
@@ -1065,10 +1091,10 @@ impl<'a> Engine<'a> {
 
     fn emit_output(&mut self, o: &Output, t: &Table, ins: &[Row], del: &[Row], action: Option<&[String]>) -> Result<()> {
         let ncols = t.columns.len();
-        let mut cols: Vec<ColMeta> = t.columns.iter().map(|c| ColMeta { qual: Some("inserted".into()), name: c.name.clone(), ty: Some(c.ty.clone()), denied: None, coll: c.collation.as_deref().and_then(crate::collation::get), mask: None }).collect();
-        cols.extend(t.columns.iter().map(|c| ColMeta { qual: Some("deleted".into()), name: c.name.clone(), ty: Some(c.ty.clone()), denied: None, coll: c.collation.as_deref().and_then(crate::collation::get), mask: None }));
+        let mut cols: Vec<ColMeta> = t.columns.iter().map(|c| ColMeta { qual: Some("inserted".into()), name: c.name.clone(), ty: Some(c.ty.clone()), denied: None, hidden: false, coll: c.collation.as_deref().and_then(crate::collation::get), mask: None }).collect();
+        cols.extend(t.columns.iter().map(|c| ColMeta { qual: Some("deleted".into()), name: c.name.clone(), ty: Some(c.ty.clone()), denied: None, hidden: false, coll: c.collation.as_deref().and_then(crate::collation::get), mask: None }));
         if action.is_some() {
-            cols.push(ColMeta { qual: None, name: "$action".into(), ty: Some(DataType::NVarChar(10)), denied: None, coll: None, mask: None });
+            cols.push(ColMeta { qual: None, name: "$action".into(), ty: Some(DataType::NVarChar(10)), denied: None, hidden: false, coll: None, mask: None });
         }
         let schema = Schema::new(cols);
         let n = ins.len().max(del.len());
@@ -1143,7 +1169,7 @@ impl<'a> Engine<'a> {
             }
             out.push(row);
         }
-        let sch = Schema::new(cols.iter().map(|c| ColMeta { qual: None, name: c.0.clone(), ty: c.3.clone(), denied: None, coll: None, mask: None }).collect());
+        let sch = Schema::new(cols.iter().map(|c| ColMeta { qual: None, name: c.0.clone(), ty: c.3.clone(), denied: None, hidden: false, coll: None, mask: None }).collect());
         Ok(Rowset::new(sch, out))
     }
 
@@ -1357,7 +1383,9 @@ impl<'a> Engine<'a> {
     fn exec_update_inner(&mut self, u: &Update) -> Result<()> {
         let (loc, name) = self.dml_target(&u.target, &u.from, "")?;
         let mut t = self.table_ref(&loc).cloned().ok_or_else(|| self.invalid_object(&name))?;
-        self.check_update_permission(&loc, &name, &t, u)?;
+        let allowed = self.check_update_permission(&loc, &name, &t, u);
+        self.audit_access("UPDATE", &loc, allowed.is_ok());
+        allowed?;
         let plan = self.update_core(&loc, &mut t, u, &name)?;
         match plan {
             UpdPlan::Instead { trg, ins, del, upd_cols } => {
@@ -1528,6 +1556,7 @@ impl<'a> Engine<'a> {
     pub fn exec_truncate(&mut self, target: &Target) -> Result<()> {
         let (loc, name) = self.dml_target(target, &[], "ALTER")?;
         let t = self.table_ref(&loc).cloned().ok_or_else(|| self.invalid_object(&name))?;
+        self.temporal_guard(&t, "TRUNCATE TABLE")?;
         let refs = self.referencing_fks(&t);
         if refs.iter().any(|(_, ck, _)| *ck != t.key()) {
             return Err(SqlError::new(4712, format!("Cannot truncate table '{}' because it is being referenced by a FOREIGN KEY constraint.", name.join("."))));
@@ -1585,7 +1614,7 @@ impl<'a> Engine<'a> {
         }
         let evs: [(&str, Vec<Row>, Vec<Row>); 3] = [("INSERT", ap.inserted.clone(), vec![]), ("UPDATE", ap.new_updated.clone(), ap.old_updated.clone()), ("DELETE", vec![], ap.deleted.clone())];
         for (ev, ins, del) in evs {
-            let trgs: Vec<Arc<Trigger>> = tc.triggers.iter().filter(|g| !g.instead && g.events.iter().any(|e| e == ev)).cloned().collect();
+            let trgs: Vec<Arc<Trigger>> = tc.triggers.iter().filter(|g| !g.disabled && !g.instead && g.events.iter().any(|e| e == ev)).cloned().collect();
             if trgs.is_empty() || (ins.is_empty() && del.is_empty()) {
                 continue;
             }

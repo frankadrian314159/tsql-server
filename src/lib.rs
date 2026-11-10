@@ -8,6 +8,7 @@
 //! assert_eq!(res.resultsets()[0].rows[0][0].to_string(), "2");
 //! ```
 pub mod ast;
+pub mod audit;
 pub mod catalog;
 pub mod convert;
 pub mod collation;
@@ -25,6 +26,7 @@ pub mod storage;
 pub mod tds;
 pub mod tools;
 pub mod types;
+pub mod xmlpath;
 
 use catalog::ServerState;
 use engine::{Engine, SessionState, SrvGuard};
@@ -88,6 +90,7 @@ impl Server {
     pub fn open_with(dir: impl AsRef<std::path::Path>, opts: StorageOptions) -> Result<Server, SqlError> {
         let (p, mut state) = persist::Persist::open(dir.as_ref(), opts)?;
         state.persist = std::sync::Mutex::new(Some(p));
+        state.core.audit.set_active(state.security.audits.iter().any(|a| a.enabled));
         Ok(Server { shared: Arc::new(Shared { state: RwLock::new(state), crashed: Default::default() }) })
     }
 
@@ -147,14 +150,59 @@ impl Server {
 
     /// Authenticate with a login name and password.
     pub fn connect_as(&self, login: &str, password: &str) -> Result<Connection, SqlError> {
+        let outcome = {
+            let mut g = self.shared.state.write().unwrap_or_else(|e| e.into_inner());
+            let r = Self::check_login(&mut g, login, password);
+            if let Err(e) = &r {
+                if g.core.audit.is_active() {
+                    engine::auditing::login_event(&g, "LOGIN FAILED", login, 0, &e.message);
+                }
+            }
+            r
+        };
+        outcome?;
+        let mut conn = self.session_for(login);
         {
-            let g = self.shared.state.write().unwrap_or_else(|e| e.into_inner());
-            let ok = g.security.logins.get(&login.to_lowercase()).map(|l| !l.disabled && l.check_password(password)).unwrap_or(false);
-            if !ok {
-                return Err(SqlError::with(18456, 14, 1, format!("Login failed for user '{}'.", login)));
+            let g = self.shared.state.read().unwrap_or_else(|e| e.into_inner());
+            if g.core.audit.is_active() {
+                engine::auditing::login_event(&g, "LOGIN SUCCEEDED", &conn.session.login, conn.session.spid, "Login succeeded for user");
             }
         }
-        Ok(self.session_for(login))
+        conn.run_logon_triggers()?;
+        Ok(conn)
+    }
+
+    fn check_login(g: &mut catalog::ServerState, login: &str, password: &str) -> Result<(), SqlError> {
+        {
+            let now = chrono::Local::now().naive_local();
+            let (threshold, minutes, max_age) = (g.core.run_value("login lockout threshold").max(1) as u32, g.core.run_value("login lockout minutes").max(1), g.core.run_value("password max age (days)"));
+            let failed = |why: &str| SqlError::with(18456, 14, 1, format!("Login failed for user '{}'.{}", login, why));
+            let Some(l) = g.security.logins.get_mut(&login.to_lowercase()) else { return Err(failed("")) };
+            if l.disabled {
+                return Err(failed(""));
+            }
+            if l.is_locked(now) {
+                return Err(SqlError::with(18486, 14, 1, format!("Login failed for user '{}' because the account is currently locked out. The system administrator can unlock it.", login)));
+            }
+            if !l.check_password(password) {
+                if l.check_policy {
+                    l.bad_count += 1;
+                    if l.bad_count >= threshold {
+                        l.locked_until = Some(now + chrono::Duration::minutes(minutes));
+                        l.bad_count = 0;
+                    }
+                }
+                return Err(failed(""));
+            }
+            if l.is_expired(now, max_age) {
+                return Err(SqlError::with(18487, 14, 1, format!("Login failed for user '{}'. Reason: The password of the account has expired.", login)));
+            }
+            if l.must_change {
+                return Err(SqlError::with(18488, 14, 1, format!("Login failed for user '{}'. Reason: The password of the account must be changed.", login)));
+            }
+            l.bad_count = 0;
+        }
+        Ok(())
     }
 
     fn session_for(&self, login: &str) -> Connection {
@@ -261,6 +309,20 @@ impl Connection {
         Ok(r.resultsets().iter().flat_map(|rs| rs.rows.iter().map(|row| row[0].to_string())).collect())
     }
 
+    /// Run the server's LOGON triggers; an error means the login is refused (the session is dropped by the caller).
+    fn run_logon_triggers(&mut self) -> Result<(), SqlError> {
+        {
+            let g = self.server.shared.state.read().unwrap_or_else(|e| e.into_inner());
+            if g.security.server_triggers.is_empty() {
+                return Ok(());
+            }
+        }
+        let shared = self.server.shared.clone();
+        let guard = SrvGuard::new(&shared.state);
+        let mut eng = Engine::new(guard, &mut self.session);
+        eng.run_logon_triggers()
+    }
+
     pub fn current_database(&self) -> String {
         self.session.db.clone()
     }
@@ -292,6 +354,9 @@ impl Drop for Connection {
         {
             let g = self.server.shared.state.read().unwrap_or_else(|e| e.into_inner());
             g.core.unregister_session(self.session.spid);
+            if g.core.audit.is_active() {
+                engine::auditing::login_event(&g, "LOGOUT", &self.session.login, self.session.spid, "");
+            }
         }
         // roll back any open transaction and release its locks
         if self.session.tx.is_some() {

@@ -48,6 +48,7 @@ impl<'a> Engine<'a> {
                 }
                 let collation = self.column_collation(&c.collation, &ty)?;
                 let mask = self.validated_mask(&c.mask, &ty, &c.name)?;
+                let nullable = if c.generated.is_some() { false } else { nullable };
                 cols.push(Column {
                     name: c.name.clone(),
                     ty,
@@ -61,6 +62,7 @@ impl<'a> Engine<'a> {
                     user_type,
                     collation,
                     mask,
+                    hidden: false,
                 });
             }
         }
@@ -68,6 +70,7 @@ impl<'a> Engine<'a> {
         let mut t = Table::new(db, schema, name, cols, &store);
         t.object_id = oid;
         t.is_temp = is_temp;
+        self.define_period(&mut t, defs)?;
         let idx_of = |t: &Table, n: &str| -> Result<usize> { t.col_index(n).ok_or_else(|| SqlError::new(1911, format!("Column name '{}' does not exist in the target table or view.", n))) };
         // constraints
         for d in defs {
@@ -109,7 +112,7 @@ impl<'a> Engine<'a> {
                     let idx: Vec<(usize, bool)> = kc.iter().map(|(c, d)| idx_of(&t, c).map(|i| (i, *d))).collect::<Result<_>>()?;
                     t.indexes.push(IndexDef { name: n.clone(), cols: idx, unique: *unique, include: vec![], filter: None });
                 }
-                TableDef::ForeignKey(_) => {}
+                TableDef::ForeignKey(_) | TableDef::Period { .. } => {}
             }
         }
         // foreign keys last (self references need the PK)
@@ -242,12 +245,53 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    fn ddl_names(&self, name: &[String]) -> (String, String, String) {
+    pub(crate) fn ddl_names(&self, name: &[String]) -> (String, String, String) {
         let (db, schema, n) = self.split_name(name);
         (db.unwrap_or_else(|| self.ses.db.clone()).to_lowercase(), schema.unwrap_or_else(|| "dbo".into()), n)
     }
 
-    fn check_schema(&self, db: &str, schema: &str) -> Result<()> {
+    /// `ENABLE | DISABLE TRIGGER names | ALL ON table`
+    pub fn set_dml_triggers_enabled(&mut self, table: &Name, names: &[String], all: bool, enable: bool) -> Result<()> {
+        let tloc = self.locate(table);
+        let Some(tt) = self.table_ref(&tloc).cloned() else {
+            return Err(SqlError::new(4902, format!("Cannot find the object \"{}\" because it does not exist or you do not have permissions.", table.join("."))));
+        };
+        self.check_alter(&tloc, table.last().unwrap())?;
+        if !all {
+            for n in names {
+                if !tt.triggers.iter().any(|g| g.name.eq_ignore_ascii_case(n)) {
+                    return Err(SqlError::new(4947, format!("Cannot find the trigger '{}', because it does not exist or you do not have permission.", n)));
+                }
+            }
+        }
+        self.ddl_lock(&tloc, &tt)?;
+        self.undo_table(&tloc, &tt);
+        let mut t = self.take_table(&tloc).unwrap();
+        let mut changed: Vec<Arc<Trigger>> = vec![];
+        for g in t.triggers.iter_mut() {
+            if all || names.iter().any(|n| g.name.eq_ignore_ascii_case(n)) {
+                let mut ng = (**g).clone();
+                ng.disabled = !enable;
+                *g = Arc::new(ng);
+                changed.push(g.clone());
+            }
+        }
+        let tk = t.key();
+        let db = t.db.to_lowercase();
+        self.put_table(&tloc, t);
+        if let Some(d) = self.srv.cat_mut().databases.get_mut(&db) {
+            for (_, (k, g)) in d.triggers.iter_mut() {
+                if *k == tk {
+                    if let Some(c) = changed.iter().find(|c| c.name.eq_ignore_ascii_case(&g.name)) {
+                        *g = c.clone();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_schema(&self, db: &str, schema: &str) -> Result<()> {
         let d = self.srv.databases.get(db).ok_or_else(|| SqlError::new(911, format!("Database '{}' does not exist.", db)))?;
         if !d.schemas.contains_key(&schema.to_lowercase()) {
             return Err(SqlError::new(2760, format!("The specified schema name \"{}\" either does not exist or you do not have permission to use it.", schema)));
@@ -261,7 +305,7 @@ impl<'a> Engine<'a> {
 
     pub fn exec_ddl(&mut self, st: &Stmt) -> Result<()> {
         match st {
-            Stmt::CreateTable { name, defs } => {
+            Stmt::CreateTable { name, defs, versioning } => {
                 let (db, schema, n) = self.ddl_names(name);
                 let loc = self.locate(name);
                 match &loc {
@@ -270,6 +314,9 @@ impl<'a> Engine<'a> {
                             return Err(self.object_exists_err(&n));
                         }
                         let mut t = self.build_table("tempdb", "dbo", &n, defs, true)?;
+                        if versioning.is_some() || t.temporal.is_some() {
+                            return Err(SqlError::new(13506, "System versioning is not supported on temporary tables."));
+                        }
                         t.is_temp = true;
                         self.put_table(&loc, t);
                         self.record_table_creation(&loc)?;
@@ -282,7 +329,11 @@ impl<'a> Engine<'a> {
                             return Err(self.object_exists_err(&n));
                         }
                         let dbname = self.srv.databases[&db].name.clone();
-                        let t = self.build_table(&dbname, &schema, &n, defs, false)?;
+                        let mut t = self.build_table(&dbname, &schema, &n, defs, false)?;
+                        match versioning {
+                            Some(v) if v.on => self.attach_history(&db, &mut t, &v.history)?,
+                            _ => {}
+                        }
                         self.ensure_tx()?;
                         self.undo_object(&db, &key);
                         self.srv.cat_mut().databases.get_mut(&db).unwrap().objects.insert(key, Object::Table(t));
@@ -405,7 +456,7 @@ impl<'a> Engine<'a> {
                 let tkey = obj_key(&schema, &n);
                 let tloc = self.locate(table);
                 let oid = self.srv.new_object_id();
-                let trg = Arc::new(Trigger { name: n.clone(), schema: schema.clone(), events: events.clone(), instead: *instead, body: body.clone(), text: text.clone(), object_id: oid });
+                let trg = Arc::new(Trigger { name: n.clone(), schema: schema.clone(), events: events.clone(), instead: *instead, body: body.clone(), text: text.clone(), object_id: oid, disabled: false });
                 match self.table_ref(&tloc).cloned() {
                     Some(tt) => {
                         self.check_alter(&tloc, table.last().unwrap())?;
@@ -569,6 +620,7 @@ impl<'a> Engine<'a> {
                     _ => return Err(SqlError::new(208, format!("Invalid object name '{}'.", name.join(".")))),
                 }
             }
+            Stmt::AlterTable { name, action: AlterAction::SetVersioning(v) } => self.set_versioning(name, v)?,
             Stmt::AlterTable { name, action } => self.alter_table(name, action)?,
             Stmt::Drop { what, names, if_exists } => {
                 for n in names {
@@ -667,6 +719,7 @@ impl<'a> Engine<'a> {
                         }
                     }
                 }
+                self.temporal_guard(&t, "DROP TABLE")?;
                 self.check_alter(&loc, &n)?;
                 self.ddl_lock(&loc, &t)?;
                 self.undo_object(&db, &key);
@@ -774,6 +827,9 @@ impl<'a> Engine<'a> {
     }
 
     fn alter_table_inner(&mut self, t: &mut Table, action: &AlterAction) -> Result<()> {
+        if (Self::is_versioned(t) || Self::is_history(t)) && matches!(action, AlterAction::AddDefs(_) | AlterAction::DropColumn(..) | AlterAction::AlterColumn { .. }) {
+            return self.temporal_guard(t, "ALTER TABLE");
+        }
         match action {
             AlterAction::AddDefs(defs) => {
                 let col_defs: Vec<&ColumnDef> = defs.iter().filter_map(|d| if let TableDef::Column(c) = d { Some(c) } else { None }).collect();
@@ -867,9 +923,11 @@ impl<'a> Engine<'a> {
                             t.indexes.push(IndexDef { name: name.clone(), cols: idx, unique: *unique, include: vec![], filter: None });
                         }
                         TableDef::Column(_) => {}
+                        TableDef::Period { .. } => {}
                     }
                 }
             }
+            AlterAction::SetVersioning(_) => {}
             AlterAction::DropConstraint(names, if_exists) => {
                 for n in names {
                     let mut found = false;

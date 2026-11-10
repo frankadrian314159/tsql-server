@@ -224,6 +224,10 @@ fn dynamic_sql() {
     assert_eq!(rows(&mut c, "EXEC('SELECT COUNT(*) FROM ' + 't')"), vec![vec!["2"]]);
     assert_eq!(rows(&mut c, "EXEC sp_executesql N'SELECT @x + @y', N'@x INT, @y INT', 3, 4"), vec![vec!["7"]]);
     assert_eq!(rows(&mut c, "DECLARE @out INT; EXEC sp_executesql N'SELECT @o = COUNT(*) FROM t', N'@o INT OUTPUT', @o = @out OUTPUT; SELECT @out"), vec![vec!["2"]]);
+    // RETURN in the statement is the return status
+    assert_eq!(rows(&mut c, "DECLARE @rc INT; EXEC @rc = sp_executesql N'RETURN 42'; SELECT @rc"), vec![vec!["42"]]);
+    assert_eq!(rows(&mut c, "DECLARE @rc INT; EXEC @rc = sp_executesql N'DECLARE @z INT = 1'; SELECT @rc"), vec![vec!["0"]]);
+    assert_eq!(rows(&mut c, "DECLARE @rc INT, @o INT; EXEC @rc = sp_executesql N'SET @o = @i * 2; RETURN @o + 1', N'@i INT, @o INT OUTPUT', 5, @o OUTPUT; SELECT @rc, @o"), vec![vec!["11", "10"]]);
     // dynamic SQL cannot see outer variables
     assert_eq!(err_no(&mut c, "DECLARE @v INT = 1; EXEC('SELECT @v')"), 137);
     // but sees temp tables

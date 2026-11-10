@@ -26,11 +26,25 @@ pub struct Column {
     pub collation: Option<String>,
     /// Dynamic data masking function (`default()`, `email()`, ...), shown to users without UNMASK.
     pub mask: Option<String>,
+    /// A `GENERATED ALWAYS AS ROW START/END` column declared `HIDDEN`.
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+/// System-versioning metadata of a table: the period columns, and the history link on either side.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Temporal {
+    pub start: String,
+    pub end: String,
+    /// For a system-versioned table: its history table (schema, name).
+    pub history: Option<(String, String)>,
+    /// For a history table: the key of the table it records.
+    pub history_for: Option<String>,
 }
 
 impl Column {
     pub fn simple(name: &str, ty: DataType) -> Column {
-        Column { name: name.to_string(), ty, nullable: true, identity: None, default: None, default_text: None, default_name: None, computed: None, computed_text: None, user_type: None, collation: None, mask: None }
+        Column { name: name.to_string(), ty, nullable: true, identity: None, default: None, default_text: None, default_name: None, computed: None, computed_text: None, user_type: None, collation: None, mask: None, hidden: false }
     }
 }
 
@@ -89,6 +103,20 @@ pub struct Trigger {
     pub body: Arc<Vec<Stmt>>,
     pub text: String,
     pub object_id: i32,
+    /// `DISABLE TRIGGER`: the trigger exists but does not fire.
+    pub disabled: bool,
+}
+
+/// A DDL trigger (`CREATE TRIGGER ... ON DATABASE | ALL SERVER FOR CREATE_TABLE, ...`) or a `LOGON` trigger.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DdlTrigger {
+    pub name: String,
+    /// Event names or event groups, upper case.
+    pub events: Vec<String>,
+    pub body: Arc<Vec<Stmt>>,
+    pub text: String,
+    pub disabled: bool,
+    pub object_id: i32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -107,6 +135,8 @@ pub struct Table {
     pub identity_next: SharedCounter,
     pub triggers: Vec<Arc<Trigger>>,
     pub is_temp: bool,
+    #[serde(default)]
+    pub temporal: Option<Temporal>,
 }
 
 /// A counter that clones share: the next identity value of a table, the current value of a sequence. A statement
@@ -163,6 +193,7 @@ impl Table {
             identity_next: SharedCounter::new(identity_next),
             triggers: vec![],
             is_temp: false,
+            temporal: None,
         }
     }
     pub fn col_index(&self, name: &str) -> Option<usize> {
@@ -415,6 +446,10 @@ pub struct Database {
     pub collation: String,
     /// Row-level security policies.
     pub policies: Vec<SecurityPolicy>,
+    /// Database-scoped DDL triggers.
+    pub ddl_triggers: Vec<DdlTrigger>,
+    /// Database audit specifications.
+    pub audit_specs: Vec<crate::audit::AuditSpec>,
     /// Commit timestamp of the last full (non-COPY_ONLY) backup: the base of differential backups.
     pub last_full_ts: Option<u64>,
     /// Signature of each table's column definition at that backup (a differential includes every row of a table whose
@@ -506,6 +541,8 @@ impl Database {
             applied_ts: 0,
             collation: crate::collation::DEFAULT_NAME.to_string(),
             policies: vec![],
+            ddl_triggers: vec![],
+            audit_specs: vec![],
             last_full_ts: None,
             backup_sigs: BTreeMap::new(),
         }

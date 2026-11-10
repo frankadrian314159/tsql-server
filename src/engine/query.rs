@@ -13,6 +13,8 @@ pub struct ColMeta {
     /// Set when the user may not read this column (column-level permissions): the text that completes the
     /// error message, e.g. ` of the object 't', database 'd', schema 's'.`
     pub denied: Option<Arc<String>>,
+    /// A `HIDDEN` period column: left out of `SELECT *`.
+    pub hidden: bool,
     /// Collation of a string column when it is not the built-in default (see `collation.rs`).
     pub coll: Option<Arc<crate::collation::Collation>>,
     /// Masking function of a masked column (see `mask.rs`); applied when the column is returned to a user without UNMASK.
@@ -82,7 +84,7 @@ impl Rowset {
         Rowset { schema, rows: Arc::new(rows), suppress: false, report_count: false }
     }
     pub fn from_rows(cols: &[String], rows: Vec<Row>) -> Rowset {
-        let schema = Schema::new(cols.iter().map(|c| ColMeta { qual: None, name: c.clone(), ty: None, denied: None, coll: None, mask: None }).collect());
+        let schema = Schema::new(cols.iter().map(|c| ColMeta { qual: None, name: c.clone(), ty: None, denied: None, hidden: false, coll: None, mask: None }).collect());
         Rowset::new(schema, rows)
     }
     /// All rows of a private table (table variable, temp table) as its owner sees them.
@@ -91,7 +93,7 @@ impl Rowset {
         Rowset::table_rows(t, alias, rows)
     }
     pub fn table_rows(t: &Table, alias: &str, rows: Vec<Row>) -> Rowset {
-        let schema = Schema::new(t.columns.iter().map(|c| ColMeta { qual: Some(alias.to_string()), name: c.name.clone(), ty: Some(c.ty.clone()), denied: None, coll: c.collation.as_deref().and_then(crate::collation::get), mask: c.mask.as_deref().and_then(|m| crate::mask::Mask::parse(m).ok()).map(Arc::new) }).collect());
+        let schema = Schema::new(t.columns.iter().map(|c| ColMeta { qual: Some(alias.to_string()), name: c.name.clone(), ty: Some(c.ty.clone()), denied: None, hidden: c.hidden, coll: c.collation.as_deref().and_then(crate::collation::get), mask: c.mask.as_deref().and_then(|m| crate::mask::Mask::parse(m).ok()).map(Arc::new) }).collect());
         Rowset { schema, rows: Arc::new(rows), suppress: false, report_count: false }
     }
     pub fn empty() -> Rowset {
@@ -372,7 +374,7 @@ impl<'a> Engine<'a> {
                 if l.schema.cols.len() != r.schema.cols.len() {
                     return Err(SqlError::new(205, "All queries combined using a UNION, INTERSECT or EXCEPT operator must have an equal number of expressions in their target lists."));
                 }
-                let schema = Schema::new(l.schema.cols.iter().map(|c| ColMeta { qual: None, name: c.name.clone(), ty: c.ty.clone(), denied: None, coll: c.coll.clone(), mask: None }).collect());
+                let schema = Schema::new(l.schema.cols.iter().map(|c| ColMeta { qual: None, name: c.name.clone(), ty: c.ty.clone(), denied: None, hidden: false, coll: c.coll.clone(), mask: None }).collect());
                 let sc: Colls = l.schema.cols.iter().map(|c| c.coll.clone()).collect();
                 let rk_of = |r: &Row| if any_coll(&sc) { key_of(&keyed(r, &sc)) } else { key_of(r) };
                 let lrows = (*l.rows).clone();
@@ -760,7 +762,7 @@ impl<'a> Engine<'a> {
                     }
                     let mut any = false;
                     for (i, c) in schema.cols.iter().enumerate() {
-                        let ok = match q {
+                        let ok = !c.hidden && match q {
                             None => true,
                             Some(qp) => c.qual.as_deref().map(|x| x.eq_ignore_ascii_case(&qp[qp.len() - 1])).unwrap_or(false),
                         };
@@ -854,7 +856,7 @@ impl<'a> Engine<'a> {
                 out.truncate(n);
             }
         }
-        let schema_out = Schema::new(cols.iter().map(|c| ColMeta { qual: None, name: c.name.clone(), ty: c.ty.clone(), denied: None, coll: c.coll.clone(), mask: None }).collect());
+        let schema_out = Schema::new(cols.iter().map(|c| ColMeta { qual: None, name: c.name.clone(), ty: c.ty.clone(), denied: None, hidden: false, coll: c.coll.clone(), mask: None }).collect());
         let rows: Vec<Row> = out.into_iter().map(|x| x.0).collect();
         // SELECT INTO
         if let Some(into) = &sel.into {
@@ -1460,6 +1462,7 @@ impl<'a> Engine<'a> {
     pub fn eval_table_ref(&mut self, tr: &TableRef, outer: Option<&Env<'_>>) -> Result<Rowset> {
         match tr {
             TableRef::Table { name, alias, .. } => self.eval_named_source(name, alias.as_deref()),
+            TableRef::Temporal { name, alias, clause } => self.eval_temporal(name, alias.as_deref(), clause),
             TableRef::TableVar { name, alias } => match self.ses.frames.last().and_then(|f| f.tables.get(name)) {
                 Some(t) => Ok(Rowset::from_table(t, alias.as_deref().unwrap_or(name))),
                 None => Err(SqlError::new(1087, format!("Must declare the table variable \"{}\".", name))),
@@ -1502,7 +1505,8 @@ impl<'a> Engine<'a> {
                 };
                 let mut vals = vec![];
                 for a in args {
-                    vals.push(self.ev(a, &env)?);
+                    // DEFAULT as an argument of a table function means "not given", as in sys.fn_get_audit_file(path, DEFAULT, DEFAULT)
+                    vals.push(if matches!(a, Expr::Default) { Value::Null } else { self.ev(a, &env)? });
                 }
                 let mut rs = self.table_function(name, vals, with.as_ref())?;
                 rename_cols(&mut rs, cols);
@@ -1562,8 +1566,8 @@ impl<'a> Engine<'a> {
                 }).collect::<Result<_>>()?;
                 let keep: Vec<usize> = (0..s.schema.cols.len()).filter(|i| !unp.contains(i)).collect();
                 let mut sc: Vec<ColMeta> = keep.iter().map(|&i| s.schema.cols[i].clone()).collect();
-                sc.push(ColMeta { qual: alias.clone(), name: ncol.clone(), ty: None, denied: None, coll: None, mask: None });
-                sc.push(ColMeta { qual: alias.clone(), name: vcol.clone(), ty: None, denied: None, coll: None, mask: None });
+                sc.push(ColMeta { qual: alias.clone(), name: ncol.clone(), ty: None, denied: None, hidden: false, coll: None, mask: None });
+                sc.push(ColMeta { qual: alias.clone(), name: vcol.clone(), ty: None, denied: None, hidden: false, coll: None, mask: None });
                 let mut rows = vec![];
                 for r in s.rows.iter() {
                     for (k, &ui) in unp.iter().enumerate() {
@@ -1581,7 +1585,7 @@ impl<'a> Engine<'a> {
         }
     }
 
-    fn eval_named_source(&mut self, name: &[String], alias: Option<&str>) -> Result<Rowset> {
+    pub(crate) fn eval_named_source(&mut self, name: &[String], alias: Option<&str>) -> Result<Rowset> {
         let display = name.last().unwrap().clone();
         let q = alias.unwrap_or(&display).to_string();
         if name.len() == 1 {
@@ -1926,9 +1930,9 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        let mut sc: Vec<ColMeta> = keep.iter().map(|&i| ColMeta { qual: alias.map(|a| a.to_string()), name: s.schema.cols[i].name.clone(), ty: s.schema.cols[i].ty.clone(), denied: None, coll: s.schema.cols[i].coll.clone(), mask: None }).collect();
+        let mut sc: Vec<ColMeta> = keep.iter().map(|&i| ColMeta { qual: alias.map(|a| a.to_string()), name: s.schema.cols[i].name.clone(), ty: s.schema.cols[i].ty.clone(), denied: None, hidden: false, coll: s.schema.cols[i].coll.clone(), mask: None }).collect();
         for v in vals {
-            sc.push(ColMeta { qual: alias.map(|a| a.to_string()), name: v.clone(), ty: None, denied: None, coll: None, mask: None });
+            sc.push(ColMeta { qual: alias.map(|a| a.to_string()), name: v.clone(), ty: None, denied: None, hidden: false, coll: None, mask: None });
         }
         let fc = FuncCall { name: agg.to_string(), schema: None, parts: vec![], args: vec![arg.clone()], distinct: false, star: false, over: None, within: None };
         let mut rows = vec![];

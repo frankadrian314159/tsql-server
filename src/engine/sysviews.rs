@@ -3,7 +3,7 @@ use super::query::{ColMeta, Rowset, Schema};
 use super::*;
 
 fn rs(cols: &[(&str, DataType)], rows: Vec<Row>) -> Rowset {
-    Rowset::new(Schema::new(cols.iter().map(|(n, t)| ColMeta { qual: None, name: n.to_string(), ty: Some(t.clone()), denied: None, coll: None, mask: None }).collect()), rows)
+    Rowset::new(Schema::new(cols.iter().map(|(n, t)| ColMeta { qual: None, name: n.to_string(), ty: Some(t.clone()), denied: None, hidden: false, coll: None, mask: None }).collect()), rows)
 }
 fn sv(s: &str) -> Value {
     Value::Str(s.to_string())
@@ -49,6 +49,62 @@ fn type_info(t: &DataType) -> (i32, i32, i32, i32) {
 
 fn type_name(t: &DataType) -> String {
     t.base_name().to_string()
+}
+
+/// The columns of `sys.fn_get_audit_file` (a subset of SQL Server's) for a set of records.
+pub fn audit_rowset(events: Vec<(String, crate::audit::AuditEvent)>) -> Rowset {
+    let rows = events
+        .into_iter()
+        .map(|(file, e)| {
+            vec![
+                Value::DateTime(e.time, DtKind::DateTime2),
+                Value::BigInt(e.seq),
+                sv(&e.action_id),
+                Value::Bit(e.succeeded),
+                Value::Int(e.session_id),
+                sv(&e.server_principal),
+                sv(&e.db_principal),
+                sv(&e.target_server_principal),
+                sv(&e.target_db_principal),
+                sv(&e.server_instance),
+                sv(&e.database),
+                sv(&e.schema),
+                sv(&e.object),
+                sv(&e.class_type),
+                sv(&e.statement),
+                sv(&e.info),
+                sv(&e.app),
+                sv(&e.host),
+                sv(&e.audit),
+                sv(&file),
+            ]
+        })
+        .collect();
+    rs(
+        &[
+            ("event_time", DataType::DateTime2(7)),
+            ("sequence_number", DataType::BigInt),
+            ("action_id", DataType::VarChar(4)),
+            ("succeeded", DataType::Bit),
+            ("session_id", DataType::SmallInt),
+            ("server_principal_name", nv()),
+            ("database_principal_name", nv()),
+            ("target_server_principal_name", nv()),
+            ("target_database_principal_name", nv()),
+            ("server_instance_name", nv()),
+            ("database_name", nv()),
+            ("schema_name", nv()),
+            ("object_name", nv()),
+            ("class_type", DataType::VarChar(2)),
+            ("statement", DataType::NVarChar(MAX)),
+            ("additional_information", DataType::NVarChar(MAX)),
+            ("application_name", nv()),
+            ("host_name", nv()),
+            ("audit_name", nv()),
+            ("file_name", DataType::NVarChar(MAX)),
+        ],
+        rows,
+    )
 }
 
 impl<'a> Engine<'a> {
@@ -320,6 +376,126 @@ impl<'a> Engine<'a> {
                 "database_principals" => {
                     let rows = db.security.principals.values().map(|p| vec![sv(&p.name), Value::Int(p.id), sv(if p.is_role { "R" } else { "S" }), sv(&p.default_schema)]).collect();
                     Some(rs(&[("name", nv()), ("principal_id", DataType::Int), ("type", DataType::Char(1)), ("default_schema_name", nv())], rows))
+                }
+                "server_audits" => {
+                    let rows = self
+                        .srv
+                        .security
+                        .audits
+                        .iter()
+                        .map(|a| {
+                            let onf = match a.on_failure.as_str() {
+                                "SHUTDOWN" => (2, "SHUTDOWN SERVER INSTANCE"),
+                                "FAIL_OPERATION" => (1, "FAIL OPERATION"),
+                                _ => (0, "CONTINUE"),
+                            };
+                            vec![Value::Int(a.id), sv(&a.name), date(a.created), sv(a.target.code()), sv(a.target.desc()), Value::Int(onf.0), sv(onf.1), Value::Bit(a.enabled), Value::Int(a.queue_delay), a.filter.as_ref().map(|(t, _)| sv(t)).unwrap_or(Value::Null)]
+                        })
+                        .collect();
+                    Some(rs(&[("audit_id", DataType::Int), ("name", nv()), ("create_date", DataType::DateTime), ("type", DataType::Char(2)), ("type_desc", nv()), ("on_failure", DataType::TinyInt), ("on_failure_desc", nv()), ("is_state_enabled", DataType::Bit), ("queue_delay", DataType::Int), ("predicate", DataType::NVarChar(MAX))], rows))
+                }
+                "server_file_audits" => {
+                    let rows = self
+                        .srv
+                        .security
+                        .audits
+                        .iter()
+                        .filter_map(|a| crate::audit::AuditSink::file_for(a).map(|f| (a, f)))
+                        .map(|(a, f)| vec![Value::Int(a.id), sv(&a.name), sv(&f.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default()), sv(&f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default())])
+                        .collect();
+                    Some(rs(&[("audit_id", DataType::Int), ("name", nv()), ("log_file_path", DataType::NVarChar(MAX)), ("log_file_name", nv())], rows))
+                }
+                "dm_server_audit_status" => {
+                    let rows = self
+                        .srv
+                        .security
+                        .audits
+                        .iter()
+                        .map(|a| {
+                            let failure = self.srv.core.audit.failure(&a.name);
+                            let (status, desc) = if !a.enabled { (0, "STOPPED") } else if failure.is_some() { (2, "FAILED") } else { (1, "STARTED") };
+                            let size = crate::audit::AuditSink::file_for(a).and_then(|f| std::fs::metadata(f).ok()).map(|m| m.len() as i64).unwrap_or(0);
+                            vec![Value::Int(a.id), sv(&a.name), Value::Int(status), sv(desc), crate::audit::AuditSink::file_for(a).map(|f| sv(&f.to_string_lossy())).unwrap_or(Value::Null), Value::BigInt(size)]
+                        })
+                        .collect();
+                    Some(rs(&[("audit_id", DataType::Int), ("name", nv()), ("status", DataType::SmallInt), ("status_desc", nv()), ("audit_file_path", DataType::NVarChar(MAX)), ("audit_file_size", DataType::BigInt)], rows))
+                }
+                "server_audit_specifications" | "database_audit_specifications" => {
+                    let specs: &[crate::audit::AuditSpec] = if lname == "server_audit_specifications" { &self.srv.security.server_specs } else { &db.audit_specs };
+                    let rows = specs
+                        .iter()
+                        .map(|s| {
+                            let guid = self.srv.security.audits.iter().find(|a| a.name.eq_ignore_ascii_case(&s.audit)).map(|a| sv(&a.guid)).unwrap_or(Value::Null);
+                            vec![Value::Int(s.id), sv(&s.name), guid, Value::Bit(s.enabled)]
+                        })
+                        .collect();
+                    let idname = if lname == "server_audit_specifications" { "server_specification_id" } else { "database_specification_id" };
+                    Some(rs(&[(idname, DataType::Int), ("name", nv()), ("audit_guid", nv()), ("is_state_enabled", DataType::Bit)], rows))
+                }
+                "server_audit_specification_details" | "database_audit_specification_details" => {
+                    let server = lname == "server_audit_specification_details";
+                    let specs: &[crate::audit::AuditSpec] = if server { &self.srv.security.server_specs } else { &db.audit_specs };
+                    let mut rows: Vec<Row> = vec![];
+                    for s in specs {
+                        for i in &s.items {
+                            match i {
+                                crate::audit::AuditItem::Group(g) => rows.push(vec![Value::Int(s.id), sv(g), sv(if server { "SERVER" } else { "DATABASE" }), Value::Null, Value::Null, Value::Bit(true)]),
+                                crate::audit::AuditItem::Action { action, object, principals } => {
+                                    let (class, obj) = match object {
+                                        crate::audit::ObjSel::Database(d) => ("DATABASE", d.clone()),
+                                        crate::audit::ObjSel::Schema(s) => ("SCHEMA", s.clone()),
+                                        crate::audit::ObjSel::Object(p) => ("OBJECT_OR_COLUMN", p.join(".")),
+                                    };
+                                    rows.push(vec![Value::Int(s.id), sv(action), sv(class), sv(&obj), sv(&principals.join(",")), Value::Bit(false)]);
+                                }
+                            }
+                        }
+                    }
+                    let idname = if server { "server_specification_id" } else { "database_specification_id" };
+                    Some(rs(&[(idname, DataType::Int), ("audit_action_name", nv()), ("class_desc", nv()), ("object_name", nv()), ("audited_principal_name", nv()), ("is_group", DataType::Bit)], rows))
+                }
+                "dm_audit_log" => Some(audit_rowset(self.srv.core.audit.ring().into_iter().map(|e| (String::new(), e)).collect())),
+                "triggers" => {
+                    // DML triggers (parent = table, class 1) and database DDL triggers (class 0)
+                    let mut rows: Vec<Row> = vec![];
+                    for (tk, trg) in db.triggers.values() {
+                        let pid = match db.objects.get(tk) {
+                            Some(Object::Table(t)) => t.object_id,
+                            _ => 0,
+                        };
+                        rows.push(vec![sv(&trg.name), Value::Int(trg.object_id), Value::Int(1), sv("OBJECT_OR_COLUMN"), Value::Int(pid), sv("TR"), Value::Bit(trg.disabled), Value::Bit(trg.instead)]);
+                    }
+                    for t in &db.ddl_triggers {
+                        rows.push(vec![sv(&t.name), Value::Int(t.object_id), Value::Int(0), sv("DATABASE"), Value::Int(0), sv("TR"), Value::Bit(t.disabled), Value::Bit(false)]);
+                    }
+                    Some(rs(&[("name", nv()), ("object_id", DataType::Int), ("parent_class", DataType::TinyInt), ("parent_class_desc", nv()), ("parent_id", DataType::Int), ("type", DataType::Char(2)), ("is_disabled", DataType::Bit), ("is_instead_of_trigger", DataType::Bit)], rows))
+                }
+                "trigger_events" => {
+                    let mut rows: Vec<Row> = vec![];
+                    for t in &db.ddl_triggers {
+                        for e in &t.events {
+                            rows.push(vec![Value::Int(t.object_id), sv(e)]);
+                        }
+                    }
+                    for (_, trg) in db.triggers.values() {
+                        for e in &trg.events {
+                            rows.push(vec![Value::Int(trg.object_id), sv(e)]);
+                        }
+                    }
+                    Some(rs(&[("object_id", DataType::Int), ("type_desc", nv())], rows))
+                }
+                "server_triggers" => {
+                    let rows = self.srv.security.server_triggers.iter().map(|t| vec![sv(&t.name), Value::Int(t.object_id), sv("SERVER"), Value::Bit(t.disabled)]).collect();
+                    Some(rs(&[("name", nv()), ("object_id", DataType::Int), ("parent_class_desc", nv()), ("is_disabled", DataType::Bit)], rows))
+                }
+                "server_trigger_events" => {
+                    let mut rows: Vec<Row> = vec![];
+                    for t in &self.srv.security.server_triggers {
+                        for e in &t.events {
+                            rows.push(vec![Value::Int(t.object_id), sv(e)]);
+                        }
+                    }
+                    Some(rs(&[("object_id", DataType::Int), ("type_desc", nv())], rows))
                 }
                 "server_principals" => {
                     let rows = self.srv.security.logins.values().enumerate().map(|(i, l)| vec![sv(&l.name), Value::Int(i as i32 + 1), sv("S"), Value::Bit(l.disabled)]).collect();

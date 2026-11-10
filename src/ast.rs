@@ -196,6 +196,8 @@ pub enum JoinKind {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum TableRef {
     Table { name: Name, alias: Option<String>, hints: Vec<String> },
+    /// A table read with `FOR SYSTEM_TIME`.
+    Temporal { name: Name, alias: Option<String>, clause: Box<TemporalClause> },
     TableVar { name: String, alias: Option<String> },
     Derived { query: Box<Query>, alias: Option<String>, cols: Option<Vec<String>> },
     Values { rows: Vec<Vec<Expr>>, alias: Option<String>, cols: Option<Vec<String>> },
@@ -203,6 +205,30 @@ pub enum TableRef {
     Join { kind: JoinKind, left: Box<TableRef>, right: Box<TableRef>, on: Option<Expr> },
     Pivot { src: Box<TableRef>, agg: String, arg: Expr, col: Vec<String>, vals: Vec<String>, alias: Option<String> },
     Unpivot { src: Box<TableRef>, vcol: String, ncol: String, cols: Vec<String>, alias: Option<String> },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum TemporalKind {
+    AsOf,
+    FromTo,
+    Between,
+    ContainedIn,
+    All,
+}
+
+/// `FOR SYSTEM_TIME AS OF a | FROM a TO b | BETWEEN a AND b | CONTAINED IN (a, b) | ALL`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TemporalClause {
+    pub kind: TemporalKind,
+    pub a: Option<Expr>,
+    pub b: Option<Expr>,
+}
+
+/// `SYSTEM_VERSIONING` options of CREATE TABLE / ALTER TABLE ... SET.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Versioning {
+    pub on: bool,
+    pub history: Option<Name>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -314,6 +340,8 @@ pub struct ColumnDef {
     pub fk: Option<ForeignKeyDef>,
     pub collation: Option<String>,
     pub mask: Option<String>,
+    /// `GENERATED ALWAYS AS ROW START` (true) or `ROW END` (false), and whether the column is `HIDDEN`.
+    pub generated: Option<(bool, bool)>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -335,6 +363,8 @@ pub enum TableDef {
     ForeignKey(ForeignKeyDef),
     DefaultFor { name: String, e: Expr, col: String, text: String },
     Index { name: String, cols: Vec<(String, bool)>, unique: bool },
+    /// `PERIOD FOR SYSTEM_TIME (start, end)`
+    Period { start: String, end: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -392,6 +422,7 @@ pub enum AlterAction {
     AddDefs(Vec<TableDef>),
     DropConstraint(Vec<String>, bool),
     DropColumn(Vec<String>, bool),
+    SetVersioning(Versioning),
     AlterColumn { col: String, ty: TypeRef, nullable: Option<bool>, collation: Option<String> },
     /// `ALTER COLUMN c ADD MASKED WITH (FUNCTION = '...')` / `DROP MASKED`
     AlterMask { col: String, mask: Option<String> },
@@ -433,7 +464,7 @@ pub enum Stmt {
     WaitFor { time: bool, e: Expr },
     Kill(Expr),
     Reconfigure,
-    CreateTable { name: Name, defs: Vec<TableDef> },
+    CreateTable { name: Name, defs: Vec<TableDef>, versioning: Option<Versioning> },
     CreateIndex { name: String, table: Name, cols: Vec<(String, bool)>, unique: bool, include: Vec<String>, filter: Option<(Expr, String)> },
     CreateView { name: Name, cols: Option<Vec<String>>, query: Rc<Query>, text: String, or_alter: bool, alter: bool },
     CreateProc { name: Name, params: Vec<Param>, body: Rc<Vec<Stmt>>, text: String, or_alter: bool, alter: bool },
@@ -448,6 +479,9 @@ pub enum Stmt {
     Security(Box<SecStmt>),
     Checkpoint,
     Backup(Box<BackupStmt>),
+    BulkInsert(Box<BulkStmt>),
+    TriggerAdmin(Box<TriggerAdmin>),
+    Audit(Box<AuditStmt>),
     CreateSecurityPolicy(Box<PolicyStmt>),
     AlterSecurityPolicy(Box<PolicyStmt>),
     DropSecurityPolicy { name: Name, if_exists: bool },
@@ -478,8 +512,8 @@ pub enum PermTargetAst {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SecStmt {
-    CreateLogin { name: String, password: Option<String>, default_db: Option<String> },
-    AlterLogin { name: String, password: Option<String>, disabled: Option<bool>, default_db: Option<String> },
+    CreateLogin { name: String, password: Option<String>, default_db: Option<String>, opts: LoginOpts },
+    AlterLogin { name: String, password: Option<String>, disabled: Option<bool>, default_db: Option<String>, opts: LoginOpts },
     CreateUser { name: String, login: Option<String>, default_schema: Option<String> },
     AlterUser { name: String, default_schema: Option<String>, new_name: Option<String> },
     CreateRole { name: String },
@@ -504,6 +538,13 @@ pub struct CreateFunction {
 }
 
 /// `BACKUP DATABASE db TO DISK = 'file' [WITH ...]` or `BACKUP LOG db TO DISK = 'file' [WITH ...]`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BulkStmt {
+    pub table: Vec<String>,
+    pub path: Expr,
+    pub opts: Vec<(String, Option<Expr>)>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BackupStmt {
     pub log: bool,
@@ -537,4 +578,52 @@ pub struct PolicyStmt {
     pub add: Vec<crate::catalog::Predicate>,
     pub drop: Vec<crate::catalog::Predicate>,
     pub state: Option<bool>,
+}
+
+/// Password-policy options of CREATE / ALTER LOGIN.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LoginOpts {
+    pub check_policy: Option<bool>,
+    pub check_expiration: Option<bool>,
+    pub must_change: bool,
+    pub unlock: bool,
+    pub old_password: Option<String>,
+}
+
+/// Where a trigger administration statement looks for its triggers.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum TriggerScope {
+    Database,
+    Server,
+    Table(Name),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum TriggerAct {
+    /// `CREATE [OR ALTER] TRIGGER name ON DATABASE | ALL SERVER FOR events AS body`
+    Create { events: Vec<String>, body: Rc<Vec<Stmt>>, text: String, or_alter: bool },
+    /// `DROP TRIGGER [IF EXISTS] name ON DATABASE | ALL SERVER`
+    Drop { if_exists: bool },
+    /// `ENABLE TRIGGER name | ALL ON scope` (true) or `DISABLE TRIGGER ...` (false)
+    Enable(bool),
+}
+
+/// DDL / logon trigger administration, and `ENABLE | DISABLE TRIGGER` for every kind of trigger.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TriggerAdmin {
+    pub names: Vec<Name>,
+    pub all: bool,
+    pub scope: TriggerScope,
+    pub act: TriggerAct,
+}
+
+/// SQL Server Audit statements.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum AuditStmt {
+    CreateAudit { name: String, target: crate::audit::AuditTarget, opts: Vec<(String, String)>, filter: Option<(String, Expr)>, state_on: bool },
+    AlterAudit { name: String, target: Option<crate::audit::AuditTarget>, opts: Vec<(String, String)>, filter: Option<Option<(String, Expr)>>, state: Option<bool> },
+    DropAudit { name: String },
+    CreateSpec { server: bool, name: String, audit: String, items: Vec<crate::audit::AuditItem>, state_on: bool },
+    AlterSpec { server: bool, name: String, add: Vec<crate::audit::AuditItem>, drop: Vec<crate::audit::AuditItem>, state: Option<bool> },
+    DropSpec { server: bool, name: String },
 }

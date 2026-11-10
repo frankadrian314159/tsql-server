@@ -31,7 +31,7 @@ VALUES VARYING VIEW WAITFOR WHEN WHERE WHILE WITH WITHIN WRITETEXT THROW OUTPUT 
 const STMT_START: &[&str] = &[
     "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "ALTER", "DROP", "TRUNCATE", "DECLARE", "SET", "IF", "WHILE", "BEGIN", "RETURN", "BREAK", "CONTINUE", "PRINT",
     "EXEC", "EXECUTE", "USE", "COMMIT", "ROLLBACK", "SAVE", "THROW", "RAISERROR", "OPEN", "CLOSE", "FETCH", "DEALLOCATE", "WAITFOR", "GOTO", "GRANT", "REVOKE", "DENY",
-    "DBCC", "WITH", "END", "ELSE", "REVERT", "BACKUP", "RESTORE", "KILL", "RECONFIGURE",
+    "DBCC", "WITH", "END", "ELSE", "REVERT", "BACKUP", "RESTORE", "KILL", "RECONFIGURE", "BULK", "ENABLE", "DISABLE",
 ];
 const NILADIC: &[&str] = &["CURRENT_TIMESTAMP", "CURRENT_USER", "SESSION_USER", "SYSTEM_USER", "USER", "CURRENT_DATE"];
 const DATEPART_FUNCS: &[&str] = &["DATEADD", "DATEDIFF", "DATEDIFF_BIG", "DATEPART", "DATENAME", "DATETRUNC", "DATE_BUCKET"];
@@ -268,6 +268,35 @@ impl Parser {
             self.expect_op(")")?;
         }
         Ok(PolicyStmt { name, add, drop, state })
+    }
+
+    /// One option of CREATE / ALTER LOGIN ... WITH.
+    fn login_option(&mut self, password: &mut Option<String>, default_db: &mut Option<String>, opts: &mut LoginOpts) -> R<()> {
+        let opt = self.ident()?.to_uppercase();
+        if opt == "MUST_CHANGE" {
+            opts.must_change = true;
+            return Ok(());
+        }
+        if opt == "UNLOCK" {
+            opts.unlock = true;
+            return Ok(());
+        }
+        if self.accept_op("=") {
+            let v = self.advance();
+            let val = match v.tok {
+                Tok::Str(s) | Tok::Id(s) | Tok::QId(s) => s,
+                _ => String::new(),
+            };
+            match opt.as_str() {
+                "PASSWORD" => *password = Some(val),
+                "OLD_PASSWORD" => opts.old_password = Some(val),
+                "DEFAULT_DATABASE" => *default_db = Some(val),
+                "CHECK_POLICY" => opts.check_policy = Some(v.up == "ON"),
+                "CHECK_EXPIRATION" => opts.check_expiration = Some(v.up == "ON"),
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// `MASKED WITH (FUNCTION = 'default()')`: the function text.
@@ -546,6 +575,9 @@ impl Parser {
                 self.i += 1;
                 let n = self.ident()?;
                 e = Expr::Collate(Box::new(e), n);
+            } else if self.is_op(".") && self.peek_kw(1, &["VALUE", "EXIST", "QUERY"]) && self.peek_is_op(2, "(") {
+                self.i += 1;
+                e = self.xml_method(e)?;
             } else if self.is_kw("AT") && self.peek_kw(1, &["TIME"]) && self.peek_kw(2, &["ZONE"]) {
                 self.i += 3;
                 let z = self.add_expr()?;
@@ -745,9 +777,41 @@ impl Parser {
             parts.push(self.ident()?);
         }
         if self.is_op("(") {
+            // column.value('/path', 'type'), column.exist(...), column.query(...)
+            if parts.len() >= 2 && matches!(parts.last().unwrap().to_uppercase().as_str(), "VALUE" | "EXIST" | "QUERY") {
+                let method = parts.pop().unwrap();
+                let base = Expr::Col(parts);
+                return self.xml_method_named(base, &method);
+            }
             return self.func_call(parts);
         }
         Ok(Expr::Col(parts))
+    }
+
+    /// `.value(path, type)` / `.exist(path)` / `.query(path)` on an xml expression; the cursor is on the method name.
+    fn xml_method(&mut self, base: Expr) -> R<Expr> {
+        let method = self.ident()?;
+        self.xml_method_named(base, &method)
+    }
+
+    fn xml_method_named(&mut self, base: Expr, method: &str) -> R<Expr> {
+        self.expect_op("(")?;
+        let path = self.expr()?;
+        let m = method.to_uppercase();
+        if m == "VALUE" {
+            self.expect_op(",")?;
+            let ty = match self.expr()? {
+                Expr::Lit(Value::Str(s)) => s,
+                _ => return Err(SqlError::new(9319, "The second argument of the xml data type method \"value\" must be a string literal.")),
+            };
+            self.expect_op(")")?;
+            let decl = parse_param_decls(&format!("@x {}", ty.trim()))?;
+            let p = decl.into_iter().next().ok_or_else(|| self.err())?;
+            let call = Expr::Func(Box::new(FuncCall { name: "XML_VALUE".into(), schema: None, parts: vec![], args: vec![base, path], distinct: false, star: false, over: None, within: None }));
+            return Ok(Expr::Cast { e: Box::new(call), ty: p.ty, try_: false, style: None });
+        }
+        self.expect_op(")")?;
+        Ok(Expr::Func(Box::new(FuncCall { name: format!("XML_{}", m), schema: None, parts: vec![], args: vec![base, path], distinct: false, star: false, over: None, within: None })))
     }
 
     fn func_call(&mut self, parts: Vec<String>) -> R<Expr> {
@@ -1380,7 +1444,14 @@ impl Parser {
                 let (alias, cols) = self.opt_alias()?;
                 node = TableRef::Func { name, args, alias, cols, with };
             } else {
+                let mut clause = None;
+                if self.is_kw("FOR") && self.peek_kw(1, &["SYSTEM_TIME"]) {
+                    clause = Some(self.temporal_clause()?);
+                }
                 let (alias, _) = self.opt_alias()?;
+                if let Some(c) = clause {
+                    node = TableRef::Temporal { name, alias, clause: Box::new(c) };
+                } else {
                 let mut hints = vec![];
                 if self.is_kw("WITH") && self.peek_is_op(1, "(") {
                     self.i += 2;
@@ -1402,6 +1473,7 @@ impl Parser {
                     self.skip_parens()?;
                 }
                 node = TableRef::Table { name, alias, hints };
+                }
             }
         }
         if self.is_kw("PIVOT") && self.peek_is_op(1, "(") {
@@ -1644,6 +1716,9 @@ impl Parser {
                     "ALTER" => {
                         let start = t.pos;
                         self.i += 1;
+                        if self.audit_ahead() {
+                            return self.audit_stmt("ALTER");
+                        }
                         if self.is_kw("TABLE") {
                             return self.alter_table();
                         }
@@ -1695,31 +1770,24 @@ impl Parser {
                             self.i += 1;
                             let name = self.ident()?;
                             let (mut password, mut disabled, mut default_db) = (None, None, None);
+                            let mut opts = LoginOpts::default();
                             if self.accept_kw("ENABLE") {
                                 disabled = Some(false);
                             } else if self.accept_kw("DISABLE") {
                                 disabled = Some(true);
                             } else if self.accept_kw("WITH") {
                                 loop {
-                                    let opt = self.ident()?.to_uppercase();
-                                    if self.accept_op("=") {
-                                        let v = self.advance();
-                                        let val = match v.tok {
-                                            Tok::Str(s) | Tok::Id(s) | Tok::QId(s) => s,
-                                            _ => String::new(),
-                                        };
-                                        match opt.as_str() {
-                                            "PASSWORD" => password = Some(val),
-                                            "DEFAULT_DATABASE" => default_db = Some(val),
-                                            _ => {}
-                                        }
+                                    self.login_option(&mut password, &mut default_db, &mut opts)?;
+                                    // OLD_PASSWORD / UNLOCK / MUST_CHANGE may follow without a comma
+                                    while self.is_kw_any(&["OLD_PASSWORD", "UNLOCK", "MUST_CHANGE"]) {
+                                        self.login_option(&mut password, &mut default_db, &mut opts)?;
                                     }
                                     if !self.accept_op(",") {
                                         break;
                                     }
                                 }
                             }
-                            return Ok(Stmt::Security(Box::new(SecStmt::AlterLogin { name, password, disabled, default_db })));
+                            return Ok(Stmt::Security(Box::new(SecStmt::AlterLogin { name, password, disabled, default_db, opts })));
                         }
                         if self.is_kw("USER") {
                             self.i += 1;
@@ -1802,6 +1870,31 @@ impl Parser {
                     "CHECKPOINT" => {
                         self.i += 1;
                         Ok(Stmt::Checkpoint)
+                    }
+                    "ENABLE" => self.st_enable_trigger(true),
+                    "DISABLE" => self.st_enable_trigger(false),
+                    "BULK" => {
+                        self.i += 1;
+                        self.expect_kw("INSERT")?;
+                        let table = self.name_parts()?;
+                        self.expect_kw("FROM")?;
+                        let path = self.expr()?;
+                        let mut opts = vec![];
+                        if self.accept_kw("WITH") {
+                            let paren = self.accept_op("(");
+                            loop {
+                                let name = self.ident()?.to_uppercase();
+                                let val = if self.accept_op("=") { Some(self.expr()?) } else { None };
+                                opts.push((name, val));
+                                if !self.accept_op(",") {
+                                    break;
+                                }
+                            }
+                            if paren {
+                                self.expect_op(")")?;
+                            }
+                        }
+                        Ok(Stmt::BulkInsert(Box::new(BulkStmt { table, path, opts })))
                     }
                     "BACKUP" => {
                         self.i += 1;
@@ -2471,8 +2564,45 @@ impl Parser {
     }
 
     // ---- DDL
+    /// `DATABASE` or `ALL SERVER` after `ON`: a DDL trigger scope.
+    fn trigger_scope_kw(&mut self) -> Option<TriggerScope> {
+        if self.is_kw("DATABASE") {
+            self.i += 1;
+            Some(TriggerScope::Database)
+        } else if self.is_kw("ALL") && self.peek_kw(1, &["SERVER"]) {
+            self.i += 2;
+            Some(TriggerScope::Server)
+        } else {
+            None
+        }
+    }
+
+    /// `ENABLE | DISABLE TRIGGER name [, ...] | ALL ON DATABASE | ALL SERVER | table`
+    fn st_enable_trigger(&mut self, enable: bool) -> R<Stmt> {
+        self.i += 1;
+        self.expect_kw("TRIGGER")?;
+        let (mut names, mut all) = (vec![], false);
+        if self.accept_kw("ALL") {
+            all = true;
+        } else {
+            names.push(self.name_parts()?);
+            while self.accept_op(",") {
+                names.push(self.name_parts()?);
+            }
+        }
+        self.expect_kw("ON")?;
+        let scope = match self.trigger_scope_kw() {
+            Some(s) => s,
+            None => TriggerScope::Table(self.name_parts()?),
+        };
+        Ok(Stmt::TriggerAdmin(Box::new(TriggerAdmin { names, all, scope, act: TriggerAct::Enable(enable) })))
+    }
+
     fn st_drop(&mut self) -> R<Stmt> {
         self.i += 1;
+        if self.audit_ahead() {
+            return self.audit_stmt("DROP");
+        }
         let what = self.advance().up;
         if what == "INDEX" {
             let mut if_exists = false;
@@ -2512,6 +2642,11 @@ impl Parser {
         let mut names = vec![self.name_parts()?];
         while self.accept_op(",") {
             names.push(self.name_parts()?);
+        }
+        if what == "TRIGGER" && self.is_kw("ON") {
+            self.i += 1;
+            let scope = self.trigger_scope_kw().ok_or_else(|| self.err())?;
+            return Ok(Stmt::TriggerAdmin(Box::new(TriggerAdmin { names, all: false, scope, act: TriggerAct::Drop { if_exists } })));
         }
         let what = if what == "PROC" { "PROCEDURE".to_string() } else { what };
         Ok(Stmt::Drop { what, names, if_exists })
@@ -2569,7 +2704,198 @@ impl Parser {
         Ok(body)
     }
 
+    /// `SERVER AUDIT` or `DATABASE AUDIT` ahead.
+    fn audit_ahead(&self) -> bool {
+        self.is_kw_any(&["SERVER", "DATABASE"]) && self.peek_kw(1, &["AUDIT"])
+    }
+
+    /// `( name = value [unit], ... )`, values as text.
+    fn audit_options(&mut self) -> R<Vec<(String, String)>> {
+        let mut opts = vec![];
+        self.expect_op("(")?;
+        loop {
+            let name = self.ident()?.to_uppercase();
+            let mut val = String::new();
+            if self.accept_op("=") {
+                let t = self.advance();
+                val = match t.tok {
+                    Tok::Str(s) | Tok::Id(s) | Tok::QId(s) => s,
+                    Tok::Int(i) => i.to_string(),
+                    _ => t.up.clone(),
+                };
+                if self.is_kw_any(&["KB", "MB", "GB", "TB"]) {
+                    self.i += 1;
+                }
+            }
+            opts.push((name, val));
+            if !self.accept_op(",") {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        Ok(opts)
+    }
+
+    fn audit_target(&mut self) -> R<crate::audit::AuditTarget> {
+        use crate::audit::AuditTarget;
+        if self.accept_kw("FILE") {
+            let opts = self.audit_options()?;
+            let path = opts.iter().find(|(n, _)| n == "FILEPATH").map(|(_, v)| v.clone()).ok_or_else(|| SqlError::with(25706, 16, 1, "The FILEPATH option is required for an audit that writes to a file."))?;
+            Ok(AuditTarget::File { path })
+        } else if self.accept_kw("APPLICATION_LOG") {
+            Ok(AuditTarget::ApplicationLog)
+        } else if self.accept_kw("SECURITY_LOG") {
+            Ok(AuditTarget::SecurityLog)
+        } else {
+            Err(self.err())
+        }
+    }
+
+    fn audit_where(&mut self) -> R<(String, Expr)> {
+        let start = self.tok().pos;
+        let e = self.expr()?;
+        let end = if self.i > 0 { self.toks[self.i - 1].end } else { start };
+        Ok((self.src[start..end].trim().to_string(), e))
+    }
+
+    /// One `( ... )` of a specification: a group name, or `action [, ...] ON [class::]securable BY principal [, ...]`.
+    fn audit_items(&mut self) -> R<Vec<crate::audit::AuditItem>> {
+        use crate::audit::{AuditItem, ObjSel};
+        self.expect_op("(")?;
+        let first = self.ident()?.to_uppercase();
+        if first.ends_with("_GROUP") {
+            self.expect_op(")")?;
+            return Ok(vec![AuditItem::Group(first)]);
+        }
+        let mut actions = vec![first];
+        while self.accept_op(",") {
+            actions.push(self.ident()?.to_uppercase());
+        }
+        self.expect_kw("ON")?;
+        let object = if self.peek_is_op(1, ":") && self.peek_is_op(2, ":") {
+            let class = self.advance().up;
+            self.i += 2;
+            match class.as_str() {
+                "SCHEMA" => ObjSel::Schema(self.ident()?),
+                "DATABASE" => ObjSel::Database(self.ident()?),
+                _ => ObjSel::Object(self.name_parts()?),
+            }
+        } else {
+            ObjSel::Object(self.name_parts()?)
+        };
+        self.expect_kw("BY")?;
+        let mut principals = vec![self.ident()?];
+        while self.accept_op(",") {
+            principals.push(self.ident()?);
+        }
+        self.expect_op(")")?;
+        Ok(actions.into_iter().map(|action| AuditItem::Action { action, object: object.clone(), principals: principals.clone() }).collect())
+    }
+
+    /// `CREATE | ALTER | DROP  SERVER AUDIT [SPECIFICATION] ...` and `... DATABASE AUDIT SPECIFICATION ...`; the cursor is on
+    /// SERVER or DATABASE.
+    fn audit_stmt(&mut self, verb: &str) -> R<Stmt> {
+        use crate::audit::AuditTarget;
+        let server = self.is_kw("SERVER");
+        self.i += 1;
+        self.expect_kw("AUDIT")?;
+        let spec = self.accept_kw("SPECIFICATION");
+        if !spec && !server {
+            return Err(self.err());
+        }
+        let name = self.ident()?;
+        let stmt = if !spec {
+            match verb {
+                "DROP" => AuditStmt::DropAudit { name },
+                "CREATE" => {
+                    self.expect_kw("TO")?;
+                    let target: AuditTarget = self.audit_target()?;
+                    let mut opts = vec![];
+                    if self.accept_kw("WITH") {
+                        opts = self.audit_options()?;
+                    }
+                    let filter = if self.accept_kw("WHERE") { Some(self.audit_where()?) } else { None };
+                    let state_on = opts.iter().any(|(n, v)| n == "STATE" && v.eq_ignore_ascii_case("ON"));
+                    AuditStmt::CreateAudit { name, target, opts, filter, state_on }
+                }
+                _ => {
+                    let mut target = None;
+                    let mut opts = vec![];
+                    let mut filter = None;
+                    let mut state = None;
+                    if self.accept_kw("TO") {
+                        target = Some(self.audit_target()?);
+                    }
+                    if self.accept_kw("WITH") {
+                        opts = self.audit_options()?;
+                        if let Some((_, v)) = opts.iter().find(|(n, _)| n == "STATE") {
+                            state = Some(v.eq_ignore_ascii_case("ON"));
+                        }
+                    }
+                    if self.accept_kw("WHERE") {
+                        filter = Some(Some(self.audit_where()?));
+                    } else if self.is_kw("REMOVE") && self.peek_kw(1, &["WHERE"]) {
+                        self.i += 2;
+                        filter = Some(None);
+                    }
+                    AuditStmt::AlterAudit { name, target, opts, filter, state }
+                }
+            }
+        } else {
+            match verb {
+                "DROP" => AuditStmt::DropSpec { server, name },
+                "CREATE" => {
+                    self.expect_kw("FOR")?;
+                    self.expect_kw("SERVER")?;
+                    self.expect_kw("AUDIT")?;
+                    let audit = self.ident()?;
+                    let mut items = vec![];
+                    while self.accept_kw("ADD") {
+                        items.extend(self.audit_items()?);
+                        if !self.accept_op(",") {
+                            break;
+                        }
+                    }
+                    let mut state_on = false;
+                    if self.accept_kw("WITH") {
+                        state_on = self.audit_options()?.iter().any(|(n, v)| n == "STATE" && v.eq_ignore_ascii_case("ON"));
+                    }
+                    AuditStmt::CreateSpec { server, name, audit, items, state_on }
+                }
+                _ => {
+                    let (mut add, mut drop, mut state) = (vec![], vec![], None);
+                    if self.accept_kw("FOR") {
+                        // the audit cannot be changed; accept and ignore a repeated FOR SERVER AUDIT name
+                        self.expect_kw("SERVER")?;
+                        self.expect_kw("AUDIT")?;
+                        self.ident()?;
+                    }
+                    while self.is_kw_any(&["ADD", "DROP"]) {
+                        let is_add = self.advance().up == "ADD";
+                        let items = self.audit_items()?;
+                        if is_add {
+                            add.extend(items);
+                        } else {
+                            drop.extend(items);
+                        }
+                        if !self.accept_op(",") {
+                            break;
+                        }
+                    }
+                    if self.accept_kw("WITH") {
+                        state = self.audit_options()?.iter().find(|(n, _)| n == "STATE").map(|(_, v)| v.eq_ignore_ascii_case("ON"));
+                    }
+                    AuditStmt::AlterSpec { server, name, add, drop, state }
+                }
+            }
+        };
+        Ok(Stmt::Audit(Box::new(stmt)))
+    }
+
     fn create_object(&mut self, or_alter: bool, alter: bool, start: usize) -> R<Stmt> {
+        if self.audit_ahead() {
+            return self.audit_stmt("CREATE");
+        }
         let mut unique = false;
         if self.accept_kw("UNIQUE") {
             unique = true;
@@ -2586,15 +2912,20 @@ impl Parser {
             "TABLE" => {
                 let name = self.name_parts()?;
                 let defs = self.table_body()?;
+                let mut versioning = None;
                 while self.is_kw_any(&["ON", "WITH", "TEXTIMAGE_ON"]) {
-                    self.i += 1;
-                    if self.is_op("(") {
+                    let with = self.advance().up == "WITH";
+                    if with && self.is_op("(") {
+                        if let Some(v) = self.table_with_options()? {
+                            versioning = Some(v);
+                        }
+                    } else if self.is_op("(") {
                         self.skip_parens()?;
                     } else {
                         self.i += 1;
                     }
                 }
-                Ok(Stmt::CreateTable { name, defs })
+                Ok(Stmt::CreateTable { name, defs, versioning })
             }
             "INDEX" => {
                 let name = self.ident()?;
@@ -2658,6 +2989,20 @@ impl Parser {
             "TRIGGER" => {
                 let name = self.name_parts()?;
                 self.expect_kw("ON")?;
+                if let Some(scope) = self.trigger_scope_kw() {
+                    self.skip_with_options();
+                    if !self.accept_kw("AFTER") {
+                        self.expect_kw("FOR")?;
+                    }
+                    let mut events = vec![self.ident()?.to_uppercase()];
+                    while self.accept_op(",") {
+                        events.push(self.ident()?.to_uppercase());
+                    }
+                    self.expect_kw("AS")?;
+                    let body = self.rest_body()?;
+                    let act = TriggerAct::Create { events, body: Rc::new(body), text: self.src[start..].to_string(), or_alter: or_alter || alter };
+                    return Ok(Stmt::TriggerAdmin(Box::new(TriggerAdmin { names: vec![name], all: false, scope, act })));
+                }
                 let table = self.name_parts()?;
                 self.skip_with_options();
                 let mut instead = false;
@@ -2724,30 +3069,19 @@ impl Parser {
             "LOGIN" => {
                 let name = self.ident()?;
                 let (mut password, mut default_db) = (None, None);
+                let mut opts = LoginOpts::default();
                 if self.accept_kw("WITH") {
                     loop {
-                        let opt = self.ident()?.to_uppercase();
-                        if self.accept_op("=") {
-                            let v = self.advance();
-                            let val = match v.tok {
-                                Tok::Str(s) | Tok::Id(s) | Tok::QId(s) => s,
-                                _ => String::new(),
-                            };
-                            match opt.as_str() {
-                                "PASSWORD" => password = Some(val),
-                                "DEFAULT_DATABASE" => default_db = Some(val),
-                                _ => {}
-                            }
-                            if opt == "PASSWORD" && self.is_kw("MUST_CHANGE") {
-                                self.i += 1;
-                            }
+                        self.login_option(&mut password, &mut default_db, &mut opts)?;
+                        while self.is_kw_any(&["MUST_CHANGE", "UNLOCK"]) {
+                            self.login_option(&mut password, &mut default_db, &mut opts)?;
                         }
                         if !self.accept_op(",") {
                             break;
                         }
                     }
                 }
-                Ok(Stmt::Security(Box::new(SecStmt::CreateLogin { name, password, default_db })))
+                Ok(Stmt::Security(Box::new(SecStmt::CreateLogin { name, password, default_db, opts })))
             }
             "USER" => {
                 let name = self.ident()?;
@@ -2945,6 +3279,15 @@ impl Parser {
         if self.accept_kw("CONSTRAINT") {
             cname = Some(self.ident()?);
         }
+        if self.is_kw("PERIOD") && self.peek_kw(1, &["FOR"]) {
+            self.i += 2;
+            self.expect_kw("SYSTEM_TIME")?;
+            let cols = self.col_list()?;
+            if cols.len() != 2 {
+                return Err(self.err());
+            }
+            return Ok(TableDef::Period { start: cols[0].clone(), end: cols[1].clone() });
+        }
         if self.is_kw("PRIMARY") && self.peek_kw(1, &["KEY"]) {
             self.i += 2;
             if self.is_kw_any(&["CLUSTERED", "NONCLUSTERED"]) {
@@ -3000,7 +3343,7 @@ impl Parser {
 
     fn column_def(&mut self) -> R<TableDef> {
         let name = self.ident()?;
-        let mut col = ColumnDef { name, ty: None, nullable: None, identity: None, default: None, default_text: None, default_name: None, computed: None, computed_text: None, pk: None, unique: None, checks: vec![], fk: None, collation: None, mask: None };
+        let mut col = ColumnDef { name, ty: None, nullable: None, identity: None, default: None, default_text: None, default_name: None, computed: None, computed_text: None, pk: None, unique: None, checks: vec![], fk: None, collation: None, mask: None, generated: None };
         if self.accept_kw("AS") {
             let (e, t) = self.expr_text()?;
             col.computed = Some(e);
@@ -3062,6 +3405,25 @@ impl Parser {
                 col.fk = Some(fk);
             } else if self.accept_kw("COLLATE") {
                 col.collation = Some(self.ident()?);
+            } else if self.is_kw("GENERATED") || (self.is_kw("AS") && self.peek_kw(1, &["ROW"])) {
+                if self.accept_kw("GENERATED") {
+                    self.expect_kw("ALWAYS")?;
+                }
+                self.expect_kw("AS")?;
+                self.expect_kw("ROW")?;
+                let start = if self.accept_kw("START") {
+                    true
+                } else {
+                    self.expect_kw("END")?;
+                    false
+                };
+                let hidden = self.accept_kw("HIDDEN");
+                col.generated = Some((start, hidden));
+            } else if self.is_kw("HIDDEN") {
+                self.i += 1;
+                if let Some((s, _)) = col.generated {
+                    col.generated = Some((s, true));
+                }
             } else if self.is_kw("MASKED") {
                 col.mask = Some(self.masked_with()?);
             } else if self.is_kw_any(&["SPARSE", "ROWGUIDCOL", "FILESTREAM", "PERSISTED", "CLUSTERED", "NONCLUSTERED"]) {
@@ -3071,6 +3433,100 @@ impl Parser {
             }
         }
         Ok(TableDef::Column(col))
+    }
+
+    /// `( option [= value] , ... )` of a CREATE TABLE ... WITH: `SYSTEM_VERSIONING` is returned, the rest skipped.
+    fn table_with_options(&mut self) -> R<Option<Versioning>> {
+        self.expect_op("(")?;
+        let mut out = None;
+        loop {
+            if self.is_kw("SYSTEM_VERSIONING") {
+                self.i += 1;
+                out = Some(self.versioning_value()?);
+            } else {
+                let mut depth = 0;
+                while !self.is_eof() {
+                    if self.is_op("(") {
+                        depth += 1;
+                    } else if self.is_op(")") {
+                        if depth == 0 {
+                            break;
+                        }
+                        depth -= 1;
+                    } else if self.is_op(",") && depth == 0 {
+                        break;
+                    }
+                    self.i += 1;
+                }
+            }
+            if !self.accept_op(",") {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        Ok(out)
+    }
+
+    /// `= ON [( HISTORY_TABLE = name [, ...] )]` or `= OFF`.
+    fn versioning_value(&mut self) -> R<Versioning> {
+        self.expect_op("=")?;
+        let on = if self.accept_kw("ON") {
+            true
+        } else {
+            self.expect_kw("OFF")?;
+            false
+        };
+        let mut history = None;
+        if self.is_op("(") {
+            self.i += 1;
+            while !self.is_op(")") {
+                if self.is_eof() {
+                    return Err(self.err());
+                }
+                if self.accept_kw("HISTORY_TABLE") {
+                    self.expect_op("=")?;
+                    history = Some(self.name_parts()?);
+                } else {
+                    self.i += 1;
+                }
+            }
+            self.expect_op(")")?;
+        }
+        Ok(Versioning { on, history })
+    }
+
+    /// `FOR SYSTEM_TIME ...` after a table name.
+    fn temporal_clause(&mut self) -> R<TemporalClause> {
+        self.expect_kw("FOR")?;
+        self.expect_kw("SYSTEM_TIME")?;
+        if self.accept_kw("ALL") {
+            return Ok(TemporalClause { kind: TemporalKind::All, a: None, b: None });
+        }
+        if self.accept_kw("AS") {
+            self.expect_kw("OF")?;
+            let a = self.expr()?;
+            return Ok(TemporalClause { kind: TemporalKind::AsOf, a: Some(a), b: None });
+        }
+        if self.accept_kw("FROM") {
+            let a = self.expr()?;
+            self.expect_kw("TO")?;
+            let b = self.expr()?;
+            return Ok(TemporalClause { kind: TemporalKind::FromTo, a: Some(a), b: Some(b) });
+        }
+        if self.accept_kw("BETWEEN") {
+            let a = self.add_expr()?;
+            self.expect_kw("AND")?;
+            let b = self.expr()?;
+            return Ok(TemporalClause { kind: TemporalKind::Between, a: Some(a), b: Some(b) });
+        }
+        self.expect_kw("CONTAINED")?;
+        self.expect_kw("IN")?;
+        self.expect_op("(")?;
+        let a = self.expr()?;
+        self.expect_op(",")?;
+        let b = self.expr()?;
+        self.expect_op(")")?;
+        Ok(TemporalClause { kind: TemporalKind::ContainedIn, a: Some(a), b: Some(b) })
     }
 
     fn alter_table(&mut self) -> R<Stmt> {
@@ -3138,6 +3594,16 @@ impl Parser {
             self.expect_kw("CONSTRAINT")?;
             let cn = if self.accept_kw("ALL") { None } else { Some(self.ident()?) };
             return Ok(Stmt::AlterTable { name, action: AlterAction::CheckConstraint { name: cn, enable } });
+        }
+        if self.is_kw("SET") && self.peek_is_op(1, "(") && self.peek_kw(2, &["SYSTEM_VERSIONING"]) {
+            self.i += 3;
+            let v = self.versioning_value()?;
+            // further options inside SET ( ... ) are skipped
+            while !self.is_op(")") && !self.is_eof() {
+                self.i += 1;
+            }
+            self.expect_op(")")?;
+            return Ok(Stmt::AlterTable { name, action: AlterAction::SetVersioning(v) });
         }
         if self.is_kw_any(&["ENABLE", "DISABLE", "REBUILD", "SWITCH", "SET"]) {
             while !self.at_eos() && !self.is_stmt_start() {

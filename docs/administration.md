@@ -50,3 +50,23 @@ so a statement a client sends repeatedly is parsed once; `sys.dm_exec_cached_pla
 counts and `DBCC FREEPROCCACHE` empties the cache. **Execution plans are not cached**: the optimizer's choices depend on the
 data, and there is no parameter sniffing. `sys.dm_exec_query_stats` is server-wide: per batch text, execution count, total / last /
 maximum elapsed microseconds, rows, first and last execution time.
+
+## BULK INSERT
+
+```sql
+BULK INSERT dbo.orders FROM 'C:\data\orders.csv'
+WITH (FORMAT = 'CSV', FIRSTROW = 2);
+BULK INSERT t FROM 'C:\data\t.txt' WITH (FIELDTERMINATOR = '|', ROWTERMINATOR = '\n', KEEPIDENTITY);
+```
+
+The file is read on the server and loaded by one ordinary INSERT, so the statement is atomic (an error loads nothing),
+fires triggers, checks constraints and row-level security, and honours `IDENTITY` and `DEFAULT`. Fields map to the table's
+columns in order, skipping identity and computed columns (identity columns are included with `KEEPIDENTITY`); a record
+with the wrong number of fields is error 4832, an unreadable file 4861. An empty field is the column default, or NULL
+when there is none or with `KEEPNULLS`. Supported options: `FIELDTERMINATOR` (default tab, or comma with `FORMAT = 'CSV'`),
+`ROWTERMINATOR` (default and `\n` accept `\r\n` too; `\t`, `\r`, `0x..` escapes work), `FIRSTROW`, `LASTROW`,
+`KEEPNULLS`, `KEEPIDENTITY`, `FORMAT = 'CSV'` with `FIELDQUOTE`, `DATAFILETYPE = 'widechar'` (UTF-16; a UTF-16 or UTF-8
+byte-order mark is detected). `BATCHSIZE`, `TABLOCK`, `CODEPAGE`, `MAXERRORS`, `ERRORFILE`, `CHECK_CONSTRAINTS` and
+`FIRE_TRIGGERS` are accepted and ignored. Only `sysadmin` may run it (error 4834), `FORMATFILE`, `BULK` rowset
+(`OPENROWSET(BULK ...)`) and `INSERT ... BULK` from client libraries are not supported, and the whole file is held in
+memory while it loads.

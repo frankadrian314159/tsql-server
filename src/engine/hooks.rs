@@ -195,7 +195,11 @@ impl<'a> Engine<'a> {
     }
 
     pub fn check_dml_permission(&mut self, loc: &Loc, name: &[String], perm: &str) -> Result<()> {
-        self.check_object_perm(loc, perm, name.last().map(|s| s.as_str()).unwrap_or(""))
+        let r = self.check_object_perm(loc, perm, name.last().map(|s| s.as_str()).unwrap_or(""));
+        if matches!(perm, "DELETE" | "UPDATE" | "INSERT") {
+            self.audit_access(perm, loc, r.is_ok());
+        }
+        r
     }
 
     pub fn check_select_permission(&mut self, loc: &Loc, name: &[String]) -> Result<()> {

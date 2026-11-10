@@ -69,12 +69,21 @@ impl<'a> Engine<'a> {
                 self.ses.frames.push(frame);
                 self.ses.nest_level += 1;
                 self.ses.module_owner.push(String::new());
+                self.ses.ret = Value::Null;
                 let r = self.exec_stmts(&stmts);
                 self.ses.module_owner.pop();
                 self.ses.nest_level -= 1;
                 let callee = self.ses.frames.pop().unwrap();
+                // a RETURN <int> in the statement is the procedure's return status
+                let mut status = Value::Int(0);
                 match r {
-                    Ok(()) | Err(Interrupt::Return) => {}
+                    Ok(()) => {}
+                    Err(Interrupt::Return) => {
+                        let v = std::mem::replace(&mut self.ses.ret, Value::Null);
+                        if !v.is_null() {
+                            status = v;
+                        }
+                    }
                     Err(e) => return Err(e),
                 }
                 for (pn, cv) in out_map {
@@ -82,7 +91,7 @@ impl<'a> Engine<'a> {
                         self.set_var(&cv, v.val.clone())?;
                     }
                 }
-                Ok(Some(Value::Int(0)))
+                Ok(Some(status))
             }
             "sp_rename" => {
                 let objname = args.first().map(|a| convert::to_str(&a.1)).unwrap_or_default();
@@ -204,7 +213,7 @@ impl<'a> Engine<'a> {
             "sp_addlogin" => {
                 let n = args.first().map(|a| convert::to_str(&a.1)).unwrap_or_default();
                 let pw = args.get(1).map(|a| convert::to_str(&a.1));
-                self.exec_security(&crate::ast::SecStmt::CreateLogin { name: n, password: pw, default_db: None })?;
+                self.exec_security(&crate::ast::SecStmt::CreateLogin { name: n, password: pw, default_db: None, opts: Default::default() })?;
                 Ok(Some(Value::Int(0)))
             }
             "sp_adduser" | "sp_grantdbaccess" => {

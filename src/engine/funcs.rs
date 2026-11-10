@@ -1732,6 +1732,25 @@ impl<'a> Engine<'a> {
                     _ => false,
                 } as i32)
             }
+            "LOGINPROPERTY" => {
+                need(name, &a, 2)?;
+                let Some(l) = self.srv.security.logins.get(&s(&a[0]).to_lowercase()) else { return Ok(Some(Value::Null)) };
+                let now = chrono::Local::now().naive_local();
+                let max_age = self.srv.core.run_value("password max age (days)");
+                match s(&a[1]).to_lowercase().as_str() {
+                    "islocked" => Value::Int(l.is_locked(now) as i32),
+                    "isexpired" => Value::Int(l.is_expired(now, max_age) as i32),
+                    "ismustchange" => Value::Int(l.must_change as i32),
+                    "badpasswordcount" => Value::Int(l.bad_count as i32),
+                    "passwordlastsettime" => match l.password_set {
+                        Some(t) => Value::DateTime(t, DtKind::DateTime),
+                        None => Value::Null,
+                    },
+                    "isdisabled" => Value::Int(l.disabled as i32),
+                    "defaultdatabase" => Value::Str(l.default_db.clone()),
+                    _ => Value::Null,
+                }
+            }
             "HAS_PERMS_BY_NAME" => {
                 need_range(name, &a, 3, 5)?;
                 let perm = s(&a[2]).to_uppercase();
@@ -1921,6 +1940,27 @@ impl<'a> Engine<'a> {
                     }
                 }
             }
+            // --------------------------------------------------------- xml methods (.value / .exist / .query)
+            "XML_VALUE" | "XML_EXIST" | "XML_QUERY" => {
+                need(name, &a, 2)?;
+                if a[0].is_null() {
+                    return Ok(Some(Value::Null));
+                }
+                let doc = crate::xmlpath::parse(&s(&a[0])).ok_or_else(|| SqlError::new(9400, "XML parsing: the document is not well-formed."))?;
+                let items = crate::xmlpath::select(&doc, &s(&a[1])).map_err(|m| SqlError::new(2225, format!("XQuery: {}", m)))?;
+                match name {
+                    "XML_EXIST" => Value::Int((!items.is_empty()) as i32),
+                    "XML_QUERY" => Value::Str(items.iter().map(|i| i.xml()).collect::<String>()),
+                    _ => match items.first() {
+                        Some(i) => Value::Str(i.string()),
+                        None => Value::Null,
+                    },
+                }
+            }
+            "EVENTDATA" => match self.ses.eventdata.last() {
+                Some(x) => Value::Str(x.clone()),
+                None => Value::Null,
+            },
             "JSON_PATH_EXISTS" => {
                 need(name, &a, 2)?;
                 if any_null(&a) { Value::Null } else {
@@ -1987,9 +2027,9 @@ impl<'a> Engine<'a> {
                         return Err(SqlError::new(174, "The string_split function requires 2 argument(s)."));
                     }
                     let ordinal = args.get(2).map(|v| v.as_i64().unwrap_or(0) != 0).unwrap_or(false);
-                    let mut cols = vec![ColMeta { qual: None, name: "value".into(), ty: Some(DataType::NVarChar(MAX)), denied: None, coll: None, mask: None }];
+                    let mut cols = vec![ColMeta { qual: None, name: "value".into(), ty: Some(DataType::NVarChar(MAX)), denied: None, hidden: false, coll: None, mask: None }];
                     if ordinal {
-                        cols.push(ColMeta { qual: None, name: "ordinal".into(), ty: Some(DataType::BigInt), denied: None, coll: None, mask: None });
+                        cols.push(ColMeta { qual: None, name: "ordinal".into(), ty: Some(DataType::BigInt), denied: None, hidden: false, coll: None, mask: None });
                     }
                     if args[0].is_null() {
                         return Ok(Rowset::new(Schema::new(cols), vec![]));
@@ -2008,11 +2048,19 @@ impl<'a> Engine<'a> {
                     }).collect();
                     return Ok(Rowset::new(Schema::new(cols), rows));
                 }
+                "FN_GET_AUDIT_FILE" => {
+                    let pattern = args.first().map(s).unwrap_or_default();
+                    if !self.is_sysadmin() {
+                        return Err(SqlError::with(262, 14, 1, "VIEW SERVER STATE permission denied."));
+                    }
+                    let events = crate::audit::read_files(&pattern).map_err(|m| SqlError::with(25706, 16, 1, format!("Cannot read the audit files: {}", m)))?;
+                    return Ok(super::sysviews::audit_rowset(events));
+                }
                 "GENERATE_SERIES" => {
                     if args.len() < 2 {
                         return Err(SqlError::new(174, "The generate_series function requires 2 argument(s)."));
                     }
-                    let col = |ty| Schema::new(vec![ColMeta { qual: None, name: "value".into(), ty: Some(ty), denied: None, coll: None, mask: None }]);
+                    let col = |ty| Schema::new(vec![ColMeta { qual: None, name: "value".into(), ty: Some(ty), denied: None, hidden: false, coll: None, mask: None }]);
                     if args.iter().any(|v| v.is_null()) {
                         return Ok(Rowset::new(col(DataType::Int), vec![]));
                     }
@@ -2135,7 +2183,7 @@ impl<'a> Engine<'a> {
             let mut types = vec![];
             for (n, tr, _) in w {
                 let dt = self.resolve_type(tr)?;
-                cols.push(ColMeta { qual: None, name: n.clone(), ty: Some(dt.clone()), denied: None, coll: None, mask: None });
+                cols.push(ColMeta { qual: None, name: n.clone(), ty: Some(dt.clone()), denied: None, hidden: false, coll: None, mask: None });
                 types.push(dt);
             }
             let mut rows = vec![];

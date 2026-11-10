@@ -11,11 +11,15 @@ pub mod secexec;
 pub mod spill;
 pub mod admin;
 pub mod backup;
+pub mod auditing;
+pub mod bulk;
+pub mod ddltrig;
 pub mod hashjoin;
 pub mod rls;
 pub mod stream;
 pub mod sysprocs;
 pub mod sysviews;
+pub mod temporal;
 pub mod txn;
 
 use crate::ast::*;
@@ -146,6 +150,8 @@ pub struct SessionState {
     pub nocount: bool,
     pub xact_abort: bool,
     pub rowcount_limit: i64,
+    /// The UTC time stamped on the rows a statement writes to system-versioned tables.
+    pub period_now: Option<chrono::NaiveDateTime>,
     pub datefirst: i32,
     pub identity_insert: HashSet<String>,
     /// Tables a DML statement is currently working on (see `Engine::checkout_table`).
@@ -173,6 +179,12 @@ pub struct SessionState {
     pub catch_stack: Vec<SqlError>,
     pub cte_stack: Vec<HashMap<String, CteEntry>>,
     pub trigger_stack: Vec<TriggerCtx>,
+    /// `EVENTDATA()` of the DDL or logon trigger being run (innermost last).
+    pub eventdata: Vec<String>,
+    /// Text of the batch being run (for `EVENTDATA()`'s command text).
+    pub batch_text: String,
+    /// Audit records already written for the current statement (one per action and object).
+    pub audit_seen: std::cell::RefCell<HashSet<String>>,
     pub capture: Vec<Vec<ResultSet>>,
     pub ret: Value,
     pub doomed: bool,
@@ -210,6 +222,7 @@ impl SessionState {
             nocount: false,
             xact_abort: false,
             rowcount_limit: 0,
+            period_now: None,
             datefirst: 7,
             identity_insert: HashSet::new(),
             checked_out: vec![],
@@ -230,6 +243,9 @@ impl SessionState {
             catch_stack: vec![],
             cte_stack: vec![],
             trigger_stack: vec![],
+            eventdata: vec![],
+            batch_text: String::new(),
+            audit_seen: Default::default(),
             capture: vec![],
             ret: Value::Null,
             doomed: false,
@@ -333,6 +349,7 @@ pub fn stmt_needs_write(st: &Stmt) -> bool {
         st,
         Stmt::Query(_)
             | Stmt::Insert(_)
+            | Stmt::BulkInsert(_)
             | Stmt::Update(_)
             | Stmt::Delete(_)
             | Stmt::Merge(_)
@@ -459,6 +476,9 @@ impl<'a> Engine<'a> {
             }
         };
         let started = std::time::Instant::now();
+        if self.srv.core.audit.is_active() || stmts.iter().any(ddltrig::is_ddl_stmt) {
+            self.ses.batch_text = sql.to_string();
+        }
         self.ses.frames.push(Frame::default());
         self.ses.try_depth = 0;
         self.ses.strict = 0;
@@ -548,7 +568,11 @@ impl<'a> Engine<'a> {
                 self.ses.hints.clear();
                 self.ses.nowait = false;
             }
-            let r = self.exec_inner(st);
+            self.ses.audit_seen.borrow_mut().clear();
+            let mut r = self.exec_inner(st);
+            if r.is_ok() && ddltrig::is_ddl_stmt(st) {
+                r = self.fire_ddl_triggers(st);
+            }
             match r {
                 Ok(()) => {
                     if owns {
@@ -680,6 +704,9 @@ impl<'a> Engine<'a> {
                 self.ses.last_error = 0;
             }
             Stmt::Insert(s) => self.exec_insert(s)?,
+            Stmt::BulkInsert(b) => self.exec_bulk_insert(b)?,
+            Stmt::TriggerAdmin(a) => self.exec_trigger_admin(a)?,
+            Stmt::Audit(a) => self.exec_audit(a)?,
             Stmt::Update(s) => self.exec_update(s)?,
             Stmt::Delete(s) => self.exec_delete(s)?,
             Stmt::Merge(s) => self.exec_merge(s)?,
@@ -1547,7 +1574,9 @@ impl<'a> Engine<'a> {
                 frame.vars.insert(prm.name.clone(), Var { ty: dt, val });
             }
             let pdb = self.split_name(&plain).0.unwrap_or_else(|| self.ses.db.clone()).to_lowercase();
-            self.check_perm("EXECUTE", &pdb, &p.schema, Some(&obj_key(&p.schema, &p.name)), &p.name)?;
+            let allowed = self.check_perm("EXECUTE", &pdb, &p.schema, Some(&obj_key(&p.schema, &p.name)), &p.name);
+            self.audit_access("EXECUTE", &Loc::Db(pdb.clone(), obj_key(&p.schema, &p.name)), allowed.is_ok());
+            allowed?;
             let owner = self.schema_owner_of(&pdb, &p.schema);
             self.ses.module_owner.push(owner);
             let r = self.run_proc_body(&p.body, frame, &mut out_map);

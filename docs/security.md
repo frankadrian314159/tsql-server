@@ -13,6 +13,26 @@
   `db_denydatareader`, `db_denydatawriter`, `db_securityadmin`, `db_accessadmin`, `public` (everyone), and your own
   (`CREATE ROLE`, `ALTER ROLE r ADD MEMBER u`, `sp_addrolemember`).
 
+## Password policy and lockout
+
+```sql
+CREATE LOGIN app WITH PASSWORD = 'Str0ng!pass' MUST_CHANGE, CHECK_POLICY = ON, CHECK_EXPIRATION = ON;
+ALTER LOGIN app WITH PASSWORD = 'N3w!password' UNLOCK;          -- administrator: reset and unlock
+ALTER LOGIN app WITH PASSWORD = 'N3w!password' OLD_PASSWORD = 'Str0ng!pass';   -- a user changing their own
+SELECT LOGINPROPERTY('app', 'IsLocked'), LOGINPROPERTY('app', 'BadPasswordCount');
+```
+
+`CHECK_POLICY = ON` requires passwords of at least 8 characters, using three of upper case, lower case, digits and
+symbols, not containing the login name (error 15118), and locks the account after `login lockout threshold` (default 5)
+consecutive failed logins for `login lockout minutes` (15); a locked account fails with 18486 even for the right password
+until the time passes or an administrator runs `ALTER LOGIN ... UNLOCK` or resets the password. `CHECK_EXPIRATION`
+(default: same as `CHECK_POLICY`) expires the password after `password max age (days)` (42; 0 = never), error 18487.
+`MUST_CHANGE` blocks login (18488) until an administrator sets a new password. A non-administrator can change only their
+own password and must give `OLD_PASSWORD`. `default login check_policy` (sp_configure) makes new logins use the policy
+unless they say otherwise; it is off by default. `LOGINPROPERTY` supports IsLocked, IsExpired, IsMustChange,
+BadPasswordCount, PasswordLastSetTime, IsDisabled and DefaultDatabase. Failed-attempt counts and lockouts are kept in memory only (they reset at
+restart); the TDS listener reports the specific error numbers.
+
 ## Permissions
 
 `GRANT | DENY | REVOKE perm [, …] [ON securable] TO | FROM principal [, …] [WITH GRANT OPTION]`.
@@ -115,7 +135,58 @@ table (33265). Policies apply to **every** user, including `dbo` and sysadmin (w
 through); managing them needs sysadmin or `db_owner`. `sys.security_policies` and `sys.security_predicates` list them; they are
 persisted, backed up and restored with the database.
 
+## SQL Server Audit
+
+```sql
+CREATE SERVER AUDIT sec_audit TO FILE (FILEPATH = 'C:udit') WITH (ON_FAILURE = CONTINUE)
+    WHERE database_name = 'shop';
+ALTER SERVER AUDIT sec_audit WITH (STATE = ON);
+
+CREATE SERVER AUDIT SPECIFICATION logins FOR SERVER AUDIT sec_audit
+    ADD (FAILED_LOGIN_GROUP), ADD (SUCCESSFUL_LOGIN_GROUP), ADD (LOGOUT_GROUP) WITH (STATE = ON);
+
+-- in the database to audit:
+CREATE DATABASE AUDIT SPECIFICATION shop_spec FOR SERVER AUDIT sec_audit
+    ADD (SCHEMA_OBJECT_CHANGE_GROUP), ADD (SELECT, UPDATE ON OBJECT::dbo.salaries BY public) WITH (STATE = ON);
+
+SELECT event_time, action_id, succeeded, server_principal_name, object_name, statement
+FROM sys.fn_get_audit_file('C:udit', DEFAULT, DEFAULT);
+```
+
+A **server audit** is where records go: `TO FILE (FILEPATH = 'dir')` appends JSON lines to `dir/<name>_<guid>.sqlaudit` (no
+rollover: `MAXSIZE`, `MAX_FILES` and the like are accepted and ignored), `APPLICATION_LOG` and `SECURITY_LOG` keep the last
+10,000 records in memory, readable through `sys.dm_audit_log` (this server has no Windows event log). An optional `WHERE`
+filters records on `server_principal_name`, `database_principal_name`, `database_name`, `schema_name`, `object_name`,
+`action_id`, `succeeded`, `statement` and a few other columns (`=`, `<>`, `LIKE`, `IN`, `IS NULL`, `AND`, `OR`, `NOT`). An
+audit starts **off**; a running audit cannot be dropped (33071). Only `sysadmin` manages server audits and server
+specifications; `db_owner` manages database specifications.
+
+Server specifications take these groups: `FAILED_LOGIN_GROUP`, `SUCCESSFUL_LOGIN_GROUP`, `LOGOUT_GROUP`,
+`SERVER_PRINCIPAL_CHANGE_GROUP` (create, alter, drop login), `DATABASE_CHANGE_GROUP`, `BACKUP_RESTORE_GROUP`,
+`AUDIT_CHANGE_GROUP` and `DBCC_GROUP`. Database specifications take `SCHEMA_OBJECT_CHANGE_GROUP`,
+`DATABASE_OBJECT_CHANGE_GROUP` (schemas), `DATABASE_PRINCIPAL_CHANGE_GROUP`, `DATABASE_ROLE_MEMBER_CHANGE_GROUP`,
+`DATABASE_PERMISSION_CHANGE_GROUP`, `SCHEMA_OBJECT_PERMISSION_CHANGE_GROUP`, `SCHEMA_OBJECT_ACCESS_GROUP` and action items:
+`SELECT | INSERT | UPDATE | DELETE | EXECUTE | REFERENCES ON [OBJECT::|SCHEMA::|DATABASE::]name BY principal [, ...]`
+(a principal is a user, a role or `public`). `ALTER ... ADD (...) | DROP (...) WITH (STATE = ON | OFF)` changes a
+specification.
+
+Access records are written when the permission check for the access is made, whether it succeeds or not (`succeeded`), for
+sysadmin too, once per statement and object (a subquery that reads a table a thousand times is one record). Reads of
+`sys.*` and `INFORMATION_SCHEMA`, columns (`REFERENCES`) and the objects a view or procedure reads on the caller's behalf
+are not audited separately. The `statement` of a record is the text of the whole batch. The records have `action_id`
+(`SL`, `IN`, `UP`, `DL`, `EX`, `CR`, `AL`, `DR`, `G`, `D`, `R`, `LGIS`, `LGIF`, `LGO`, `BA`, `RS`, `DBCC`, `AUSC`),
+`class_type`, the session, principals, database, schema, object and a sequence number. A login record is written by
+`Server::connect_as` (every TDS login); the trusted in-process `connect()` session writes only its logout.
+
+Catalog: `sys.server_audits`, `sys.server_file_audits`, `sys.dm_server_audit_status`, `sys.server_audit_specifications`,
+`sys.server_audit_specification_details`, `sys.database_audit_specifications`,
+`sys.database_audit_specification_details`, `sys.fn_get_audit_file(path, DEFAULT, DEFAULT)` (a directory, a file or a path
+with `*`; the columns are a subset of SQL Server's, plus `audit_name` and `file_name`). Not supported: `ON_FAILURE =
+SHUTDOWN` and `FAIL_OPERATION` (a failing target only shows in `sys.dm_server_audit_status`), file rollover and
+reserve space, audit by column, `USER_CHANGE_PASSWORD_GROUP` and the other groups not listed, and the audit of the audit
+log's own reading.
+
 ## Limits
 
 Security statements are applied immediately and are not undone by `ROLLBACK`. Not implemented: certificates and signed
-modules, Always Encrypted, auditing, contained databases, password policy and Windows/Azure AD authentication.
+modules, Always Encrypted, contained databases and Windows/Azure AD authentication.

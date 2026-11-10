@@ -80,7 +80,7 @@ follow as they are; with "login only" encryption TLS is dropped again after the 
 * Bulk load (`bcp`, `SqlBulkCopy`), server-side cursors (`sp_cursor*`, used by some JDBC settings), MARS,
   query notifications, table-valued parameters, and `sql_variant` and `hierarchyid`/spatial types on the wire.
 * Session options sent in the Login7 flags are ignored; `varchar` parameters are always read as code page 1252.
-* The return status of `sp_executesql` is always 0 (a `RETURN n` inside the statement is not propagated).
+* The return status of `sp_executesql` is the value of a `RETURN n` inside the statement (0 when there is none).
 
 ## Tests
 

@@ -16,7 +16,7 @@ use crate::persist::LogOp;
 use crate::storage::{Row, RowId};
 
 impl<'a> Engine<'a> {
-    fn can_manage_policies(&self) -> bool {
+    pub(crate) fn can_manage_policies(&self) -> bool {
         if self.is_sysadmin() {
             return true;
         }

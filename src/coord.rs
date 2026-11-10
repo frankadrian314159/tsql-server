@@ -233,6 +233,10 @@ fn default_config() -> Vec<ConfigOption> {
         o("lock timeout default (ms)", -1, 2147483647, -1, true, "Default LOCK_TIMEOUT for new sessions (ms)"),
         o("query governor cost limit", 0, 2147483647, 0, true, "Maximum estimated cost allowed by query governor"),
         o("audit log enabled", 0, 1, 1, true, "Keep the in-memory audit log"),
+        o("login lockout threshold", 1, 1000, 5, false, "Failed logins (of a login with CHECK_POLICY) before the account is locked"),
+        o("login lockout minutes", 1, 1440, 15, false, "How long a locked-out account stays locked"),
+        o("password max age (days)", 0, 3650, 42, false, "Age at which a password of a login with CHECK_EXPIRATION expires (0 = never)"),
+        o("default login check_policy", 0, 1, 0, false, "Create new logins with CHECK_POLICY ON unless they say otherwise"),
     ]
 }
 
@@ -268,6 +272,8 @@ pub struct Core {
     forces: AtomicU64,
     latches: Latches,
     pub locks: LockTable,
+    /// Where audit records are written.
+    pub audit: crate::audit::AuditSink,
 }
 
 impl Default for Core {
@@ -296,6 +302,7 @@ impl Core {
             forces: AtomicU64::new(0),
             latches: Latches::default(),
             locks: LockTable::default(),
+            audit: Default::default(),
         }
     }
 

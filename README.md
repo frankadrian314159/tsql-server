@@ -23,9 +23,10 @@ statement-terminating vs batch-aborting errors, blocking and deadlocks, permissi
 | **Transactions & isolation** | `READ UNCOMMITTED`, `READ COMMITTED` (locking), `REPEATABLE READ`, `SERIALIZABLE`, `SNAPSHOT`, `READ_COMMITTED_SNAPSHOT`; row and table locks with intent modes, blocking, lock timeouts (1222), deadlock detection (1205). | [docs/concurrency.md](docs/concurrency.md) |
 | **Backup & recovery** | `BACKUP DATABASE` (a consistent snapshot while others write), `BACKUP LOG`, `RESTORE DATABASE` / `LOG` with `NORECOVERY`, `STOPAT` point-in-time recovery, `VERIFYONLY`, `HEADERONLY`, recovery models. | [docs/backup.md](docs/backup.md) |
 | **Collations** | `COLLATE` on databases, columns and expressions: case-, accent- and binary-sensitive comparison, ordering, grouping, joins, indexes and unique keys. | [docs/collations.md](docs/collations.md) |
-| **Administration** | `WAITFOR`, `KILL`, `sp_who`/`sp_who2`, `sp_configure`/`RECONFIGURE`, table hints (`NOLOCK`, `UPDLOCK`, `READPAST`, `NOWAIT`, ...), `OPTION` hints, a per-connection parse cache, `sys.dm_exec_sessions`/`requests`/`query_stats`/`cached_plans`. | [docs/administration.md](docs/administration.md) |
+| **Administration** | `WAITFOR`, `KILL`, `sp_who`/`sp_who2`, `sp_configure`/`RECONFIGURE`, table hints (`NOLOCK`, `UPDLOCK`, `READPAST`, `NOWAIT`, ...), `OPTION` hints, a per-connection parse cache, `sys.dm_exec_sessions`/`requests`/`query_stats`/`cached_plans`, `BULK INSERT`, SQL login password policy and lockout, DDL and LOGON triggers with `EVENTDATA()` ([docs/triggers.md](docs/triggers.md)), SQL Server Audit ([docs/security.md](docs/security.md#sql-server-audit)). | [docs/administration.md](docs/administration.md) |
 | **Security** | Logins with salted password hashes, database users, roles (fixed and custom), `GRANT` / `DENY` / `REVOKE`, ownership chaining, `EXECUTE AS`, permission errors with SQL Server's numbers and text. | [docs/security.md](docs/security.md) |
 | **Query optimizer** | Predicate pushdown, index selection (seek / range / IN-list), cost-based join ordering, index nested-loop and hash joins, ordered index reads that stop early for `TOP … ORDER BY`, `SET SHOWPLAN_TEXT`. | [docs/optimizer.md](docs/optimizer.md) |
+| **Temporal tables** | `PERIOD FOR SYSTEM_TIME`, `SYSTEM_VERSIONING = ON` with an automatic or named history table, `FOR SYSTEM_TIME AS OF / FROM..TO / BETWEEN / CONTAINED IN / ALL`, `HIDDEN` period columns. | [docs/temporal.md](docs/temporal.md) |
 | **Shell and desktop app** | `tsql`: an interactive shell with `GO` batches, grids, dot-commands (`.tables`, `.schema`, `.import`, `.export`, `.plan`, `.storage`, …) and script/exit-code support. `tsql-gui`: an egui app with a navigation pane, editable datasheets, a table designer, a query editor with plans, CSV import/export, transactions and live storage statistics. | [docs/shell-and-gui.md](docs/shell-and-gui.md) |
 | **TDS server** | `tsql-serve` listens on a TCP port and speaks TDS 7.4: SQL logins, batches, `sp_executesql`, prepared statements and procedure calls with OUTPUT parameters and return status, transactions, attention, all the data types. Checked against `System.Data.SqlClient` and tiberius. TLS supported. | [docs/tds.md](docs/tds.md) |
 | **T-SQL language** | Queries, DML, DDL, procedural code, cursors, dynamic SQL, JSON, windows, CTEs, MERGE, triggers, … | [Coverage](#t-sql-coverage) |
@@ -164,16 +165,16 @@ Things that are **not** implemented, so you are not surprised:
   section of that document.
 * **Permissions** — object-, schema- and database-level permissions; **column-level** `SELECT` / `UPDATE` permissions (see [docs/security.md](docs/security.md));
   security statements (`CREATE LOGIN`, `GRANT`, …) take effect immediately and are not rolled back with a transaction;
-  **dynamic data masking** and **row-level security** (filter and block predicates); no certificates, signatures, auditing, or Windows authentication.
+  **dynamic data masking** and **row-level security** (filter and block predicates); **password policy and lockout**, **SQL Server Audit**, DDL and LOGON triggers; no certificates, signatures, Always Encrypted, contained databases or Windows authentication.
 * **Optimizer** — heuristic and statistics-on-demand (distinct counts come from the indexes, exact for small ones and
   sampled for large ones);
   no histograms on unindexed columns, `OPTION (HASH JOIN | LOOP JOIN | FORCE ORDER)` and table hints are honoured (see
   [docs/administration.md](docs/administration.md)), outer joins are not reordered, subqueries are executed per row rather than
   rewritten to semi-joins, and only parsed batches (not execution plans) are cached.
 * **Tools** — the shell and the desktop app use one session each (see [docs/shell-and-gui.md](docs/shell-and-gui.md)).
-* **XML / spatial / hierarchy** — `xml` is stored as text with no XQuery (`.value()`, `.query()`, `OPENXML`);
+* **XML / spatial / hierarchy** — `xml` is stored as text; `.value()`, `.exist()` and `.query()` handle simple XPath only, with no `.nodes()`, `.modify()` or `OPENXML` (see [docs/triggers.md](docs/triggers.md));
   `geography`, `geometry`, `hierarchyid` are not functional. No full-text search, Service Broker, CLR, SQL Agent,
-  linked servers, `BULK INSERT`, temporal tables, graph tables, columnstore, partitioning, replication, 
+  linked servers, `OPENROWSET(BULK)`, graph tables, columnstore, partitioning, replication, 
   backup compression (full, differential and log backups, restore and point-in-time recovery exist; see [docs/backup.md](docs/backup.md)).
 * **Collations** — case, accent and binary sensitivity (`CI`/`CS`, `AI`/`AS`, `BIN`/`BIN2`) per database, column and expression, in
   comparisons, sorting, grouping, joins, indexes and constraints; language-specific alphabetical orders and kana/width

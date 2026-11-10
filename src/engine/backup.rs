@@ -170,6 +170,8 @@ fn op_db(op: &LogOp) -> Option<&str> {
         | LogOp::DbOptions { db, .. }
         | LogOp::DbRecovery { db, .. }
         | LogOp::DbPolicies { db, .. }
+        | LogOp::DbDdlTriggers { db, .. }
+        | LogOp::DbAuditSpecs { db, .. }
         | LogOp::DbSecurity { db, .. } => Some(db),
         _ => None,
     }
@@ -190,6 +192,8 @@ fn retarget(op: &mut LogOp, to: &str) {
         | LogOp::DbOptions { db, .. }
         | LogOp::DbRecovery { db, .. }
         | LogOp::DbPolicies { db, .. }
+        | LogOp::DbDdlTriggers { db, .. }
+        | LogOp::DbAuditSpecs { db, .. }
         | LogOp::DbSecurity { db, .. } => *db = to.to_string(),
         _ => {}
     }

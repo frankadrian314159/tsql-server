@@ -19,6 +19,38 @@ pub struct Login {
     pub hash: Vec<u8>,
     pub disabled: bool,
     pub default_db: String,
+    /// `CHECK_POLICY`: the password must be complex enough, and repeated failures lock the account.
+    #[serde(default)]
+    pub check_policy: bool,
+    /// `CHECK_EXPIRATION`: the password expires after the configured maximum age.
+    #[serde(default)]
+    pub check_expiration: bool,
+    /// The password must be changed before the login can be used again.
+    #[serde(default)]
+    pub must_change: bool,
+    #[serde(default)]
+    pub password_set: Option<chrono::NaiveDateTime>,
+    /// Consecutive failed logins, and when the lockout ends.
+    #[serde(default)]
+    pub bad_count: u32,
+    #[serde(default)]
+    pub locked_until: Option<chrono::NaiveDateTime>,
+}
+
+/// Why a password does not meet the policy, or `None` when it does: at least 8 characters, at least three of
+/// upper case, lower case, digits and symbols, and not containing the login's name.
+pub fn password_problem(login: &str, pw: &str) -> Option<&'static str> {
+    if pw.chars().count() < 8 {
+        return Some("it is too short");
+    }
+    let classes = [pw.chars().any(|c| c.is_uppercase()), pw.chars().any(|c| c.is_lowercase()), pw.chars().any(|c| c.is_ascii_digit()), pw.chars().any(|c| !c.is_alphanumeric())].iter().filter(|b| **b).count();
+    if classes < 3 {
+        return Some("it is not complex enough");
+    }
+    if login.len() >= 3 && pw.to_lowercase().contains(&login.to_lowercase()) {
+        return Some("it contains the login name");
+    }
+    None
 }
 
 pub fn hash_password(salt: &[u8], pw: &str) -> Vec<u8> {
@@ -35,10 +67,20 @@ impl Login {
             Some(p) => hash_password(&salt, p),
             None => vec![],
         };
-        Login { name: name.to_string(), salt, hash, disabled: false, default_db: "master".into() }
+        Login { name: name.to_string(), salt, hash, disabled: false, default_db: "master".into(), check_policy: false, check_expiration: false, must_change: false, password_set: Some(chrono::Local::now().naive_local()), bad_count: 0, locked_until: None }
     }
     pub fn set_password(&mut self, pw: &str) {
         self.hash = hash_password(&self.salt, pw);
+        self.password_set = Some(chrono::Local::now().naive_local());
+        self.must_change = false;
+    }
+    /// Is the account locked out at `now`?
+    pub fn is_locked(&self, now: chrono::NaiveDateTime) -> bool {
+        self.locked_until.is_some_and(|t| t > now)
+    }
+    /// Has the password outlived `max_age_days` (0 = never)? Only for logins with CHECK_EXPIRATION.
+    pub fn is_expired(&self, now: chrono::NaiveDateTime, max_age_days: i64) -> bool {
+        self.check_expiration && max_age_days > 0 && self.password_set.is_some_and(|t| now - t > chrono::Duration::days(max_age_days))
     }
     /// A login with no password set accepts any password only for trusted (in-process) connections.
     pub fn check_password(&self, pw: &str) -> bool {
@@ -52,11 +94,16 @@ pub struct Security {
     pub logins: BTreeMap<String, Login>, // lower-case name -> login
     pub sysadmins: BTreeSet<String>,     // lower-case login names
     pub dbcreators: BTreeSet<String>,
+    /// Server-scoped DDL triggers and LOGON triggers.
+    pub server_triggers: Vec<crate::catalog::DdlTrigger>,
+    /// SQL Server Audit: server audits and server audit specifications.
+    pub audits: Vec<crate::audit::ServerAudit>,
+    pub server_specs: Vec<crate::audit::AuditSpec>,
 }
 
 impl Default for Security {
     fn default() -> Self {
-        let mut s = Security { logins: BTreeMap::new(), sysadmins: BTreeSet::new(), dbcreators: BTreeSet::new() };
+        let mut s = Security { logins: BTreeMap::new(), sysadmins: BTreeSet::new(), dbcreators: BTreeSet::new(), server_triggers: vec![], audits: vec![], server_specs: vec![] };
         s.logins.insert("sa".into(), Login::new("sa", None));
         s.sysadmins.insert("sa".into());
         s

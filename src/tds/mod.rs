@@ -718,8 +718,8 @@ fn handshake(server: &Server, mut t: Transport, cfg: &Config) -> io::Result<Opti
     }
     let conn = match server.connect_as(&login.user, &login.password) {
         Ok(c) => c,
-        Err(_) => {
-            login_failure(&mut t, 18456, 1, 14, &format!("Login failed for user '{}'.", login.user))?;
+        Err(e) => {
+            login_failure(&mut t, e.number, 1, 14, &e.message)?;
             return Ok(None);
         }
     };
