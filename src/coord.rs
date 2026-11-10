@@ -30,12 +30,25 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct LockTable {
     m: Mutex<LockManager>,
     cv: Condvar,
+    /// Does anyone hold a lock or key range? Kept up to date under the latch; while it is false the common calls
+    /// (is something in my way? release everything) answer without taking the latch.
+    busy: std::sync::atomic::AtomicBool,
+    /// Sessions asleep in [`LockTable::wait_until`].
+    waiters: AtomicUsize,
 }
 
 impl LockTable {
     /// Sleep until `done()` is true; returns true when `timeout` elapsed first.
     pub fn wait_until(&self, done: impl Fn() -> bool, timeout: Option<Duration>) -> bool {
         let mut g = lock(&self.m);
+        self.waiters.fetch_add(1, Ordering::SeqCst);
+        std::sync::atomic::fence(Ordering::SeqCst);
+        let r = self.wait_loop(g, &done, timeout);
+        self.waiters.fetch_sub(1, Ordering::SeqCst);
+        r
+    }
+
+    fn wait_loop(&self, mut g: MutexGuard<'_, LockManager>, done: &impl Fn() -> bool, timeout: Option<Duration>) -> bool {
         let deadline = timeout.map(|d| std::time::Instant::now() + d);
         while !done() {
             match deadline {
@@ -58,25 +71,48 @@ impl LockTable {
         self.cv.notify_all();
     }
 
+    fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::SeqCst)
+    }
     pub fn conflicts(&self, tx: TxId, res: &Res, mode: Mode) -> Vec<TxId> {
+        if !self.is_busy() {
+            return vec![];
+        }
         lock(&self.m).conflicts(tx, res, mode)
     }
     pub fn acquire(&self, tx: TxId, res: &Res, mode: Mode) -> Result<(), Vec<TxId>> {
-        lock(&self.m).acquire(tx, res, mode)
+        let mut g = lock(&self.m);
+        let r = g.acquire(tx, res, mode);
+        self.busy.store(!g.is_idle(), Ordering::SeqCst);
+        r
     }
     pub fn acquire_range(&self, r: KeyRange) {
-        lock(&self.m).acquire_range(r)
+        let mut g = lock(&self.m);
+        g.acquire_range(r);
+        self.busy.store(!g.is_idle(), Ordering::SeqCst);
     }
     pub fn has_ranges(&self) -> bool {
-        lock(&self.m).has_ranges()
+        self.is_busy() && lock(&self.m).has_ranges()
     }
     pub fn range_conflicts(&self, tx: TxId, oid: i32, idx: usize, key: &[Value]) -> Vec<TxId> {
+        if !self.is_busy() {
+            return vec![];
+        }
         lock(&self.m).range_conflicts(tx, oid, idx, key)
     }
-    /// Release everything `tx` holds and wake the sessions waiting for locks.
+    /// Release everything `tx` holds and wake the sessions waiting for locks (or for a transaction to end; call this
+    /// after the transaction has left the active table).
     pub fn release_all(&self, tx: TxId) {
+        // nothing is held by anybody and nobody is waiting: there is nothing to release and nobody to wake
+        if !self.is_busy() {
+            std::sync::atomic::fence(Ordering::SeqCst);
+            if self.waiters.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+        }
         let mut g = lock(&self.m);
         g.release_all(tx);
+        self.busy.store(!g.is_idle(), Ordering::SeqCst);
         drop(g);
         self.cv.notify_all();
     }
@@ -199,10 +235,16 @@ pub struct SessionInfo {
     pub isolation: i32,
     pub login_time: chrono::NaiveDateTime,
     pub last_batch: chrono::NaiveDateTime,
+    /// When the last batch started; kept as a plain timestamp so that noting it costs nothing (`last_batch` is
+    /// filled in from it when the session list is read).
+    pub last_batch_at: std::time::SystemTime,
     pub batches: u64,
     /// The statement being run (first 200 characters).
     pub command: String,
 }
+
+/// A session's entry in the session table. Its own lock, so that noting each statement does not queue on the table.
+pub type SessionHandle = std::sync::Arc<Mutex<SessionInfo>>;
 
 /// One `sp_configure` option.
 #[derive(Clone, Debug)]
@@ -253,8 +295,48 @@ pub struct QueryStat {
     pub last: chrono::NaiveDateTime,
 }
 
+const ACTIVE_SHARDS: usize = 16;
+
+/// Most statement texts one session (or the retired total) keeps statistics for.
+const STAT_ENTRIES: usize = 1000;
+
+#[derive(Clone)]
+struct Stat {
+    text: String,
+    executions: u64,
+    total_us: u64,
+    last_us: u64,
+    max_us: u64,
+    rows: u64,
+    created: std::time::SystemTime,
+    last: std::time::SystemTime,
+}
+
+impl Stat {
+    fn merge(&mut self, o: &Stat) {
+        self.executions += o.executions;
+        self.total_us += o.total_us;
+        if o.last > self.last {
+            self.last = o.last;
+            self.last_us = o.last_us;
+        }
+        self.max_us = self.max_us.max(o.max_us);
+        self.rows += o.rows;
+        self.created = self.created.min(o.created);
+    }
+}
+
+type StatMap = std::collections::HashMap<u64, Stat>;
+
+/// One session's statement statistics. Only its own session writes to it, so recording a batch takes a lock nobody
+/// else wants; `dm_exec_query_stats` adds the sessions' buffers together.
+#[derive(Default)]
+pub struct StatBuf {
+    m: Mutex<StatMap>,
+    registered: std::sync::atomic::AtomicBool,
+}
+
 /// Clock, counters, running transactions and locks.
-const STAT_SHARDS: usize = 16;
 
 pub struct Core {
     clock: AtomicU64,
@@ -262,15 +344,17 @@ pub struct Core {
     next_object_id: AtomicI32,
     next_rowversion: AtomicU64,
     next_spid: AtomicI32,
-    active: Mutex<BTreeMap<TxId, TxInfo>>,
+    /// Running transactions, in shards by id so that starting and ending one does not queue on a single lock.
+    active: Vec<Mutex<BTreeMap<TxId, TxInfo>>>,
     commit: Mutex<()>,
-    sessions: Mutex<BTreeMap<i32, SessionInfo>>,
+    sessions: Mutex<BTreeMap<i32, SessionHandle>>,
     killed: Mutex<std::collections::HashSet<i32>>,
     /// Number of sessions asked to stop (so the common case, none, costs no lock).
     kill_pending: AtomicUsize,
     config: Mutex<Vec<ConfigOption>>,
-    /// Statement statistics, in shards by statement hash so sessions do not queue on one lock.
-    stats: Vec<Mutex<std::collections::HashMap<u64, QueryStat>>>,
+    /// Statement statistics: one buffer per session, plus the totals of sessions that have ended.
+    stat_bufs: Mutex<Vec<std::sync::Arc<StatBuf>>>,
+    stats_retired: Mutex<StatMap>,
     commits: Mutex<Commits>,
     group: Mutex<GroupSync>,
     group_cv: Condvar,
@@ -295,13 +379,14 @@ impl Core {
             next_object_id: AtomicI32::new(100_000),
             next_rowversion: AtomicU64::new(1),
             next_spid: AtomicI32::new(51),
-            active: Mutex::new(BTreeMap::new()),
+            active: (0..ACTIVE_SHARDS).map(|_| Mutex::new(BTreeMap::new())).collect(),
             commit: Mutex::new(()),
             sessions: Mutex::new(BTreeMap::new()),
             killed: Mutex::new(Default::default()),
             kill_pending: AtomicUsize::new(0),
             config: Mutex::new(default_config()),
-            stats: (0..STAT_SHARDS).map(|_| Mutex::new(Default::default())).collect(),
+            stat_bufs: Mutex::new(vec![]),
+            stats_retired: Mutex::new(Default::default()),
             commits: Mutex::new(Commits::default()),
             group: Mutex::new(GroupSync::default()),
             group_cv: Condvar::new(),
@@ -341,20 +426,25 @@ impl Core {
     }
 
     // ---- sessions
-    pub fn register_session(&self, s: SessionInfo) {
-        lock(&self.sessions).insert(s.spid, s);
+    pub fn register_session(&self, s: SessionInfo) -> SessionHandle {
+        let spid = s.spid;
+        let h = std::sync::Arc::new(Mutex::new(s));
+        lock(&self.sessions).insert(spid, h.clone());
+        h
     }
     pub fn unregister_session(&self, spid: i32) {
         lock(&self.sessions).remove(&spid);
         self.unkill(spid);
     }
-    pub fn update_session(&self, spid: i32, f: impl FnOnce(&mut SessionInfo)) {
-        if let Some(s) = lock(&self.sessions).get_mut(&spid) {
-            f(s);
-        }
-    }
     pub fn session_list(&self) -> Vec<SessionInfo> {
-        lock(&self.sessions).values().cloned().collect()
+        let hs: Vec<SessionHandle> = lock(&self.sessions).values().cloned().collect();
+        hs.iter()
+            .map(|h| {
+                let mut s = lock(h).clone();
+                s.last_batch = chrono::DateTime::<chrono::Local>::from(s.last_batch_at).naive_local();
+                s
+            })
+            .collect()
     }
     pub fn session_exists(&self, spid: i32) -> bool {
         lock(&self.sessions).contains_key(&spid)
@@ -404,16 +494,20 @@ impl Core {
     }
 
     // ---- statement statistics
-    pub fn record_stat(&self, text: &str, us: u64, rows: u64) {
+    pub fn record_stat(&self, buf: &std::sync::Arc<StatBuf>, text: &str, us: u64, rows: u64) {
         use std::hash::{Hash, Hasher};
+        if !buf.registered.swap(true, Ordering::Relaxed) {
+            lock(&self.stat_bufs).push(buf.clone());
+        }
         let mut h = std::collections::hash_map::DefaultHasher::new();
         text.hash(&mut h);
-        let now = chrono::Local::now().naive_local();
-        let mut m = lock(&self.stats[(h.finish() % STAT_SHARDS as u64) as usize]);
-        if m.len() > 5000 / STAT_SHARDS && !m.contains_key(&h.finish()) {
+        let key = h.finish();
+        let now = std::time::SystemTime::now();
+        let mut m = lock(&buf.m);
+        if m.len() >= STAT_ENTRIES && !m.contains_key(&key) {
             return;
         }
-        let e = m.entry(h.finish()).or_insert_with(|| QueryStat { text: text.chars().take(4000).collect(), executions: 0, total_us: 0, last_us: 0, max_us: 0, rows: 0, created: now, last: now });
+        let e = m.entry(key).or_insert_with(|| Stat { text: text.chars().take(4000).collect(), executions: 0, total_us: 0, last_us: 0, max_us: 0, rows: 0, created: now, last: now });
         e.executions += 1;
         e.total_us += us;
         e.last_us = us;
@@ -421,12 +515,42 @@ impl Core {
         e.rows += rows;
         e.last = now;
     }
+    /// A session is ending: keep what it recorded.
+    pub fn retire_stats(&self, buf: &std::sync::Arc<StatBuf>) {
+        if !buf.registered.load(Ordering::Relaxed) {
+            return;
+        }
+        lock(&self.stat_bufs).retain(|b| !std::sync::Arc::ptr_eq(b, buf));
+        let mine = std::mem::take(&mut *lock(&buf.m));
+        let mut r = lock(&self.stats_retired);
+        for (k, v) in mine {
+            if let Some(e) = r.get_mut(&k) {
+                e.merge(&v);
+            } else if r.len() < STAT_ENTRIES * 5 {
+                r.insert(k, v);
+            }
+        }
+    }
     pub fn stats_list(&self) -> Vec<QueryStat> {
-        self.stats.iter().flat_map(|m| lock(m).values().cloned().collect::<Vec<_>>()).collect()
+        let mut all: StatMap = lock(&self.stats_retired).clone();
+        let bufs: Vec<_> = lock(&self.stat_bufs).clone();
+        for b in bufs {
+            for (k, v) in lock(&b.m).iter() {
+                if let Some(e) = all.get_mut(k) {
+                    e.merge(v);
+                } else {
+                    all.insert(*k, v.clone());
+                }
+            }
+        }
+        let local = |t: std::time::SystemTime| chrono::DateTime::<chrono::Local>::from(t).naive_local();
+        all.into_values().map(|s| QueryStat { text: s.text, executions: s.executions, total_us: s.total_us, last_us: s.last_us, max_us: s.max_us, rows: s.rows, created: local(s.created), last: local(s.last) }).collect()
     }
     pub fn clear_stats(&self) {
-        for m in &self.stats {
-            lock(m).clear();
+        lock(&self.stats_retired).clear();
+        let bufs: Vec<_> = lock(&self.stat_bufs).clone();
+        for b in bufs {
+            lock(&b.m).clear();
         }
     }
 
@@ -465,12 +589,15 @@ impl Core {
     }
 
     // ---- running transactions
+    fn shard(&self, id: TxId) -> MutexGuard<'_, BTreeMap<TxId, TxInfo>> {
+        lock(&self.active[(id as usize) % ACTIVE_SHARDS])
+    }
     /// Register a new transaction. A snapshot transaction reads the clock and enters the active table in one step
-    /// (under the table's latch), so [`Core::horizon`] can never pass a snapshot that is just starting.
-    /// Returns the id and the clock value at the start.
+    /// (under its shard's latch); [`Core::horizon`] reads the clock before it looks at any shard, so it can never
+    /// pass a snapshot that is just starting. Returns the id and the clock value at the start.
     pub fn begin(&self, snapshot: bool) -> (TxId, u64) {
-        let mut a = lock(&self.active);
         let id = self.next_tx.fetch_add(1, Ordering::SeqCst);
+        let mut a = self.shard(id);
         let start = self.clock();
         a.insert(id, TxInfo { snapshot_ts: if snapshot { Some(start) } else { None }, ddl: false });
         (id, start)
@@ -532,27 +659,29 @@ impl Core {
         lock(&self.commit)
     }
     pub fn end(&self, id: TxId) {
-        lock(&self.active).remove(&id);
+        self.shard(id).remove(&id);
     }
     /// Note that transaction `id` has changed the catalog.
     pub fn mark_ddl(&self, id: TxId) {
-        if let Some(t) = lock(&self.active).get_mut(&id) {
+        if let Some(t) = self.shard(id).get_mut(&id) {
             t.ddl = true;
         }
     }
     /// Running transactions (other than `except`) that have changed the catalog and not finished.
     pub fn ddl_txs(&self, except: TxId) -> Vec<TxId> {
-        lock(&self.active).iter().filter(|(id, t)| t.ddl && **id != except).map(|(id, _)| *id).collect()
+        let mut v: Vec<TxId> = self.active.iter().flat_map(|m| lock(m).iter().filter(|(id, t)| t.ddl && **id != except).map(|(id, _)| *id).collect::<Vec<_>>()).collect();
+        v.sort_unstable();
+        v
     }
     /// Running transactions other than `except`.
     pub fn others_active(&self, except: TxId) -> Vec<TxId> {
-        lock(&self.active).keys().copied().filter(|id| *id != except).collect()
+        self.active_ids().into_iter().filter(|id| *id != except).collect()
     }
     pub fn no_active(&self) -> bool {
-        lock(&self.active).is_empty()
+        self.active.iter().all(|m| lock(m).is_empty())
     }
     pub fn is_active(&self, id: TxId) -> bool {
-        lock(&self.active).contains_key(&id)
+        self.shard(id).contains_key(&id)
     }
     /// Wait until none of `txs` is running any more; returns true when `timeout` elapsed first. A transaction ends
     /// by leaving the active table and then releasing its locks, so the release that wakes this wait always
@@ -565,18 +694,21 @@ impl Core {
         self.locks.wait_until(|| self.is_killed(spid) || !txs.iter().any(|t| self.is_active(*t)), timeout)
     }
     pub fn active_count(&self) -> usize {
-        lock(&self.active).len()
+        self.active.iter().map(|m| lock(m).len()).sum()
     }
     pub fn active_ids(&self) -> Vec<TxId> {
-        lock(&self.active).keys().copied().collect()
+        let mut v: Vec<TxId> = self.active.iter().flat_map(|m| lock(m).keys().copied().collect::<Vec<_>>()).collect();
+        v.sort_unstable();
+        v
     }
     pub fn tx_snapshot(&self, id: TxId) -> Option<Option<u64>> {
-        lock(&self.active).get(&id).map(|t| t.snapshot_ts)
+        self.shard(id).get(&id).map(|t| t.snapshot_ts)
     }
     /// Oldest timestamp any running snapshot still needs.
     pub fn horizon(&self) -> u64 {
-        let a = lock(&self.active);
-        a.values().filter_map(|t| t.snapshot_ts).min().unwrap_or_else(|| self.clock())
+        // the clock first: a snapshot that starts while the shards are being read starts at or after this value
+        let now = self.clock();
+        self.active.iter().filter_map(|m| lock(m).values().filter_map(|t| t.snapshot_ts).min()).min().map_or(now, |m| m.min(now))
     }
 }
 

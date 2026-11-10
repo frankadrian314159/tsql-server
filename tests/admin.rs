@@ -2,6 +2,7 @@
 mod common;
 use common::*;
 use std::thread;
+use tsql_server::Connection;
 use std::time::{Duration, Instant};
 
 #[test]
@@ -146,4 +147,72 @@ fn repeated_batches_are_parsed_once_and_dbcc_empties_the_cache() {
     exec(&mut c, "SET DATEFIRST 7");
     let b = scalar(&mut c, "SELECT DATEPART(weekday, '2026-11-09')");
     assert_ne!(a, b);
+}
+
+#[test]
+fn query_statistics_add_up_across_sessions_and_survive_a_session_ending() {
+    let s = server();
+    let mut watcher = s.connect();
+    let q = "SELECT 5151 AS stats_marker";
+    let mut a = s.connect();
+    let mut b = s.connect();
+    exec(&mut a, q);
+    exec(&mut a, q);
+    exec(&mut b, q);
+    let stat = |c: &mut Connection| rows(c, "SELECT execution_count, total_rows FROM sys.dm_exec_query_stats WHERE sql_text = 'SELECT 5151 AS stats_marker'");
+    assert_eq!(stat(&mut watcher), [["3", "3"]]);
+    drop(a);
+    assert_eq!(stat(&mut watcher), [["3", "3"]], "a session that ends keeps its statistics");
+    exec(&mut b, q);
+    assert_eq!(stat(&mut watcher), [["4", "4"]]);
+    exec(&mut watcher, "DBCC FREEPROCCACHE");
+    assert_eq!(stat(&mut watcher), Vec::<Vec<String>>::new());
+    exec(&mut b, q);
+    assert_eq!(stat(&mut watcher), [["1", "1"]]);
+}
+
+#[test]
+fn the_session_table_follows_each_batch() {
+    let s = server();
+    let mut a = s.connect();
+    let mut w = s.connect();
+    let spid = scalar(&mut a, "SELECT @@SPID");
+    let batches = |w: &mut Connection| scalar(w, &format!("SELECT batch_count FROM sys.dm_exec_sessions WHERE session_id = {}", spid)).parse::<i64>().unwrap();
+    let before = batches(&mut w);
+    exec(&mut a, "SELECT 1");
+    exec(&mut a, "SELECT 2");
+    assert_eq!(batches(&mut w), before + 2);
+    exec(&mut a, "CREATE DATABASE sess_db");
+    exec(&mut a, "USE sess_db");
+    assert_eq!(scalar(&mut w, &format!("SELECT COUNT(*) FROM sys.dm_exec_sessions WHERE session_id = {} AND last_request_start_time IS NOT NULL", spid)), "1");
+    drop(a);
+    assert_eq!(scalar(&mut w, &format!("SELECT COUNT(*) FROM sys.dm_exec_sessions WHERE session_id = {}", spid)), "0");
+}
+
+#[test]
+fn read_only_transactions_leave_no_trace_and_a_waiting_writer_is_woken_when_the_holder_commits() {
+    let s = server();
+    let mut a = s.connect();
+    let mut b = s.connect();
+    exec(&mut a, "CREATE TABLE ro_t (id INT PRIMARY KEY, v INT)");
+    exec(&mut a, "INSERT ro_t VALUES (1, 10)");
+    // a transaction that has only read holds no locks, so it is no obstacle to a schema change
+    exec(&mut a, "BEGIN TRAN");
+    exec(&mut a, "SELECT * FROM ro_t");
+    exec(&mut b, "ALTER TABLE ro_t ADD w INT");
+    exec(&mut a, "COMMIT");
+    assert_eq!(scalar(&mut b, "SELECT v FROM ro_t WHERE id = 1"), "10");
+    // an uncommitted writer is still waited for, and released when it ends
+    exec(&mut a, "BEGIN TRAN");
+    exec(&mut a, "UPDATE ro_t SET v = 11 WHERE id = 1");
+    let t = {
+        let mut c = s.connect();
+        thread::spawn(move || {
+            exec(&mut c, "UPDATE ro_t SET v = 12 WHERE id = 1");
+            scalar(&mut c, "SELECT v FROM ro_t WHERE id = 1")
+        })
+    };
+    thread::sleep(Duration::from_millis(200));
+    exec(&mut a, "COMMIT");
+    assert_eq!(t.join().unwrap(), "12");
 }

@@ -70,11 +70,51 @@ column schema 0.4, plan text 0.7, and about 4 of set-up in `exec_select` and `ev
 epoch checked on every use, because permissions, definitions and statistics all change plans, and the access path depends
 on parameter values. That is more risk than the gain justifies; the cheap, safe part (parsed text) is cached.
 
+## Concurrency: what stopped sessions scaling
+
+Even `SELECT 1`, which touches no data, stopped scaling at four sessions: eight sessions ran slower than four. The
+cause was per-statement bookkeeping that every session funnelled through global locks. Measured on a 12-thread machine,
+in memory (statements per second):
+
+| Workload | 1 thread | 8 threads before | 8 threads after |
+| --- | ---: | ---: | ---: |
+| `SELECT 1` | 278k -> 717k | 371k | 3.0M |
+| point lookup by primary key | 47k -> 56k | 120k | 261k |
+
+1. **The session table.** Each statement updated the session's row in one table (`sys.dm_exec_sessions`) twice, under a
+   global lock, after reading the time zone-aware clock and allocating strings. Each session now owns its row (its own
+   lock), the time is a plain `SystemTime` converted when the view is read, and the command text is written into the
+   existing buffer.
+2. **Query statistics.** Every batch hashed its text and took a lock on one of 16 shards, so the same popular statement
+   always hit the same shard. Each session records into its own buffer; `dm_exec_query_stats` adds the buffers of the
+   running sessions to the totals kept from sessions that have ended.
+3. **The active-transaction table** (every statement begins and ends an implicit transaction) is in 16 shards by
+   transaction id. The oldest-snapshot calculation reads the clock before it looks at the shards, so a snapshot that is
+   just starting cannot be passed.
+4. **Read-only statements ran the whole commit protocol.** A query's implicit transaction took the commit lock,
+   allocated a commit timestamp, advanced the clock and walked the lock table. A transaction that changed nothing now
+   leaves the active table and is done.
+5. **The lock manager is one latch.** While nobody holds a lock or key range and nobody is waiting, "is anything in my
+   way?" and "release everything" answer from an atomic flag without taking it. A transaction that ends still wakes
+   sleepers (DDL waits for open transactions), checked with a fence so no wake-up is lost.
+6. **The page store was one mutex.** It is a reader-writer lock now. A lookup, and a scan of a store without a page
+   file, read the cached pages with the pool held shared; the replacement bit is atomic and the hit counter is kept in
+   per-thread slots so readers on different cores do not write the same cache line. Anything that must load a page or
+   change the tree takes the pool exclusively as before, and a lookup that misses the cache retries that way.
+
+Making commits and lock releases this much faster exposed a latent race in locking reads. `REPEATABLE READ` (and
+`UPDLOCK`) read a chunk of rows and then lock them, so a commit that landed in between left the reader holding a stale
+value under a lock it had just been granted: in a read-modify-write test, increments were lost in about 5 of 80 loaded
+runs. After taking the locks a read now checks whether any of those rows was committed after the statement began and, if
+so, runs the statement again with a fresh view (the rule `UPDATE` already used for its own rows).
+
+Writes to the same store still queue on the pool (updates scale to about 2x at 4 sessions, limited by that and by the
+catalog's per-table latches), as does any scan of a store with a page file.
+
 ## Where the time goes now
 
 A point lookup by primary key costs about 20 microseconds from `Connection::execute`: parsing 5-10 (statements with
 different literals are parsed afresh; identical text hits the parse cache), planning and scan setup 10, execution
 a few. A correlated subquery costs about 11 microseconds per outer row, mostly the same per-query planning. Both would
 need a cache of plans keyed by statement shape. A durable single-row commit costs one disk flush (about 0.5 ms);
-sessions that commit together share it (group commit). Throughput flattens at 4-8 sessions: the page store's buffer pool
-is one mutex.
+sessions that commit together share it (group commit). Read throughput scales with the number of cores; writers to one store still take its page pool exclusively.

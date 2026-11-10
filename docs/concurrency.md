@@ -107,11 +107,16 @@ statement runs. Statements from different sessions run **in parallel**; what the
    reads, and a writer checks the ranges *after* putting its new versions in place, so either the reader sees the
    uncommitted version (and waits for the writer) or the writer sees the range (and waits for the reader); a wait
    undoes the statement.
-3. **Core** (`coord::Core`): the commit clock and id counters (atomics), the table of running transactions,
-   the lock table and the commit lock, each with its own short latch. Waiting for a lock sleeps until one of the
+3. **Core** (`coord::Core`): the commit clock and id counters (atomics), the table of running transactions (in 16
+   shards by transaction id), the lock table and the commit lock, each with its own short latch. While nobody holds a lock
+   the lock table answers "is anything in my way?" and "release everything" without its latch, and a transaction that
+   changed nothing skips the commit protocol. Each session owns its row of the session table and its query statistics. Waiting for a lock sleeps until one of the
    transactions waited for has ended (`Core::wait_for_end`); deadlock detection records the wait and looks for a
    cycle in one step (`LockTable::wait_and_check`).
-4. **The page store** has one latch per store (the buffer pool); every tree operation holds it for the operation.
+4. **The page store** has one reader-writer latch per store (the buffer pool). Lookups, and scans of a store without a page
+   file, hold it shared and so run in parallel; loading a page, changing a tree or evicting holds it exclusively.
+   A locking read (`REPEATABLE READ`, `UPDLOCK`) reads rows before it locks them, so after locking it re-checks that none
+   was committed since the statement began and runs the statement again if one was.
 5. **The redo log** (`ServerState::persist`) is appended to under its own latch.
 
 Identity columns and sequences are shared counters (`SharedCounter`): a statement works on a copy of the table and

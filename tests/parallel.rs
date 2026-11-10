@@ -491,3 +491,46 @@ fn serializable_readers_still_block_phantoms_while_writers_run_in_parallel() {
     }
     assert!(checked > 0);
 }
+
+#[test]
+fn readers_of_cached_pages_see_consistent_rows_while_a_writer_changes_them() {
+    let s = server();
+    let mut c = s.connect();
+    exec(&mut c, "CREATE TABLE pr (id INT PRIMARY KEY, a INT, b INT)");
+    exec(&mut c, "DECLARE @i INT = 1; BEGIN TRAN; WHILE @i <= 2000 BEGIN INSERT pr VALUES (@i, 0, 0); SET @i = @i + 1; END; COMMIT");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM pr"), "2000");
+    let stop = Arc::new(AtomicBool::new(false));
+    let bad = Arc::new(AtomicUsize::new(0));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let mut hs = vec![];
+    for t in 0..6 {
+        let mut conn = s.connect();
+        let (stop, bad, reads) = (stop.clone(), bad.clone(), reads.clone());
+        hs.push(thread::spawn(move || {
+            let mut k = t * 7;
+            while !stop.load(Ordering::Relaxed) {
+                k = (k + 13) % 2000 + 1;
+                // a and b are always changed together, so a reader must never see them differ
+                let r = conn.query(&format!("SELECT a, b FROM pr WHERE id = {}", k)).unwrap();
+                if r.len() != 1 || r[0][0].to_string() != r[0][1].to_string() {
+                    bad.fetch_add(1, Ordering::Relaxed);
+                }
+                let r = conn.query("SELECT COUNT(*), SUM(a) - SUM(b) FROM pr").unwrap();
+                if r[0][0].to_string() != "2000" || r[0][1].to_string() != "0" {
+                    bad.fetch_add(1, Ordering::Relaxed);
+                }
+                reads.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+    let mut w = s.connect();
+    for i in 1..=150 {
+        retry(&mut w, &format!("UPDATE pr SET a = {0}, b = {0} WHERE id % 50 = {1}", i, i % 50));
+    }
+    stop.store(true, Ordering::Relaxed);
+    for h in hs {
+        h.join().unwrap();
+    }
+    assert_eq!(bad.load(Ordering::Relaxed), 0);
+    assert!(reads.load(Ordering::Relaxed) > 0);
+}

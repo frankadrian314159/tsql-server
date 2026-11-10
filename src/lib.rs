@@ -218,7 +218,7 @@ impl Server {
             }
         }
         let now = chrono::Local::now().naive_local();
-        g.core.register_session(coord::SessionInfo {
+        session.info = Some(g.core.register_session(coord::SessionInfo {
             spid,
             login: session.login.clone(),
             host: session.host_name.clone(),
@@ -228,9 +228,10 @@ impl Server {
             isolation: session.isolation.level(),
             login_time: now,
             last_batch: now,
+            last_batch_at: std::time::SystemTime::now(),
             batches: 0,
             command: String::new(),
-        });
+        }));
         drop(g);
         Connection { server: self.clone(), session }
     }
@@ -246,7 +247,7 @@ impl Connection {
     /// Execute a single batch (no `GO` handling).
     pub fn execute(&mut self, sql: &str) -> BatchResult {
         crate::span!("execute");
-        let shared = self.server.shared.clone();
+        let shared = &self.server.shared;
         let guard = SrvGuard::new(&shared.state);
         let mut eng = Engine::new(guard, &mut self.session);
         eng.run_batch(sql);
@@ -259,7 +260,7 @@ impl Connection {
     /// consumer has gone away; the statement is then abandoned. Small results and every other kind of result set
     /// arrive whole, as `Event::Rows`.
     pub fn execute_streaming(&mut self, sql: &str, sink: &mut dyn FnMut(Streamed) -> bool) {
-        let shared = self.server.shared.clone();
+        let shared = &self.server.shared;
         let guard = SrvGuard::new(&shared.state);
         let mut eng = Engine::with_sink(guard, &mut self.session, sink);
         eng.run_batch(sql);
@@ -319,7 +320,7 @@ impl Connection {
                 return Ok(());
             }
         }
-        let shared = self.server.shared.clone();
+        let shared = &self.server.shared;
         let guard = SrvGuard::new(&shared.state);
         let mut eng = Engine::new(guard, &mut self.session);
         eng.run_logon_triggers()
@@ -343,7 +344,7 @@ impl Connection {
 
     /// Roll back whatever a killed session had open and forget the kill request.
     pub fn finish_kill(&mut self) {
-        let shared = self.server.shared.clone();
+        let shared = &self.server.shared;
         let guard = SrvGuard::new(&shared.state);
         let mut eng = Engine::new(guard, &mut self.session);
         eng.rollback_all();
@@ -356,13 +357,14 @@ impl Drop for Connection {
         {
             let g = self.server.shared.state.read().unwrap_or_else(|e| e.into_inner());
             g.core.unregister_session(self.session.spid);
+            g.core.retire_stats(&self.session.stat_buf);
             if g.core.audit.is_active() {
                 engine::auditing::login_event(&g, "LOGOUT", &self.session.login, self.session.spid, "");
             }
         }
         // roll back any open transaction and release its locks
         if self.session.tx.is_some() {
-            let shared = self.server.shared.clone();
+            let shared = &self.server.shared;
             let guard = SrvGuard::new(&shared.state);
             let mut eng = Engine::new(guard, &mut self.session);
             eng.rollback_all();

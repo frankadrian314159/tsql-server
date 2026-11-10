@@ -97,6 +97,13 @@ impl<'a> Engine<'a> {
         let mut undo = std::mem::take(&mut tx.undo);
         let wrote = undo.iter().any(|u| !matches!(u, Undo::Temp { .. } | Undo::GTemp { .. } | Undo::Row { tab: TabRef::Temp(_), .. } | Undo::Row { tab: TabRef::GTemp(_), .. }));
         let core = self.srv.core.clone();
+        if undo.is_empty() {
+            // changed nothing (a query, or a transaction that rolled everything back): no timestamp, log record or
+            // versions to stamp, so none of the commit machinery
+            core.end(id);
+            core.locks.release_all(id);
+            return Ok(());
+        }
         let commit = core.commit_lock();
         let ts = core.alloc_commit_ts();
         let mut lsn = None;
@@ -485,10 +492,12 @@ impl<'a> Engine<'a> {
                     for (rid, _) in &chunk.rows {
                         self.lock_row(oid, *rid, Mode::X)?;
                     }
+                    self.changed_since_read(t, chunk.rows.iter().map(|(r, _)| *r))?;
                 } else if iso == Isolation::RepeatableRead {
                     for (rid, _) in &chunk.rows {
                         self.lock_row(oid, *rid, Mode::S)?;
                     }
+                    self.changed_since_read(t, chunk.rows.iter().map(|(r, _)| *r))?;
                 }
                 let rows = match flt {
                     Some((sc, es)) => self.filter_pushed(sc, chunk.rows, es)?,
@@ -559,10 +568,12 @@ impl<'a> Engine<'a> {
                 for (rid, _) in &rows {
                     self.lock_row(oid, *rid, Mode::X)?;
                 }
+                self.changed_since_read(t, rows.iter().map(|(r, _)| *r))?;
             } else if iso == Isolation::RepeatableRead || iso == Isolation::Serializable {
                 for (rid, _) in &rows {
                     self.lock_row(oid, *rid, Mode::S)?;
                 }
+                self.changed_since_read(t, rows.iter().map(|(r, _)| *r))?;
             }
             match flt {
                 Some((sc, es)) => all.extend(self.filter_pushed(sc, rows, es)?),
@@ -570,6 +581,19 @@ impl<'a> Engine<'a> {
             }
         }
         Ok(all)
+    }
+
+    /// Rows are read before they are locked, so a transaction may have committed a change to one of them in between;
+    /// the lock is then granted on a row whose value this statement has not seen (a read-modify-write would lose that
+    /// update). A row committed after the statement began makes the statement run again with a fresh view.
+    fn changed_since_read(&mut self, t: &Table, rids: impl Iterator<Item = RowId>) -> Result<()> {
+        let began = self.ses.stmt_ts;
+        for rid in rids {
+            if t.data.latest_committed_ts(rid) > began {
+                return Err(self.blocked(vec![]));
+            }
+        }
+        Ok(())
     }
 
     /// A single row by id as the current transaction sees it (no locking).

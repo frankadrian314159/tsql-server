@@ -34,7 +34,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtOrd};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 pub const PAGE_SIZE: usize = 8192;
 const HDR: usize = 8;
@@ -141,7 +141,8 @@ enum ImageRef<'a> {
 struct Frame {
     node: Node,
     dirty: bool,
-    refbit: bool,
+    /// Recently used (clock replacement); atomic so that readers holding the pool shared can set it.
+    refbit: AtomicBool,
     /// Overflow pages that back this leaf's on-disk image.
     chains: Vec<PageId>,
     /// A leaf's estimated size, valid while the leaf still has this many entries (inserts and deletes keep it up to
@@ -181,6 +182,30 @@ pub struct StoreStats {
     pub truncated: u64,
 }
 
+/// Buffer-cache hits, counted in per-thread slots so that readers on different cores do not fight over one counter.
+#[derive(Default)]
+struct Hits([HitSlot; 16]);
+
+#[derive(Default)]
+#[repr(align(64))]
+struct HitSlot(AtomicU64);
+
+impl Hits {
+    fn add(&self) {
+        thread_local! {
+            static SLOT: usize = {
+                static NEXT: AtomicU64 = AtomicU64::new(0);
+                NEXT.fetch_add(1, AtOrd::Relaxed) as usize
+            };
+        }
+        let i = SLOT.with(|s| *s) % self.0.len();
+        self.0[i].0.fetch_add(1, AtOrd::Relaxed);
+    }
+    fn total(&self) -> u64 {
+        self.0.iter().map(|s| s.0.load(AtOrd::Relaxed)).sum()
+    }
+}
+
 struct Pool {
     file: Option<File>,
     durable: bool,
@@ -194,6 +219,7 @@ struct Pool {
     order: VecDeque<PageId>,
     pinned: Vec<PageId>,
     stats: StoreStats,
+    hits: Hits,
     failed: Option<String>,
 }
 
@@ -324,26 +350,26 @@ impl Pool {
     fn frame(&mut self, id: PageId) -> R<&mut Frame> {
         if !self.frames.contains_key(&id) {
             let (node, chains) = self.decode(id)?;
-            self.frames.insert(id, Frame { node, dirty: false, refbit: true, chains, est: None });
+            self.frames.insert(id, Frame { node, dirty: false, refbit: AtomicBool::new(true), chains, est: None });
             self.touch_new(id);
             self.pinned.push(id);
             if self.frames.len() > self.capacity {
                 self.evict_one()?;
             }
         } else {
-            self.stats.hits += 1;
+            self.hits.add();
             if !self.pinned.contains(&id) {
                 self.pinned.push(id);
             }
         }
         let f = self.frames.get_mut(&id).unwrap();
-        f.refbit = true;
+        *f.refbit.get_mut() = true;
         Ok(f)
     }
 
     fn new_frame(&mut self, node: Node) -> PageId {
         let id = self.alloc_id();
-        self.frames.insert(id, Frame { node, dirty: true, refbit: true, chains: vec![], est: None });
+        self.frames.insert(id, Frame { node, dirty: true, refbit: AtomicBool::new(true), chains: vec![], est: None });
         self.touch_new(id);
         self.pinned.push(id);
         id
@@ -367,8 +393,7 @@ impl Pool {
             };
             let (present, refbit) = match self.frames.get_mut(&id) {
                 Some(f) => {
-                    let r = f.refbit;
-                    f.refbit = false;
+                    let r = std::mem::replace(f.refbit.get_mut(), false);
                     (true, r)
                 }
                 None => (false, false),
@@ -469,6 +494,73 @@ impl Pool {
                     id = next;
                 }
             }
+        }
+    }
+
+    // ---- read-only access: a pool held shared can read the pages that are cached (a miss means "retry exclusively")
+    fn ro_leaf(&self, root: PageId, first_true: &dyn Fn(&KeyVals, u64) -> bool) -> Option<&Frame> {
+        let mut id = root;
+        loop {
+            let f = self.frames.get(&id)?;
+            if !f.refbit.load(AtOrd::Relaxed) {
+                f.refbit.store(true, AtOrd::Relaxed);
+            }
+            self.hits.add();
+            match &f.node {
+                Node::Leaf { .. } => return Some(f),
+                Node::Inner { keys, children, .. } => {
+                    id = children[keys.partition_point(|(k, r)| !first_true(k, *r))];
+                }
+            }
+        }
+    }
+
+    fn ro_peek(&self, root: PageId, key: &KeyVals, rid: u64, f: &mut dyn FnMut(Option<&Slot>)) -> Option<()> {
+        let leaf = self.ro_leaf(root, &|k, r| cmp_tk(k, r, key, rid) == Ordering::Greater)?;
+        if let Node::Leaf { entries, .. } = &leaf.node {
+            let pos = entries.partition_point(|e| cmp_tk(&e.key, e.rid, key, rid) == Ordering::Less);
+            match entries.get(pos) {
+                Some(e) if cmp_tk(&e.key, e.rid, key, rid) == Ordering::Equal => f(Some(&e.slot)),
+                _ => f(None),
+            }
+        }
+        Some(())
+    }
+
+    /// `bt_scan` over a pool that is held shared. Only for a store without a file, where every page is always
+    /// cached: a scan that had to stop part-way could not be resumed.
+    fn ro_scan(&self, root: PageId, first_true: &dyn Fn(&KeyVals, u64) -> bool, forward: bool, visit: &mut dyn FnMut(&KeyVals, u64, &Slot) -> bool) -> Option<()> {
+        let mut leaf = self.ro_leaf(root, first_true)?;
+        let mut pos = match &leaf.node {
+            Node::Leaf { entries, .. } => entries.partition_point(|e| !first_true(&e.key, e.rid)),
+            _ => 0,
+        };
+        loop {
+            let Node::Leaf { entries, prev, next } = &leaf.node else { return None };
+            let link;
+            if forward {
+                for e in &entries[pos.min(entries.len())..] {
+                    if !visit(&e.key, e.rid, &e.slot) {
+                        return Some(());
+                    }
+                }
+                link = *next;
+            } else {
+                for e in entries[..pos.min(entries.len())].iter().rev() {
+                    if !visit(&e.key, e.rid, &e.slot) {
+                        return Some(());
+                    }
+                }
+                link = *prev;
+            }
+            if link == NO_PAGE {
+                return Some(());
+            }
+            leaf = self.frames.get(&link)?;
+            if !leaf.refbit.load(AtOrd::Relaxed) {
+                leaf.refbit.store(true, AtOrd::Relaxed);
+            }
+            pos = if forward { 0 } else { usize::MAX };
         }
     }
 
@@ -1022,7 +1114,9 @@ fn keys_len(n: &Node) -> usize {
 // ------------------------------------------------------------------- store
 /// A page file plus its buffer pool. Cheap to share (`Arc`); all access is serialised by an internal lock.
 pub struct PageStore {
-    pool: Mutex<Pool>,
+    pool: RwLock<Pool>,
+    /// Is there a page file? (a store without one keeps every page cached, so its reads never need the pool exclusively)
+    has_file: bool,
     closing: AtomicBool,
 }
 
@@ -1042,7 +1136,8 @@ impl PageStore {
         let used: std::collections::HashSet<u64> = table.iter().filter(|e| e.phys != NO_BLOCK).map(|e| e.phys).collect();
         let free_blocks: Vec<u64> = (0..nblocks).filter(|b| !used.contains(b)).rev().collect();
         PageStore {
-            pool: Mutex::new(Pool {
+            has_file: file.is_some(),
+            pool: RwLock::new(Pool {
                 file,
                 durable,
                 capacity: capacity.max(8),
@@ -1055,6 +1150,7 @@ impl PageStore {
                 order: VecDeque::new(),
                 pinned: vec![],
                 stats: StoreStats::default(),
+                hits: Hits::default(),
                 failed: None,
             }),
             closing: AtomicBool::new(false),
@@ -1073,8 +1169,18 @@ impl PageStore {
         Ok(Arc::new(PageStore::from_pool(Some(file), durable, capacity_pages, image.unwrap_or_default())))
     }
 
+    /// Run `f` with the pool held shared (so readers do not wait for one another). `f` returns `None` when it needs
+    /// a page that is not cached; the caller then retries through [`PageStore::run`].
+    fn read<T: Default>(&self, f: impl FnOnce(&Pool) -> Option<T>) -> Option<T> {
+        let p = self.pool.read().unwrap_or_else(|e| e.into_inner());
+        if p.failed.is_some() {
+            return Some(T::default());
+        }
+        f(&p)
+    }
+
     fn run<T: Default>(&self, f: impl FnOnce(&mut Pool) -> R<T>) -> T {
-        let mut p = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = self.pool.write().unwrap_or_else(|e| e.into_inner());
         if p.failed.is_some() {
             return T::default();
         }
@@ -1093,7 +1199,7 @@ impl PageStore {
 
     /// The first storage error since the store was opened, if any. Once set, the store refuses all work.
     pub fn failed(&self) -> Option<String> {
-        self.pool.lock().unwrap_or_else(|e| e.into_inner()).failed.clone()
+        self.pool.read().unwrap_or_else(|e| e.into_inner()).failed.clone()
     }
 
     /// Stop freeing pages when trees are dropped (the process is shutting down).
@@ -1102,8 +1208,9 @@ impl PageStore {
     }
 
     pub fn stats(&self) -> StoreStats {
-        let p = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+        let p = self.pool.read().unwrap_or_else(|e| e.into_inner());
         let mut s = p.stats;
+        s.hits = p.hits.total();
         s.pool_capacity = if p.capacity == usize::MAX { 0 } else { p.capacity };
         s.pages_cached = p.frames.len();
         s.pages_live = p.table.iter().filter(|e| e.phys != NO_BLOCK).count() + p.frames.iter().filter(|(i, _)| p.table[**i as usize].phys == NO_BLOCK).count();
@@ -1122,7 +1229,7 @@ impl PageStore {
 
     /// Write every dirty page and sync the file; returns the page table to store in the checkpoint.
     pub fn prepare_checkpoint(&self) -> Result<StoreImage, SqlError> {
-        let mut p = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = self.pool.write().unwrap_or_else(|e| e.into_inner());
         if let Some(e) = &p.failed {
             return Err(SqlError::with(823, 24, 2, format!("The page store has failed: {}", e)));
         }
@@ -1139,7 +1246,7 @@ impl PageStore {
     /// Call after the checkpoint file naming the image is durable: its blocks become protected and
     /// superseded blocks are released.
     pub fn commit_checkpoint(&self) {
-        let mut p = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = self.pool.write().unwrap_or_else(|e| e.into_inner());
         if p.durable {
             p.commit_checkpoint();
         }
@@ -1214,13 +1321,22 @@ impl Tree {
     pub fn with<T>(&self, key: &KeyVals, rid: u64, f: impl FnOnce(Option<&Slot>) -> T) -> T {
         let mut f = Some(f);
         let mut out = None;
-        self.st().run(|p| {
-            p.bt_peek(self.root, key, rid, &mut |s| {
+        let hit = self.st().read(|p| {
+            p.ro_peek(self.root, key, rid, &mut |s| {
                 if let Some(f) = f.take() {
                     out = Some(f(s));
                 }
             })
         });
+        if hit.is_none() {
+            self.st().run(|p| {
+                p.bt_peek(self.root, key, rid, &mut |s| {
+                    if let Some(f) = f.take() {
+                        out = Some(f(s));
+                    }
+                })
+            });
+        }
         match out {
             Some(v) => v,
             None => (f.take().unwrap())(None),
@@ -1259,7 +1375,11 @@ impl Tree {
 
     /// See `Pool::bt_scan`.
     pub fn scan(&self, first_true: &dyn Fn(&KeyVals, u64) -> bool, forward: bool, visit: &mut dyn FnMut(&KeyVals, u64, &Slot) -> bool) {
-        self.st().run(|p| p.bt_scan(self.root, first_true, forward, visit));
+        let st = self.st();
+        if !st.has_file && st.read(|p| p.ro_scan(self.root, first_true, forward, &mut *visit)).is_some() {
+            return;
+        }
+        st.run(|p| p.bt_scan(self.root, first_true, forward, visit));
     }
 
     /// Keys of a leaf at relative position `frac` (0..1) plus the last key of the leaf before it.

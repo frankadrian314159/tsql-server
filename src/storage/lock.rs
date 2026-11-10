@@ -169,6 +169,11 @@ impl LockManager {
         v
     }
 
+    /// Does nobody hold any lock or key range?
+    pub fn is_idle(&self) -> bool {
+        self.held.is_empty() && self.ranges.is_empty()
+    }
+
     pub fn release_all(&mut self, tx: TxId) {
         self.ranges.retain(|r| r.tx != tx);
         if let Some(rs) = self.by_tx.remove(&tx) {

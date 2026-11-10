@@ -128,6 +128,9 @@ pub struct TriggerCtx {
 
 pub struct SessionState {
     pub spid: i32,
+    /// This session's entry in the session table (none for a session that is not registered).
+    pub info: Option<crate::coord::SessionHandle>,
+    pub stat_buf: std::sync::Arc<crate::coord::StatBuf>,
     pub login: String,
     pub db: String,
     pub temp: HashMap<String, Table>,
@@ -205,6 +208,8 @@ impl SessionState {
     pub fn new(spid: i32) -> SessionState {
         SessionState {
             spid,
+            info: None,
+            stat_buf: Default::default(),
             login: "sa".into(),
             db: "master".into(),
             temp: HashMap::new(),
@@ -471,9 +476,16 @@ pub fn clear_parse_cache() {
 /// The name of a statement's kind (`Query`, `Insert`, ...): the head of its `Debug` text. The text is not built in
 /// full (for a big INSERT that would visit every value): the writer refuses everything after the first word.
 pub fn stmt_head(st: &Stmt) -> String {
+    let mut s = String::new();
+    stmt_head_into(st, &mut s);
+    s
+}
+
+/// Append the leading word of `st`'s debug form (its kind) to `out`.
+pub fn stmt_head_into(st: &Stmt, out: &mut String) {
     use std::fmt::Write;
-    struct Head(String);
-    impl Write for Head {
+    struct Head<'a>(&'a mut String);
+    impl Write for Head<'_> {
         fn write_str(&mut self, s: &str) -> std::fmt::Result {
             for ch in s.chars() {
                 if !ch.is_alphanumeric() {
@@ -484,9 +496,8 @@ pub fn stmt_head(st: &Stmt) -> String {
             Ok(())
         }
     }
-    let mut h = Head(String::new());
+    let mut h = Head(out);
     let _ = write!(h, "{:?}", st);
-    h.0
 }
 
 pub fn parse_cache_entries() -> Vec<(String, u64)> {
@@ -555,7 +566,7 @@ impl<'a> Engine<'a> {
         self.ses.capture.clear();
         self.ses.catch_stack.clear();
         self.ses.checked_out.clear();
-        self.srv.core.record_stat(sql, started.elapsed().as_micros() as u64, self.ses.rowcount.max(0) as u64);
+        self.srv.core.record_stat(&self.ses.stat_buf, sql, started.elapsed().as_micros() as u64, self.ses.rowcount.max(0) as u64);
         // a batch-aborting error with an open XACT_ABORT transaction rolls back
     }
 
@@ -610,16 +621,19 @@ impl<'a> Engine<'a> {
                     let e = self.kill_error();
                     return self.handle_error(e);
                 }
-                let (db, iso) = (self.ses.db.clone(), self.ses.isolation.level());
-                let cmd: String = stmt_head(st);
-                self.srv.core.update_session(spid, |s| {
-                    s.db = db;
+                if let Some(h) = &self.ses.info {
+                    let iso = self.ses.isolation.level();
+                    let mut s = h.lock().unwrap_or_else(|e| e.into_inner());
+                    if s.db != self.ses.db {
+                        s.db.clone_from(&self.ses.db);
+                    }
                     s.status = "running";
                     s.isolation = iso;
-                    s.command = cmd;
-                    s.last_batch = chrono::Local::now().naive_local();
+                    s.command.clear();
+                    stmt_head_into(st, &mut s.command);
+                    s.last_batch_at = std::time::SystemTime::now();
                     s.batches += 1;
-                });
+                }
             }
             let write = !SHARED_READS || stmt_needs_write(st);
             if self.ses.nest_level == 0 || write {
@@ -644,7 +658,9 @@ impl<'a> Engine<'a> {
                         }
                     }
                     if self.ses.nest_level == 0 {
-                        self.srv.core.update_session(self.ses.spid, |s| s.status = "sleeping");
+                        if let Some(h) = &self.ses.info {
+                            h.lock().unwrap_or_else(|e| e.into_inner()).status = "sleeping";
+                        }
                         self.srv.yield_lock();
                     }
                     return Ok(());
