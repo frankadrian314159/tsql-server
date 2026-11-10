@@ -45,8 +45,10 @@ impl TlsConfig {
         }
         let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(bad)?;
         let provider = Arc::new(rustls::crypto::ring::default_provider());
+        // TLS 1.2 only, as SQL Server before 2022 and the TDS 7.x clients (the Microsoft JDBC driver among them) expect: the
+        // handshake is wrapped in TDS packets and TLS 1.3 changes what follows it
         let mut cfg = ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
+            .with_protocol_versions(&[&rustls::version::TLS12])
             .map_err(bad)?
             .with_no_client_auth()
             .with_single_cert(chain, key)

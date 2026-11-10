@@ -672,15 +672,37 @@ fn login_failure(t: &mut Transport, number: i32, state: u8, class: u8, text: &st
     t.send(T_REPLY, &out)
 }
 
+/// With `TSQL_TDS_TRACE=1` in the environment the server prints every packet it receives and sends (type and size) and why
+/// a session ends, to find out what a client that fails to connect is doing.
+fn tracing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TSQL_TDS_TRACE").is_some())
+}
+
+fn trace(msg: &str) {
+    if tracing() {
+        eprintln!("tsql-serve trace: {}", msg);
+    }
+}
+
+/// Say why a connection is being dropped before it is logged in (otherwise the client just sees the socket close).
+fn refused(why: &str) {
+    eprintln!("tsql-serve: closing a connection during login: {}", why);
+}
+
 fn handshake(server: &Server, mut t: Transport, cfg: &Config) -> io::Result<Option<Session>> {
     let bad = |e: String| io::Error::new(io::ErrorKind::InvalidData, e);
     let (kind, _, pre) = t.read_message()?;
     if kind != T_PRELOGIN {
+        refused(&format!("the first packet was type {} ({}), not PRELOGIN (18); the jTDS driver does this (it needs TDS 7.0/7.1, which is not supported): use the Microsoft JDBC driver", kind, if kind == T_LOGIN7 { "LOGIN7" } else { "unknown" }));
         return Ok(None);
     }
+    trace(&format!("PRELOGIN, {} bytes, client encryption option {:?}", pre.len(), prelogin_encryption(&pre)));
     let answer = encryption_answer(prelogin_encryption(&pre).unwrap_or(2), cfg.tls.is_some(), cfg.encryption);
+    trace(&format!("answering PRELOGIN with encryption {}", answer));
     t.send(T_REPLY, &prelogin_reply(answer))?;
     if answer == 3 {
+        refused("the server requires encryption and the client does not offer it");
         return Ok(None); // the client cannot encrypt and the server insists: it will close the connection
     }
     if answer < 2 {
@@ -705,14 +727,18 @@ fn handshake(server: &Server, mut t: Transport, cfg: &Config) -> io::Result<Opti
         t.go_plain()?;
     }
     if kind == T_SSPI || kind != T_LOGIN7 {
+        refused(&format!("expected LOGIN7 (16) after PRELOGIN, got packet type {}", kind));
         return Ok(None);
     }
+    trace(&format!("LOGIN7, {} bytes", payload.len()));
     let login = parse_login7(&payload).map_err(bad)?;
+    trace(&format!("login as '{}', TDS version {:#x}, packet size {}, database '{}'", login.user, login.tds_version, login.packet_size, login.database));
     if login.sspi {
         login_failure(&mut t, 18452, 1, 14, "Login failed. Integrated (Windows) authentication is not supported; use a SQL Server login.")?;
         return Ok(None);
     }
     if login.tds_version < 0x7200_0000 {
+        refused(&format!("the client asked for TDS version {:#x}; this server needs 7.2 or later (0x72000000)", login.tds_version));
         login_failure(&mut t, 18456, 1, 14, "This server requires TDS 7.2 or later.")?;
         return Ok(None);
     }
@@ -793,7 +819,12 @@ fn serve_connection(server: Server, stream: TcpStream, cfg: Arc<Config>) {
     let t = Transport { stream: tls::Wire::Plain(stream), packet_size: DEFAULT_PACKET, spid: 0, pending: vec![], next_id: 0 };
     let mut s = match handshake(&server, t, &cfg) {
         Ok(Some(s)) => s,
-        _ => return,
+        Ok(None) => return,
+        Err(e) => {
+            // a TLS failure, a malformed packet, a client that gave up: the client sees only a closed connection
+            eprintln!("tsql-serve: login handshake failed: {} ({:?})", e, e.kind());
+            return;
+        }
     };
     let _ = s.t.stream.tcp().set_read_timeout(None);
     let Ok(probe) = s.t.stream.tcp().try_clone() else { return };
@@ -804,8 +835,12 @@ fn serve_connection(server: Server, stream: TcpStream, cfg: Arc<Config>) {
         }
         let (kind, status, payload) = match s.t.read_message() {
             Ok(m) => m,
-            Err(_) => return,
+            Err(e) => {
+                trace(&format!("the client's connection ended: {} ({:?})", e, e.kind()));
+                return;
+            }
         };
+        trace(&format!("request: packet type {}, {} bytes, status {:#x}", kind, payload.len(), status));
         if status & 0x08 != 0 {
             // RESETCONNECTION: end any open transaction
             s.conn.execute("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION");
@@ -827,15 +862,21 @@ fn serve_connection(server: Server, stream: TcpStream, cfg: Arc<Config>) {
                 done(&mut out, 0xFD, DONE_ERROR, 0);
                 Ok(out)
             }
-            _ => return,
+            other => {
+                eprintln!("tsql-serve: closing a session: unsupported packet type {}", other);
+                return;
+            }
         };
         let out = reply.unwrap_or_else(|msg| {
+            eprintln!("tsql-serve: a request could not be processed: {}", msg);
             let mut out = vec![];
             error_token(&mut out, &SqlError::new(8144, format!("The request could not be processed: {}", msg)));
             done(&mut out, 0xFD, DONE_ERROR, 0);
             out
         });
-        if s.t.send(T_REPLY, &out).is_err() {
+        trace(&format!("reply, {} bytes", out.len()));
+        if let Err(e) = s.t.send(T_REPLY, &out) {
+            trace(&format!("sending the reply failed: {} ({:?})", e, e.kind()));
             return;
         }
     }

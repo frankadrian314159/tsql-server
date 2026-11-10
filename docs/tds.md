@@ -70,7 +70,7 @@ How the listener answers the client's pre-login `ENCRYPTION` request:
 | on / required | whole session encrypted | whole session encrypted |
 | not supported | plain session | refused |
 
-TLS 1.2 and 1.3 are supported (rustls). As in TDS, the handshake travels inside pre-login packets and the records
+TLS 1.2 is supported (rustls; TLS 1.3 is not offered, because TDS 7.x clients such as the Microsoft JDBC driver expect what SQL Server before 2022 does). As in TDS, the handshake travels inside pre-login packets and the records
 follow as they are; with "login only" encryption TLS is dropped again after the Login7 message. From Rust:
 `Config::with_tls(TlsConfig::from_pem_files(cert, key)?, Encryption::Required)`.
 
@@ -90,3 +90,9 @@ follow as they are; with "login only" encryption TLS is dropped again after the 
 status, prepared statements, transaction-manager requests, attention, bad logins and garbage input. The encoders and
 decoders also have unit tests (`src/tds/wire.rs`). The listener was also checked by hand with
 `System.Data.SqlClient` (parameters, transactions, a stored procedure with OUTPUT and return value, errors).
+
+## Clients
+
+The Microsoft drivers (JDBC, ODBC, `System.Data.SqlClient`) and tiberius work. **jTDS** (DBeaver's "old driver") does not: it sends a LOGIN7 packet without the PRELOGIN handshake and speaks TDS 7.0/7.1, so the server closes the connection. When a connection is dropped before login completes, `tsql-serve` prints the reason on stderr (`tsql-serve: closing a connection during login: ...` or `login handshake failed: ...`).
+
+GUI clients such as DBeaver, SSMS and Azure Data Studio build their navigators from the `sys` catalog views. Those they commonly use are provided (`sys.schemas`, `objects` / `all_objects`, `tables`, `views`, `columns`, `types`, `indexes`, `index_columns`, `foreign_keys`, `foreign_key_columns`, `default_constraints`, `check_constraints`, `key_constraints`, `synonyms`, `sql_modules`, `partitions`, `dm_db_partition_stats`, `database_files`, `database_principals`, ... and the `INFORMATION_SCHEMA` views), as are `OBJECT_DEFINITION`, `OBJECT_ID` (also for triggers), `SERVERPROPERTY` and `sp_help`. `sys.extended_properties` exists but is always empty (descriptions are not kept). If a client reports `Invalid object name 'sys.something'`, that view is missing: tell us which.

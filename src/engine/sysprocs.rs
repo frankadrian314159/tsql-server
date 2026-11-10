@@ -195,8 +195,9 @@ impl<'a> Engine<'a> {
             }
             "sp_columns" => {
                 let n = args.first().map(|a| convert::to_str(&a.1)).unwrap_or_default();
-                let loc = self.locate(&[n.clone()]);
-                let t = self.table_ref(&loc).cloned().ok_or_else(|| self.invalid_object(&[n.clone()]))?;
+                let parts: Vec<String> = n.split('.').map(|p| p.trim().trim_matches(|c| c == '[' || c == ']').to_string()).collect();
+                let loc = self.locate(&parts);
+                let t = self.table_ref(&loc).cloned().ok_or_else(|| self.invalid_object(&parts))?;
                 let rows: Vec<Row> = t
                     .columns
                     .iter()

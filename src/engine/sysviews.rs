@@ -138,13 +138,13 @@ impl<'a> Engine<'a> {
                             }
                         }
                         let parent = 0;
-                        rows.push(vec![sv(o.name()), Value::Int(o.object_id()), Value::Int(sid(o.schema())), Value::Int(parent), sv(o.type_code()), sv(o.type_desc()), date(db.created), date(db.created)]);
+                        rows.push(vec![sv(o.name()), Value::Int(o.object_id()), Value::Int(sid(o.schema())), Value::Int(parent), sv(o.type_code()), sv(o.type_desc()), date(db.created), date(db.created), Value::Bit(false), Value::Null]);
                     }
                     if lname == "objects" || lname == "all_objects" {
                         for o in db.objects.values() {
                             if let Object::Table(t) = o {
                                 let mut add = |n: &str, code: &str, desc: &str| {
-                                    rows.push(vec![sv(n), Value::Int(t.object_id * 10 + rows.len() as i32 % 9 + 1), Value::Int(sid(&t.schema)), Value::Int(t.object_id), sv(code), sv(desc), date(db.created), date(db.created)]);
+                                    rows.push(vec![sv(n), Value::Int(t.object_id * 10 + rows.len() as i32 % 9 + 1), Value::Int(sid(&t.schema)), Value::Int(t.object_id), sv(code), sv(desc), date(db.created), date(db.created), Value::Bit(false), Value::Null]);
                                 };
                                 if let Some(pk) = &t.pk {
                                     add(&pk.name, "PK", "PRIMARY_KEY_CONSTRAINT");
@@ -168,10 +168,10 @@ impl<'a> Engine<'a> {
                                 Some(Object::Table(t)) => t.object_id,
                                 _ => 0,
                             };
-                            rows.push(vec![sv(&trg.name), Value::Int(trg.object_id), Value::Int(sid(&trg.schema)), Value::Int(pid), sv("TR"), sv("SQL_TRIGGER"), date(db.created), date(db.created)]);
+                            rows.push(vec![sv(&trg.name), Value::Int(trg.object_id), Value::Int(sid(&trg.schema)), Value::Int(pid), sv("TR"), sv("SQL_TRIGGER"), date(db.created), date(db.created), Value::Bit(false), Value::Null]);
                         }
                     }
-                    Some(rs(&[("name", nv()), ("object_id", DataType::Int), ("schema_id", DataType::Int), ("parent_object_id", DataType::Int), ("type", DataType::Char(2)), ("type_desc", nv()), ("create_date", DataType::DateTime), ("modify_date", DataType::DateTime)], rows))
+                    Some(rs(&[("name", nv()), ("object_id", DataType::Int), ("schema_id", DataType::Int), ("parent_object_id", DataType::Int), ("type", DataType::Char(2)), ("type_desc", nv()), ("create_date", DataType::DateTime), ("modify_date", DataType::DateTime), ("is_ms_shipped", DataType::Bit), ("principal_id", DataType::Int)], rows))
                 }
                 "columns" | "all_columns" => {
                     let mut rows = vec![];
@@ -179,11 +179,11 @@ impl<'a> Engine<'a> {
                         if let Object::Table(t) = o {
                             for (i, c) in t.columns.iter().enumerate() {
                                 let (st, ml, p, s) = type_info(&c.ty);
-                                rows.push(vec![Value::Int(t.object_id), sv(&c.name), Value::Int(i as i32 + 1), Value::Int(st), Value::Int(st), Value::Int(ml), Value::Int(p), Value::Int(s), Value::Bit(c.nullable), Value::Bit(c.identity.is_some()), Value::Bit(c.computed.is_some()), if c.ty.is_string() { sv(c.collation.as_deref().unwrap_or(&db.collation_or_default())) } else { Value::Null }]);
+                                rows.push(vec![Value::Int(t.object_id), sv(&c.name), Value::Int(i as i32 + 1), Value::Int(st), Value::Int(st), Value::Int(ml), Value::Int(p), Value::Int(s), Value::Bit(c.nullable), Value::Bit(c.identity.is_some()), Value::Bit(c.computed.is_some()), if c.ty.is_string() { sv(c.collation.as_deref().unwrap_or(&db.collation_or_default())) } else { Value::Null }, Value::Int(if c.default_name.is_some() { t.object_id * 1000 + 500 + i as i32 } else { 0 })]);
                             }
                         }
                     }
-                    Some(rs(&[("object_id", DataType::Int), ("name", nv()), ("column_id", DataType::Int), ("system_type_id", DataType::Int), ("user_type_id", DataType::Int), ("max_length", DataType::SmallInt), ("precision", DataType::TinyInt), ("scale", DataType::TinyInt), ("is_nullable", DataType::Bit), ("is_identity", DataType::Bit), ("is_computed", DataType::Bit), ("collation_name", nv())], rows))
+                    Some(rs(&[("object_id", DataType::Int), ("name", nv()), ("column_id", DataType::Int), ("system_type_id", DataType::Int), ("user_type_id", DataType::Int), ("max_length", DataType::SmallInt), ("precision", DataType::TinyInt), ("scale", DataType::TinyInt), ("is_nullable", DataType::Bit), ("is_identity", DataType::Bit), ("is_computed", DataType::Bit), ("collation_name", nv()), ("default_object_id", DataType::Int)], rows))
                 }
                 "parameters" | "all_parameters" => {
                     // the parameters of procedures and functions (the return value of a function is not listed)
@@ -272,18 +272,59 @@ impl<'a> Engine<'a> {
                 }
                 "types" | "systypes" => {
                     let builtin = [("int", 56), ("bigint", 127), ("smallint", 52), ("tinyint", 48), ("bit", 104), ("decimal", 106), ("numeric", 108), ("money", 60), ("smallmoney", 122), ("float", 62), ("real", 59), ("char", 175), ("varchar", 167), ("nchar", 239), ("nvarchar", 231), ("text", 35), ("ntext", 99), ("binary", 173), ("varbinary", 165), ("image", 34), ("date", 40), ("time", 41), ("datetime", 61), ("smalldatetime", 58), ("datetime2", 42), ("datetimeoffset", 43), ("uniqueidentifier", 36), ("xml", 241), ("sql_variant", 98), ("timestamp", 189)];
-                    let mut rows: Vec<Row> = builtin.iter().map(|(n, id)| vec![sv(n), Value::Int(*id), Value::Int(*id), Value::Int(4), Value::Bit(false)]).collect();
+                    // (max_length, precision, scale) of each system type
+                    let size = |n: &str| -> (i32, i32, i32) {
+                        match n {
+                            "int" => (4, 10, 0),
+                            "bigint" => (8, 19, 0),
+                            "smallint" => (2, 5, 0),
+                            "tinyint" => (1, 3, 0),
+                            "bit" => (1, 1, 0),
+                            "decimal" | "numeric" => (17, 18, 0),
+                            "money" => (8, 19, 4),
+                            "smallmoney" => (4, 10, 4),
+                            "float" => (8, 53, 0),
+                            "real" => (4, 24, 0),
+                            "char" | "varchar" | "nchar" | "nvarchar" | "binary" | "varbinary" => (8000, 0, 0),
+                            "text" | "ntext" | "image" => (16, 0, 0),
+                            "date" => (3, 10, 0),
+                            "time" => (5, 16, 7),
+                            "datetime" => (8, 23, 3),
+                            "smalldatetime" => (4, 16, 0),
+                            "datetime2" => (8, 27, 7),
+                            "datetimeoffset" => (10, 34, 7),
+                            "uniqueidentifier" => (16, 0, 0),
+                            "xml" => (-1, 0, 0),
+                            "sql_variant" => (8016, 0, 0),
+                            _ => (8, 0, 0),
+                        }
+                    };
+                    let mut rows: Vec<Row> = builtin
+                        .iter()
+                        .map(|(n, id)| {
+                            let (ml, p, sc) = size(n);
+                            vec![sv(n), Value::Int(*id), Value::Int(*id), Value::Int(4), Value::Bit(false), Value::Int(ml), Value::Int(p), Value::Int(sc), Value::Bit(true)]
+                        })
+                        .collect();
                     for u in db.types.values() {
-                        rows.push(vec![sv(&u.name), Value::Int(u.type_id), Value::Int(0), Value::Int(sid(&u.schema)), Value::Bit(true)]);
+                        rows.push(vec![sv(&u.name), Value::Int(u.type_id), Value::Int(0), Value::Int(sid(&u.schema)), Value::Bit(true), Value::Int(0), Value::Int(0), Value::Int(0), Value::Bit(true)]);
                     }
-                    Some(rs(&[("name", nv()), ("user_type_id", DataType::Int), ("system_type_id", DataType::Int), ("schema_id", DataType::Int), ("is_user_defined", DataType::Bit)], rows))
+                    Some(rs(&[("name", nv()), ("user_type_id", DataType::Int), ("system_type_id", DataType::Int), ("schema_id", DataType::Int), ("is_user_defined", DataType::Bit), ("max_length", DataType::SmallInt), ("precision", DataType::TinyInt), ("scale", DataType::TinyInt), ("is_nullable", DataType::Bit)], rows))
                 }
                 "indexes" => {
                     let mut rows = vec![];
                     for o in db.objects.values() {
                         if let Object::Table(t) = o {
                             let mut id = 1;
-                            let row = |name: Value, id: i32, ty: &str, uniq: bool, pk: bool, f: &Option<crate::storage::FilterPred>| vec![Value::Int(t.object_id), name, Value::Int(id), sv(ty), Value::Bit(uniq), Value::Bit(pk), Value::Bit(f.is_some()), f.as_ref().map(|f| sv(&f.text)).unwrap_or(Value::Null)];
+                            let row = |name: Value, id: i32, ty: &str, uniq: bool, pk: bool, f: &Option<crate::storage::FilterPred>| {
+                                let code = match ty {
+                                    "HEAP" => 0,
+                                    "CLUSTERED" => 1,
+                                    _ => 2,
+                                };
+                                let uq_constraint = uniq && !pk && !f.is_some() && matches!(&name, Value::Str(n) if t.uniques.iter().any(|u| !u.is_index && u.name == *n));
+                                vec![Value::Int(t.object_id), name, Value::Int(id), sv(ty), Value::Bit(uniq), Value::Bit(pk), Value::Bit(f.is_some()), f.as_ref().map(|f| sv(&f.text)).unwrap_or(Value::Null), Value::Int(code), Value::Bit(uq_constraint), Value::Bit(false), Value::Int(0)]
+                            };
                             if t.pk.is_none() {
                                 rows.push(row(Value::Null, 0, "HEAP", false, false, &None));
                             }
@@ -301,7 +342,7 @@ impl<'a> Engine<'a> {
                             }
                         }
                     }
-                    Some(rs(&[("object_id", DataType::Int), ("name", nv()), ("index_id", DataType::Int), ("type_desc", nv()), ("is_unique", DataType::Bit), ("is_primary_key", DataType::Bit), ("has_filter", DataType::Bit), ("filter_definition", DataType::NVarChar(MAX))], rows))
+                    Some(rs(&[("object_id", DataType::Int), ("name", nv()), ("index_id", DataType::Int), ("type_desc", nv()), ("is_unique", DataType::Bit), ("is_primary_key", DataType::Bit), ("has_filter", DataType::Bit), ("filter_definition", DataType::NVarChar(MAX)), ("type", DataType::TinyInt), ("is_unique_constraint", DataType::Bit), ("is_disabled", DataType::Bit), ("fill_factor", DataType::TinyInt)], rows))
                 }
                 "index_columns" => {
                     let mut rows = vec![];
@@ -310,45 +351,115 @@ impl<'a> Engine<'a> {
                             let mut id = 1;
                             if let Some(pk) = &t.pk {
                                 for (k, &c) in pk.cols.iter().enumerate() {
-                                    rows.push(vec![Value::Int(t.object_id), Value::Int(id), Value::Int(k as i32 + 1), Value::Int(c as i32 + 1), Value::Bit(false), Value::Bit(false)]);
+                                    rows.push(vec![Value::Int(t.object_id), Value::Int(id), Value::Int(k as i32 + 1), Value::Int(c as i32 + 1), Value::Bit(false), Value::Bit(false), Value::Int(k as i32 + 1), Value::Int(0)]);
                                 }
                                 id += 1;
                             }
                             for u in t.uniques.iter().filter(|u| !u.is_index) {
                                 for (k, &c) in u.cols.iter().enumerate() {
-                                    rows.push(vec![Value::Int(t.object_id), Value::Int(id), Value::Int(k as i32 + 1), Value::Int(c as i32 + 1), Value::Bit(false), Value::Bit(false)]);
+                                    rows.push(vec![Value::Int(t.object_id), Value::Int(id), Value::Int(k as i32 + 1), Value::Int(c as i32 + 1), Value::Bit(false), Value::Bit(false), Value::Int(k as i32 + 1), Value::Int(0)]);
                                 }
                                 id += 1;
                             }
                             for i in &t.indexes {
                                 for (k, (c, desc)) in i.cols.iter().enumerate() {
-                                    rows.push(vec![Value::Int(t.object_id), Value::Int(id), Value::Int(k as i32 + 1), Value::Int(*c as i32 + 1), Value::Bit(*desc), Value::Bit(false)]);
+                                    rows.push(vec![Value::Int(t.object_id), Value::Int(id), Value::Int(k as i32 + 1), Value::Int(*c as i32 + 1), Value::Bit(*desc), Value::Bit(false), Value::Int(k as i32 + 1), Value::Int(0)]);
                                 }
                                 for (k, &c) in i.include.iter().enumerate() {
-                                    rows.push(vec![Value::Int(t.object_id), Value::Int(id), Value::Int(0), Value::Int(c as i32 + 1), Value::Bit(false), Value::Bit(true)]);
+                                    rows.push(vec![Value::Int(t.object_id), Value::Int(id), Value::Int(0), Value::Int(c as i32 + 1), Value::Bit(false), Value::Bit(true), Value::Int(0), Value::Int(0)]);
                                     let _ = k;
                                 }
                                 id += 1;
                             }
                         }
                     }
-                    Some(rs(&[("object_id", DataType::Int), ("index_id", DataType::Int), ("index_column_id", DataType::Int), ("column_id", DataType::Int), ("is_descending_key", DataType::Bit), ("is_included_column", DataType::Bit)], rows))
+                    Some(rs(&[("object_id", DataType::Int), ("index_id", DataType::Int), ("index_column_id", DataType::Int), ("column_id", DataType::Int), ("is_descending_key", DataType::Bit), ("is_included_column", DataType::Bit), ("key_ordinal", DataType::TinyInt), ("partition_ordinal", DataType::TinyInt)], rows))
                 }
                 "foreign_keys" => {
                     let mut rows = vec![];
                     for o in db.objects.values() {
                         if let Object::Table(t) = o {
-                            for f in &t.fks {
+                            for (k, f) in t.fks.iter().enumerate() {
                                 let rid = match db.objects.get(&f.ref_key) {
                                     Some(Object::Table(p)) => p.object_id,
                                     _ => 0,
                                 };
-                                rows.push(vec![sv(&f.name), Value::Int(t.object_id * 10 + 1), Value::Int(t.object_id), Value::Int(rid), sv(&f.on_delete.replace(' ', "_")), sv(&f.on_update.replace(' ', "_"))]);
+                                rows.push(vec![sv(&f.name), Value::Int(t.object_id * 1000 + 1 + k as i32), Value::Int(t.object_id), Value::Int(rid), sv(&f.on_delete.replace(' ', "_")), sv(&f.on_update.replace(' ', "_"))]);
                             }
                         }
                     }
                     Some(rs(&[("name", nv()), ("object_id", DataType::Int), ("parent_object_id", DataType::Int), ("referenced_object_id", DataType::Int), ("delete_referential_action_desc", nv()), ("update_referential_action_desc", nv())], rows))
                 }
+                "partitions" | "dm_db_partition_stats" => {
+                    // one partition per table (heap or clustered index); the sizes are estimates from the row count
+                    let stats = lname == "dm_db_partition_stats";
+                    let mut rows = vec![];
+                    for o in db.objects.values() {
+                        if let Object::Table(t) = o {
+                            let n = t.data.slot_count() as i64;
+                            let pages = (n / 40 + 1).max(1);
+                            let idx = if t.pk.is_some() { 1 } else { 0 };
+                            if stats {
+                                rows.push(vec![Value::Int(t.object_id), Value::Int(idx), Value::Int(1), Value::BigInt(n), Value::BigInt(pages), Value::BigInt(pages), Value::BigInt(pages)]);
+                            } else {
+                                rows.push(vec![Value::Int(t.object_id), Value::Int(idx), Value::Int(1), Value::BigInt(n), Value::Int(0), Value::BigInt(t.object_id as i64 * 10 + idx as i64)]);
+                            }
+                        }
+                    }
+                    Some(if stats {
+                        rs(&[("object_id", DataType::Int), ("index_id", DataType::Int), ("partition_number", DataType::Int), ("row_count", DataType::BigInt), ("used_page_count", DataType::BigInt), ("reserved_page_count", DataType::BigInt), ("in_row_data_page_count", DataType::BigInt)], rows)
+                    } else {
+                        rs(&[("object_id", DataType::Int), ("index_id", DataType::Int), ("partition_number", DataType::Int), ("rows", DataType::BigInt), ("data_compression", DataType::TinyInt), ("partition_id", DataType::BigInt)], rows)
+                    })
+                }
+                "database_files" => Some(rs(
+                    &[("file_id", DataType::Int), ("name", nv()), ("physical_name", nv()), ("type_desc", nv()), ("state_desc", nv()), ("size", DataType::Int), ("max_size", DataType::Int), ("growth", DataType::Int)],
+                    vec![vec![Value::Int(1), sv(&dbname), sv(&format!("{}.mdf", dbname)), sv("ROWS"), sv("ONLINE"), Value::Int(128), Value::Int(-1), Value::Int(0)]],
+                )),
+                "foreign_key_columns" => {
+                    let mut rows = vec![];
+                    for o in db.objects.values() {
+                        if let Object::Table(t) = o {
+                            for (k, f) in t.fks.iter().enumerate() {
+                                let refd = match db.objects.get(&f.ref_key) {
+                                    Some(Object::Table(p)) => Some(p),
+                                    _ => None,
+                                };
+                                for (i, c) in f.cols.iter().enumerate() {
+                                    let ref_col = refd.and_then(|p| f.ref_cols.get(i).and_then(|n| p.col_index(n))).map(|x| x as i32 + 1).unwrap_or(0);
+                                    rows.push(vec![Value::Int(t.object_id * 1000 + 1 + k as i32), Value::Int(i as i32 + 1), Value::Int(t.object_id), Value::Int(*c as i32 + 1), Value::Int(refd.map(|p| p.object_id).unwrap_or(0)), Value::Int(ref_col)]);
+                                }
+                            }
+                        }
+                    }
+                    Some(rs(&[("constraint_object_id", DataType::Int), ("constraint_column_id", DataType::Int), ("parent_object_id", DataType::Int), ("parent_column_id", DataType::Int), ("referenced_object_id", DataType::Int), ("referenced_column_id", DataType::Int)], rows))
+                }
+                "default_constraints" => {
+                    let mut rows = vec![];
+                    for o in db.objects.values() {
+                        if let Object::Table(t) = o {
+                            for (i, c) in t.columns.iter().enumerate() {
+                                if let (Some(name), Some(text)) = (&c.default_name, &c.default_text) {
+                                    rows.push(vec![sv(name), Value::Int(t.object_id * 1000 + 500 + i as i32), Value::Int(t.object_id), Value::Int(i as i32 + 1), sv(&format!("({})", text)), sv("D"), sv("DEFAULT_CONSTRAINT"), Value::Int(sid(&t.schema))]);
+                                }
+                            }
+                        }
+                    }
+                    Some(rs(&[("name", nv()), ("object_id", DataType::Int), ("parent_object_id", DataType::Int), ("parent_column_id", DataType::Int), ("definition", nv()), ("type", DataType::Char(2)), ("type_desc", nv()), ("schema_id", DataType::Int)], rows))
+                }
+                "synonyms" => {
+                    let rows = db
+                        .objects
+                        .values()
+                        .filter_map(|o| match o {
+                            Object::Synonym(s) => Some(vec![sv(&s.name), Value::Int(s.object_id), Value::Int(sid(&s.schema)), sv(&s.target.iter().map(|p| format!("[{}]", p)).collect::<Vec<_>>().join(".")), sv("SN")]),
+                            _ => None,
+                        })
+                        .collect();
+                    Some(rs(&[("name", nv()), ("object_id", DataType::Int), ("schema_id", DataType::Int), ("base_object_name", nv()), ("type", DataType::Char(2))], rows))
+                }
+                // descriptions (MS_Description and the like) are not kept: clients ask for them and get none
+                "extended_properties" => Some(rs(&[("class", DataType::TinyInt), ("class_desc", nv()), ("major_id", DataType::Int), ("minor_id", DataType::Int), ("name", nv()), ("value", DataType::Variant)], vec![])),
                 "check_constraints" => {
                     let mut rows = vec![];
                     for o in db.objects.values() {

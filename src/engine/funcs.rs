@@ -1736,13 +1736,35 @@ impl<'a> Engine<'a> {
                     let loc = self.locate(&parts);
                     let want = if a.len() > 1 && !a[1].is_null() { Some(s(&a[1]).trim().to_uppercase()) } else { None };
                     let found = match &loc {
-                        Loc::Db(..) => self.object_ref(&loc).map(|o| (o.object_id(), o.type_code().to_string())),
+                        Loc::Db(d, k) => self
+                            .object_ref(&loc)
+                            .map(|o| (o.object_id(), o.type_code().to_string()))
+                            // triggers are kept apart from the other objects
+                            .or_else(|| self.srv.databases.get(d).and_then(|db| db.triggers.get(k)).map(|(_, t)| (t.object_id, "TR".to_string()))),
                         _ => self.table_ref(&loc).map(|t| (t.object_id, "U".to_string())),
                     };
                     match found {
                         Some((id, tc)) if want.as_ref().map(|w| *w == tc || (w == "FN" && matches!(tc.as_str(), "FN" | "IF" | "TF"))).unwrap_or(true) => Value::Int(id),
                         _ => Value::Null,
                     }
+                }
+            }
+            "OBJECT_DEFINITION" => {
+                need(name, &a, 1)?;
+                if a[0].is_null() {
+                    Value::Null
+                } else {
+                    let id = int(&a[0])?;
+                    let db = self.srv.databases.get(&self.ses.db.to_lowercase());
+                    let text = db.and_then(|d| {
+                        d.objects.values().find(|o| o.object_id() as i64 == id).and_then(|o| match o {
+                            Object::View(v) => Some(v.text.clone()),
+                            Object::Proc(p) => Some(p.text.clone()),
+                            Object::Func(f) => Some(f.def.text.clone()),
+                            _ => None,
+                        }).or_else(|| d.triggers.values().find(|(_, t)| t.object_id as i64 == id).map(|(_, t)| t.text.clone()))
+                    });
+                    text.map(Value::Str).unwrap_or(Value::Null)
                 }
             }
             "OBJECT_NAME" | "OBJECT_SCHEMA_NAME" => {
