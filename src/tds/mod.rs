@@ -392,6 +392,9 @@ impl Session {
         let mut rd = Rd::new(payload);
         rd.all_headers()?;
         let sql = rd.utf16(rd.left() / 2)?;
+        if tracing() {
+            trace(&format!("batch: {:?}", sql));
+        }
         let mut out = vec![];
         let mut live = Live::new(Reply::Batch);
         {
@@ -407,6 +410,9 @@ impl Session {
     /// Run the batch for one RPC and write its tokens; returns whether it failed.
     fn run_plan(&mut self, plan: &rpc::Plan, params: &[rpc::Param], out: &mut Vec<u8>, status_override: Option<i32>) -> bool {
         // the trailer is the last result set whose first column is the marker; `Live` keeps it apart
+        if tracing() {
+            trace(&format!("rpc batch: {:?}", plan.sql));
+        }
         let mut live = Live::new(Reply::Proc);
         {
             let Session { t, conn, .. } = self;
