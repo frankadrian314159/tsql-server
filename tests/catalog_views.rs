@@ -95,3 +95,13 @@ fn sp_help_and_sp_columns_accept_schema_qualified_names() {
     assert_eq!(rows(&mut c, "EXEC sp_columns '[dbo].[p]'").len(), 3);
     assert_eq!(rows(&mut c, "EXEC sp_help 'dbo.p'").len(), 3);
 }
+
+#[test]
+fn computed_columns_are_listed() {
+    let mut c = conn();
+    setup(&mut c);
+    script(&mut c, "CREATE TABLE dbo.cc (a INT, b INT, s AS a + b)");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM master.sys.computed_columns WHERE object_id = OBJECT_ID('dbo.cc')"), "1");
+    assert_eq!(scalar(&mut c, "SELECT name FROM sys.computed_columns WHERE object_id = OBJECT_ID('dbo.cc')"), "s");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.computed_columns WHERE object_id = OBJECT_ID('dbo.p')"), "0");
+}

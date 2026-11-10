@@ -243,6 +243,19 @@ impl<'a> Engine<'a> {
                     }
                     Some(rs(&[("object_id", DataType::Int), ("name", nv()), ("column_id", DataType::Int), ("seed_value", DataType::BigInt), ("increment_value", DataType::BigInt), ("last_value", DataType::BigInt)], rows))
                 }
+                "computed_columns" => {
+                    let mut rows = vec![];
+                    for o in db.objects.values() {
+                        if let Object::Table(t) = o {
+                            for (i, c) in t.columns.iter().enumerate() {
+                                if c.computed.is_some() {
+                                    rows.push(vec![Value::Int(t.object_id), sv(&c.name), Value::Int(i as i32 + 1), sv(c.computed_text.as_deref().unwrap_or("")), Value::Bit(false)]);
+                                }
+                            }
+                        }
+                    }
+                    Some(rs(&[("object_id", DataType::Int), ("name", nv()), ("column_id", DataType::Int), ("definition", nv()), ("is_persisted", DataType::Bit)], rows))
+                }
                 "schemas" => {
                     let rows = db.schemas.values().map(|s| vec![sv(s), Value::Int(sid(s)), Value::Int(1)]).collect();
                     Some(rs(&[("name", nv()), ("schema_id", DataType::Int), ("principal_id", DataType::Int)], rows))
