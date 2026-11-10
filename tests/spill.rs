@@ -174,7 +174,7 @@ fn unsupported_shapes_fall_back_to_the_general_executor() {
     for q in [
         "SELECT grp, COUNT(*) FROM big GROUP BY ROLLUP(grp)",
         "SELECT COUNT(*) FROM big",
-        "SELECT grp, ROW_NUMBER() OVER (ORDER BY id) FROM big ORDER BY id",
+        "SELECT grp, ROW_NUMBER() OVER (ORDER BY id), RANK() OVER (ORDER BY grp) FROM big ORDER BY id",
         "SELECT a.id FROM big a JOIN big b ON a.id = b.id ORDER BY a.id",
     ] {
         exec(&mut c, q);
@@ -429,9 +429,142 @@ fn abandoning_a_streamed_result_stops_the_statement_and_cleans_up() {
 fn results_that_are_not_streamable_still_arrive_whole() {
     let (s, mut c, dir) = join_setup();
     s.set_work_mem(4096, 0, Some(dir.path().to_path_buf()));
-    for q in ["SELECT COUNT(*) AS n FROM fact", "SELECT id FROM fact UNION SELECT id FROM dim ORDER BY 1", "SELECT TOP 5 PERCENT id FROM fact ORDER BY id", "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS r FROM dim"] {
+    for q in ["SELECT COUNT(*) AS n FROM fact", "SELECT id FROM fact UNION SELECT id FROM dim ORDER BY 1", "SELECT TOP 5 PERCENT id FROM fact ORDER BY id", "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS r, RANK() OVER (ORDER BY region) AS k FROM dim"] {
         let (got, whole, _) = streamed(&mut c, q);
         assert_eq!(whole, 1, "{q}");
         assert_eq!(got, rows(&mut c, q), "{q}");
     }
+}
+
+/// Set operations whose inputs exceed the budget run on external sorts; the answers (and their order) must equal
+/// those of the in-memory hash implementation, and no spill file may be left behind.
+#[test]
+fn set_operations_over_big_inputs_match_the_in_memory_ones() {
+    let (s, mut c, dir) = setup();
+    for q in [
+        "SELECT grp, name FROM big UNION SELECT grp + 1, name FROM big",
+        "SELECT grp FROM big UNION ALL SELECT grp FROM big WHERE id < 100",
+        "SELECT name FROM big INTERSECT SELECT name FROM big WHERE grp < 10",
+        "SELECT name, grp FROM big EXCEPT SELECT name, grp FROM big WHERE id % 2 = 0",
+        "SELECT grp FROM big EXCEPT SELECT grp FROM big WHERE grp > 5",
+        "SELECT note FROM big INTERSECT SELECT note FROM big WHERE id % 3 = 0",
+        "SELECT id FROM big WHERE id < 500 UNION SELECT id FROM big WHERE id > 300 AND id < 900 ORDER BY id DESC",
+        "SELECT TOP 20 name FROM (SELECT name FROM big UNION SELECT name FROM big) d ORDER BY name",
+    ] {
+        s.set_work_mem(2048, 0, Some(dir.path().to_path_buf()));
+        let external = rows(&mut c, q);
+        let plan = c.last_plan().join("
+");
+        assert!(plan.contains("external sort"), "set operation did not spill for {q}: {plan}");
+        s.set_work_mem(256 << 20, usize::MAX, Some(dir.path().to_path_buf()));
+        let in_memory = rows(&mut c, q);
+        assert_eq!(external, in_memory, "set operation differs for: {q}");
+        assert!(!external.is_empty(), "{q}");
+    }
+    assert_eq!(spill_files(dir.path()), 0, "spill files are removed after the statement");
+}
+
+/// A derived table or CTE over a big table collects its rows in a buffer that spills to a file, and whatever reads
+/// it gets the same answer as without spilling.
+#[test]
+fn derived_tables_and_ctes_over_big_tables_spill_into_a_buffer() {
+    let (s, mut c, dir) = setup();
+    for q in [
+        "SELECT COUNT(*), SUM(grp) FROM (SELECT id, grp FROM big WHERE id % 2 = 0) d",
+        "WITH c AS (SELECT id, name FROM big WHERE id > 10) SELECT COUNT(*), MIN(name) FROM c",
+        "SELECT TOP 5 d.id FROM (SELECT id, grp FROM big) d JOIN (SELECT grp FROM big WHERE id < 100) e ON e.grp = d.grp ORDER BY d.id",
+        "SELECT x.grp, COUNT(*) FROM (SELECT grp, name FROM big ORDER BY name, id) x GROUP BY x.grp ORDER BY x.grp",
+    ] {
+        s.set_work_mem(2048, 0, Some(dir.path().to_path_buf()));
+        let small = rows(&mut c, q);
+        let plan = c.last_plan().join("\n");
+        assert!(plan.contains("buffered (spilled"), "no spilled buffer for {q}: {plan}");
+        s.set_work_mem(256 << 20, usize::MAX, Some(dir.path().to_path_buf()));
+        let big = rows(&mut c, q);
+        assert_eq!(small, big, "{q}");
+    }
+    assert_eq!(spill_files(dir.path()), 0, "spill files are removed after the statement");
+}
+
+/// Window functions over a big table run on an external sort by partition and order, one partition at a time, and
+/// agree with the general executor.
+#[test]
+fn window_functions_run_partition_by_partition() {
+    let (s, mut c, dir) = setup();
+    for q in [
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY id) AS rn FROM big",
+        "SELECT id, RANK() OVER (PARTITION BY grp ORDER BY name), DENSE_RANK() OVER (PARTITION BY grp ORDER BY name) FROM big",
+        "SELECT id, SUM(val) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM big",
+        "SELECT id, LAG(val) OVER (PARTITION BY grp ORDER BY id), LEAD(val, 2) OVER (PARTITION BY grp ORDER BY id) FROM big",
+        "SELECT id, grp, COUNT(*) OVER (PARTITION BY grp) AS n, MAX(val) OVER (PARTITION BY grp) AS m FROM big WHERE id < 3000",
+        "SELECT TOP 50 id, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val DESC, id) AS rn FROM big ORDER BY rn, id",
+        "SELECT DISTINCT grp, COUNT(*) OVER (PARTITION BY grp) FROM big",
+        "SELECT id, NTILE(4) OVER (PARTITION BY grp ORDER BY id) FROM big ORDER BY id DESC",
+    ] {
+        s.set_work_mem(4096, 0, Some(dir.path().to_path_buf()));
+        let streamed = rows(&mut c, q);
+        let plan = c.last_plan().join("\n");
+        assert!(plan.contains("window by sort"), "windows did not stream for {q}: {plan}");
+        s.set_work_mem(256 << 20, usize::MAX, Some(dir.path().to_path_buf()));
+        let general = rows(&mut c, q);
+        let mut a = streamed.clone();
+        let mut b = general.clone();
+        // without ORDER BY the order of rows is unspecified; compare as sets then
+        if !q.contains("ORDER BY id DESC") && !q.contains("ORDER BY rn") {
+            a.sort();
+            b.sort();
+        }
+        assert_eq!(a, b, "window results differ for {q}");
+    }
+    assert_eq!(spill_files(dir.path()), 0, "spill files are removed after the statement");
+}
+
+/// RIGHT and FULL joins stream too: build rows nobody matched (including those with a NULL key) are kept.
+#[test]
+fn right_and_full_joins_spill_and_match_the_general_executor() {
+    let (s, mut c, dir) = join_setup();
+    for q in [
+        "SELECT f.id, d.id, d.label FROM fact f RIGHT JOIN dim d ON f.dim_id = d.id",
+        "SELECT f.id, d.id FROM fact f FULL JOIN dim d ON f.dim_id = d.id",
+        "SELECT f.id, d.id FROM dim d RIGHT JOIN fact f ON f.dim_id = d.id AND d.region < 5",
+        "SELECT f.id, d.id FROM fact f FULL JOIN dim d ON f.dim_id = d.id AND f.qty > d.region WHERE f.id IS NULL OR d.id IS NULL",
+        "SELECT d.region, COUNT(f.id) AS n, COUNT(*) AS m FROM fact f RIGHT JOIN dim d ON f.dim_id = d.id GROUP BY d.region ORDER BY d.region",
+        "SELECT f.id, d.id, r.rname FROM fact f JOIN dim d ON f.dim_id = d.id FULL JOIN reg r ON d.region = r.region",
+        "SELECT r.region, d.id FROM dim d RIGHT JOIN reg r ON d.region = r.region WHERE r.region > 8",
+    ] {
+        for budget in [4096usize, 1 << 20] {
+            let (r, _) = same_join(&s, &mut c, dir.path(), q, budget);
+            assert!(!r.is_empty(), "{q}");
+        }
+    }
+    // build rows with a NULL key are kept by a right join even though they match nothing
+    script(&mut c, "CREATE TABLE nk (k INT NULL, v INT);\nINSERT nk VALUES (NULL, 1), (NULL, 2), (5, 3);");
+    for budget in [4096usize, 1 << 20] {
+        s.set_work_mem(budget, 0, Some(dir.path().to_path_buf()));
+        let r = rows(&mut c, "SELECT COUNT(*), COUNT(f.id) FROM fact f RIGHT JOIN nk ON f.dim_id = nk.k");
+        assert_eq!(r[0][0].parse::<usize>().unwrap() >= 3, true);
+    }
+    assert_eq!(spill_files(dir.path()), 0);
+}
+
+/// A SELECT that sorts, groups, de-duplicates or windows a derived table or CTE reads it from its buffer.
+#[test]
+fn queries_over_derived_tables_and_ctes_stream_from_the_buffer() {
+    let (s, mut c, dir) = setup();
+    for q in [
+        "SELECT x.grp, COUNT(*) AS n FROM (SELECT grp, name FROM big) x GROUP BY x.grp ORDER BY x.grp",
+        "SELECT x.id FROM (SELECT id, grp FROM big WHERE grp < 30) x ORDER BY x.grp DESC, x.id",
+        "SELECT DISTINCT x.name FROM (SELECT name FROM big UNION ALL SELECT name FROM big) x ORDER BY x.name",
+        "WITH c AS (SELECT id, grp, val FROM big) SELECT id, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn FROM c ORDER BY id",
+        "WITH c AS (SELECT id, name FROM big) SELECT TOP 10 id, name FROM c ORDER BY name DESC, id",
+    ] {
+        s.set_work_mem(2048, 0, Some(dir.path().to_path_buf()));
+        let streamed = rows(&mut c, q);
+        let plan = c.last_plan().join("\n");
+        assert!(plan.contains("streaming rowset source"), "not streamed from the buffer: {q}: {plan}");
+        s.set_work_mem(256 << 20, usize::MAX, Some(dir.path().to_path_buf()));
+        let general = rows(&mut c, q);
+        assert_eq!(streamed, general, "{q}");
+    }
+    assert_eq!(spill_files(dir.path()), 0);
 }

@@ -24,6 +24,8 @@ const PARTS: usize = 32;
 pub struct JoinSpec {
     /// Left outer join: probe rows without a match are kept, extended with NULLs.
     pub left: bool,
+    /// Right outer join: build rows that no probe row matched are kept, preceded by NULLs (FULL is both).
+    pub right: bool,
     /// Key expressions over the probe row (the rows joined so far) and over the build row, pairwise equal.
     pub left_keys: Vec<Expr>,
     pub right_keys: Vec<Expr>,
@@ -71,6 +73,10 @@ pub struct HashJoin {
     budget: usize,
     work: WorkMem,
     map: HashMap<String, Vec<Row>>,
+    /// Right/full joins: which build rows of `map` have matched.
+    flags: HashMap<String, Vec<bool>>,
+    /// Right/full joins: build rows whose key is NULL (they match nothing but are kept).
+    null_build: Option<PartWriter>,
     mem: usize,
     grace: Option<Grace>,
     right_cols: usize,
@@ -86,7 +92,7 @@ type Emit<'e> = &'e mut dyn FnMut(&mut Engine<'_>, Row) -> Result<bool>;
 impl HashJoin {
     pub fn new(spec: JoinSpec, budget: usize, work: WorkMem) -> HashJoin {
         let right_cols = spec.right_schema.cols.len();
-        HashJoin { spec, budget: budget.max(1), work, map: HashMap::new(), mem: 0, grace: None, right_cols, built: 0, probed: 0, spilled_partitions: 0, extra_passes: 0 }
+        HashJoin { spec, budget: budget.max(1), work, map: HashMap::new(), flags: HashMap::new(), null_build: None, mem: 0, grace: None, right_cols, built: 0, probed: 0, spilled_partitions: 0, extra_passes: 0 }
     }
 
     /// Did the build side overflow into partition files?
@@ -99,6 +105,7 @@ impl HashJoin {
         for _ in 0..PARTS {
             build.push(PartWriter::create(&self.work.dir)?);
         }
+        self.flags.clear();
         for (k, rows) in self.map.drain() {
             let p = part_of(&k);
             for r in rows {
@@ -116,7 +123,15 @@ impl HashJoin {
     /// Add one row of the build side.
     pub fn add_build(&mut self, eng: &mut Engine<'_>, row: Row, outer: Option<&Env<'_>>) -> Result<()> {
         self.built += 1;
-        let Some(k) = key_for(eng, &self.spec.right_keys, &self.spec.colls, &self.spec.right_schema, &row, outer)? else { return Ok(()) };
+        let Some(k) = key_for(eng, &self.spec.right_keys, &self.spec.colls, &self.spec.right_schema, &row, outer)? else {
+            if self.spec.right {
+                if self.null_build.is_none() {
+                    self.null_build = Some(PartWriter::create(&self.work.dir)?);
+                }
+                self.null_build.as_mut().unwrap().push(&row)?;
+            }
+            return Ok(());
+        };
         if let Some(g) = self.grace.as_mut() {
             let mut stored = Vec::with_capacity(row.len() + 1);
             stored.push(Value::Str(k.clone()));
@@ -124,11 +139,21 @@ impl HashJoin {
             return g.build[part_of(&k)].push(&stored);
         }
         self.mem += row_bytes(&row) + k.len() + 64;
+        if self.spec.right {
+            self.flags.entry(k.clone()).or_default().push(false);
+        }
         self.map.entry(k).or_default().push(row);
         if self.mem > self.budget {
             self.go_grace()?;
         }
         Ok(())
+    }
+
+    /// A build row with NULLs in place of the probe columns.
+    fn left_null_extended(&self, brow: &[Value]) -> Row {
+        let mut row: Row = std::iter::repeat(Value::Null).take(self.spec.left_schema.cols.len()).collect();
+        row.extend(brow.iter().cloned());
+        row
     }
 
     fn null_extended(&self, lrow: &[Value]) -> Row {
@@ -179,17 +204,31 @@ impl HashJoin {
         }
         let mut matched = false;
         if let Some(k) = key {
+            let mut hits: Vec<usize> = vec![];
+            let mut stop = false;
             if let Some(cands) = self.map.get(&k) {
-                for r in cands {
+                for (i, r) in cands.iter().enumerate() {
                     let mut row = lrow.clone();
                     row.extend(r.iter().cloned());
                     if self.residual_ok(eng, &row, outer)? {
                         matched = true;
+                        hits.push(i);
                         if !emit(eng, row)? {
-                            return Ok(false);
+                            stop = true;
+                            break;
                         }
                     }
                 }
+            }
+            if self.spec.right {
+                if let Some(f) = self.flags.get_mut(&k) {
+                    for i in hits {
+                        f[i] = true;
+                    }
+                }
+            }
+            if stop {
+                return Ok(false);
             }
         }
         if !matched && self.spec.left {
@@ -201,11 +240,42 @@ impl HashJoin {
 
     /// The probe input is exhausted: join the spilled partitions. Returns false when the consumer wants no more rows.
     pub fn finish(&mut self, eng: &mut Engine<'_>, outer: Option<&Env<'_>>, emit: Emit<'_>) -> Result<bool> {
-        let Some(g) = self.grace.take() else { return Ok(true) };
+        let Some(g) = self.grace.take() else {
+            if self.spec.right {
+                let mut out: Vec<Row> = vec![];
+                for (k, rows) in &self.map {
+                    for (i, r) in rows.iter().enumerate() {
+                        if !self.flags.get(k).is_some_and(|f| f[i]) {
+                            out.push(self.left_null_extended(r));
+                        }
+                    }
+                }
+                for row in out {
+                    if !emit(eng, row)? {
+                        return Ok(false);
+                    }
+                }
+                return self.emit_null_build(eng, emit);
+            }
+            return Ok(true);
+        };
         for (b, p) in g.build.into_iter().zip(g.probe) {
             let build: PartFile = b.finish()?;
             self.spilled_partitions += 1;
-            let Some(pw) = p else { continue };
+            let Some(pw) = p else {
+                if self.spec.right {
+                    // nothing probed this partition: every build row in it is unmatched
+                    let mut brd = build.reader()?;
+                    while let Some(mut r) = brd.next_row()? {
+                        r.remove(0);
+                        let row = self.left_null_extended(&r);
+                        if !emit(eng, row)? {
+                            return Ok(false);
+                        }
+                    }
+                }
+                continue;
+            };
             let probe: PartFile = pw.finish()?;
             if build.count == 0 {
                 if self.spec.left {
@@ -220,11 +290,15 @@ impl HashJoin {
                 continue;
             }
             let mut flags: Vec<bool> = if self.spec.left { vec![false; probe.count] } else { vec![] };
+            if build.count == 0 {
+                continue;
+            }
             let mut brd = build.reader()?;
             let mut chunks = 0;
             loop {
                 // the next chunk of the build partition that fits in memory
                 let mut map: HashMap<String, Vec<Row>> = HashMap::new();
+                let mut bflags: HashMap<String, Vec<bool>> = HashMap::new();
                 let mut bytes = 0usize;
                 let mut exhausted = false;
                 while bytes < self.budget {
@@ -235,6 +309,9 @@ impl HashJoin {
                                 _ => String::new(),
                             };
                             bytes += row_bytes(&r) + k.len() + 64;
+                            if self.spec.right {
+                                bflags.entry(k.clone()).or_default().push(false);
+                            }
                             map.entry(k).or_default().push(r);
                         }
                         None => {
@@ -258,12 +335,17 @@ impl HashJoin {
                         _ => String::new(),
                     };
                     if let Some(cands) = map.get(&k) {
-                        for r in cands {
+                        for (ci, r) in cands.iter().enumerate() {
                             let mut row = prow.clone();
                             row.extend(r.iter().cloned());
                             if self.residual_ok(eng, &row, outer)? {
                                 if self.spec.left {
                                     flags[i] = true;
+                                }
+                                if self.spec.right {
+                                    if let Some(f) = bflags.get_mut(&k) {
+                                        f[ci] = true;
+                                    }
                                 }
                                 if !emit(eng, row)? {
                                     return Ok(false);
@@ -272,6 +354,18 @@ impl HashJoin {
                         }
                     }
                     i += 1;
+                }
+                if self.spec.right {
+                    for (k, rows) in &map {
+                        for (ci, r) in rows.iter().enumerate() {
+                            if !bflags.get(k).is_some_and(|f| f[ci]) {
+                                let row = self.left_null_extended(r);
+                                if !emit(eng, row)? {
+                                    return Ok(false);
+                                }
+                            }
+                        }
+                    }
                 }
                 if exhausted {
                     break;
@@ -289,6 +383,20 @@ impl HashJoin {
                     }
                     i += 1;
                 }
+            }
+        }
+        self.emit_null_build(eng, emit)
+    }
+
+    /// Right/full joins: the build rows whose key was NULL.
+    fn emit_null_build(&mut self, eng: &mut Engine<'_>, emit: Emit<'_>) -> Result<bool> {
+        let Some(w) = self.null_build.take() else { return Ok(true) };
+        let file: PartFile = w.finish()?;
+        let mut rd = file.reader()?;
+        while let Some(r) = rd.next_row()? {
+            let row = self.left_null_extended(&r);
+            if !emit(eng, row)? {
+                return Ok(false);
             }
         }
         Ok(true)
@@ -389,17 +497,19 @@ impl<'a> Engine<'a> {
             name: &'q Vec<String>,
             alias: Option<&'q String>,
             left: bool,
+            right: bool,
             on: Option<&'q Expr>,
         }
         fn flatten<'q>(tr: &'q TableRef, out: &mut Vec<Entry<'q>>) -> bool {
             match tr {
                 TableRef::Table { name, alias, .. } => {
-                    out.push(Entry { name, alias: alias.as_ref(), left: false, on: None });
+                    out.push(Entry { name, alias: alias.as_ref(), left: false, right: false, on: None });
                     true
                 }
                 TableRef::Join { kind, left, right, on } => {
-                    let l = matches!(kind, JoinKind::Left);
-                    if !matches!(kind, JoinKind::Inner | JoinKind::Cross | JoinKind::Left) {
+                    let l = matches!(kind, JoinKind::Left | JoinKind::Full);
+                    let rt = matches!(kind, JoinKind::Right | JoinKind::Full);
+                    if !matches!(kind, JoinKind::Inner | JoinKind::Cross | JoinKind::Left | JoinKind::Right | JoinKind::Full) {
                         return false;
                     }
                     if !flatten(left, out) {
@@ -407,7 +517,7 @@ impl<'a> Engine<'a> {
                     }
                     match &**right {
                         TableRef::Table { name, alias, .. } => {
-                            out.push(Entry { name, alias: alias.as_ref(), left: l, on: on.as_ref() });
+                            out.push(Entry { name, alias: alias.as_ref(), left: l, right: rt, on: on.as_ref() });
                             true
                         }
                         _ => false,
@@ -428,7 +538,7 @@ impl<'a> Engine<'a> {
         if self.ses.query_opts.iter().any(|o| o == "LOOP JOIN") {
             return Ok(None);
         }
-        let has_left = entries.iter().any(|e| e.left) || self.ses.query_opts.iter().any(|o| o == "FORCE ORDER");
+        let has_left = entries.iter().any(|e| e.left || e.right) || self.ses.query_opts.iter().any(|o| o == "FORCE ORDER");
 
         // ---- leaves
         let pushed_all = self.plan_pushdown(&sel.from, &sel.where_);
@@ -472,7 +582,7 @@ impl<'a> Engine<'a> {
                 split_and(on, &mut parts);
                 for c in parts {
                     let Some(refs) = leaves_of(c, &schemas) else { return Ok(None) };
-                    conds.push((c.clone(), refs, if e.left { Some(i) } else { None }));
+                    conds.push((c.clone(), refs, if e.left || e.right { Some(i) } else { None }));
                 }
             }
         }
@@ -612,7 +722,7 @@ impl<'a> Engine<'a> {
                     colls.clear();
                 }
             }
-            stages.push(StagePlan { leaf: li, spec: JoinSpec { left: entries[li].left, left_keys, right_keys, colls, residual, left_schema: acc_schema.clone(), right_schema, joined: joined.clone() } });
+            stages.push(StagePlan { leaf: li, spec: JoinSpec { left: entries[li].left, right: entries[li].right, left_keys, right_keys, colls, residual, left_schema: acc_schema.clone(), right_schema, joined: joined.clone() } });
             acc_schema = joined;
             joined_set.insert(li);
         }

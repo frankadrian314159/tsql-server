@@ -8,6 +8,7 @@ pub mod joins;
 pub mod optimizer;
 pub mod query;
 pub mod secexec;
+pub mod setops;
 pub mod spill;
 pub mod admin;
 pub mod backup;
@@ -158,6 +159,11 @@ pub struct SessionState {
     pub checked_out: Vec<String>,
     /// The next `SELECT` to start may stream its rows (see `Engine::try_stream_select`).
     pub stream_ok: bool,
+    /// The next `SELECT` feeds another operator (set operation, derived table, CTE): it may collect its rows in a
+    /// buffer that spills to a file.
+    pub stream_to_buf: bool,
+    /// A FROM source the streaming executor evaluated and then declined: (address of its TableRef, rows).
+    pub preeval: Option<(usize, query::Rowset)>,
     /// Table hints of the statement being run, by table object id (see `Engine::collect_hints`).
     pub hints: HashMap<i32, Vec<String>>,
     /// A NOWAIT table hint is in effect: a lock that cannot be granted at once is error 1222.
@@ -227,6 +233,8 @@ impl SessionState {
             identity_insert: HashSet::new(),
             checked_out: vec![],
             stream_ok: false,
+            stream_to_buf: false,
+            preeval: None,
             hints: HashMap::new(),
             nowait: false,
             in_rls: false,
@@ -918,10 +926,7 @@ impl<'a> Engine<'a> {
         let types: Vec<DataType> = rs.schema.cols.iter().enumerate().map(|(i, c)| {
             c.ty.clone().unwrap_or_else(|| rs.rows.iter().map(|r| &r[i]).find(|v| !v.is_null()).map(|v| v.data_type()).unwrap_or(DataType::Int))
         }).collect();
-        let rows = match Arc::try_unwrap(rs.rows) {
-            Ok(r) => r,
-            Err(a) => (*a).clone(),
-        };
+        let rows = rs.rows.into_vec();
         let r = ResultSet { columns, types, rows };
         if let Some(cap) = self.ses.capture.last_mut() {
             cap.push(r);

@@ -74,14 +74,14 @@ impl Schema {
 #[derive(Clone)]
 pub struct Rowset {
     pub schema: Schema,
-    pub rows: Rows,
+    pub rows: super::spill::RowsRef,
     pub suppress: bool,
     pub report_count: bool,
 }
 
 impl Rowset {
     pub fn new(schema: Schema, rows: Vec<Row>) -> Rowset {
-        Rowset { schema, rows: Arc::new(rows), suppress: false, report_count: false }
+        Rowset { schema, rows: rows.into(), suppress: false, report_count: false }
     }
     pub fn from_rows(cols: &[String], rows: Vec<Row>) -> Rowset {
         let schema = Schema::new(cols.iter().map(|c| ColMeta { qual: None, name: c.clone(), ty: None, denied: None, hidden: false, coll: None, mask: None }).collect());
@@ -94,7 +94,7 @@ impl Rowset {
     }
     pub fn table_rows(t: &Table, alias: &str, rows: Vec<Row>) -> Rowset {
         let schema = Schema::new(t.columns.iter().map(|c| ColMeta { qual: Some(alias.to_string()), name: c.name.clone(), ty: Some(c.ty.clone()), denied: None, hidden: c.hidden, coll: c.collation.as_deref().and_then(crate::collation::get), mask: c.mask.as_deref().and_then(|m| crate::mask::Mask::parse(m).ok()).map(Arc::new) }).collect());
-        Rowset { schema, rows: Arc::new(rows), suppress: false, report_count: false }
+        Rowset { schema, rows: rows.into(), suppress: false, report_count: false }
     }
     pub fn empty() -> Rowset {
         Rowset::new(Schema::default(), vec![])
@@ -369,14 +369,22 @@ impl<'a> Engine<'a> {
             QueryBody::Select(s) => self.exec_select(s, &[], &None, &None, outer),
             QueryBody::Paren(q) => self.exec_query(q, outer),
             QueryBody::SetOp { op, all, left, right } => {
+                self.ses.stream_to_buf = matches!(**left, QueryBody::Select(_));
                 let l = self.exec_body(left, outer)?;
+                self.ses.stream_to_buf = matches!(**right, QueryBody::Select(_));
                 let r = self.exec_body(right, outer)?;
+                self.ses.stream_to_buf = false;
                 if l.schema.cols.len() != r.schema.cols.len() {
                     return Err(SqlError::new(205, "All queries combined using a UNION, INTERSECT or EXCEPT operator must have an equal number of expressions in their target lists."));
                 }
                 let schema = Schema::new(l.schema.cols.iter().map(|c| ColMeta { qual: None, name: c.name.clone(), ty: c.ty.clone(), denied: None, hidden: false, coll: c.coll.clone(), mask: None }).collect());
                 let sc: Colls = l.schema.cols.iter().map(|c| c.coll.clone()).collect();
                 let rk_of = |r: &Row| if any_coll(&sc) { key_of(&keyed(r, &sc)) } else { key_of(r) };
+                if self.setop_needs_spill(&l.rows, &r.rows) {
+                    let rows = self.set_op_external(op, *all, &l.rows, &r.rows, &rk_of)?;
+                    self.ses.plan.push(format!("{:?}{} by external sort -> {} rows", op, if *all { " ALL" } else { "" }, rows.count()));
+                    return Ok(Rowset { schema, rows, suppress: false, report_count: false });
+                }
                 let lrows = (*l.rows).clone();
                 let rrows = (*r.rows).clone();
                 let rows = match (op, all) {
@@ -521,8 +529,9 @@ impl<'a> Engine<'a> {
     fn exec_select(&mut self, sel: &Select, order: &[OrderItem], offset: &Option<Expr>, fetch: &Option<Expr>, outer: Option<&Env<'_>>) -> Result<Rowset> {
         // only the outermost SELECT of a statement may stream; subqueries started from it must not
         let may_stream = std::mem::take(&mut self.ses.stream_ok);
+        let to_buf = std::mem::take(&mut self.ses.stream_to_buf);
         self.collect_hints(&sel.from)?;
-        if let Some(rs) = self.try_stream_select(sel, order, offset, fetch, outer, may_stream)? {
+        if let Some(rs) = self.try_stream_select(sel, order, offset, fetch, outer, may_stream, to_buf)? {
             return Ok(rs);
         }
         // FROM (conditions on single tables are applied while those tables are read)
@@ -536,6 +545,7 @@ impl<'a> Engine<'a> {
             self.ses.ordered_used = false;
             self.ses.order_hint = self.compute_order_hint(sel, order, offset, fetch);
             let r = self.eval_from_list(&sel.from, &sel.where_, outer);
+            self.ses.preeval = None;
             self.ses.pushdown.pop();
             ordered = std::mem::take(&mut self.ses.ordered_used);
             self.ses.order_hint = saved_hint.0;
@@ -1181,6 +1191,12 @@ impl<'a> Engine<'a> {
     }
 
     // ------------------------------------------------------------- windows
+    /// Window values for the rows of one partition set (used by the streaming executor, one partition at a time).
+    pub(crate) fn window_rows(&mut self, wins: &[&FuncCall], schema: &Schema, rows: Vec<Row>, outer: Option<&Env<'_>>) -> Result<Vec<HashMap<usize, Value>>> {
+        let units: Vec<Unit> = rows.into_iter().map(|row| Unit { row, group: None }).collect();
+        self.compute_windows(wins, schema, &units, outer)
+    }
+
     fn compute_windows(&mut self, wins: &[&FuncCall], schema: &Schema, units: &[Unit], outer: Option<&Env<'_>>) -> Result<Vec<HashMap<usize, Value>>> {
         let mut results: Vec<HashMap<usize, Value>> = (0..units.len()).map(|_| HashMap::new()).collect();
         for fc in wins {
@@ -1460,6 +1476,11 @@ impl<'a> Engine<'a> {
 
     // ------------------------------------------------------------ FROM
     pub fn eval_table_ref(&mut self, tr: &TableRef, outer: Option<&Env<'_>>) -> Result<Rowset> {
+        if self.ses.preeval.as_ref().is_some_and(|(p, _)| *p == tr as *const TableRef as usize) {
+            if let Some((_, rs)) = self.ses.preeval.take() {
+                return Ok(rs);
+            }
+        }
         match tr {
             TableRef::Table { name, alias, .. } => self.eval_named_source(name, alias.as_deref()),
             TableRef::Temporal { name, alias, clause } => self.eval_temporal(name, alias.as_deref(), clause),
@@ -1468,7 +1489,10 @@ impl<'a> Engine<'a> {
                 None => Err(SqlError::new(1087, format!("Must declare the table variable \"{}\".", name))),
             },
             TableRef::Derived { query, alias, cols } => {
-                let mut rs = self.exec_query(query, outer)?;
+                self.ses.stream_to_buf = query.ctes.is_empty() && matches!(query.body, QueryBody::Select(_));
+                let rs = self.exec_query(query, outer);
+                self.ses.stream_to_buf = false;
+                let mut rs = rs?;
                 rename_cols(&mut rs, cols);
                 rs.schema.cols.iter_mut().for_each(|c| c.qual = alias.clone());
                 if alias.is_none() {
@@ -1605,7 +1629,10 @@ impl<'a> Engine<'a> {
                         if query_refs_name(&query, &lname) {
                             self.eval_recursive_cte(si, &lname, &query, &cols)?
                         } else {
-                            self.exec_query(&query, None)?
+                            self.ses.stream_to_buf = query.ctes.is_empty() && matches!(query.body, QueryBody::Select(_));
+                            let r = self.exec_query(&query, None);
+                            self.ses.stream_to_buf = false;
+                            r?
                         }
                     }
                 };

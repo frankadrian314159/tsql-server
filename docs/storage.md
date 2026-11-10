@@ -92,8 +92,29 @@ is a *build* side with a share of `work_mem`:
 Rows with a NULL key never match (they appear only null-extended in a left join). The plan says how each stage ran:
 `streaming hash join [n probe rows read]: scan f: ... -> scan d [rows]: ...; grace hash, 32 partition(s) spilled`.
 A big table joined to a handful of rows through one of its indexes is left to the general executor, whose index
-nested-loop join is the better plan there. Right and full outer joins, `APPLY`, derived tables, views, CTEs and joins
-without an equality use the general executor.
+nested-loop join is the better plan there. `INNER`, `LEFT`, `RIGHT` and `FULL` joins stream (a right or full join keeps
+a matched flag per build row, and emits the unmatched ones, with NULLs for the probe columns, when the probe side is
+exhausted; build rows with a NULL key are kept in a file for the same purpose). `APPLY`, views and joins without an
+equality use the general executor.
+
+### Spilling rowsets
+
+A result that feeds another operator (an operand of `UNION`/`INTERSECT`/`EXCEPT`, a derived table, a CTE body) is
+collected in a `RowsRef` (`spill.rs`): rows stay in memory until they exceed the budget, then move to a temporary file.
+Code written for in-memory rows keeps working, because dereferencing a spilled rowset reads it back once; code that can
+handle one row at a time (the streaming executor, the set operations) reads the file sequentially instead.
+
+* **Set operations** run on external sorts once an input has spilled or the inputs would not fit the budget (plan:
+  `Union by external sort -> n rows`): `UNION` sorts by row identity and keeps each identity's first arrival, then puts
+  the survivors back into arrival order; `INTERSECT`/`EXCEPT` sort both inputs by identity and merge them. `UNION ALL`
+  concatenates the two files.
+* **Derived tables and CTEs** over big tables stream into such a buffer, and a `SELECT` that sorts, groups,
+  de-duplicates, limits or evaluates window functions over a derived table or CTE reads its source from the buffer
+  (plan: `streaming rowset source`).
+* **Window functions** in the select list run in the streaming executor when they all share one `OVER` clause and the
+  query has no `GROUP BY`: rows are sorted externally by partition key and the window's order, and one partition at a
+  time is evaluated (plan: `window by sort (n spilled run(s))`). A single partition is held in memory, so
+  `OVER (ORDER BY x)` without `PARTITION BY` is one partition holding the whole input.
 
 ### Streamed results
 
@@ -104,7 +125,8 @@ every batch and RPC, writing rows into TDS packets and sending them as they fill
 not declared, so they are guessed from the first 64 rows (held back until then); the TDS layer sends such string
 columns as `nvarchar(max)` so later, wider or non-code-page values are not lost. If the consumer goes away the
 statement stops (error 64) and its spill files are removed. `SELECT ... INTO`, `TOP ... PERCENT`/`WITH TIES`, results
-captured by `INSERT ... EXEC`, set operations and CTEs deliver the whole result set (`Event::Rows`).
+captured by `INSERT ... EXEC`, set operations and queries whose rows are read from a CTE deliver the whole result set
+(`Event::Rows`).
 
 Results are identical to the general executor's (the tests run both and compare, and `TSQL_TEST_SPILL=1 cargo test`
 runs the whole suite with the streaming executor forced on and a 2 KiB budget). Ties keep the order rows were read in,
@@ -113,9 +135,10 @@ like a stable in-memory sort. Run files are named `tsql-spill-<pid>-<n>.run`, li
 fails. `Server::set_work_mem(bytes, stream_min_slots, dir)` changes the budget; the plan (`last_plan()`,
 `SET SHOWPLAN_TEXT`-style output) says `streaming scan ... external sort (n spilled run(s))`.
 
-Everything else still materialises: window functions, scalar aggregates (one group holding every row),
-`ROLLUP`/`CUBE`, set operations, views, CTEs, derived tables, the outer join kinds listed above, and results that are
-captured rather than delivered. So the bound for the streamed shapes is `work_mem` plus the largest group, not a
+Everything else still materialises: scalar aggregates (one group holding every row), `ROLLUP`/`CUBE`, window
+functions with different `OVER` clauses or inside `ORDER BY`, views, `APPLY`, recursive CTEs, a derived table that is
+itself joined to something, and results that are captured rather than delivered (a spilled set-operation or
+derived-table result is loaded back when one of those reads it). So the bound for the streamed shapes is `work_mem` plus the largest group, not a
 constant for every query. A query whose ordered index read already provides the order (and can stop early) keeps using
 that instead of a sort, unless its whole result is being streamed to a client.
 

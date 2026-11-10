@@ -152,8 +152,10 @@ Things that are **not** implemented, so you are not surprised:
   bounded buffer pool, so a database may be much larger than RAM. What must still fit in memory is the working set of
   one statement: single-table `ORDER BY`, `DISTINCT`, `TOP n` and `GROUP BY`, and joins of base tables (a streaming hash
   join that spills to partition files, grace-hash style), stream and spill to temporary files, and the rows of such a
-  `SELECT` are delivered to a TDS client as they are produced; window functions, scalar aggregates, set operations,
-  CTEs and derived tables are still materialised;
+  `SELECT` are delivered to a TDS client as they are produced; so are right and full joins, window functions that share
+  one `OVER` clause (one partition at a time), set operations (external sort/merge) and `SELECT`s over a derived table or
+  CTE (their buffers spill to a file); scalar aggregates, `APPLY`, views, recursive CTEs and a derived table that is
+  itself joined are still materialised;
   plus the catalog, the page table (~0.1 % of the data size) and the undo log of open transactions.
   Sparse leaves are merged after deletes and the page file is compacted and truncated at checkpoints. A checkpoint is only taken
   when no transaction is open, so a transaction left open indefinitely keeps the log growing. See

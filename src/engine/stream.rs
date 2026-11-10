@@ -9,7 +9,7 @@
 //! differs.
 use super::hashjoin::{finish_all, push_through, HashJoin, JoinPlan};
 use super::query::{any_coll, cmp_keys, collect_windows, has_agg, keyed, Colls, Env, OutCol, Rowset};
-use super::spill::{Cmp, Entry, Sorter, WorkMem};
+use super::spill::{Cmp, Entry, RowsWriter, Sorter, WorkMem};
 use super::*;
 use crate::convert::key_of;
 
@@ -29,6 +29,8 @@ struct Sinks {
     has_order: bool,
     /// Collations of the output columns: rows are de-duplicated by their sort keys.
     out_colls: Colls,
+    /// Plain rows go straight to a (spilling) buffer: rows still to skip, rows still wanted.
+    direct: Option<(RowsWriter, usize, Option<usize>)>,
 }
 
 impl Sinks {
@@ -42,7 +44,7 @@ impl Sinks {
     fn new(work: WorkMem, order_desc: Vec<bool>, distinct: bool, cap: Option<usize>, restore_arrival: bool, out_colls: Colls) -> Sinks {
         let has_order = !order_desc.is_empty();
         let out_colls = if any_coll(&out_colls) { out_colls } else { vec![] };
-        let mut k = Sinks { work: work.clone(), order_desc, cap, dedupe: None, sorter: None, best: vec![], plain: vec![], use_top_n: false, has_order, out_colls };
+        let mut k = Sinks { work: work.clone(), order_desc, cap, dedupe: None, sorter: None, best: vec![], plain: vec![], use_top_n: false, has_order, out_colls, direct: None };
         if distinct {
             // sort by the row's identity, then by arrival, so the first arrival of each distinct row survives
             let cmp: Cmp = Box::new(|a: &Entry, b: &Entry| a.keys[0].to_string().cmp(&b.keys[0].to_string()).then(a.seq.cmp(&b.seq)));
@@ -74,6 +76,15 @@ impl Sinks {
                 let cmp = self.by_order();
                 self.best.sort_by(|a, b| cmp(a, b));
                 self.best.truncate(c);
+            }
+        } else if let Some((w, skip, take)) = self.direct.as_mut() {
+            if *skip > 0 {
+                *skip -= 1;
+                return Ok(true);
+            }
+            w.push(prow)?;
+            if take.is_some_and(|t| w.len() >= t) {
+                return Ok(false);
             }
         } else {
             self.plain.push((prow, keys));
@@ -146,8 +157,8 @@ impl Sinks {
 impl<'a> Engine<'a> {
     /// Run a single-table SELECT with the streaming executor if it is eligible (see the module docs);
     /// `Ok(None)` means the caller should use the general executor.
-    pub fn try_stream_select(&mut self, sel: &Select, order: &[OrderItem], offset: &Option<Expr>, fetch: &Option<Expr>, outer: Option<&Env<'_>>, may_stream: bool) -> Result<Option<Rowset>> {
-        if self.ses.dry_run || sel.from.is_empty() || !self.ses.cte_stack.is_empty() {
+    pub fn try_stream_select(&mut self, sel: &Select, order: &[OrderItem], offset: &Option<Expr>, fetch: &Option<Expr>, outer: Option<&Env<'_>>, may_stream: bool, to_buf: bool) -> Result<Option<Rowset>> {
+        if self.ses.dry_run || sel.from.is_empty() {
             return Ok(None);
         }
         // GROUP BY over plain expressions is done by sorting on the group key; ROLLUP/CUBE/GROUPING SETS and
@@ -159,10 +170,28 @@ impl<'a> Engine<'a> {
         if sel.having.is_some() && !grouped {
             return Ok(None);
         }
-        let single = sel.from.len() == 1 && matches!(sel.from[0], TableRef::Table { .. });
+        // a lone derived table or CTE is read from its (possibly spilled) buffer
+        let rowsrc_tr: Option<&TableRef> = match sel.from.as_slice() {
+            [tr @ TableRef::Derived { .. }] => Some(tr),
+            [tr @ TableRef::Table { name, .. }] if name.len() == 1 && self.ses.cte_stack.iter().any(|m| m.contains_key(&name[0].to_lowercase())) => Some(tr),
+            _ => None,
+        };
+        let single = rowsrc_tr.is_none() && sel.from.len() == 1 && matches!(sel.from[0], TableRef::Table { .. });
+        // inside a statement with CTEs a table name may mean a CTE: only a single table that is none stays eligible
+        if !self.ses.cte_stack.is_empty() && rowsrc_tr.is_none() {
+            let TableRef::Table { name, .. } = &sel.from[0] else { return Ok(None) };
+            let is_cte = name.len() == 1 && self.ses.cte_stack.iter().any(|m| m.contains_key(&name[0].to_lowercase()));
+            if !single || is_cte {
+                return Ok(None);
+            }
+        }
         // only single-table queries that must sort, group, de-duplicate or limit gain anything from streaming
-        // (a join always does: the general executor holds both inputs and the whole join result)
-        if single && !(grouped || sel.distinct || !order.is_empty() || sel.top.is_some() || offset.is_some() || fetch.is_some()) {
+        // (a join always does: the general executor holds both inputs and the whole join result);
+        // a result that goes into a buffer (set operand, derived table, CTE) streams plain scans too
+        if single && !to_buf && !has_window_items(sel) && !(grouped || sel.distinct || !order.is_empty() || sel.top.is_some() || offset.is_some() || fetch.is_some()) {
+            return Ok(None);
+        }
+        if rowsrc_tr.is_some() && !to_buf && !(grouped || sel.distinct || !order.is_empty() || sel.top.is_some() || offset.is_some() || fetch.is_some() || has_window_items(sel)) {
             return Ok(None);
         }
         // an index that already delivers the rows in ORDER BY order (and can stop early) beats any sort
@@ -172,17 +201,33 @@ impl<'a> Engine<'a> {
         if single && self.compute_order_hint(sel, order, offset, fetch).is_some() && (!may_stream || limited) {
             return Ok(None);
         }
+        // window functions in the select list are evaluated one partition at a time; they must all share one OVER
+        // clause, and nothing else may need them (no GROUP BY, no window in ORDER BY or HAVING)
+        let mut win_calls: Vec<&FuncCall> = vec![];
         for it in &sel.items {
             match it {
                 SelectItem::Assign { .. } => return Ok(None),
                 SelectItem::Expr { e, .. } => {
-                    let mut w = vec![];
-                    collect_windows(e, &mut w);
-                    if (has_agg(e) && !grouped) || !w.is_empty() || matches!(e, Expr::IdentityFn { .. }) {
+                    collect_windows(e, &mut win_calls);
+                    if matches!(e, Expr::IdentityFn { .. }) {
                         return Ok(None);
                     }
                 }
                 SelectItem::Star(_) => {}
+            }
+        }
+        if !win_calls.is_empty() {
+            let first = format!("{:?}", win_calls[0].over);
+            if grouped || sel.having.is_some() || win_calls.iter().any(|w| format!("{:?}", w.over) != first) || win_calls[0].within.is_some() {
+                return Ok(None);
+            }
+        }
+        let win_over: Option<Over> = win_calls.first().and_then(|w| w.over.clone());
+        for it in &sel.items {
+            if let SelectItem::Expr { e, .. } = it {
+                if has_agg(e) && !grouped {
+                    return Ok(None);
+                }
             }
         }
         for o in order {
@@ -211,8 +256,19 @@ impl<'a> Engine<'a> {
         }
         let mut one: Option<One> = None;
         let mut join: Option<JoinPlan> = None;
+        let mut rowsrc: Option<super::query::Rowset> = None;
         let schema: super::query::Schema;
-        if single {
+        if let Some(tr) = rowsrc_tr {
+            // evaluate the source now; when it turns out small, hand it to the general executor instead (which
+            // picks it up from `preeval`, so nothing runs twice)
+            let rs = self.eval_table_ref(tr, outer)?;
+            if !(rs.rows.is_spilled() || rs.rows.count() >= self.srv.work.stream_min_slots.max(1)) {
+                self.ses.preeval = Some((tr as *const TableRef as usize, rs));
+                return Ok(None);
+            }
+            schema = rs.schema.clone();
+            rowsrc = Some(rs);
+        } else if single {
             let TableRef::Table { name, alias, .. } = &sel.from[0] else { return Ok(None) };
             let loc = self.locate(name);
             if !matches!(loc, Loc::Db(..)) {
@@ -245,6 +301,7 @@ impl<'a> Engine<'a> {
             schema = plan.schema.clone();
             join = Some(plan);
         }
+        let from_rowset = rowsrc.is_some();
         for it in &sel.items {
             if let SelectItem::Expr { e, .. } = it {
                 self.validate_columns(e, &schema, outer)?;
@@ -286,6 +343,9 @@ impl<'a> Engine<'a> {
         let out_colls: Colls = cols.iter().map(|c| c.coll.clone()).collect();
         let order_colls: Colls = self.order_colls(order, &cols, &schema, outer);
         let mut sinks = Sinks::new(self.srv.work.clone(), order.iter().map(|o| o.desc).collect(), sel.distinct, cap, grouped, out_colls);
+        if to_buf && !may_stream && sel.into.is_none() && sel.top.as_ref().is_none_or(|t| !t.percent && !t.ties) && sinks.dedupe.is_none() && sinks.sorter.is_none() && !sinks.use_top_n {
+            sinks.direct = Some((RowsWriter::new(self.srv.work.clone()), off, take));
+        }
         let group_exprs: Vec<&Expr> = {
             let mut v: Vec<&Expr> = vec![];
             if let Some(g) = &sel.group {
@@ -316,6 +376,14 @@ impl<'a> Engine<'a> {
         } else {
             None
         };
+        let mut wsorter: Option<Sorter> = win_over.as_ref().map(|o| {
+            let desc: Vec<bool> = o.order.iter().map(|x| x.desc).collect();
+            let cmp: Cmp = Box::new(move |a: &Entry, b: &Entry| {
+                let (ka, kb) = (a.keys[0].to_string(), b.keys[0].to_string());
+                ka.cmp(&kb).then_with(|| cmp_keys(&a.keys[1..], &b.keys[1..], &desc)).then(a.seq.cmp(&b.seq))
+            });
+            Sorter::new(cmp, self.srv.work.clone())
+        });
         let mut seq: u64 = 0;
         let mut scanned = 0usize;
         let mut join_note = String::new();
@@ -324,6 +392,7 @@ impl<'a> Engine<'a> {
             let schema = &schema;
             let where_ = &sel.where_;
             let (sinks, seq, grouper, group_exprs) = (&mut sinks, &mut seq, &mut grouper, &group_exprs);
+            let (wsorter_ref, win_over_ref) = (&mut wsorter, &win_over);
             let (group_colls, order_colls) = (&group_colls, &order_colls);
             // what happens to each row of the source: filter, then group, or project and hand to the sink
             let mut handle = |eng: &mut Engine<'_>, row: Row| -> Result<bool> {
@@ -334,6 +403,19 @@ impl<'a> Engine<'a> {
                     }
                 }
                 *seq += 1;
+                if let (Some(ws), Some(over)) = (wsorter_ref.as_mut(), win_over_ref.as_ref()) {
+                    // window functions: sort by partition, then by the window's order, and process partition by partition
+                    let mut pv = Vec::with_capacity(over.partition.len());
+                    for p in &over.partition {
+                        pv.push(eng.ev(p, &env)?);
+                    }
+                    let mut keys = vec![Value::Str(key_of(&pv))];
+                    for o in &over.order {
+                        keys.push(eng.ev(&o.e, &env)?);
+                    }
+                    ws.push(Entry { keys, seq: *seq, row })?;
+                    return Ok(true);
+                }
                 if let Some(g) = grouper.as_mut() {
                     // grouping: sort the filtered rows by group key; groups are processed afterwards
                     let mut kv = Vec::with_capacity(group_exprs.len());
@@ -347,7 +429,15 @@ impl<'a> Engine<'a> {
                 let (prow, keys) = eng.project_env(&env, cols, order, order_colls)?;
                 sinks.push(prow, keys, *seq)
             };
-            if let Some(o) = &one {
+            if let Some(rs) = rowsrc.take() {
+                let mut it = rs.rows.stream();
+                while let Some(row) = it.next_row()? {
+                    scanned += 1;
+                    if !handle(self, row)? {
+                        break;
+                    }
+                }
+            } else if let Some(o) = &one {
                 let scanned = &mut scanned;
                 self.scan_each(&o.loc, &o.t, &o.ap, Some((&o.schema, &o.pushed)), &mut |eng, chunk| {
                     for (_, row) in chunk {
@@ -408,6 +498,36 @@ impl<'a> Engine<'a> {
                 join_note = parts.join(" -> ");
             }
         }
+        let mut win_runs = 0usize;
+        if let Some(ws) = wsorter.take() {
+            win_runs = ws.spilled_runs;
+            let mut cur: Vec<(u64, Row)> = vec![];
+            let mut cur_key: Option<String> = None;
+            let r = {
+                let eng = &mut *self;
+                let (schema_ref, cols_ref, order_colls_ref, sinks_ref) = (&schema, &cols, &order_colls, &mut sinks);
+                let mut more = true;
+                let r = ws.finish(|e| {
+                    let k = e.keys[0].to_string();
+                    if cur_key.as_deref() != Some(k.as_str()) {
+                        if !cur.is_empty() {
+                            more = flush_window_partition(eng, &win_calls, schema_ref, cols_ref, order, order_colls_ref, outer, sinks_ref, std::mem::take(&mut cur))?;
+                            if !more {
+                                return Ok(false);
+                            }
+                        }
+                        cur_key = Some(k);
+                    }
+                    cur.push((e.seq, e.row));
+                    Ok(true)
+                });
+                match r {
+                    Ok(()) if more && !cur.is_empty() => flush_window_partition(eng, &win_calls, schema_ref, cols_ref, order, order_colls_ref, outer, sinks_ref, std::mem::take(&mut cur)).map(|_| ()),
+                    other => other,
+                }
+            };
+            r?;
+        }
         let mut group_runs = 0usize;
         let mut groups = 0usize;
         if let Some(g) = grouper.take() {
@@ -465,14 +585,50 @@ impl<'a> Engine<'a> {
             }
         }
         let use_top_n = sinks.use_top_n;
+        // a result that feeds another operator is collected in a buffer that spills to a file when it is big
+        let into_ok = sel.into.is_none() && sel.top.as_ref().is_none_or(|t| !t.percent && !t.ties);
+        if to_buf && into_ok && !may_stream {
+            let schema_out = super::query::Schema::new(cols.iter().map(|c| super::query::ColMeta { qual: None, name: c.name.clone(), ty: c.ty.clone(), denied: None, hidden: false, coll: c.coll.clone(), mask: None }).collect());
+            let mut out = RowsWriter::new(self.srv.work.clone());
+            let mut skipped = 0usize;
+            let mut sent = 0usize;
+            let direct = sinks.direct.take();
+            let mut spilled = 0usize;
+            if let Some((w, _, _)) = direct {
+                out = w;
+                sent = out.len();
+            } else {
+                spilled = sinks.finish_with(&mut |row, _keys| {
+                    if skipped < off {
+                        skipped += 1;
+                        return Ok(true);
+                    }
+                    if take.is_some_and(|t| sent >= t) {
+                        return Ok(false);
+                    }
+                    sent += 1;
+                    out.push(row)?;
+                    Ok(take.is_none_or(|t| sent < t))
+                })?;
+            }
+            let rows = out.finish()?;
+            let what = match &one {
+                Some(o) => format!("streaming scan {} [{} rows read]: {}", o.a, scanned, o.ap.describe()),
+                None if from_rowset => format!("streaming rowset source [{} rows read]", scanned),
+                None => format!("streaming hash join [{} probe rows read]: {}", scanned, join_note),
+            };
+            self.ses.plan.push(format!("{}, buffered ({}) -> {} rows", what, if rows.is_spilled() { format!("spilled; {} run(s)", spilled) } else { "in memory".to_string() }, rows.count()));
+            return Ok(Some(Rowset { schema: schema_out, rows, suppress: false, report_count: false }));
+        }
         // the rows of a plain top-level SELECT go to the client as they leave the final sort or merge
         let top_plain = sel.top.as_ref().is_none_or(|t| !t.percent && !t.ties);
         if may_stream && sel.into.is_none() && top_plain && self.sink.is_some() {
             let (sent, spilled) = self.stream_out(sinks, &cols, off, take)?;
             let sort_note = if order.is_empty() { String::new() } else if use_top_n { ", top-N in memory".to_string() } else { format!(", external sort ({} spilled run(s))", spilled) };
-            let group_note = if grouped { format!(", group by sort ({} group(s), {} spilled run(s))", groups, group_runs) } else { String::new() };
+            let group_note = if grouped { format!(", group by sort ({} group(s), {} spilled run(s))", groups, group_runs) } else if win_over.is_some() { format!(", window by sort ({} spilled run(s))", win_runs) } else { String::new() };
             let what = match &one {
                 Some(o) => format!("streaming scan {} [{} rows read]: {}", o.a, scanned, o.ap.describe()),
+                None if from_rowset => format!("streaming rowset source [{} rows read]", scanned),
                 None => format!("streaming hash join [{} probe rows read]: {}", scanned, join_note),
             };
             self.ses.plan.push(format!("{}{}{}{}, rows streamed to the client -> {} rows", what, group_note, if sel.distinct { ", distinct by sort" } else { "" }, sort_note, sent));
@@ -490,9 +646,10 @@ impl<'a> Engine<'a> {
         } else {
             format!(", external sort ({} spilled run(s))", spilled)
         };
-        let group_note = if grouped { format!(", group by sort ({} group(s), {} spilled run(s))", groups, group_runs) } else { String::new() };
+        let group_note = if grouped { format!(", group by sort ({} group(s), {} spilled run(s))", groups, group_runs) } else if win_over.is_some() { format!(", window by sort ({} spilled run(s))", win_runs) } else { String::new() };
         let what = match &one {
             Some(o) => format!("streaming scan {} [{} rows read]: {}", o.a, scanned, o.ap.describe()),
+            None if from_rowset => format!("streaming rowset source [{} rows read]", scanned),
             None => format!("streaming hash join [{} probe rows read]: {}", scanned, join_note),
         };
         self.ses.plan.push(format!("{}{}{}{} -> {} rows", what, group_note, if sel.distinct { ", distinct by sort" } else { "" }, sort_note, out.len()));
@@ -591,4 +748,29 @@ impl<'a> Engine<'a> {
         }
         Ok((out, keys))
     }
+}
+
+fn has_window_items(sel: &Select) -> bool {
+    let mut w = vec![];
+    for it in &sel.items {
+        if let SelectItem::Expr { e, .. } = it {
+            collect_windows(e, &mut w);
+        }
+    }
+    !w.is_empty()
+}
+
+/// Evaluate the window functions of one partition, then project and sink its rows.
+#[allow(clippy::too_many_arguments)]
+fn flush_window_partition(eng: &mut Engine<'_>, wins: &[&FuncCall], schema: &super::query::Schema, cols: &[OutCol<'_>], order: &[OrderItem], order_colls: &Colls, outer: Option<&Env<'_>>, sinks: &mut Sinks, part: Vec<(u64, Row)>) -> Result<bool> {
+    let (seqs, rows): (Vec<u64>, Vec<Row>) = part.into_iter().unzip();
+    let vals = eng.window_rows(wins, schema, rows.clone(), outer)?;
+    for (i, row) in rows.iter().enumerate() {
+        let env = Env { schema, row, parent: outer, group: None, win: vals.get(i) };
+        let (prow, keys) = eng.project_env(&env, cols, order, order_colls)?;
+        if !sinks.push(prow, keys, seqs[i])? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }

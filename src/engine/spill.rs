@@ -13,6 +13,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering as AtOrd};
+use std::sync::{Arc, OnceLock};
 
 type R<T> = Result<T, SqlError>;
 
@@ -203,6 +204,162 @@ impl PartWriter {
     pub fn finish(mut self) -> R<PartFile> {
         self.w.flush().map_err(io_err)?;
         Ok(self.part)
+    }
+}
+
+/// The rows of a result: in memory, or in a temporary file when the producer found them too many to hold.
+///
+/// Cloning is cheap (the data is shared). Code written for in-memory rows keeps working: dereferencing a spilled
+/// `RowsRef` reads the file back into memory once (and keeps it for later uses). Code that can handle rows one at a
+/// time calls [`RowsRef::stream`] instead, which never loads the whole result.
+#[derive(Clone)]
+pub struct RowsRef(Arc<RowsData>);
+
+struct RowsData {
+    mem: OnceLock<Vec<Row>>,
+    file: Option<PartFile>,
+}
+
+impl RowsRef {
+    pub fn from_vec(rows: Vec<Row>) -> RowsRef {
+        let cell = OnceLock::new();
+        let _ = cell.set(rows);
+        RowsRef(Arc::new(RowsData { mem: cell, file: None }))
+    }
+
+    fn spilled(file: PartFile) -> RowsRef {
+        RowsRef(Arc::new(RowsData { mem: OnceLock::new(), file: Some(file) }))
+    }
+
+    /// Number of rows, without loading a spilled result.
+    pub fn count(&self) -> usize {
+        match (&self.0.mem.get(), &self.0.file) {
+            (Some(m), _) => m.len(),
+            (None, Some(f)) => f.count,
+            (None, None) => 0,
+        }
+    }
+
+    /// Does the result live in a file (and has it not been loaded)?
+    pub fn is_spilled(&self) -> bool {
+        self.0.file.is_some() && self.0.mem.get().is_none()
+    }
+
+    /// The rows one at a time, reading a spilled result from its file.
+    pub fn stream(&self) -> RowsIter {
+        match (self.0.mem.get(), &self.0.file) {
+            (Some(_), _) | (None, None) => RowsIter::Mem(self.clone(), 0),
+            (None, Some(f)) => match f.reader() {
+                Ok(r) => RowsIter::File(r, Some(self.clone())),
+                Err(e) => RowsIter::Failed(Some(e)),
+            },
+        }
+    }
+
+    /// The rows as a vector, taking them out when this is the only handle.
+    pub fn into_vec(self) -> Vec<Row> {
+        self.load();
+        match Arc::try_unwrap(self.0) {
+            Ok(d) => d.mem.into_inner().unwrap_or_default(),
+            Err(a) => a.mem.get().cloned().unwrap_or_default(),
+        }
+    }
+
+    fn load(&self) -> &Vec<Row> {
+        self.0.mem.get_or_init(|| {
+            let mut out = vec![];
+            if let Some(f) = &self.0.file {
+                let mut r = f.reader().unwrap_or_else(|e| panic!("cannot read a spilled result: {}", e.message));
+                while let Some(row) = r.next_row().unwrap_or_else(|e| panic!("cannot read a spilled result: {}", e.message)) {
+                    out.push(row);
+                }
+            }
+            out
+        })
+    }
+}
+
+impl std::ops::Deref for RowsRef {
+    type Target = Vec<Row>;
+    fn deref(&self) -> &Vec<Row> {
+        self.load()
+    }
+}
+
+impl From<Vec<Row>> for RowsRef {
+    fn from(v: Vec<Row>) -> RowsRef {
+        RowsRef::from_vec(v)
+    }
+}
+
+/// Iterator over the rows of a [`RowsRef`].
+pub enum RowsIter {
+    Mem(RowsRef, usize),
+    File(PartReader, Option<RowsRef>),
+    Failed(Option<SqlError>),
+}
+
+impl RowsIter {
+    /// The next row. A read error is returned once.
+    pub fn next_row(&mut self) -> R<Option<Row>> {
+        match self {
+            RowsIter::Mem(r, i) => {
+                let row = r.load().get(*i).cloned();
+                *i += 1;
+                Ok(row)
+            }
+            RowsIter::File(r, _) => r.next_row(),
+            RowsIter::Failed(e) => match e.take() {
+                Some(e) => Err(e),
+                None => Ok(None),
+            },
+        }
+    }
+}
+
+/// Collects rows, moving them to a temporary file once they exceed the work-memory budget.
+pub struct RowsWriter {
+    work: WorkMem,
+    mem: Vec<Row>,
+    bytes: usize,
+    file: Option<PartWriter>,
+}
+
+impl RowsWriter {
+    pub fn new(work: WorkMem) -> RowsWriter {
+        RowsWriter { work, mem: vec![], bytes: 0, file: None }
+    }
+
+    pub fn push(&mut self, row: Row) -> R<()> {
+        if let Some(f) = self.file.as_mut() {
+            return f.push(&row);
+        }
+        self.bytes += row_bytes(&row);
+        self.mem.push(row);
+        if self.bytes >= self.work.bytes && self.mem.len() > 1 {
+            let mut w = PartWriter::create(&self.work.dir)?;
+            for r in self.mem.drain(..) {
+                w.push(&r)?;
+            }
+            self.bytes = 0;
+            self.file = Some(w);
+        }
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.mem.len() + self.file.as_ref().map_or(0, |f| f.part.count)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn finish(self) -> R<RowsRef> {
+        match self.file {
+            Some(w) => Ok(RowsRef::spilled(w.finish()?)),
+            None => Ok(RowsRef::from_vec(self.mem)),
+        }
     }
 }
 

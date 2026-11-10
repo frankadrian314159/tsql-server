@@ -285,7 +285,7 @@ impl<'a> Engine<'a> {
         };
         let mut rows: Vec<Row> = cur.rows.iter().filter(|r| keep(r)).cloned().collect();
         rows.extend(hist.rows.iter().filter(|r| keep(r)).cloned());
-        cur.rows = std::sync::Arc::new(rows);
+        cur.rows = rows.into();
         Ok(cur)
     }
 }
