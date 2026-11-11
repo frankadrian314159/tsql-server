@@ -342,6 +342,15 @@ impl<'a> Engine<'a> {
                     None => None,
                 };
                 let dt = self.resolve_type_cast(ty)?;
+                // a hierarchyid cast to a string is its text form, '/1/2/', not its bytes
+                if let (Value::Bin(b), true) = (&v, dt.is_string()) {
+                    if self.is_hierarchyid_expr(e, env) {
+                        return match crate::hierarchyid::decode(b) {
+                            Ok(p) => convert::cast(&Value::Str(crate::hierarchyid::to_string(&p)), &dt, st),
+                            Err(m) => Err(SqlError::new(6522, format!("A .NET Framework error occurred during execution of user-defined routine or aggregate \"hierarchyid\": {}.", m))),
+                        };
+                    }
+                }
                 match convert::cast(&v, &dt, st) {
                     Ok(x) => Ok(x),
                     Err(err) if *try_ && matches!(err.number, 245 | 241 | 242 | 8114 | 8115 | 220 | 8169 | 8152 | 8116) => Ok(Value::Null),
@@ -363,6 +372,21 @@ impl<'a> Engine<'a> {
             Expr::Default => Err(SqlError::new(8101, "DEFAULT is not allowed in this context.")),
             Expr::IdentityFn { .. } => Err(SqlError::new(177, "The IDENTITY function can only be used when the SELECT statement has an INTO clause.")),
             Expr::Func(fc) => self.eval_func(fc, env),
+        }
+    }
+
+    /// Does the expression have the type hierarchyid? (A column, a variable, or one of the methods and casts that give one.)
+    fn is_hierarchyid_expr(&self, e: &Expr, env: &Env<'_>) -> bool {
+        match e {
+            Expr::Paren(x) => self.is_hierarchyid_expr(x, env),
+            Expr::Col(p) => match env.schema.find_parts(p) {
+                super::query::Found::One(i) => matches!(env.schema.cols[i].ty, Some(DataType::HierarchyId)),
+                _ => env.parent.is_some_and(|par| self.is_hierarchyid_expr(e, par)),
+            },
+            Expr::Var(n) => self.ses.frames.last().and_then(|f| f.vars.get(n)).is_some_and(|v| matches!(v.ty, DataType::HierarchyId)),
+            Expr::Cast { ty, .. } => ty.parts.last().is_some_and(|n| n.eq_ignore_ascii_case("hierarchyid")),
+            Expr::Func(fc) => matches!(fc.name.as_str(), "HID_GETANCESTOR" | "HID_GETDESCENDANT" | "HID_GETREPARENTEDVALUE" | "HID_S_GETROOT" | "HID_S_PARSE"),
+            _ => false,
         }
     }
 

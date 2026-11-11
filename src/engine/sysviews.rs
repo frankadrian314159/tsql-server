@@ -43,6 +43,8 @@ fn type_info(t: &DataType) -> (i32, i32, i32, i32) {
         DataType::DateTimeOffset(s) => (43, 10, 34, *s as i32),
         DataType::Guid => (36, 16, 0, 0),
         DataType::Xml => (241, -1, 0, 0),
+        // the user type id; its system type (the CLR types) is 240
+        DataType::HierarchyId => (128, 892, 0, 0),
         _ => (98, 8016, 0, 0),
     }
 }
@@ -179,7 +181,7 @@ impl<'a> Engine<'a> {
                         if let Object::Table(t) = o {
                             for (i, c) in t.columns.iter().enumerate() {
                                 let (st, ml, p, s) = type_info(&c.ty);
-                                rows.push(vec![Value::Int(t.object_id), sv(&c.name), Value::Int(i as i32 + 1), Value::Int(st), Value::Int(st), Value::Int(ml), Value::Int(p), Value::Int(s), Value::Bit(c.nullable), Value::Bit(c.identity.is_some()), Value::Bit(c.computed.is_some()), if c.ty.is_string() { sv(c.collation.as_deref().unwrap_or(&db.collation_or_default())) } else { Value::Null }, Value::Int(if c.default_name.is_some() { t.object_id * 1000 + 500 + i as i32 } else { 0 })]);
+                                rows.push(vec![Value::Int(t.object_id), sv(&c.name), Value::Int(i as i32 + 1), Value::Int(if matches!(c.ty, DataType::HierarchyId) { 240 } else { st }), Value::Int(st), Value::Int(ml), Value::Int(p), Value::Int(s), Value::Bit(c.nullable), Value::Bit(c.identity.is_some()), Value::Bit(c.computed.is_some()), if c.ty.is_string() { sv(c.collation.as_deref().unwrap_or(&db.collation_or_default())) } else { Value::Null }, Value::Int(if c.default_name.is_some() { t.object_id * 1000 + 500 + i as i32 } else { 0 })]);
                             }
                         }
                     }
@@ -284,7 +286,7 @@ impl<'a> Engine<'a> {
                     ))
                 }
                 "types" | "systypes" => {
-                    let builtin = [("int", 56), ("bigint", 127), ("smallint", 52), ("tinyint", 48), ("bit", 104), ("decimal", 106), ("numeric", 108), ("money", 60), ("smallmoney", 122), ("float", 62), ("real", 59), ("char", 175), ("varchar", 167), ("nchar", 239), ("nvarchar", 231), ("text", 35), ("ntext", 99), ("binary", 173), ("varbinary", 165), ("image", 34), ("date", 40), ("time", 41), ("datetime", 61), ("smalldatetime", 58), ("datetime2", 42), ("datetimeoffset", 43), ("uniqueidentifier", 36), ("xml", 241), ("sql_variant", 98), ("timestamp", 189)];
+                    let builtin = [("int", 56), ("bigint", 127), ("smallint", 52), ("tinyint", 48), ("bit", 104), ("decimal", 106), ("numeric", 108), ("money", 60), ("smallmoney", 122), ("float", 62), ("real", 59), ("char", 175), ("varchar", 167), ("nchar", 239), ("nvarchar", 231), ("text", 35), ("ntext", 99), ("binary", 173), ("varbinary", 165), ("image", 34), ("date", 40), ("time", 41), ("datetime", 61), ("smalldatetime", 58), ("datetime2", 42), ("datetimeoffset", 43), ("uniqueidentifier", 36), ("xml", 241), ("sql_variant", 98), ("timestamp", 189), ("hierarchyid", 128)];
                     // (max_length, precision, scale) of each system type
                     let size = |n: &str| -> (i32, i32, i32) {
                         match n {
@@ -309,6 +311,7 @@ impl<'a> Engine<'a> {
                             "uniqueidentifier" => (16, 0, 0),
                             "xml" => (-1, 0, 0),
                             "sql_variant" => (8016, 0, 0),
+                            "hierarchyid" => (892, 0, 0),
                             _ => (8, 0, 0),
                         }
                     };

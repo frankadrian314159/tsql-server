@@ -270,6 +270,14 @@ fn restore_database_from_a_sql_server_backup() {
     assert_eq!(n(&mut c, "SELECT COUNT(*) FROM sys.views WHERE name = 'vSalesPerson'"), "1");
     assert_eq!(n(&mut c, "SELECT COUNT(*) FROM sys.triggers WHERE name = 'iWorkOrder'"), "1");
     assert_eq!(n(&mut c, "SELECT COUNT(*) FROM sys.procedures WHERE name = 'uspGetBillOfMaterials'"), "1");
+    // hierarchyid columns, their computed levels and the indexes on them
+    // (the first employee has no node in this sample, so no level)
+    assert_eq!(n(&mut c, "SELECT COUNT(*) FROM aw.HumanResources.Employee WHERE OrganizationNode IS NULL"), "1");
+    assert_eq!(n(&mut c, "SELECT MIN(OrganizationLevel) FROM aw.HumanResources.Employee"), "1");
+    assert_eq!(n(&mut c, "SELECT MAX(OrganizationLevel) FROM aw.HumanResources.Employee"), "4");
+    assert_eq!(n(&mut c, "SELECT COUNT(*) FROM aw.HumanResources.Employee WHERE OrganizationNode.IsDescendantOf(hierarchyid::Parse('/3/')) = 1 AND OrganizationLevel = 1"), "1");
+    assert_eq!(n(&mut c, "SELECT DocumentLevel FROM aw.Production.Document WHERE DocumentNode = hierarchyid::Parse('/1/2/')"), "2");
+    assert_eq!(n(&mut c, "SELECT COUNT(*) FROM sys.indexes WHERE name IN ('IX_Employee_OrganizationLevel_OrganizationNode', 'AK_Document_DocumentLevel_DocumentNode')"), "2");
     // views and a procedure that shred xml with .nodes() and search with full-text functions
     assert_eq!(n(&mut c, "SELECT COUNT(*) FROM aw.Sales.vPersonDemographics"), n(&mut c, "SELECT COUNT(*) FROM aw.Person.Person WHERE Demographics IS NOT NULL"));
     assert!(n(&mut c, "SELECT COUNT(*) FROM aw.HumanResources.vJobCandidateEducation").parse::<i64>().unwrap() > 0);

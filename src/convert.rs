@@ -444,6 +444,15 @@ fn cast_inner(v: &Value, t: &DataType, style: Option<i32>, strict: bool) -> Resu
             _ => Err(not_allowed(v, "uniqueidentifier")),
         },
         DataType::Xml => Ok(Value::Str(to_str(v))),
+        // a string such as '/1/2/' is parsed; bytes are checked
+        DataType::HierarchyId => {
+            let bad = |m: String| SqlError::new(6522, format!("A .NET Framework error occurred during execution of user-defined routine or aggregate \"hierarchyid\": {}.", m));
+            match v {
+                Value::Str(s) => crate::hierarchyid::parse(s).and_then(|p| crate::hierarchyid::encode(&p)).map(Value::Bin).map_err(bad),
+                Value::Bin(b) => crate::hierarchyid::decode(b).map(|_| v.clone()).map_err(bad),
+                _ => Err(not_allowed(v, "hierarchyid")),
+            }
+        }
         DataType::Variant | DataType::Other(_) => Ok(v.clone()),
     }
 }

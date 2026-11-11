@@ -209,6 +209,8 @@ impl Wire {
             DataType::DateTimeOffset(s) => Wire::Dto((*s).min(7)),
             DataType::Guid => Wire::Guid,
             DataType::Xml => Wire::Xml,
+            // sent as the bytes it is stored as
+            DataType::HierarchyId => Wire::VarBinary(PLP),
             DataType::Variant | DataType::Other(_) => Wire::NVarChar(PLP),
         }
     }

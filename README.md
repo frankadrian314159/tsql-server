@@ -183,7 +183,7 @@ Things that are **not** implemented, so you are not surprised:
 * **Triggers on views** — `INSTEAD OF` triggers on views are not supported (`AFTER` triggers on tables are; a view that maps onto one table is updatable, with `WITH CHECK OPTION`).
 * **Tools** — the shell and the desktop app use one session each (see [docs/shell-and-gui.md](docs/shell-and-gui.md)).
 * **XML / spatial / hierarchy** — `xml` is stored as text; `.value()`, `.exist()`, `.query()`, `.nodes()` and `.modify()` handle a subset of XQuery (paths, predicates, simple expressions, `insert` / `delete` / `replace value of`; no FLWOR, no `OPENXML`, no typed xml; see [docs/triggers.md](docs/triggers.md)); XML indexes can be created, and are only recorded in the catalog (see [docs/optimizer.md](docs/optimizer.md));
-  `geography`, `geometry`, `hierarchyid` are not functional. Full-text search (`CONTAINS`, `FREETEXT`, `CONTAINSTABLE`, `FREETEXTTABLE`) works by scanning, with no full-text index (see [docs/triggers.md](docs/triggers.md)). No Service Broker, CLR, SQL Agent,
+  `hierarchyid` is a real type with its methods (see [docs/hierarchyid.md](docs/hierarchyid.md)); `geography` and `geometry` are not functional. Full-text search (`CONTAINS`, `FREETEXT`, `CONTAINSTABLE`, `FREETEXTTABLE`) works by scanning, with no full-text index (see [docs/triggers.md](docs/triggers.md)). No Service Broker, CLR, SQL Agent,
   linked servers, `OPENROWSET(BULK)`, graph tables, columnstore, partitioning, replication, 
   backup compression (full, differential and log backups, restore and point-in-time recovery exist; see [docs/backup.md](docs/backup.md)).
 * **Collations** — case, accent and binary sensitivity (`CI`/`CS`, `AI`/`AS`, `BIN`/`BIN2`) per database, column and expression, in

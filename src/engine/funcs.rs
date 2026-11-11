@@ -1998,7 +1998,7 @@ impl<'a> Engine<'a> {
             "TYPE_NAME" | "TYPE_ID" => {
                 need_range(name, &a, 1, 1)?;
                 // the system types as sys.types lists them, then the database's own
-                const SYS_TYPES: [(&str, i64); 30] = [("int", 56), ("bigint", 127), ("smallint", 52), ("tinyint", 48), ("bit", 104), ("decimal", 106), ("numeric", 108), ("money", 60), ("smallmoney", 122), ("float", 62), ("real", 59), ("char", 175), ("varchar", 167), ("nchar", 239), ("nvarchar", 231), ("text", 35), ("ntext", 99), ("binary", 173), ("varbinary", 165), ("image", 34), ("date", 40), ("time", 41), ("datetime", 61), ("smalldatetime", 58), ("datetime2", 42), ("datetimeoffset", 43), ("uniqueidentifier", 36), ("xml", 241), ("sql_variant", 98), ("timestamp", 189)];
+                const SYS_TYPES: [(&str, i64); 31] = [("int", 56), ("bigint", 127), ("smallint", 52), ("tinyint", 48), ("bit", 104), ("decimal", 106), ("numeric", 108), ("money", 60), ("smallmoney", 122), ("float", 62), ("real", 59), ("char", 175), ("varchar", 167), ("nchar", 239), ("nvarchar", 231), ("text", 35), ("ntext", 99), ("binary", 173), ("varbinary", 165), ("image", 34), ("date", 40), ("time", 41), ("datetime", 61), ("smalldatetime", 58), ("datetime2", 42), ("datetimeoffset", 43), ("uniqueidentifier", 36), ("xml", 241), ("sql_variant", 98), ("timestamp", 189), ("hierarchyid", 128)];
                 let user: Vec<(String, i64)> = self.srv.databases.get(&self.ses.db.to_lowercase()).map(|d| d.types.values().map(|u| (u.name.clone(), u.type_id as i64)).collect()).unwrap_or_default();
                 if a[0].is_null() {
                     Value::Null
@@ -2059,6 +2059,86 @@ impl<'a> Engine<'a> {
                         Some(i) => Value::Str(doc.string_of(i)),
                         None => Value::Null,
                     },
+                }
+            }
+            // the methods of hierarchyid (see hierarchyid.rs)
+            "HID_GETLEVEL" | "HID_TOSTRING" | "HID_GETANCESTOR" | "HID_GETDESCENDANT" | "HID_ISDESCENDANTOF" | "HID_GETREPARENTEDVALUE" | "HID_S_GETROOT" | "HID_S_PARSE" => {
+                use crate::hierarchyid as h;
+                let bad = |m: String| SqlError::new(6522, format!("A .NET Framework error occurred during execution of user-defined routine or aggregate \"hierarchyid\": {}.", m));
+                // an argument is the stored bytes, or a string such as '/1/2/'
+                let path = |v: &Value| -> Result<Option<h::Path>> {
+                    match v {
+                        Value::Null => Ok(None),
+                        Value::Bin(b) => h::decode(b).map(Some).map_err(bad),
+                        Value::Str(t) => h::parse(t).map(Some).map_err(bad),
+                        other => Err(SqlError::new(8116, format!("Argument data type {} is invalid for argument of the hierarchyid method.", other.type_label()))),
+                    }
+                };
+                let out = |p: h::Path| -> Result<Value> { h::encode(&p).map(Value::Bin).map_err(bad) };
+                let want = |n: usize| -> Result<()> {
+                    if a.len() != n {
+                        return Err(SqlError::new(174, format!("The {} method requires {} argument(s).", name.trim_start_matches("HID_").trim_start_matches("S_").to_lowercase(), n.saturating_sub(if name.starts_with("HID_S_") { 0 } else { 1 }))));
+                    }
+                    Ok(())
+                };
+                match name {
+                    "HID_S_GETROOT" => {
+                        want(0)?;
+                        Value::Bin(vec![])
+                    }
+                    "HID_S_PARSE" => {
+                        want(1)?;
+                        match path(&a[0])? {
+                            Some(p) => out(p)?,
+                            None => Value::Null,
+                        }
+                    }
+                    _ => {
+                        let Some(me) = path(&a[0])? else { return Ok(Some(Value::Null)) };
+                        match name {
+                            "HID_GETLEVEL" => {
+                                want(1)?;
+                                Value::Int(h::level(&me))
+                            }
+                            "HID_TOSTRING" => {
+                                want(1)?;
+                                Value::Str(h::to_string(&me))
+                            }
+                            "HID_GETANCESTOR" => {
+                                want(2)?;
+                                if a[1].is_null() {
+                                    Value::Null
+                                } else {
+                                    match h::ancestor(&me, int(&a[1])?) {
+                                        Some(p) => out(p)?,
+                                        None => Value::Null,
+                                    }
+                                }
+                            }
+                            "HID_GETDESCENDANT" => {
+                                want(3)?;
+                                let (c1, c2) = (path(&a[1])?, path(&a[2])?);
+                                out(h::descendant(&me, c1.as_deref(), c2.as_deref()).map_err(bad)?)?
+                            }
+                            "HID_ISDESCENDANTOF" => {
+                                want(2)?;
+                                match path(&a[1])? {
+                                    Some(p) => Value::Bit(h::is_descendant_of(&me, &p)),
+                                    None => Value::Null,
+                                }
+                            }
+                            _ => {
+                                want(3)?;
+                                match (path(&a[1])?, path(&a[2])?) {
+                                    (Some(old), Some(new)) => match h::reparent(&me, &old, &new) {
+                                        Some(p) => out(p)?,
+                                        None => Value::Null,
+                                    },
+                                    _ => Value::Null,
+                                }
+                            }
+                        }
+                    }
                 }
             }
             "EVENTDATA" => match self.ses.eventdata.last() {

@@ -39,6 +39,8 @@ pub enum DataType {
     Guid,
     Xml,
     Variant,
+    /// the binary form of a node of a tree (see hierarchyid.rs); a value is `Value::Bin`
+    HierarchyId,
     Other(String),
 }
 
@@ -95,8 +97,9 @@ impl DataType {
             "datetimeoffset" => DataType::DateTimeOffset(a0.unwrap_or(7) as u8),
             "uniqueidentifier" => DataType::Guid,
             "xml" => DataType::Xml,
+            "hierarchyid" => DataType::HierarchyId,
             "sql_variant" => DataType::Variant,
-            "hierarchyid" | "geography" | "geometry" | "json" | "cursor" => DataType::Other(n),
+            "geography" | "geometry" | "json" | "cursor" => DataType::Other(n),
             _ => return Err(SqlError::new(2715, format!("Column, parameter, or variable #1: Cannot find data type {}.", name))),
         })
     }
@@ -147,6 +150,7 @@ impl DataType {
             DataType::Guid => "uniqueidentifier",
             DataType::Xml => "xml",
             DataType::Variant => "sql_variant",
+            DataType::HierarchyId => "hierarchyid",
             DataType::Other(_) => "other",
         }
     }

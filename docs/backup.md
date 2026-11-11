@@ -120,7 +120,8 @@ What does not:
   a warning names a key that has any), descending key columns are read from a bit that no index of the sample uses
   (unverified);
 * a computed column whose expression this server cannot create: the table is then created without its computed columns and
-  a warning says why (a `hierarchyid` method such as `GetLevel()`, for one, since `hierarchyid` values are kept as `varbinary`);
+  a warning says why. `hierarchyid` columns import as `hierarchyid`, with their methods (see [datatypes.md](hierarchyid.md)),
+  but a node with a label above 271, a negative label or a fractional label (`/1.1/`) is not read by this server;
 * `sql_variant` values whose base type is `decimal`, `time`, `datetime2` or `datetimeoffset` (their properties have not been
   seen in a backup), and the typed XML types listed below, which come over as NULL with a warning that names the column and
   the count;

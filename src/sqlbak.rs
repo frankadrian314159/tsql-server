@@ -454,7 +454,7 @@ impl<R: Read + Seek> Backup<R> {
                     prec,
                     scale,
                     status,
-                    ty: col_type(xtype, length, prec, scale),
+                    ty: col_type(xtype, length, prec, scale, r.fu32(11)),
                     nullable: status & 1 == 0,
                     identity,
                     computed: status & 0x80 != 0,
@@ -904,7 +904,7 @@ fn identity_of(b: &[u8], xtype: u8) -> Option<(i64, i64, i64)> {
 }
 
 /// The engine's type for a column of the backup.
-pub fn col_type(xtype: u8, length: i16, prec: u8, scale: u8) -> DataType {
+pub fn col_type(xtype: u8, length: i16, prec: u8, scale: u8, utype: u32) -> DataType {
     let max = length < 0;
     match xtype {
         48 => DataType::TinyInt,
@@ -936,7 +936,8 @@ pub fn col_type(xtype: u8, length: i16, prec: u8, scale: u8) -> DataType {
         99 => DataType::NText,
         34 => DataType::Image,
         98 => DataType::Variant,
-        // CLR types (hierarchyid, geography, geometry) are kept in their binary form
+        // the CLR types share a type number; hierarchyid is user type 128, geometry and geography are kept in their binary form
+        240 if utype == 128 => DataType::HierarchyId,
         _ => DataType::VarBinary(crate::types::MAX),
     }
 }

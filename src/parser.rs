@@ -35,6 +35,8 @@ const STMT_START: &[&str] = &[
 ];
 const NILADIC: &[&str] = &["CURRENT_TIMESTAMP", "CURRENT_USER", "SESSION_USER", "SYSTEM_USER", "USER", "CURRENT_DATE"];
 const DATEPART_FUNCS: &[&str] = &["DATEADD", "DATEDIFF", "DATEDIFF_BIG", "DATEPART", "DATENAME", "DATETRUNC", "DATE_BUCKET"];
+/// The methods of the hierarchyid type (see hierarchyid.rs), written `expr.GetLevel()`.
+const HID_METHODS: &[&str] = &["GETLEVEL", "TOSTRING", "GETANCESTOR", "GETDESCENDANT", "ISDESCENDANTOF", "GETREPARENTEDVALUE"];
 const RESERVED_OK_AS_FUNC: &[&str] = &["LEFT", "RIGHT", "USER", "CURRENT", "KEY", "PERCENT", "DOUBLE", "PRECISION", "FILE", "OFFSETS", "PLAN", "RULE", "READ", "LOAD", "UPDATE", "TRUNCATE", "CONTAINS", "FREETEXT"];
 
 pub struct Parser {
@@ -617,6 +619,10 @@ impl Parser {
             } else if self.is_op(".") && self.peek_kw(1, &["VALUE", "EXIST", "QUERY"]) && self.peek_is_op(2, "(") {
                 self.i += 1;
                 e = self.xml_method(e)?;
+            } else if self.is_op(".") && self.peek_kw(1, HID_METHODS) && self.peek_is_op(2, "(") {
+                self.i += 1;
+                let m = self.ident()?;
+                e = self.hid_call(Some(e), &m)?;
             } else if self.is_kw("AT") && self.peek_kw(1, &["TIME"]) && self.peek_kw(2, &["ZONE"]) {
                 self.i += 3;
                 let z = self.add_expr()?;
@@ -820,7 +826,18 @@ impl Parser {
             }
             parts.push(self.ident()?);
         }
+        // hierarchyid::Parse('/1/'), hierarchyid::GetRoot()
+        if parts.len() == 1 && parts[0].eq_ignore_ascii_case("hierarchyid") && self.is_op(":") && self.peek_is_op(1, ":") {
+            self.i += 2;
+            let m = self.ident()?;
+            return self.hid_call(None, &m);
+        }
         if self.is_op("(") {
+            // column.GetLevel(), column.GetAncestor(1), ...
+            if parts.len() >= 2 && HID_METHODS.contains(&parts.last().unwrap().to_uppercase().as_str()) {
+                let method = parts.pop().unwrap();
+                return self.hid_call(Some(Expr::Col(parts)), &method);
+            }
             // column.value('/path', 'type'), column.exist(...), column.query(...)
             if parts.len() >= 2 && matches!(parts.last().unwrap().to_uppercase().as_str(), "VALUE" | "EXIST" | "QUERY") {
                 let method = parts.pop().unwrap();
@@ -830,6 +847,23 @@ impl Parser {
             return self.func_call(parts);
         }
         Ok(Expr::Col(parts))
+    }
+
+    /// A method of a hierarchyid: `base.Method(args)`, or, with no base, the static `hierarchyid::Method(args)`; the cursor is on
+    /// the `(`. It is the call `HID_METHOD(base, args...)` (`HID_S_METHOD(args...)` for a static one).
+    fn hid_call(&mut self, base: Option<Expr>, method: &str) -> R<Expr> {
+        self.expect_op("(")?;
+        let mut args: Vec<Expr> = base.into_iter().collect();
+        let is_static = args.is_empty();
+        if !self.is_op(")") {
+            args.push(self.expr()?);
+            while self.accept_op(",") {
+                args.push(self.expr()?);
+            }
+        }
+        self.expect_op(")")?;
+        let name = format!("{}{}", if is_static { "HID_S_" } else { "HID_" }, method.to_uppercase());
+        Ok(Expr::Func(Box::new(FuncCall { name, schema: None, parts: vec![], args, distinct: false, star: false, over: None, within: None })))
     }
 
     /// `.value(path, type)` / `.exist(path)` / `.query(path)` on an xml expression; the cursor is on the method name.
