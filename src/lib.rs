@@ -32,6 +32,7 @@ pub mod tds;
 pub mod tools;
 pub mod types;
 pub mod xmlpath;
+pub mod fulltext;
 pub mod xpress;
 
 use catalog::ServerState;

@@ -69,6 +69,26 @@ query's own conditions imply the filter (`amount > 600` implies `amount > 500`; 
 and ordered reads never rely on one. `INCLUDE` columns are recorded (`sys.index_columns.is_included_column`, scripts) but, with
 no covering-index reads, they change nothing at run time. `sys.indexes` shows `has_filter` and `filter_definition`.
 
+## XML indexes
+
+```sql
+CREATE PRIMARY XML INDEX pxml_body ON doc (body);
+CREATE XML INDEX xp_body ON doc (body) USING XML INDEX pxml_body FOR PATH;   -- FOR VALUE | PATH | PROPERTY
+```
+
+An XML index here is **a catalog entry that changes no result and no plan**. SQL Server builds a shredded copy of the xml
+column and answers `.value`, `.exist` and `.query` from it; this server evaluates the simple XPath it supports directly over
+the stored text, and has no structure to speed up, so the index is recorded and nothing more. It exists so that scripts, backups
+and `.bak` files of SQL Server that create XML indexes load, and so that the catalog and scripts show them. The rules of
+SQL Server that decide whether a script is valid are kept: the table needs a primary key (error 6332), the column must be
+`xml`, there is one primary XML index per column, a secondary one names the primary index it is built on (`USING XML INDEX`),
+names are shared with the other indexes of the table (error 1913), dropping a primary XML index drops the secondary indexes built on
+it, and the xml column and the primary key cannot be dropped while an XML index needs them. Apart from 6332, 1913 and 3703
+the error numbers are this server's own (6324 for the XML index rules). `sys.indexes` shows them with `type` 3 and `type_desc`
+`XML` (index ids from 256000), `sys.xml_indexes` gives the kind (`PRIMARY_XML`, `SECONDARY_XML` with `V`, `P` or `R`) and the
+primary index of a secondary one, `sys.index_columns` the column, and the table scripts (`tools::script_table`) create them
+after the other indexes. A real shredded index would be a change to the storage and the planner; it is not built.
+
 ## Rewrites found by running the TPC queries
 
 * **Subqueries that do not use the outer row are evaluated once per statement.** Whether a subquery is correlated is

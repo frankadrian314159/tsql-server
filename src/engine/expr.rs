@@ -502,6 +502,41 @@ impl<'a> Engine<'a> {
             };
         }
         let name = fc.name.as_str();
+        // CONTAINS and FREETEXT (see fulltext.rs): the columns are the arguments after the count, or all the text columns of the row
+        if matches!(name, "FT_CONTAINS" | "FT_FREETEXT") && fc.schema.is_none() {
+            let n = match fc.args.first() {
+                Some(Expr::Lit(Value::Int(n))) => *n as usize,
+                _ => 0,
+            };
+            let cond = self.ev(&fc.args[n + 1], env)?;
+            let mut texts: Vec<String> = vec![];
+            if n == 0 {
+                for (i, c) in env.schema.cols.iter().enumerate() {
+                    if c.denied.is_none() && c.ty.as_ref().is_some_and(|t| t.is_string() || matches!(t, DataType::Xml)) && !env.row[i].is_null() {
+                        texts.push(convert::to_str(&env.row[i]));
+                    }
+                }
+            } else {
+                for e in &fc.args[1..=n] {
+                    let v = self.ev(e, env)?;
+                    if !v.is_null() {
+                        texts.push(convert::to_str(&v));
+                    }
+                }
+            }
+            if cond.is_null() {
+                return Ok(Value::Null);
+            }
+            let refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
+            let q = convert::to_str(&cond);
+            let rank = if name == "FT_CONTAINS" {
+                let c = crate::fulltext::parse_contains(&q).map_err(ft_error)?;
+                crate::fulltext::contains_rank(&c, &refs)
+            } else {
+                crate::fulltext::freetext_rank(&q, &refs)
+            };
+            return Ok(Value::Bit(rank > 0));
+        }
         if name == "SQL_VARIANT_PROPERTY" && fc.args.len() == 2 && fc.schema.is_none() {
             let v = self.ev(&fc.args[0], env)?;
             let prop = self.ev(&fc.args[1], env)?;
@@ -808,4 +843,13 @@ pub fn like_match_fold(s: &str, pat: &str, esc: Option<char>, fold: &dyn Fn(char
     let p = compile_like(pat, esc, fold);
     let chars: Vec<char> = s.trim_end_matches(' ').chars().collect();
     like_rec(&p, &chars, fold)
+}
+
+/// A full-text search condition that cannot be used: error 7619 when only noise words are left, 7630 for a syntax error.
+pub(crate) fn ft_error(m: String) -> SqlError {
+    if m.contains("only ignored words") {
+        SqlError::new(7619, "Execution of a full-text operation failed. A clause of the query contained only ignored words.")
+    } else {
+        SqlError::new(7630, format!("Syntax error near the end of the full-text search condition: {}.", m))
+    }
 }

@@ -353,9 +353,66 @@ impl<'a> Engine<'a> {
                                 rows.push(row(sv(&i.name), id, "NONCLUSTERED", i.unique, false, &i.filter));
                                 id += 1;
                             }
+                            // XML indexes are numbered from 256000
+                            for (k, x) in t.xml_indexes.iter().enumerate() {
+                                let mut r = row(sv(&x.name), 256_000 + k as i32, "XML", false, false, &None);
+                                r[8] = Value::Int(3);
+                                rows.push(r);
+                            }
                         }
                     }
                     Some(rs(&[("object_id", DataType::Int), ("name", nv()), ("index_id", DataType::Int), ("type_desc", nv()), ("is_unique", DataType::Bit), ("is_primary_key", DataType::Bit), ("has_filter", DataType::Bit), ("filter_definition", DataType::NVarChar(MAX)), ("type", DataType::TinyInt), ("is_unique_constraint", DataType::Bit), ("is_disabled", DataType::Bit), ("fill_factor", DataType::TinyInt)], rows))
+                }
+                "xml_indexes" => {
+                    let mut rows = vec![];
+                    for o in db.objects.values() {
+                        if let Object::Table(t) = o {
+                            for (k, x) in t.xml_indexes.iter().enumerate() {
+                                let using = x.using.as_ref().and_then(|u| t.xml_indexes.iter().position(|p| p.name.eq_ignore_ascii_case(u))).map(|p| Value::Int(256_000 + p as i32)).unwrap_or(Value::Null);
+                                let (st, sd) = match x.secondary {
+                                    Some('V') => (sv("V"), sv("VALUE")),
+                                    Some('P') => (sv("P"), sv("PATH")),
+                                    Some('R') => (sv("R"), sv("PROPERTY")),
+                                    _ => (Value::Null, Value::Null),
+                                };
+                                rows.push(vec![
+                                    Value::Int(t.object_id),
+                                    sv(&x.name),
+                                    Value::Int(256_000 + k as i32),
+                                    Value::Int(3),
+                                    sv("XML"),
+                                    Value::Bit(false),
+                                    Value::Bit(false),
+                                    Value::Bit(false),
+                                    Value::Bit(false),
+                                    Value::Int(if x.primary { 0 } else { 1 }),
+                                    sv(if x.primary { "PRIMARY_XML" } else { "SECONDARY_XML" }),
+                                    using,
+                                    st,
+                                    sd,
+                                ]);
+                            }
+                        }
+                    }
+                    Some(rs(
+                        &[
+                            ("object_id", DataType::Int),
+                            ("name", nv()),
+                            ("index_id", DataType::Int),
+                            ("type", DataType::TinyInt),
+                            ("type_desc", nv()),
+                            ("is_unique", DataType::Bit),
+                            ("is_primary_key", DataType::Bit),
+                            ("is_unique_constraint", DataType::Bit),
+                            ("is_disabled", DataType::Bit),
+                            ("xml_index_type", DataType::TinyInt),
+                            ("xml_index_type_description", nv()),
+                            ("using_xml_index_id", DataType::Int),
+                            ("secondary_type", DataType::Char(1)),
+                            ("secondary_type_desc", nv()),
+                        ],
+                        rows,
+                    ))
                 }
                 "index_columns" => {
                     let mut rows = vec![];
@@ -373,6 +430,9 @@ impl<'a> Engine<'a> {
                                     rows.push(vec![Value::Int(t.object_id), Value::Int(id), Value::Int(k as i32 + 1), Value::Int(c as i32 + 1), Value::Bit(false), Value::Bit(false), Value::Int(k as i32 + 1), Value::Int(0)]);
                                 }
                                 id += 1;
+                            }
+                            for (k, x) in t.xml_indexes.iter().enumerate() {
+                                rows.push(vec![Value::Int(t.object_id), Value::Int(256_000 + k as i32), Value::Int(1), Value::Int(x.col as i32 + 1), Value::Bit(false), Value::Bit(false), Value::Int(0), Value::Int(0)]);
                             }
                             for i in &t.indexes {
                                 for (k, (c, desc)) in i.cols.iter().enumerate() {

@@ -335,6 +335,22 @@ pub fn script_table(t: &TableInfo) -> String {
         let filter = ix.filter.as_ref().map(|f| format!(" WHERE {}", f)).unwrap_or_default();
         out.push_str(&format!("CREATE INDEX {} ON {} ({}){}{};\n", bracket(&ix.name), t.quoted(), cols, include, filter));
     }
+    for x in &t.xml_indexes {
+        let using = match (&x.using, x.secondary) {
+            (Some(u), kind) => format!(
+                " USING XML INDEX {}{}",
+                bracket(u),
+                match kind {
+                    Some('P') => " FOR PATH",
+                    Some('R') => " FOR PROPERTY",
+                    _ => " FOR VALUE",
+                }
+            ),
+            _ => String::new(),
+        };
+        out.push_str(&format!("CREATE {}XML INDEX {} ON {} ({}){};
+", if x.primary { "PRIMARY " } else { "" }, bracket(&x.name), t.quoted(), bracket(&x.column), using));
+    }
     for f in &t.foreign_keys {
         let own = f.columns.iter().map(|c| bracket(c)).collect::<Vec<_>>().join(", ");
         let theirs = f.ref_columns.iter().map(|c| bracket(c)).collect::<Vec<_>>().join(", ");

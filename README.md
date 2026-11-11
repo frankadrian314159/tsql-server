@@ -41,7 +41,7 @@ cargo run --release --bin tsql -- -D ./data           # durable shell on ./data 
 cargo run --release --bin tsql -- -D ./data --pool-pages 4096   # cache 4096 pages = 32 MiB
 cargo run --release --bin tsql                         # in-memory shell (nothing is written)
 cargo run --release --bin tsql-serve -- ./data --sa-password "Str0ng!pw"   # TDS server on 127.0.0.1:1433
-cargo run --release --bin tsql-bakinfo -- some.bak               # describe a native SQL Server backup (reader in progress)
+cargo run --release --bin tsql-bakinfo -- some.bak               # describe a native SQL Server backup (RESTORE DATABASE x FROM DISK = 'file.bak' imports it)
 cargo run --release --features gui --bin tsql-gui      # desktop app (add a data directory to keep your data)
 cargo run --bin tsql -- -D ./data -Q "SELECT @@VERSION"
 cargo run --bin tsql -- -D ./data -U ann -P secret     # log in as a SQL login
@@ -90,7 +90,8 @@ exactly as described in [docs/concurrency.md](docs/concurrency.md).
 | `catalog` | Databases, schemas, tables, views, procedures, functions, triggers, sequences, user types |
 | `persist` | Write-ahead log, checkpoints, crash recovery, data-directory locking |
 | `inspect`, `tools` | Catalog introspection (`table_info`, `objects`, …) and helpers for front ends: result grids, CSV import/export, SQL literals, table scripts |
-| `mtf.rs`, `mssqlbak.rs`, `xpress.rs`, `sqlbak.rs`, `binxml.rs`, `engine/bakimport.rs`, `bakinfo.rs` | Native SQL Server `.bak` files (restore of tables and rows; see [docs/backup.md](docs/backup.md)): the Microsoft Tape Format reader, the compressed `MSSQLBAK` chunks and their Xpress Huffman decoder, pages and system tables, binary XML, the import into this server, and the `tsql-bakinfo` inspector |
+| `xmlpath.rs`, `fulltext.rs` | The XQuery subset behind the xml methods (`.value`, `.exist`, `.query`, `.nodes`, `.modify`), and full-text matching |
+| `mtf.rs`, `mssqlbak.rs`, `xpress.rs`, `sqlbak.rs`, `binxml.rs`, `engine/bakimport.rs`, `bakinfo.rs` | Native SQL Server `.bak` files (restore of tables, rows, large values, XML, computed columns, keys, indexes, defaults, checks, views, procedures, functions and triggers; see [docs/backup.md](docs/backup.md)): the Microsoft Tape Format reader, the compressed `MSSQLBAK` chunks and their Xpress Huffman decoder, pages and system tables, binary XML, the import into this server, and the `tsql-bakinfo` inspector |
 | `tds/`, `serve.rs` | The TDS 7.4 listener (`tds::Listener`) and the `tsql-serve` program: packets, login, batches, RPC, transaction-manager requests, token streams, data type encoding |
 | `main.rs`, `gui/` | The `tsql` shell, and the optional `tsql-gui` desktop app (cargo feature `gui`) |
 | `security` | Logins, users, roles, permission resolution |
@@ -181,8 +182,8 @@ Things that are **not** implemented, so you are not surprised:
   rather than being rewritten to a semi-join or a grouped join, and only parsed batches (not execution plans) are cached.
 * **Triggers on views** — `INSTEAD OF` triggers on views are not supported (`AFTER` triggers on tables are; a view that maps onto one table is updatable, with `WITH CHECK OPTION`).
 * **Tools** — the shell and the desktop app use one session each (see [docs/shell-and-gui.md](docs/shell-and-gui.md)).
-* **XML / spatial / hierarchy** — `xml` is stored as text; `.value()`, `.exist()` and `.query()` handle simple XPath only, with no `.nodes()`, `.modify()` or `OPENXML` (see [docs/triggers.md](docs/triggers.md));
-  `geography`, `geometry`, `hierarchyid` are not functional. No full-text search, Service Broker, CLR, SQL Agent,
+* **XML / spatial / hierarchy** — `xml` is stored as text; `.value()`, `.exist()`, `.query()`, `.nodes()` and `.modify()` handle a subset of XQuery (paths, predicates, simple expressions, `insert` / `delete` / `replace value of`; no FLWOR, no `OPENXML`, no typed xml; see [docs/triggers.md](docs/triggers.md)); XML indexes can be created, and are only recorded in the catalog (see [docs/optimizer.md](docs/optimizer.md));
+  `geography`, `geometry`, `hierarchyid` are not functional. Full-text search (`CONTAINS`, `FREETEXT`, `CONTAINSTABLE`, `FREETEXTTABLE`) works by scanning, with no full-text index (see [docs/triggers.md](docs/triggers.md)). No Service Broker, CLR, SQL Agent,
   linked servers, `OPENROWSET(BULK)`, graph tables, columnstore, partitioning, replication, 
   backup compression (full, differential and log backups, restore and point-in-time recovery exist; see [docs/backup.md](docs/backup.md)).
 * **Collations** — case, accent and binary sensitivity (`CI`/`CS`, `AI`/`AS`, `BIN`/`BIN2`) per database, column and expression, in

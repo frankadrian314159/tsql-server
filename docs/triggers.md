@@ -65,9 +65,51 @@ and policy statements.
 
 ## The xml methods
 
-`xmlcol.value('path', 'type')`, `.exist('path')` and `.query('path')`, on columns, variables and expressions such as
-`EVENTDATA()`. The path language is a small subset of XPath: `/a/b`, `//b`, `*`, `@attr`, `text()`, positions `[n]` and
-`[last()]`, equality predicates `[@a='v']` and `[child='v']`, a wrapping `(...)[n]` and `data(...)`; namespaces are
-ignored. `.value` returns the first match's text converted to the type (NULL if none, error 9400 for malformed xml, 2225
-for an unsupported path), `.exist` is 1 or 0, `.query` the matching nodes as xml text. Not supported: FLWOR,
-other XQuery functions, `.nodes()`, `.modify()`, `OPENXML`, typed xml and XML indexes.
+`xmlcol.value('path', 'type')`, `.exist('path')`, `.query('path')`, `.nodes('path') AS t(c)` and `.modify('dml')`, on columns,
+variables and expressions such as `EVENTDATA()` (`src/xmlpath.rs`). The document is parsed into a tree that keeps prefixes and
+`xmlns` attributes, so a modified document is written out as it was. Names are matched by their local part; namespaces are not
+resolved, and a `declare namespace p = "...";` or `declare default element namespace "...";` prolog is accepted and not used.
+
+The query language is a subset of XQuery: absolute and relative paths (`/a/b`, `//b`, `a/b`, `.`, `..`), the steps `name`,
+`p:name`, `*`, `@attr`, `@*`, `text()`, `node()`, `(path)[n]` followed by more steps, predicates (`[n]`, `[last()]`, comparisons
+joined by `and` / `or`, `not()`, an existence test), numbers, strings, `+ - * div mod`, and `data`, `string`, `number`, `count`,
+`sum`, `not`, `concat`, `contains`, `starts-with`, `string-length`, `empty`, `exists` and the `xs:` casts. `sql:column("t.c")` and
+`sql:variable("@v")` are bound by the SQL parser to the column or variable. Not supported: FLWOR, `if`, written-out axes,
+typed xml, user functions.
+
+* `.value` returns the first item's text converted to the type (NULL if none; error 9400 for malformed xml, 2225 for a query
+  that is not supported), `.exist` is 1 or 0, `.query` the items as xml text.
+* `.nodes('path')` is a table: one row per selected element, in a single `xml` column, used with `CROSS APPLY` or `OUTER APPLY`
+  (`FROM t CROSS APPLY t.doc.nodes('/a/b') AS n(ref)`) or on a variable (`FROM @x.nodes(...) AS n(ref)`); `n.ref.nodes(...)`
+  works on a node again.
+* `.modify` is `insert <element/> | attribute n {e} | "text"` with `as first into`, `as last into`, `into`, `before` or `after`
+  a target, `delete target`, and `replace value of target with expr`; `{ expr }` inside new content is evaluated. It is used
+  as `UPDATE t SET col.modify('...')` and `SET @x.modify('...')`. The target of `insert` and `replace value of` must be one
+  node. A `NULL` xml stays `NULL`.
+
+**The nodes that `.nodes()` returns are xml text** (each is the element, with the namespace declarations that are in scope for it),
+not positions in the document they came from. Two things follow. The parent of a node is not available (`..` from a node finds
+nothing), and a relative path in a method of a node starts at the node, as in SQL Server, which is told from a relative path
+on a document, which starts at the document, by a rule: a relative path that finds nothing at the document is tried again at
+its single top-level element. The one case in which that differs from SQL Server is a relative path that SQL Server would
+evaluate to nothing, and that this server does evaluate from the element.
+
+Error 2225 carries the reason for a query or statement that is not supported or cannot be applied; SQL Server's own numbers
+for these (2256, 2260 and others) are not used. XML indexes can be created but are only recorded (see
+[optimizer.md](optimizer.md#xml-indexes)).
+
+## Full-text search
+
+`CONTAINS(col | (c1, c2) | *, 'condition' [, LANGUAGE n])`, `FREETEXT(...)`, `CONTAINSTABLE(table, cols, 'condition' [, LANGUAGE n]
+[, top])` and `FREETEXTTABLE(...)` (`src/fulltext.rs`). The two tables have the columns `KEY` (the single-column key of the table) and
+`RANK`. There is no full-text index: a text is tokenised and matched when a row is looked at, so a search is a scan, and
+`CREATE FULLTEXT INDEX` and `CREATE FULLTEXT CATALOG` are not supported (nothing needs them, and there is no error 7601 for a table
+without one). `*` is every text column of the table (of every table in the row, in the predicate form).
+
+A condition understands words (case does not matter), `"phrases"`, prefix terms (`"comp*"`), `AND`, `OR`, `AND NOT` (and `&`,
+`|`, `&!`), parentheses, `NEAR` (`a NEAR b`, `a ~ b`, `NEAR((a, b), distance, TRUE)`), `FORMSOF(INFLECTIONAL, word)` (words with the
+same plain English stem; irregular forms are not known), `FORMSOF(THESAURUS, word)` (no thesaurus: the word itself) and
+`ISABOUT(term WEIGHT(w), ...)` (matches any term). A short English list of noise words is ignored, and a phrase skips over
+them; a condition with only noise words is error 7619, a syntax error 7630. `FREETEXT` takes the words of its text, drops the noise
+words and matches texts that have the stem of any of them. **The rank is a number from 1 to 1000 that grows with the number of
+matches; it orders results and is not SQL Server's rank.** The language is read and not used.

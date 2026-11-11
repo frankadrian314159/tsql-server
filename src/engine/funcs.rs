@@ -27,6 +27,18 @@ fn num(v: &Value) -> Result<f64> {
         },
     }
 }
+/// A value handed to an XML query as the value of `sql:column()` or `sql:variable()`.
+fn xml_arg(v: &Value) -> crate::xmlpath::Arg {
+    use crate::xmlpath::Arg;
+    match v {
+        Value::Null => Arg::Null,
+        Value::Bit(_) | Value::Int(_) | Value::BigInt(_) | Value::Dec(_) | Value::Float(_) => match convert::as_num(v) {
+            Some(n) => Arg::Num(convert::num_to_f64(n)),
+            None => Arg::Str(to_str(v)),
+        },
+        other => Arg::Str(to_str(other)),
+    }
+}
 fn any_null(a: &[Value]) -> bool {
     a.iter().any(|v| v.is_null())
 }
@@ -2027,18 +2039,24 @@ impl<'a> Engine<'a> {
                 }
             }
             // --------------------------------------------------------- xml methods (.value / .exist / .query)
-            "XML_VALUE" | "XML_EXIST" | "XML_QUERY" => {
-                need(name, &a, 2)?;
+            "XML_VALUE" | "XML_EXIST" | "XML_QUERY" | "XML_MODIFY" => {
+                // the arguments after the query are the values of its sql:column() and sql:variable() calls
+                need_range(name, &a, 2, 64)?;
                 if a[0].is_null() {
                     return Ok(Some(Value::Null));
                 }
-                let doc = crate::xmlpath::parse(&s(&a[0])).ok_or_else(|| SqlError::new(9400, "XML parsing: the document is not well-formed."))?;
-                let items = crate::xmlpath::select(&doc, &s(&a[1])).map_err(|m| SqlError::new(2225, format!("XQuery: {}", m)))?;
+                let mut doc = crate::xmlpath::Doc::parse(&s(&a[0])).ok_or_else(|| SqlError::new(9400, "XML parsing: the document is not well-formed."))?;
+                let xargs: Vec<crate::xmlpath::Arg> = a[2..].iter().map(xml_arg).collect();
+                if name == "XML_MODIFY" {
+                    doc.modify(&s(&a[1]), &xargs).map_err(|m| SqlError::new(2225, format!("XQuery [modify()]: {}", m)))?;
+                    return Ok(Some(Value::Str(doc.to_xml())));
+                }
+                let items = doc.select(&s(&a[1]), &xargs).map_err(|m| SqlError::new(2225, format!("XQuery: {}", m)))?;
                 match name {
                     "XML_EXIST" => Value::Int((!items.is_empty()) as i32),
-                    "XML_QUERY" => Value::Str(items.iter().map(|i| i.xml()).collect::<String>()),
+                    "XML_QUERY" => Value::Str(items.iter().map(|i| doc.xml_of(i)).collect::<String>()),
                     _ => match items.first() {
-                        Some(i) => Value::Str(i.string()),
+                        Some(i) => Value::Str(doc.string_of(i)),
                         None => Value::Null,
                     },
                 }
@@ -2103,11 +2121,82 @@ impl<'a> Engine<'a> {
     }
 
     // ------------------------------------------------------ table functions
+    /// `CONTAINSTABLE` / `FREETEXTTABLE`: arguments are the table name and the column names (joined by a control character; no
+    /// columns means all of the text columns), the condition and the number of rows wanted (NULL for all). The result has the
+    /// columns `KEY` (the single column key of the table) and `RANK`, best rank first.
+    fn fulltext_table(&mut self, contains: bool, args: &[Value]) -> Result<Rowset> {
+        let parts: Vec<String> = s(&args[0]).split('\u{1}').map(|p| p.to_string()).collect();
+        let want: Vec<String> = if s(&args[1]).is_empty() { vec![] } else { s(&args[1]).split('\u{1}').map(|p| p.to_string()).collect() };
+        let loc = self.locate(&parts);
+        let key = match self.table_ref(&loc) {
+            Some(t) => {
+                let single = |k: &crate::catalog::KeyDef| if k.cols.len() == 1 { Some(k.cols[0]) } else { None };
+                let ci = t.pk.as_ref().and_then(single).or_else(|| t.uniques.iter().find_map(single));
+                ci.map(|i| t.columns[i].name.clone())
+            }
+            None => return Err(SqlError::new(208, format!("Invalid object name '{}'.", parts.join(".")))),
+        };
+        let Some(key) = key else {
+            return Err(SqlError::new(7652, format!("A full-text search on '{}' needs a unique index on one column to identify the rows.", parts.join("."))));
+        };
+        let tr = TableRef::Table { name: parts.clone(), alias: None, hints: vec![] };
+        let rs = self.eval_table_ref(&tr, None)?;
+        let find = |n: &str| rs.schema.cols.iter().position(|c| c.name.eq_ignore_ascii_case(n));
+        let ki = find(&key).ok_or_else(|| SqlError::new(207, format!("Invalid column name '{}'.", key)))?;
+        let text_cols: Vec<usize> = if want.is_empty() {
+            rs.schema.cols.iter().enumerate().filter(|(_, c)| c.denied.is_none() && c.ty.as_ref().is_some_and(|t| t.is_string() || matches!(t, DataType::Xml))).map(|(i, _)| i).collect()
+        } else {
+            want.iter().map(|n| find(n).ok_or_else(|| SqlError::new(207, format!("Invalid column name '{}'.", n)))).collect::<Result<_>>()?
+        };
+        let cols = vec![
+            ColMeta { qual: None, name: "KEY".into(), ty: rs.schema.cols[ki].ty.clone(), denied: None, hidden: false, coll: None, mask: None },
+            ColMeta { qual: None, name: "RANK".into(), ty: Some(DataType::Int), denied: None, hidden: false, coll: None, mask: None },
+        ];
+        if args[2].is_null() {
+            return Ok(Rowset::new(Schema::new(cols), vec![]));
+        }
+        let q = s(&args[2]);
+        let cond = if contains { Some(crate::fulltext::parse_contains(&q).map_err(super::expr::ft_error)?) } else { None };
+        let mut hits: Vec<(u32, Value)> = vec![];
+        for r in rs.rows.iter() {
+            let texts: Vec<String> = text_cols.iter().filter(|&&i| !r[i].is_null()).map(|&i| to_str(&r[i])).collect();
+            let refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
+            let rank = match &cond {
+                Some(c) => crate::fulltext::contains_rank(c, &refs),
+                None => crate::fulltext::freetext_rank(&q, &refs),
+            };
+            if rank > 0 {
+                hits.push((rank, r[ki].clone()));
+            }
+        }
+        hits.sort_by(|a, b| b.0.cmp(&a.0));
+        if let Some(n) = args.get(3).filter(|v| !v.is_null()).and_then(|v| v.as_i64()) {
+            hits.truncate(n.max(0) as usize);
+        }
+        Ok(Rowset::new(Schema::new(cols), hits.into_iter().map(|(rank, k)| vec![k, Value::Int(rank as i32)]).collect()))
+    }
+
     pub fn table_function(&mut self, name: &[String], args: Vec<Value>, with: Option<&Vec<(String, TypeRef, Option<String>)>>) -> Result<Rowset> {
         let up = name.last().unwrap().to_uppercase();
         let plain = name.len() == 1 || name[name.len() - 2].eq_ignore_ascii_case("sys");
         if plain {
             match up.as_str() {
+                // CONTAINSTABLE and FREETEXTTABLE: the key and the rank of the rows that match (see fulltext.rs)
+                "FT_CONTAINSTABLE" | "FT_FREETEXTTABLE" => return self.fulltext_table(up == "FT_CONTAINSTABLE", &args),
+                // xmlcol.nodes('path'): one row per selected element, as xml text (see xmlpath.rs)
+                "XML_NODES" => {
+                    if args.len() < 2 {
+                        return Err(SqlError::new(174, "The nodes function requires 1 argument(s)."));
+                    }
+                    let cols = vec![ColMeta { qual: None, name: "node".into(), ty: Some(DataType::Xml), denied: None, hidden: false, coll: None, mask: None }];
+                    if args[0].is_null() {
+                        return Ok(Rowset::new(Schema::new(cols), vec![]));
+                    }
+                    let doc = crate::xmlpath::Doc::parse(&s(&args[0])).ok_or_else(|| SqlError::new(9400, "XML parsing: the document is not well-formed."))?;
+                    let xargs: Vec<crate::xmlpath::Arg> = args[2..].iter().map(xml_arg).collect();
+                    let frags = doc.nodes(&s(&args[1]), &xargs).map_err(|m| SqlError::new(2225, format!("XQuery [nodes()]: {}", m)))?;
+                    return Ok(Rowset::new(Schema::new(cols), frags.into_iter().map(|f| vec![Value::Str(f)]).collect()));
+                }
                 "STRING_SPLIT" => {
                     if args.len() < 2 {
                         return Err(SqlError::new(174, "The string_split function requires 2 argument(s)."));

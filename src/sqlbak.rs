@@ -27,10 +27,6 @@ fn u16_at(b: &[u8], o: usize) -> Option<u16> {
 fn u32_at(b: &[u8], o: usize) -> Option<u32> {
     b.get(o..o + 4).map(|x| u32::from_le_bytes(x.try_into().unwrap()))
 }
-fn u64_at(b: &[u8], o: usize) -> Option<u64> {
-    b.get(o..o + 8).map(|x| u64::from_le_bytes(x.try_into().unwrap()))
-}
-
 /// A record in a page: the bytes of the page and where the record starts.
 struct Rec<'a> {
     p: &'a [u8],
@@ -123,8 +119,12 @@ pub struct ColMeta {
     pub nullable: bool,
     /// (seed, increment, last value)
     pub identity: Option<(i64, i64, i64)>,
-    /// computed columns are not stored in the row
+    /// a computed column: its values are not stored in the row, unless it is persisted
     pub computed: bool,
+    /// the expression of a computed column, as written
+    pub definition: Option<String>,
+    /// a computed column that is stored in the row
+    pub persisted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +140,81 @@ pub struct TableMeta {
     pub rows: u64,
     /// where each stored column is in the records, by column id (from `sysrscols`)
     pub locs: HashMap<u32, ColLoc>,
+    /// clustered and nonclustered indexes, including the ones behind PRIMARY KEY and UNIQUE constraints
+    pub indexes: Vec<IndexMeta>,
+    /// XML indexes, primary ones first
+    pub xml_indexes: Vec<XmlIndexMeta>,
+    /// indexes of other kinds (spatial, columnstore ...) as (name, type number); not read
+    pub other_indexes: Vec<(String, u8)>,
+    /// FOREIGN KEY constraints that this table holds
+    pub foreign_keys: Vec<ForeignKey>,
+    pub defaults: Vec<Constraint>,
+    pub checks: Vec<Constraint>,
+}
+
+type Key = (u8, u32, u32);
+
+/// A view, procedure, function or trigger.
+#[derive(Debug, Clone)]
+pub struct ModuleMeta {
+    pub id: u32,
+    pub schema: String,
+    pub name: String,
+    /// the object type: `V ` view, `P ` procedure, `FN` scalar function, `IF` inline and `TF` multi-statement table
+    /// function, `TR` trigger; `AF`, `FS`, `FT`, `PC`, `TA` are CLR objects
+    pub kind: [u8; 2],
+    /// for a trigger, the id of its table (0 for a database trigger)
+    pub parent: u32,
+    /// the `CREATE` statement; none for an encrypted object
+    pub definition: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct XmlIndexMeta {
+    pub name: String,
+    /// the id of the xml column
+    pub column: u32,
+    pub primary: bool,
+    /// a secondary index: `V` value, `P` path or `R` property
+    pub secondary: Option<char>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexMeta {
+    pub id: u32,
+    pub name: String,
+    pub clustered: bool,
+    pub unique: bool,
+    /// the index behind a PRIMARY KEY constraint
+    pub primary: bool,
+    /// the index behind a UNIQUE constraint
+    pub unique_constraint: bool,
+    /// key columns in key order: (column id, descending)
+    pub keys: Vec<(u32, bool)>,
+    /// INCLUDE columns, as column ids
+    pub included: Vec<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForeignKey {
+    pub name: String,
+    /// (column id in this table, column id in the referenced table), in key order
+    pub columns: Vec<(u32, u32)>,
+    /// the id of the referenced table
+    pub ref_table: u32,
+    pub cascade_delete: bool,
+    /// status bits that are set and not understood
+    pub unknown_flags: u32,
+}
+
+/// A DEFAULT or CHECK constraint.
+#[derive(Debug, Clone)]
+pub struct Constraint {
+    pub name: String,
+    /// the column it belongs to (0 for a CHECK on the table)
+    pub column: u32,
+    /// the expression as written, including its outer parentheses
+    pub definition: String,
 }
 
 /// Where a column is in a record.
@@ -187,6 +262,11 @@ const SYSCOLPARS: u32 = 41;
 const SYSCLSOBJS: u32 = 64;
 const SYSRSCOLS: u32 = 3;
 const SYSISCOLS: u32 = 55;
+const SYSIDXSTATS: u32 = 54;
+const SYSOBJVALUES: u32 = 60;
+const SYSSINGLEOBJREFS: u32 = 74;
+#[cfg(test)]
+const SYSXPROPS: u32 = 49;
 
 impl<R: Read + Seek> Backup<R> {
     /// Index the pages of a backup whose container has been opened.
@@ -320,10 +400,30 @@ impl<R: Read + Seek> Backup<R> {
     pub fn tables(&mut self) -> Res<Vec<TableMeta>> {
         // objects: id int, nsid int, nsclass tinyint, status int, type char(2), pid, pclass, intprop, created, modified; name
         let mut tables: Vec<TableMeta> = vec![];
+        // (id, type, parent table, status, intprop, name) of DEFAULT, CHECK and FOREIGN KEY constraints
+        let mut cons: Vec<(u32, [u8; 2], u32, u32, u32, String)> = vec![];
         self.each_record(SYSSCHOBJS, 1, true, &mut |r| {
             if r.fixed(13, 2) == Some(b"U ") {
                 let name = r.var(0).map(|(n, _)| utf16(n)).unwrap_or_default();
-                tables.push(TableMeta { id: r.fu32(0), schema: r.fu32(4).to_string(), name, cols: vec![], data: None, rows: 0, locs: HashMap::new() });
+                tables.push(TableMeta {
+                    id: r.fu32(0),
+                    schema: r.fu32(4).to_string(),
+                    name,
+                    cols: vec![],
+                    data: None,
+                    rows: 0,
+                    locs: HashMap::new(),
+                    indexes: vec![],
+                    xml_indexes: vec![],
+                    other_indexes: vec![],
+                    foreign_keys: vec![],
+                    defaults: vec![],
+                    checks: vec![],
+                });
+            } else if let Some(ty @ (b"D " | b"C " | b"F ")) = r.fixed(13, 2) {
+                // status int @9, pid @15, intprop @20 (the column of a default or column check)
+                let name = r.var(0).map(|(n, _)| utf16(n)).unwrap_or_default();
+                cons.push((r.fu32(0), [ty[0], ty[1]], r.fu32(15), r.fu32(9), r.fu32(20), name));
             }
         })?;
         for t in &mut tables {
@@ -358,6 +458,8 @@ impl<R: Read + Seek> Backup<R> {
                     nullable: status & 1 == 0,
                     identity,
                     computed: status & 0x80 != 0,
+                    definition: None,
+                    persisted: false,
                 },
             ));
         })?;
@@ -388,9 +490,9 @@ impl<R: Read + Seek> Backup<R> {
                 }
             }
         }
-        // the physical layout: sysrscols (rowset -> column -> offset, null bit, bit position) with the columns numbered as
-        // the b-tree stores them (the clustered key first, in key order, then the others by column id; computed columns
-        // are not stored)
+        // the physical layout: sysrscols (rowset -> column -> offset, null bit, bit position); rscolid, the second column, is
+        // the column id of syscolpars. A rowset lists the columns that are stored: not the computed columns, except the
+        // persisted ones.
         let mut rs_cols: HashMap<u64, HashMap<u32, ColLoc>> = HashMap::new();
         self.each_record(SYSRSCOLS, 0, false, &mut |r| {
             let (off, nullbit) = (r.fu32(40) as u16, r.fu32(44) as u16);
@@ -399,39 +501,257 @@ impl<R: Read + Seek> Backup<R> {
             } else {
                 ColLoc { fixed: (off as usize).checked_sub(4), var: None, nullbit: (nullbit as usize).saturating_sub(1), bitpos: Some(r.fu16(48) as u8) }
             };
-            rs_cols.entry(r.fu64(0)).or_default().insert(r.fu32(12), loc);
+            rs_cols.entry(r.fu64(0)).or_default().insert(r.fu32(8), loc);
         })?;
         // sysiscols: idmajor int, idminor int, subid int, status int, intprop int (the column id), tinyprop1 (the position in
         // the key, 0 when the column is not a key column), ...
-        let mut keys: HashMap<u32, Vec<(u8, u32)>> = HashMap::new(); // table -> (position in the key, colid) of the clustered index
+        // (table, index) -> (subid, status, position in the key, column id); status 0x10 marks an INCLUDE column, 0x4 a
+        // descending key column
+        let mut iscols: HashMap<(u32, u32), Vec<(u32, u32, u8, u32)>> = HashMap::new();
         self.each_record(SYSISCOLS, 1, true, &mut |r| {
             let pos = r.fixed(20, 1).map(|b| b[0]).unwrap_or(0);
-            if r.fu32(4) == 1 && pos > 0 {
-                keys.entry(r.fu32(0)).or_default().push((pos, r.fu32(16)));
-            }
+            iscols.entry((r.fu32(0), r.fu32(4))).or_default().push((r.fu32(8), r.fu32(12), pos, r.fu32(16)));
         })?;
         for t in &mut tables {
             let Some((_, _, clustered)) = t.data else { continue };
             // the rowset that holds the data
             let rs = rowsets.iter().find(|(rs, v)| v.0 == t.id && v.1 == if clustered { 1 } else { 0 } && units.get(*rs).is_some_and(|u| u.iter().any(|x| x.0 == 1))).map(|(rs, _)| *rs);
             let Some(layout) = rs.and_then(|rs| rs_cols.get(&rs)) else { continue };
-            let stored: Vec<u32> = t.cols.iter().filter(|c| !c.computed).map(|c| c.colid).collect();
-            let mut order: Vec<u32> = vec![];
-            if clustered {
-                let mut k = keys.get(&t.id).cloned().unwrap_or_default();
-                k.sort_unstable();
-                order.extend(k.into_iter().map(|(_, c)| c).filter(|c| stored.contains(c)));
-            }
-            let first = order.clone();
-            order.extend(stored.iter().copied().filter(|c| !first.contains(c)));
-            for (i, colid) in order.iter().enumerate() {
-                if let Some(loc) = layout.get(&(i as u32 + 1)) {
-                    t.locs.insert(*colid, *loc);
+            for c in &mut t.cols {
+                if let Some(loc) = layout.get(&c.colid) {
+                    t.locs.insert(c.colid, *loc);
+                    c.persisted = c.computed;
                 }
             }
         }
+        self.read_keys(&mut tables, &by_id, &iscols, &cons)?;
         tables.sort_by(|a, b| (a.schema.as_str(), a.name.as_str()).cmp(&(b.schema.as_str(), b.name.as_str())));
         Ok(tables)
+    }
+
+    /// The text values of `sysobjvalues` (valclass tinyint, objid int, subobjid int, valnum int, value sql_variant, imageval
+    /// image) for which `accept(class, objid)` is true: the pieces of each (class, objid, subobjid) by valnum.
+    fn object_values(&mut self, accept: &dyn Fn(u8, u32) -> bool) -> Res<HashMap<Key, std::collections::BTreeMap<u32, Vec<u8>>>> {
+        let mut pieces: HashMap<Key, std::collections::BTreeMap<u32, Vec<u8>>> = HashMap::new();
+        let mut pending: Vec<(Key, u32, Vec<u8>)> = vec![];
+        self.each_record(SYSOBJVALUES, 1, true, &mut |r| {
+            let Some(class) = r.fixed(0, 1).map(|c| c[0]) else { return };
+            let id = r.fu32(1);
+            if !accept(class, id) {
+                return;
+            }
+            let key = (class, id, r.fu32(5));
+            match r.var(1) {
+                Some((b, false)) => {
+                    pieces.entry(key).or_default().insert(r.fu32(9), b.to_vec());
+                }
+                Some((b, true)) => pending.push((key, r.fu32(9), b.to_vec())),
+                None => {}
+            }
+        })?;
+        for (key, n, ptr) in pending {
+            if let Some(b) = self.lob(&ptr) {
+                pieces.entry(key).or_default().insert(n, b);
+            }
+        }
+        Ok(pieces)
+    }
+
+    /// Views, procedures, functions and triggers of the user schemas, with their definitions (the whole `CREATE` statement).
+    pub fn modules(&mut self) -> Res<Vec<ModuleMeta>> {
+        let mut found: Vec<ModuleMeta> = vec![];
+        // objects: id @0, nsid @4, type @13, pid @15 (for a trigger, its table)
+        self.each_record(SYSSCHOBJS, 1, true, &mut |r| {
+            if let Some(ty @ (b"V " | b"P " | b"FN" | b"IF" | b"TF" | b"TR" | b"AF" | b"FS" | b"FT" | b"PC" | b"TA")) = r.fixed(13, 2) {
+                found.push(ModuleMeta {
+                    id: r.fu32(0),
+                    schema: r.fu32(4).to_string(),
+                    name: r.var(0).map(|(n, _)| utf16(n)).unwrap_or_default(),
+                    kind: [ty[0], ty[1]],
+                    parent: r.fu32(15),
+                    definition: None,
+                });
+            }
+        })?;
+        for m in &mut found {
+            m.schema = self.schemas.get(&m.schema.parse().unwrap_or(0)).cloned().unwrap_or_else(|| "dbo".to_string());
+        }
+        found.retain(|m| m.schema != "sys" && m.schema != "INFORMATION_SCHEMA");
+        let ids: std::collections::HashSet<u32> = found.iter().map(|m| m.id).collect();
+        let pieces = self.object_values(&|class, id| class == 1 && ids.contains(&id))?;
+        for m in &mut found {
+            // the first (lowest) procedure number
+            let first = pieces.keys().filter(|k| k.1 == m.id).map(|k| k.2).min();
+            if let Some(p) = first.and_then(|sub| pieces.get(&(1, m.id, sub))) {
+                m.definition = Some(cp1252(&p.values().flatten().copied().collect::<Vec<u8>>()));
+            }
+        }
+        found.sort_by_key(|m| m.id);
+        Ok(found)
+    }
+
+    /// Indexes, foreign keys, defaults and checks of the tables.
+    fn read_keys(
+        &mut self,
+        tables: &mut [TableMeta],
+        by_id: &HashMap<u32, usize>,
+        iscols: &HashMap<(u32, u32), Vec<(u32, u32, u8, u32)>>,
+        cons: &[(u32, [u8; 2], u32, u32, u32, String)],
+    ) -> Res<()> {
+        // sysidxstats: id int, indid int, status int, intprop int, fillfact tinyint, type tinyint, ...; name.
+        // type 1 clustered, 2 nonclustered, 0 a heap or the statistics of a column, others XML, spatial, columnstore ...;
+        // status 0x8 unique, 0x20 PRIMARY KEY, 0x40 UNIQUE constraint
+        // type 3 is an XML index; its tinyprop (byte 18) is 0 for a primary one and the letter of the kind (V, P, R) for a
+        // secondary one, and its column is in sysiscols
+        let mut idxs: Vec<(u32, u32, u32, u8, String, u8)> = vec![];
+        self.each_record(SYSIDXSTATS, 1, true, &mut |r| {
+            let ty = r.fixed(17, 1).map(|b| b[0]).unwrap_or(0);
+            let kind = r.fixed(18, 1).map(|b| b[0]).unwrap_or(0);
+            idxs.push((r.fu32(0), r.fu32(4), r.fu32(8), ty, r.var(0).map(|(n, _)| utf16(n)).unwrap_or_default(), kind));
+        })?;
+        for (tid, indid, status, ty, name, kind) in idxs {
+            let Some(&ti) = by_id.get(&tid) else { continue };
+            match ty {
+                0 => {}
+                1 | 2 => {
+                    let mut cols = iscols.get(&(tid, indid)).cloned().unwrap_or_default();
+                    cols.sort_unstable();
+                    let mut keys: Vec<(u8, u32, bool)> = cols.iter().filter(|c| c.1 & 0x10 == 0 && c.2 > 0).map(|c| (c.2, c.3, c.1 & 0x4 != 0)).collect();
+                    keys.sort_unstable();
+                    let included = cols.iter().filter(|c| c.1 & 0x10 != 0).map(|c| c.3).collect();
+                    tables[ti].indexes.push(IndexMeta {
+                        id: indid,
+                        name,
+                        clustered: ty == 1,
+                        unique: status & 0x8 != 0,
+                        primary: status & 0x20 != 0,
+                        unique_constraint: status & 0x40 != 0,
+                        keys: keys.into_iter().map(|k| (k.1, k.2)).collect(),
+                        included,
+                    });
+                }
+                3 => {
+                    let column = iscols.get(&(tid, indid)).and_then(|c| c.first()).map(|c| c.3).unwrap_or(0);
+                    tables[ti].xml_indexes.push(XmlIndexMeta { name, column, primary: kind == 0, secondary: if kind == 0 { None } else { Some(kind as char) } });
+                }
+                other => tables[ti].other_indexes.push((name, other)),
+            }
+        }
+        for t in tables.iter_mut() {
+            t.indexes.sort_by_key(|i| i.id);
+            // primary XML indexes before the secondary ones; the order of the catalog otherwise
+            t.xml_indexes.sort_by_key(|x| !x.primary);
+        }
+        // definitions of defaults and checks: sysobjvalues (valclass tinyint = 1, objid int, subobjid int, valnum int,
+        // value sql_variant, imageval image), the text in 8-bit characters, in pieces by valnum
+        let want: std::collections::HashSet<u32> = cons.iter().filter(|c| c.1 != *b"F ").map(|c| c.0).collect();
+        // class 1 is the definition of a default or check (objid), class 2 that of a computed column (objid the table,
+        // subobjid the column)
+        let pieces = self.object_values(&|class, id| match class {
+            1 => want.contains(&id),
+            2 => by_id.contains_key(&id),
+            _ => false,
+        })?;
+        let text = |key: Key| -> Option<String> { pieces.get(&key).map(|p| cp1252(&p.values().flatten().copied().collect::<Vec<u8>>())) };
+        let definition = |id: u32| text((1, id, 0));
+        for t in tables.iter_mut() {
+            let tid = t.id;
+            for c in t.cols.iter_mut().filter(|c| c.computed) {
+                c.definition = text((2, tid, c.colid));
+            }
+        }
+        // foreign key columns: syssingleobjrefs (class tinyint, depid int, depsubid int, indepid int, indepsubid int, status);
+        // class 27: the referenced table, 28: the n-th column of the key in the referencing table, 29: in the referenced table
+        let mut refs: HashMap<u32, (u32, Vec<(u32, u32)>, Vec<(u32, u32)>)> = HashMap::new();
+        self.each_record(SYSSINGLEOBJREFS, 1, true, &mut |r| {
+            let Some(class) = r.fixed(0, 1).map(|b| b[0]) else { return };
+            let e = refs.entry(r.fu32(1)).or_default();
+            match class {
+                27 => e.0 = r.fu32(9),
+                28 => e.1.push((r.fu32(5), r.fu32(13))),
+                29 => e.2.push((r.fu32(5), r.fu32(13))),
+                _ => {}
+            }
+        })?;
+        for (id, ty, pid, status, col, name) in cons {
+            let Some(&ti) = by_id.get(pid) else { continue };
+            match ty {
+                b"F " => {
+                    let Some((ref_table, mut child, mut parent)) = refs.get(id).cloned() else { continue };
+                    child.sort_unstable();
+                    parent.sort_unstable();
+                    if ref_table == 0 || child.is_empty() || child.len() != parent.len() {
+                        continue;
+                    }
+                    tables[ti].foreign_keys.push(ForeignKey {
+                        name: name.clone(),
+                        columns: child.iter().zip(&parent).map(|(c, p)| (c.1, p.1)).collect(),
+                        ref_table,
+                        cascade_delete: status & 0x4000 != 0,
+                        unknown_flags: status & !0x4000,
+                    });
+                }
+                b"D " => {
+                    if let Some(d) = definition(*id) {
+                        tables[ti].defaults.push(Constraint { name: name.clone(), column: *col, definition: d });
+                    }
+                }
+                _ => {
+                    if let Some(d) = definition(*id) {
+                        tables[ti].checks.push(Constraint { name: name.clone(), column: *col, definition: d });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A large value stored outside its row, given the pointer in the row: a root of type 4 whose 12-byte links (cumulative
+    /// size, page, file, slot) lead to data fragments (type 3) or to internal nodes (type 2, with 16-byte links) in
+    /// text pages. The bytes of the fragments, in link order, are the value.
+    fn lob(&mut self, ptr: &[u8]) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        match u16_at(ptr, 0)? {
+            4 => {
+                for l in ptr.get(12..)?.chunks_exact(12) {
+                    self.lob_node(u32_at(l, 4)?, u16_at(l, 10)? as usize, 0, &mut out)?;
+                }
+            }
+            // the 16-byte pointer of text, ntext and image columns: type, blob id, page, file, slot of a root in a text page
+            0 if ptr.len() == 16 => self.lob_node(u32_at(ptr, 8)?, u16_at(ptr, 14)? as usize, 0, &mut out)?,
+            _ => return None,
+        }
+        Some(out)
+    }
+
+    fn lob_node(&mut self, page: u32, slot: usize, depth: u8, out: &mut Vec<u8>) -> Option<()> {
+        if depth > 6 {
+            return None;
+        }
+        let p = self.page(page).ok()?;
+        let off = *Self::slots(&p).get(slot)?;
+        let len = u16_at(&p, off + 2)? as usize;
+        let rec = p.get(off..off + len)?;
+        match u16_at(rec, 12)? {
+            3 => out.extend_from_slice(rec.get(14..)?),
+            2 => {
+                let n = (u32_at(rec, 16)? as usize).min(len.saturating_sub(20) / 16);
+                for k in 0..n {
+                    let l = rec.get(20 + 16 * k..36 + 16 * k)?;
+                    self.lob_node(u32_at(l, 8)?, u16_at(l, 14)? as usize, depth + 1, out)?;
+                }
+            }
+            // a root: 24 bytes of header (type, room for links, number of links) and then 12-byte links like those of a type 4 pointer
+            5 => {
+                let n = (u32_at(rec, 16)? as usize).min(len.saturating_sub(24) / 12);
+                for k in 0..n {
+                    let l = rec.get(24 + 12 * k..36 + 12 * k)?;
+                    self.lob_node(u32_at(l, 4)?, u16_at(l, 10)? as usize, depth + 1, out)?;
+                }
+            }
+            _ => return None,
+        }
+        Some(())
     }
 
     /// Decode the rows of a table (only the stored columns: computed columns are not in the pages).
@@ -447,7 +767,7 @@ impl<R: Read + Seek> Backup<R> {
                 if !matches!(r.kind(), 0 | 1) {
                     continue;
                 }
-                out.rows.push(plan.decode(&r, &cols, &mut out.skipped));
+                out.rows.push(plan.decode(&r, &cols, &mut out.skipped, &mut |ptr| self.lob(ptr)));
             }
         }
         Ok(out)
@@ -525,7 +845,7 @@ impl Plan {
         Plan { cols }
     }
 
-    fn decode(&self, r: &Rec, cols: &[&ColMeta], skipped: &mut HashMap<String, u64>) -> Vec<Value> {
+    fn decode(&self, r: &Rec, cols: &[&ColMeta], skipped: &mut HashMap<String, u64>, lob: &mut dyn FnMut(&[u8]) -> Option<Vec<u8>>) -> Vec<Value> {
         let mut row = Vec::with_capacity(cols.len());
         for (i, c) in cols.iter().enumerate() {
             let (kind, nullbit) = self.cols[i];
@@ -537,8 +857,13 @@ impl Plan {
                 Kind::Fixed(pos, n) => r.fixed(pos, n).and_then(|b| fixed_value(c, b)),
                 Kind::Bit(pos, bit) => r.fixed(pos, 1).map(|b| Value::Bit(b[0] >> bit & 1 != 0)),
                 Kind::Var(k) => match r.var(k) {
+                    // text, ntext and image keep a pointer in the row (the form of an in-row value is not known)
+                    Some((_, false)) if matches!(c.xtype, 34 | 35 | 99) => None,
                     Some((b, false)) => var_value(c, b),
-                    _ => None,
+                    Some((b, true)) => lob(b).and_then(|v| var_value(c, &v)),
+                    // a trailing variable-length column of zero length is not stored at all
+                    None if k >= r.nvar => var_value(c, &[]),
+                    None => None,
                 },
                 Kind::Unknown => None,
             };
@@ -694,7 +1019,110 @@ fn var_value(c: &ColMeta, b: &[u8]) -> Option<Value> {
         167 => Some(Value::Str(cp1252(b))),
         165 | 240 => Some(Value::Bin(b.to_vec())),
         241 => crate::binxml::to_xml(b).ok().map(Value::Str),
-        // text, ntext, image, sql_variant: not decoded
+        35 => Some(Value::Str(cp1252(b))),
+        99 => Some(Value::Str(utf16(b))),
+        34 => Some(Value::Bin(b.to_vec())),
+        98 => variant_value(c, b),
         _ => None,
+    }
+}
+
+/// A `sql_variant`: the base type, a byte that is 1, the properties of the type, and the value in the form of that type.
+/// Seen in the system tables of the sample: `tinyint`, `int`, `bigint`, `bit` (no properties), `nvarchar` (maximum length in
+/// bytes as 2 bytes, then the collation id as 4 bytes) and `varbinary` (maximum length). The other types without
+/// properties, and `char`, `varchar`, `nchar` and `binary`, follow the same form; `decimal`, `time`, `datetime2` and
+/// `datetimeoffset` carry properties whose layout has not been seen, so they are not decoded.
+fn variant_value(c: &ColMeta, b: &[u8]) -> Option<Value> {
+    let (&base, rest) = b.split_first()?;
+    let rest = match rest.split_first()? {
+        (1, r) => r,
+        _ => return None,
+    };
+    let mut t = c.clone();
+    t.xtype = base;
+    match base {
+        104 => Some(Value::Bit(*rest.first()? != 0)),
+        48 | 52 | 56 | 127 | 59 | 62 | 60 | 122 | 36 | 61 | 58 | 40 => (rest.len() == fixed_size(&t)).then(|| fixed_value(&t, rest)).flatten(),
+        231 | 239 => Some(Value::Str(utf16(rest.get(6..)?))),
+        167 | 175 => Some(Value::Str(cp1252(rest.get(6..)?))),
+        165 | 173 => Some(Value::Bin(rest.get(2..)?.to_vec())),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 16-byte pointers of the system tables of the sample backup (object 145 holds the XML schema components) lead to
+    /// roots in text pages, which lead to the data: the same form that `text`, `ntext` and `image` columns use.
+    #[test]
+    fn text_pointers_of_the_system_tables_are_followed() {
+        let Ok(f) = std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/resources/AdventureWorks2025.bak")) else { return };
+        let mut b = Backup::open(Expanded::open(std::io::BufReader::new(f)).unwrap().unwrap()).unwrap();
+        let keys: Vec<(u32, u16)> = b.by_obj.keys().copied().filter(|k| k.0 == 145).collect();
+        let mut pointers: Vec<Vec<u8>> = vec![];
+        for (obj, idx) in keys {
+            for pid in b.leaf_pages(obj, idx, false) {
+                let p = b.page(pid).unwrap();
+                for off in Backup::<std::io::BufReader<std::fs::File>>::slots(&p) {
+                    let Some(r) = Rec::new(&p, off) else { continue };
+                    for i in 0..r.nvar {
+                        if let Some((v, true)) = r.var(i) {
+                            if v.len() == 16 {
+                                pointers.push(v.to_vec());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(pointers.len() >= 100, "{}", pointers.len());
+        let mut sized = 0;
+        for ptr in &pointers {
+            let v = b.lob(ptr).unwrap_or_else(|| panic!("pointer {:02x?}", ptr));
+            assert!(!v.is_empty());
+            sized += v.len();
+        }
+        assert!(sized > 100_000, "{}", sized);
+    }
+
+    fn variants(b: &mut Backup<std::io::BufReader<std::fs::File>>, obj: u32, col: usize) -> Vec<Vec<u8>> {
+        let mut out = vec![];
+        for pid in b.leaf_pages(obj, 1, true) {
+            let p = b.page(pid).unwrap();
+            for off in Backup::<std::io::BufReader<std::fs::File>>::slots(&p) {
+                let Some(r) = Rec::new(&p, off) else { continue };
+                if r.kind() == 0 {
+                    if let Some((v, false)) = r.var(col) {
+                        out.push(v.to_vec());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// `sql_variant` values of the system tables: the extended properties of the sample (`sysxprops`, nvarchar descriptions)
+    /// and the numbers of `sysobjvalues`.
+    #[test]
+    fn sql_variant_values_of_the_system_tables_are_decoded() {
+        let Ok(f) = std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/resources/AdventureWorks2025.bak")) else { return };
+        let mut b = Backup::open(Expanded::open(std::io::BufReader::new(f)).unwrap().unwrap()).unwrap();
+        let col = ColMeta { colid: 1, name: "value".into(), xtype: 98, utype: 0, length: 8016, prec: 0, scale: 0, status: 0, ty: DataType::Variant, nullable: true, identity: None, computed: false, definition: None, persisted: false };
+        let texts: Vec<String> = variants(&mut b, SYSXPROPS, 1).iter().filter_map(|v| variant_value(&col, v)).map(|v| v.to_string()).collect();
+        assert_eq!(texts.len(), 538, "every description decodes");
+        assert!(texts.iter().all(|t| !t.is_empty() && !t.contains('\u{0}')));
+        assert!(texts.iter().any(|t| t.starts_with("Primary key for ")), "{:?}", &texts[..3]);
+        // sysobjvalues: tinyint, int, bigint, bit, nvarchar and varbinary values, all of them in the forms that are decoded
+        let all = variants(&mut b, SYSOBJVALUES, 0);
+        let decoded: Vec<Value> = all.iter().filter_map(|v| variant_value(&col, v)).collect();
+        assert_eq!(decoded.len(), all.iter().filter(|v| !v.is_empty()).count());
+        assert!(decoded.iter().any(|v| matches!(v, Value::BigInt(_))) && decoded.iter().any(|v| matches!(v, Value::Int(2))) && decoded.iter().any(|v| matches!(v, Value::Bit(true))));
+        assert!(decoded.iter().any(|v| matches!(v, Value::Bin(x) if x.len() == 8)), "a varbinary");
+        assert!(decoded.iter().any(|v| matches!(v, Value::Str(x) if x.starts_with("microsoft.sqlserver"))));
+        // forms that have not been seen are left alone
+        assert!(variant_value(&col, &[0x6C, 1, 10, 2, 1, 0, 0, 0, 0]).is_none(), "decimal");
+        assert!(variant_value(&col, &[0x38, 2, 1, 0, 0, 0]).is_none(), "an unknown version");
     }
 }

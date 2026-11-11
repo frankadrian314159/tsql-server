@@ -581,6 +581,20 @@ impl<'a> Engine<'a> {
                 for (table, col, n) in &report.skipped {
                     self.emit(Event::Message(format!("Warning: {} value(s) of {}.{} are stored in a form that is not read yet (large objects, XML) and were set to NULL.", n, table, col)));
                 }
+                self.emit(Event::Message(format!(
+                    "Created {} primary/unique key(s), {} index(es), {} XML index(es), {} foreign key(s), {} default(s) and {} check constraint(s).",
+                    report.keys, report.indexes, report.xml_indexes, report.foreign_keys, report.defaults, report.checks
+                )));
+                self.emit(Event::Message(format!(
+                    "Created {} view(s), {} procedure(s), {} function(s) and {} trigger(s).",
+                    report.views, report.procedures, report.functions, report.triggers
+                )));
+                for p in report.problems.iter().take(30) {
+                    self.emit(Event::Message(format!("Warning: {}.", p)));
+                }
+                if report.problems.len() > 30 {
+                    self.emit(Event::Message(format!("Warning: {} more problem(s) like these.", report.problems.len() - 30)));
+                }
                 if !report.computed.is_empty() {
                     let list: Vec<String> = report.computed.iter().map(|(t, c)| format!("{}.{}", t, c)).collect();
                     self.emit(Event::Message(format!("Warning: computed column(s) were not created: {}.", list.join(", "))));

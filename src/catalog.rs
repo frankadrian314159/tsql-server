@@ -94,6 +94,20 @@ pub struct IndexDef {
     pub filter: Option<crate::storage::FilterPred>,
 }
 
+/// An XML index. It has no structure of its own: this server evaluates XPath over the stored text, so such an index changes no
+/// result and no plan; it is kept so that scripts and backups that create one still work, and shows in the catalog views.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct XmlIndexDef {
+    pub name: String,
+    /// the xml column
+    pub col: usize,
+    pub primary: bool,
+    /// a secondary index: the primary XML index it is built on
+    pub using: Option<String>,
+    /// a secondary index: `V` value, `P` path or `R` property
+    pub secondary: Option<char>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Trigger {
     pub name: String,
@@ -190,6 +204,8 @@ pub struct Table {
     pub is_temp: bool,
     #[serde(default)]
     pub temporal: Option<Temporal>,
+    #[serde(default)]
+    pub xml_indexes: Vec<XmlIndexDef>,
 }
 
 /// A counter that clones share: the next identity value of a table, the current value of a sequence. A statement
@@ -247,6 +263,7 @@ impl Table {
             triggers: vec![],
             is_temp: false,
             temporal: None,
+            xml_indexes: vec![],
         }
     }
     pub fn col_index(&self, name: &str) -> Option<usize> {

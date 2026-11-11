@@ -377,3 +377,17 @@ fn repeated_sp_executesql_calls_reuse_parsed_text_but_not_results() {
     exec(&mut c, "DBCC FREEPROCCACHE");
     assert_eq!(scalar(&mut c, &format!("{q}1")), "z");
 }
+
+#[test]
+fn execute_as_and_not_for_replication_options_are_accepted() {
+    // as scripted by SQL Server (AdventureWorks): neither changes how the object runs here
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE t (a INT, b INT)");
+    exec(&mut c, "CREATE PROCEDURE p @x INT WITH EXECUTE AS CALLER AS BEGIN INSERT INTO t VALUES (@x, 1) END");
+    exec(&mut c, "CREATE PROCEDURE q @x INT WITH RECOMPILE, EXECUTE AS OWNER AS BEGIN INSERT INTO t VALUES (@x, 2) END");
+    exec(&mut c, "CREATE TRIGGER trg ON t INSTEAD OF DELETE NOT FOR REPLICATION AS BEGIN SELECT 1 END");
+    exec(&mut c, "CREATE TRIGGER trg2 ON t AFTER INSERT, UPDATE NOT FOR REPLICATION AS BEGIN SELECT 1 END");
+    exec(&mut c, "EXEC p 5");
+    exec(&mut c, "EXEC q 6");
+    assert_eq!(rows(&mut c, "SELECT a, b FROM t ORDER BY a"), vec![vec!["5", "1"], vec!["6", "2"]]);
+}

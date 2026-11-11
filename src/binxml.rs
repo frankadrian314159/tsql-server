@@ -11,6 +11,8 @@
 //! | `F8 q` | start of an element with qualified name `q`; `F6 q value` are its attributes and `F5` ends them |
 //! | `F7` | end of an element |
 //! | `11 n chars` | text |
+//! | `F3 n chars` | a comment |
+//! | `F4 name n chars` | a processing instruction |
 //! | `EA n bytes` | type information (skipped), or in typed XML the type of the value that follows |
 //!
 //! A qualified name with prefix `xmlns` is a namespace declaration. In typed XML a value is stored in the form of its type:
@@ -153,14 +155,18 @@ pub fn to_xml(b: &[u8]) -> Res<String> {
             }
             0xF6 => {
                 let q = mb32(b, &mut i)?;
-                if b.get(i) != Some(&0x11) {
-                    return Err("an attribute value that is not text".into());
-                }
-                i += 1;
-                let n = mb32(b, &mut i)?;
-                let val = utf16(b, &mut i, n)?;
+                let val = if b.get(i) == Some(&0x11) {
+                    i += 1;
+                    let n = mb32(b, &mut i)?;
+                    utf16(b, &mut i, n)?
+                } else {
+                    typed_value(b, &mut i)?
+                };
                 let (_, pre, nm) = d.qname(q)?;
-                let attr = if pre != 0 && d.name(pre)? == "xmlns" {
+                let attr = if pre != 0 && nm == 0 {
+                    // a namespace declaration whose whole name ("xmlns" or "xmlns:p") is one defined name
+                    d.name(pre)?.to_string()
+                } else if pre != 0 && d.name(pre)? == "xmlns" {
                     if nm == 0 {
                         "xmlns".to_string()
                     } else {
@@ -188,14 +194,33 @@ pub fn to_xml(b: &[u8]) -> Res<String> {
                 let s = utf16(b, &mut i, n)?;
                 d.text(&s);
             }
+            // a comment: its length in characters, then the text
+            0xF3 => {
+                let n = mb32(b, &mut i)?;
+                let s = utf16(b, &mut i, n)?;
+                d.close_start();
+                d.out.push_str(&format!("<!--{}-->", s));
+            }
+            // a processing instruction: the number of its name, the length of its text, the text
+            0xF4 => {
+                let nm = mb32(b, &mut i)?;
+                let n = mb32(b, &mut i)?;
+                let s = utf16(b, &mut i, n)?;
+                d.close_start();
+                let name = d.name(nm)?.to_string();
+                d.out.push_str(&format!("<?{} {}?>", name, s));
+            }
+            // type information, which describes the element or attribute that is declared next; skipped
             0xEA => {
                 let n = mb32(b, &mut i)?;
-                let blob = b.get(i..i + n).ok_or("the XML ends inside type information")?;
+                b.get(i..i + n).ok_or("the XML ends inside type information")?;
                 i += n;
-                // five bytes before a value: 0, the type, 0, 0 or 1, the storage type
-                if n == 5 {
-                    typed_value(b, &mut i, blob[1], blob[4], &mut d)?;
-                }
+            }
+            // typed values lead with a byte of their own
+            0x87 | 0x7C | 0x03 => {
+                i -= 1;
+                let v = typed_value(b, &mut i)?;
+                d.text(&v);
             }
             other => return Err(format!("the token {:#x} at offset {} is not known", other, i - 1)),
         }
@@ -206,13 +231,11 @@ pub fn to_xml(b: &[u8]) -> Res<String> {
     Ok(d.out)
 }
 
-/// The value after a type block, by the storage type.
-fn typed_value(b: &[u8], i: &mut usize, ty: u8, storage: u8, d: &mut Doc) -> Res<()> {
-    match storage {
-        // strings and years: ordinary text follows
-        0x0F | 0x19 => Ok(()),
-        // decimal and the integer types derived from it
-        0x13 => {
+/// A typed value, by its leading byte: `87` a decimal (and the integer types derived from it: `87 13`, precision, scale, a
+/// sign byte and the mantissa), `03` a real, `7C` a date (a `datetimeoffset`). Other types are not known.
+fn typed_value(b: &[u8], i: &mut usize) -> Res<String> {
+    match b.get(*i) {
+        Some(0x87) => {
             let hdr = b.get(*i..*i + 4).ok_or("the XML ends inside a decimal")?;
             let (prec, scale) = (hdr[2], hdr[3] as u32);
             *i += 4;
@@ -226,26 +249,16 @@ fn typed_value(b: &[u8], i: &mut usize, ty: u8, storage: u8, d: &mut Doc) -> Res
             *i += 1 + size;
             let mut m = [0u8; 16];
             m[..size].copy_from_slice(&data[1..]);
-            let _ = ty;
-            let s = decimal_text(data[0] == 0, u128::from_le_bytes(m), scale);
-            d.text(&s);
-            Ok(())
+            Ok(decimal_text(data[0] == 0, u128::from_le_bytes(m), scale))
         }
-        // a real
-        0x11 => {
+        Some(0x03) => {
             let data = b.get(*i..*i + 5).ok_or("the XML ends inside a float")?;
-            if data[0] != 0x03 {
-                return Err("a float of a form that is not known".into());
-            }
             *i += 5;
-            let f = f32::from_le_bytes([data[1], data[2], data[3], data[4]]);
-            d.text(&format!("{}", f));
-            Ok(())
+            Ok(format!("{}", f32::from_le_bytes([data[1], data[2], data[3], data[4]])))
         }
-        // a date: a datetimeoffset (time, date, offset in minutes) of scale 7
-        0x17 => {
+        Some(0x7C) => {
             let data = b.get(*i..*i + 12).ok_or("the XML ends inside a date")?;
-            if data[0] != 0x7C || data[1] != 7 {
+            if data[1] != 7 {
                 return Err("a date of a form that is not known".into());
             }
             *i += 12;
@@ -253,9 +266,8 @@ fn typed_value(b: &[u8], i: &mut usize, ty: u8, storage: u8, d: &mut Doc) -> Res
             let date = NaiveDate::from_num_days_from_ce_opt(days + 1).ok_or("a date out of range")?;
             let off = i16::from_le_bytes([data[10], data[11]]);
             let tz = if off == 0 { "Z".to_string() } else { format!("{}{:02}:{:02}", if off < 0 { '-' } else { '+' }, off.abs() / 60, off.abs() % 60) };
-            d.text(&format!("{}{}", date.format("%Y-%m-%d"), tz));
-            Ok(())
+            Ok(format!("{}{}", date.format("%Y-%m-%d"), tz))
         }
-        other => Err(format!("the XML type {:#x} is not known", other)),
+        _ => Err("a value of a type that is not known".into()),
     }
 }

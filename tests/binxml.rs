@@ -90,6 +90,34 @@ fn typed_values() {
 }
 
 #[test]
+fn comments_instructions_declarations_and_typed_attributes() {
+    let mut b = vec![0xDF, 0xFF, 0x02, 0xB0, 0x04];
+    // a processing instruction and a comment before the root
+    b.extend(name("xml-stylesheet"));
+    b.extend([0xF4, 1, 6]);
+    b.extend("a=\"b\" ".encode_utf16().flat_map(|u| u.to_le_bytes()));
+    b.extend([0xF3, 3]);
+    b.extend(" c ".encode_utf16().flat_map(|u| u.to_le_bytes()));
+    // a type declaration that is followed by a name, not by a value
+    b.extend([0xEA, 5, 0, 0x13, 0, 0, 0x13]);
+    b.extend(name("r"));
+    b.extend(name("urn:x"));
+    b.extend(name("p"));
+    b.extend(name("xmlns:p"));
+    b.extend([0xEF, 3, 4, 2]); // (urn:x, p, r): p:r
+    b.extend([0xEF, 0, 5, 0]); // the declaration: the whole name is "xmlns:p"
+    b.extend([0xF8, 1, 0xF6, 2]);
+    b.extend(text("urn:x"));
+    // an attribute whose value is a typed decimal
+    b.extend(name("n"));
+    b.extend([0xEF, 0, 0, 6, 0xF6, 3, 0x87, 0x13, 38, 1, 1]);
+    b.extend(25u128.to_le_bytes());
+    b.extend([0xF5, 0xF7]);
+    let x = to_xml(&b);
+    assert_eq!(x.unwrap(), r#"<?xml-stylesheet a="b" ?><!-- c --><p:r xmlns:p="urn:x" n="2.5"></p:r>"#);
+}
+
+#[test]
 fn what_is_not_known_is_an_error_not_a_guess() {
     let mut b = vec![0xDF, 0xFF, 0x02, 0xB0, 0x04];
     b.extend(name("v"));

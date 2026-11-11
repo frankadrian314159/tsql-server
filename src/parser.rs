@@ -35,7 +35,7 @@ const STMT_START: &[&str] = &[
 ];
 const NILADIC: &[&str] = &["CURRENT_TIMESTAMP", "CURRENT_USER", "SESSION_USER", "SYSTEM_USER", "USER", "CURRENT_DATE"];
 const DATEPART_FUNCS: &[&str] = &["DATEADD", "DATEDIFF", "DATEDIFF_BIG", "DATEPART", "DATENAME", "DATETRUNC", "DATE_BUCKET"];
-const RESERVED_OK_AS_FUNC: &[&str] = &["LEFT", "RIGHT", "USER", "CURRENT", "KEY", "PERCENT", "DOUBLE", "PRECISION", "FILE", "OFFSETS", "PLAN", "RULE", "READ", "LOAD", "UPDATE", "TRUNCATE"];
+const RESERVED_OK_AS_FUNC: &[&str] = &["LEFT", "RIGHT", "USER", "CURRENT", "KEY", "PERCENT", "DOUBLE", "PRECISION", "FILE", "OFFSETS", "PLAN", "RULE", "READ", "LOAD", "UPDATE", "TRUNCATE", "CONTAINS", "FREETEXT"];
 
 pub struct Parser {
     toks: Vec<Token>,
@@ -838,9 +838,92 @@ impl Parser {
         self.xml_method_named(base, &method)
     }
 
+    /// The query of an xml method. When it is a string literal, each `sql:column("t.c")` and `sql:variable("@v")` in it is
+    /// replaced by `sql:arg(n)` and the column or variable becomes the n-th extra argument of the call, so that it is evaluated
+    /// like any other expression (see xmlpath.rs).
+    fn xml_query_args(&self, path: Expr) -> (Expr, Vec<Expr>) {
+        match path {
+            Expr::Lit(Value::Str(t)) => {
+                let (t, extra) = Self::bind_sql_args(&t);
+                (Expr::Lit(Value::Str(t)), extra)
+            }
+            // N'...' is a cast of a literal
+            Expr::Cast { e, ty, try_, style } if matches!(*e, Expr::Lit(Value::Str(_))) => {
+                let Expr::Lit(Value::Str(t)) = *e else { unreachable!() };
+                let (t, extra) = Self::bind_sql_args(&t);
+                (Expr::Cast { e: Box::new(Expr::Lit(Value::Str(t))), ty, try_, style }, extra)
+            }
+            other => (other, vec![]),
+        }
+    }
+
+    fn bind_sql_args(text: &str) -> (String, Vec<Expr>) {
+        let lower = text.to_lowercase();
+        if !lower.contains("sql:column") && !lower.contains("sql:variable") {
+            return (text.to_string(), vec![]);
+        }
+        let mut out = String::new();
+        let mut extra: Vec<Expr> = vec![];
+        let mut i = 0;
+        while i < text.len() {
+            let rest = &lower[i..];
+            let (kind, len) = if rest.starts_with("sql:column") {
+                (1, 10)
+            } else if rest.starts_with("sql:variable") {
+                (2, 12)
+            } else {
+                let c = text[i..].chars().next().unwrap();
+                out.push(c);
+                i += c.len_utf8();
+                continue;
+            };
+            // sql:column ( "name" )
+            let after = text[i + len..].trim_start();
+            let skipped = text.len() - i - len - after.len();
+            let parsed = after.strip_prefix('(').map(|r| r.trim_start()).and_then(|r| {
+                let q = r.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+                let end = r[1..].find(q)? + 1;
+                let name = r[1..end].to_string();
+                let tail = r[end + 1..].trim_start().strip_prefix(')')?;
+                Some((name, text.len() - tail.len()))
+            });
+            match parsed {
+                Some((name, end)) => {
+                    let e = if kind == 2 {
+                        Expr::Var(format!("@{}", name.trim_start_matches('@')).to_lowercase())
+                    } else {
+                        Expr::Col(name.split('.').map(|p| p.trim().trim_matches(|c| c == '[' || c == ']' || c == '"').to_string()).collect())
+                    };
+                    let _ = skipped;
+                    extra.push(e);
+                    out.push_str(&format!("sql:arg({})", extra.len() - 1));
+                    i = end;
+                }
+                None => {
+                    out.push_str(&text[i..i + len]);
+                    i += len;
+                }
+            }
+        }
+        (out, extra)
+    }
+
+    /// `.modify('...')` after `col` or `@var`; the cursor is after the `(`'s method name. Returns the call
+    /// `XML_MODIFY(base, text, args...)`, which is the new value of the xml.
+    fn xml_modify_call(&mut self, base: Expr) -> R<Expr> {
+        self.expect_op("(")?;
+        let stmt = self.expr()?;
+        self.expect_op(")")?;
+        let (stmt, extra) = self.xml_query_args(stmt);
+        let mut args = vec![base, stmt];
+        args.extend(extra);
+        Ok(Expr::Func(Box::new(FuncCall { name: "XML_MODIFY".into(), schema: None, parts: vec![], args, distinct: false, star: false, over: None, within: None })))
+    }
+
     fn xml_method_named(&mut self, base: Expr, method: &str) -> R<Expr> {
         self.expect_op("(")?;
         let path = self.expr()?;
+        let (path, extra) = self.xml_query_args(path);
         let m = method.to_uppercase();
         if m == "VALUE" {
             self.expect_op(",")?;
@@ -851,15 +934,83 @@ impl Parser {
             self.expect_op(")")?;
             let decl = parse_param_decls(&format!("@x {}", ty.trim()))?;
             let p = decl.into_iter().next().ok_or_else(|| self.err())?;
-            let call = Expr::Func(Box::new(FuncCall { name: "XML_VALUE".into(), schema: None, parts: vec![], args: vec![base, path], distinct: false, star: false, over: None, within: None }));
+            let mut args = vec![base, path];
+            args.extend(extra);
+            let call = Expr::Func(Box::new(FuncCall { name: "XML_VALUE".into(), schema: None, parts: vec![], args, distinct: false, star: false, over: None, within: None }));
             return Ok(Expr::Cast { e: Box::new(call), ty: p.ty, try_: false, style: None });
         }
         self.expect_op(")")?;
-        Ok(Expr::Func(Box::new(FuncCall { name: format!("XML_{}", m), schema: None, parts: vec![], args: vec![base, path], distinct: false, star: false, over: None, within: None })))
+        let mut args = vec![base, path];
+        args.extend(extra);
+        Ok(Expr::Func(Box::new(FuncCall { name: format!("XML_{}", m), schema: None, parts: vec![], args, distinct: false, star: false, over: None, within: None })))
+    }
+
+    /// The column list of a full-text predicate or table function: `*`, a column, or `(c1, c2, ...)`. Empty for `*`.
+    fn ft_columns(&mut self) -> R<Vec<Expr>> {
+        if self.accept_op("*") {
+            return Ok(vec![]);
+        }
+        let mut cols = vec![];
+        if self.accept_op("(") {
+            loop {
+                cols.push(Expr::Col(self.name_parts()?));
+                if !self.accept_op(",") {
+                    break;
+                }
+            }
+            self.expect_op(")")?;
+        } else {
+            cols.push(Expr::Col(self.name_parts()?));
+        }
+        Ok(cols)
+    }
+
+    /// `CONTAINS(cols, 'condition' [, LANGUAGE n])` and `FREETEXT(cols, 'text' [, LANGUAGE n])`, as the call
+    /// `FT_CONTAINS(n, col1, ..., coln, condition)` where n is the number of columns (0 for `*`).
+    fn fulltext_pred(&mut self, name: &str) -> R<Expr> {
+        self.expect_op("(")?;
+        let cols = self.ft_columns()?;
+        self.expect_op(",")?;
+        let cond = self.expr()?;
+        if self.accept_op(",") {
+            self.expect_kw("LANGUAGE")?;
+            self.expr()?;
+        }
+        self.expect_op(")")?;
+        let mut args = vec![Expr::Lit(Value::Int(cols.len() as i32))];
+        args.extend(cols);
+        args.push(cond);
+        Ok(Expr::Func(Box::new(FuncCall { name: format!("FT_{}", name), schema: None, parts: vec![], args, distinct: false, star: false, over: None, within: None })))
+    }
+
+    /// `CONTAINSTABLE(table, cols, 'condition' [, LANGUAGE n] [, top])` and `FREETEXTTABLE(...)`: the table and the columns
+    /// are passed as text (names separated by a control character), then the condition and the number of rows (or NULL).
+    fn fulltext_table(&mut self, name: &str) -> R<TableRef> {
+        self.expect_op("(")?;
+        let table = self.name_parts()?;
+        self.expect_op(",")?;
+        let cols: Vec<String> = self.ft_columns()?.into_iter().filter_map(|c| if let Expr::Col(p) = c { p.last().cloned() } else { None }).collect();
+        self.expect_op(",")?;
+        let cond = self.expr()?;
+        let mut top = Expr::Lit(Value::Null);
+        while self.accept_op(",") {
+            if self.accept_kw("LANGUAGE") {
+                self.expr()?;
+            } else {
+                top = self.expr()?;
+            }
+        }
+        self.expect_op(")")?;
+        let (alias, cols_alias) = self.opt_alias()?;
+        let args = vec![Expr::Lit(Value::Str(table.join("\u{1}"))), Expr::Lit(Value::Str(cols.join("\u{1}"))), cond, top];
+        Ok(TableRef::Func { name: vec![format!("FT_{}", name)], args, alias, cols: cols_alias, with: None })
     }
 
     fn func_call(&mut self, parts: Vec<String>) -> R<Expr> {
         let name = parts.last().unwrap().to_uppercase();
+        if parts.len() == 1 && (name == "CONTAINS" || name == "FREETEXT") && self.is_op("(") {
+            return self.fulltext_pred(&name);
+        }
         let schema = if parts.len() > 1 { Some(parts[parts.len() - 2].clone()) } else { None };
         self.expect_op("(")?;
         let mut args = vec![];
@@ -1441,6 +1592,18 @@ impl Parser {
         Ok(())
     }
 
+    /// `.nodes('path') [AS] alias(column)` after the xml expression; the cursor is on the `(`.
+    fn xml_nodes(&mut self, base: Expr) -> R<TableRef> {
+        self.expect_op("(")?;
+        let path = self.expr()?;
+        self.expect_op(")")?;
+        let (path, extra) = self.xml_query_args(path);
+        let (alias, cols) = self.opt_alias()?;
+        let mut args = vec![base, path];
+        args.extend(extra);
+        Ok(TableRef::Func { name: vec!["XML_NODES".into()], args, alias, cols, with: None })
+    }
+
     fn table_primary(&mut self) -> R<TableRef> {
         let mut node;
         if self.is_op("(") {
@@ -1466,11 +1629,22 @@ impl Parser {
             }
         } else if let Tok::Var(v) = self.tok().tok.clone() {
             self.i += 1;
-            let (alias, _) = self.opt_alias()?;
-            node = TableRef::TableVar { name: v.to_lowercase(), alias };
+            if self.is_op(".") && self.peek_kw(1, &["NODES"]) {
+                self.i += 2;
+                node = self.xml_nodes(Expr::Var(v.to_lowercase()))?;
+            } else {
+                let (alias, _) = self.opt_alias()?;
+                node = TableRef::TableVar { name: v.to_lowercase(), alias };
+            }
         } else {
             let name = self.name_parts()?;
-            if self.is_op("(") {
+            if name.len() >= 2 && name.last().unwrap().eq_ignore_ascii_case("nodes") && self.is_op("(") {
+                // col.nodes('path'), alias.col.nodes('path')
+                let col = Expr::Col(name[..name.len() - 1].to_vec());
+                node = self.xml_nodes(col)?;
+            } else if name.len() == 1 && (name[0].eq_ignore_ascii_case("CONTAINSTABLE") || name[0].eq_ignore_ascii_case("FREETEXTTABLE")) && self.is_op("(") {
+                node = self.fulltext_table(&name[0].to_uppercase())?;
+            } else if self.is_op("(") {
                 self.i += 1;
                 let mut args = vec![];
                 if !self.is_op(")") {
@@ -2267,10 +2441,17 @@ impl Parser {
                 let e = self.expr()?;
                 sets.push(SetItem::Var { var: v.to_lowercase(), op, e });
             } else {
-                let parts = self.name_parts()?;
-                let op = self.assign_op().ok_or_else(|| self.err())?;
-                let e = self.expr()?;
-                sets.push(SetItem::Col { parts, op, e });
+                let mut parts = self.name_parts()?;
+                // SET col.modify('...'): the column becomes what the xml data manipulation makes of it
+                if parts.len() >= 2 && parts.last().unwrap().eq_ignore_ascii_case("modify") && self.is_op("(") {
+                    parts.pop();
+                    let e = self.xml_modify_call(Expr::Col(parts.clone()))?;
+                    sets.push(SetItem::Col { parts, op: None, e });
+                } else {
+                    let op = self.assign_op().ok_or_else(|| self.err())?;
+                    let e = self.expr()?;
+                    sets.push(SetItem::Col { parts, op, e });
+                }
             }
             if !self.accept_op(",") {
                 break;
@@ -2449,6 +2630,12 @@ impl Parser {
         self.i += 1;
         if let Tok::Var(v) = self.tok().tok.clone() {
             self.i += 1;
+            // SET @x.modify('...')
+            if self.is_op(".") && self.peek_kw(1, &["MODIFY"]) {
+                self.i += 2;
+                let e = self.xml_modify_call(Expr::Var(v.to_lowercase()))?;
+                return Ok(Stmt::Set { var: v.to_lowercase(), op: None, e });
+            }
             let op = self.assign_op().ok_or_else(|| self.err())?;
             if self.is_kw("CURSOR") {
                 self.i += 1;
@@ -2773,9 +2960,15 @@ impl Parser {
 
     fn skip_with_options(&mut self) {
         if self.accept_kw("WITH") {
-            self.advance();
-            while self.accept_op(",") {
-                self.advance();
+            loop {
+                let option = self.advance();
+                // EXECUTE AS CALLER | SELF | OWNER | 'user' is three tokens; it is accepted and not applied
+                if option.up == "EXECUTE" && self.accept_kw("AS") {
+                    self.advance();
+                }
+                if !self.accept_op(",") {
+                    break;
+                }
             }
         }
     }
@@ -2993,6 +3186,15 @@ impl Parser {
         if self.is_kw("COLUMNSTORE") {
             self.i += 1;
         }
+        // CREATE [PRIMARY] XML INDEX
+        let mut xml_primary = None;
+        if self.is_kw("PRIMARY") && self.peek_kw(1, &["XML"]) && self.peek_kw(2, &["INDEX"]) {
+            self.i += 2;
+            xml_primary = Some(true);
+        } else if self.is_kw("XML") && self.peek_kw(1, &["INDEX"]) {
+            self.i += 1;
+            xml_primary = Some(false);
+        }
         let t = self.advance();
         let what = t.up.clone();
         match what.as_str() {
@@ -3031,6 +3233,25 @@ impl Parser {
                     }
                     self.expect_op(")")?;
                 }
+                let mut xml = xml_primary.map(|primary| XmlIndexSpec { primary, using: None, secondary: None });
+                if xml.is_some() && self.accept_kw("USING") {
+                    self.expect_kw("XML")?;
+                    self.expect_kw("INDEX")?;
+                    let using = self.ident()?;
+                    let mut secondary = None;
+                    if self.accept_kw("FOR") {
+                        secondary = match self.advance().up.as_str() {
+                            "VALUE" => Some('V'),
+                            "PATH" => Some('P'),
+                            "PROPERTY" => Some('R'),
+                            _ => return Err(self.err()),
+                        };
+                    }
+                    if let Some(x) = xml.as_mut() {
+                        x.using = Some(using);
+                        x.secondary = secondary;
+                    }
+                }
                 let (mut include, mut filter) = (vec![], None);
                 while self.is_kw_any(&["INCLUDE", "WHERE", "WITH", "ON"]) {
                     let w = self.advance().up;
@@ -3051,7 +3272,7 @@ impl Parser {
                         self.i += 1;
                     }
                 }
-                Ok(Stmt::CreateIndex { name, table, cols, unique, include, filter })
+                Ok(Stmt::CreateIndex { name, table, cols, unique, include, filter, xml })
             }
             "VIEW" => {
                 let name = self.name_parts()?;
@@ -3109,6 +3330,10 @@ impl Parser {
                 }
                 if self.accept_kw("WITH") {
                     self.i += 1;
+                }
+                // NOT FOR REPLICATION: accepted, there is no replication
+                if self.is_kw("NOT") && self.peek_kw(1, &["FOR"]) && self.peek_kw(2, &["REPLICATION"]) {
+                    self.i += 3;
                 }
                 self.expect_kw("AS")?;
                 let body = self.rest_body()?;

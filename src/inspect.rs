@@ -73,6 +73,17 @@ pub struct IndexInfo {
 }
 
 #[derive(Clone, Debug)]
+pub struct XmlIndexInfo {
+    pub name: String,
+    pub column: String,
+    pub primary: bool,
+    /// The primary index a secondary one is built on.
+    pub using: Option<String>,
+    /// `V` value, `P` path, `R` property.
+    pub secondary: Option<char>,
+}
+
+#[derive(Clone, Debug)]
 pub struct ForeignKeyInfo {
     pub name: String,
     pub columns: Vec<String>,
@@ -96,6 +107,8 @@ pub struct TableInfo {
     /// The check constraints with their expressions.
     pub check_defs: Vec<CheckInfo>,
     pub triggers: Vec<String>,
+    /// XML indexes, primary ones before the secondary ones built on them.
+    pub xml_indexes: Vec<XmlIndexInfo>,
     /// Slots in the heap: live rows plus deleted rows not yet collected. Cheap, approximate.
     pub approx_rows: usize,
 }
@@ -196,6 +209,11 @@ fn describe(db: &str, t: &Table) -> TableInfo {
         checks: t.checks.iter().map(|c| c.name.clone()).collect(),
         check_defs: t.checks.iter().map(|c| CheckInfo { name: c.name.clone(), text: c.text.clone(), enabled: c.enabled, column: c.col.clone() }).collect(),
         triggers: t.triggers.iter().map(|t| t.name.clone()).collect(),
+        xml_indexes: {
+            let mut x: Vec<XmlIndexInfo> = t.xml_indexes.iter().map(|x| XmlIndexInfo { name: x.name.clone(), column: col_name(x.col), primary: x.primary, using: x.using.clone(), secondary: x.secondary }).collect();
+            x.sort_by_key(|x| !x.primary);
+            x
+        },
         approx_rows: t.data.slot_count(),
     }
 }

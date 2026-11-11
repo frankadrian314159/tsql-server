@@ -429,6 +429,16 @@ pub enum AlterAction {
     CheckConstraint { name: Option<String>, enable: bool },
 }
 
+/// What makes a `CREATE INDEX` an XML index: `PRIMARY`, or `USING XML INDEX name [FOR VALUE | PATH | PROPERTY]`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct XmlIndexSpec {
+    pub primary: bool,
+    /// the primary XML index a secondary one is built on
+    pub using: Option<String>,
+    /// `V` value, `P` path or `R` property
+    pub secondary: Option<char>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Stmt {
     Query(Box<Query>),
@@ -465,7 +475,7 @@ pub enum Stmt {
     Kill(Expr),
     Reconfigure,
     CreateTable { name: Name, defs: Vec<TableDef>, versioning: Option<Versioning> },
-    CreateIndex { name: String, table: Name, cols: Vec<(String, bool)>, unique: bool, include: Vec<String>, filter: Option<(Expr, String)> },
+    CreateIndex { name: String, table: Name, cols: Vec<(String, bool)>, unique: bool, include: Vec<String>, filter: Option<(Expr, String)>, xml: Option<XmlIndexSpec> },
     CreateView { name: Name, cols: Option<Vec<String>>, query: Rc<Query>, text: String, or_alter: bool, alter: bool, check_option: bool },
     CreateProc { name: Name, params: Vec<Param>, body: Rc<Vec<Stmt>>, text: String, or_alter: bool, alter: bool },
     CreateFunction(Box<CreateFunction>),
