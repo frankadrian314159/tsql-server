@@ -17,6 +17,10 @@ path = "src/main.rs"
 name = "tsql-serve"
 path = "src/serve.rs"
 
+[[bin]]
+name = "tsql-bakinfo"
+path = "src/bakinfo.rs"
+
 # The desktop app is optional so the engine and the shell build without a GUI toolkit:
 #   cargo run --release --features gui --bin tsql-gui
 [[bin]]

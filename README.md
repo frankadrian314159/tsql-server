@@ -41,6 +41,7 @@ cargo run --release --bin tsql -- -D ./data           # durable shell on ./data 
 cargo run --release --bin tsql -- -D ./data --pool-pages 4096   # cache 4096 pages = 32 MiB
 cargo run --release --bin tsql                         # in-memory shell (nothing is written)
 cargo run --release --bin tsql-serve -- ./data --sa-password "Str0ng!pw"   # TDS server on 127.0.0.1:1433
+cargo run --release --bin tsql-bakinfo -- some.bak               # describe a native SQL Server backup (reader in progress)
 cargo run --release --features gui --bin tsql-gui      # desktop app (add a data directory to keep your data)
 cargo run --bin tsql -- -D ./data -Q "SELECT @@VERSION"
 cargo run --bin tsql -- -D ./data -U ann -P secret     # log in as a SQL login
@@ -89,6 +90,7 @@ exactly as described in [docs/concurrency.md](docs/concurrency.md).
 | `catalog` | Databases, schemas, tables, views, procedures, functions, triggers, sequences, user types |
 | `persist` | Write-ahead log, checkpoints, crash recovery, data-directory locking |
 | `inspect`, `tools` | Catalog introspection (`table_info`, `objects`, …) and helpers for front ends: result grids, CSV import/export, SQL literals, table scripts |
+| `mtf.rs`, `mssqlbak.rs`, `xpress.rs`, `bakinfo.rs` | The container of native SQL Server `.bak` files: the Microsoft Tape Format reader, the compressed `MSSQLBAK` chunks and their Xpress Huffman decoder, and the `tsql-bakinfo` inspector (reader in progress; see [docs/backup.md](docs/backup.md)) |
 | `tds/`, `serve.rs` | The TDS 7.4 listener (`tds::Listener`) and the `tsql-serve` program: packets, login, batches, RPC, transaction-manager requests, token streams, data type encoding |
 | `main.rs`, `gui/` | The `tsql` shell, and the optional `tsql-gui` desktop app (cargo feature `gui`) |
 | `security` | Logins, users, roles, permission resolution |

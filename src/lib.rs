@@ -19,6 +19,8 @@ pub mod error;
 pub mod inspect;
 pub mod lexer;
 pub mod mask;
+pub mod mssqlbak;
+pub mod mtf;
 pub mod parser;
 pub mod persist;
 pub mod prof;
@@ -28,6 +30,7 @@ pub mod tds;
 pub mod tools;
 pub mod types;
 pub mod xmlpath;
+pub mod xpress;
 
 use catalog::ServerState;
 use engine::{Engine, SessionState, SrvGuard};

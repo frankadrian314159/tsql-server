@@ -107,7 +107,11 @@ impl FrameReader {
         let f = File::open(path).map_err(|e| io_fail(path, "open", e))?;
         let mut r = BufReader::with_capacity(256 << 10, f);
         let mut magic = [0u8; 8];
-        if r.read_exact(&mut magic).is_err() || &magic != MAGIC {
+        let read = r.read_exact(&mut magic).is_ok();
+        if read && (crate::mtf::is_mtf(&magic) || crate::mssqlbak::is_bak(&magic)) {
+            return Err(bad_media(path, "it is a SQL Server backup, which this server cannot restore yet; tsql-bakinfo describes it"));
+        }
+        if !read || &magic != MAGIC {
             return Err(bad_media(path, "it is not a backup written by this server"));
         }
         Ok(FrameReader { r, path: path.to_string() })
