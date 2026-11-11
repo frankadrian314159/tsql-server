@@ -2061,6 +2061,27 @@ impl<'a> Engine<'a> {
                     },
                 }
             }
+            // XML_SCHEMA_NAMESPACE(schema, collection [, namespace]): the schemas of a collection as xml text
+            "XML_SCHEMA_NAMESPACE" => {
+                if a.len() < 2 || a.iter().any(|v| v.is_null()) {
+                    return Ok(Some(Value::Null));
+                }
+                let key = obj_key(&convert::to_str(&a[0]), &convert::to_str(&a[1]));
+                let ns = a.get(2).map(convert::to_str);
+                let db = self.ses.db.to_lowercase();
+                let texts: Option<Vec<String>> = self.srv.databases.get(&db).and_then(|d| d.xml_schemas.iter().find(|x| obj_key(&x.schema, &x.name) == key)).map(|x| x.texts.clone());
+                match texts {
+                    Some(t) => {
+                        let picked: Vec<String> = t.into_iter().filter(|s| ns.as_ref().is_none_or(|n| crate::xsd::target_namespace(s).as_deref() == Some(n.as_str()))).collect();
+                        if picked.is_empty() {
+                            Value::Null
+                        } else {
+                            Value::Str(picked.join(""))
+                        }
+                    }
+                    None => Value::Null,
+                }
+            }
             // the methods of geometry and geography (see spatial.rs)
             n if super::spatialfn::is_spatial_call(n, &a) => self.spatial_call(n, &a)?,
             // the methods of hierarchyid (see hierarchyid.rs)

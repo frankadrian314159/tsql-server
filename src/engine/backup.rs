@@ -181,6 +181,7 @@ fn op_db(op: &LogOp) -> Option<&str> {
         | LogOp::DbRecovery { db, .. }
         | LogOp::DbPolicies { db, .. }
         | LogOp::DbFtCatalogs { db, .. }
+        | LogOp::DbXmlSchemas { db, .. }
         | LogOp::DbDdlTriggers { db, .. }
         | LogOp::DbAuditSpecs { db, .. }
         | LogOp::DbSecurity { db, .. } => Some(db),
@@ -204,6 +205,7 @@ fn retarget(op: &mut LogOp, to: &str) {
         | LogOp::DbRecovery { db, .. }
         | LogOp::DbPolicies { db, .. }
         | LogOp::DbFtCatalogs { db, .. }
+        | LogOp::DbXmlSchemas { db, .. }
         | LogOp::DbDdlTriggers { db, .. }
         | LogOp::DbAuditSpecs { db, .. }
         | LogOp::DbSecurity { db, .. } => *db = to.to_string(),
@@ -584,8 +586,8 @@ impl<'a> Engine<'a> {
                     self.emit(Event::Message(format!("Warning: {} value(s) of {}.{} are stored in a form that is not read yet (large objects, XML) and were set to NULL.", n, table, col)));
                 }
                 self.emit(Event::Message(format!(
-                    "Created {} primary/unique key(s), {} index(es), {} XML index(es), {} foreign key(s), {} default(s) and {} check constraint(s).",
-                    report.keys, report.indexes, report.xml_indexes, report.foreign_keys, report.defaults, report.checks
+                    "Created {} primary/unique key(s), {} index(es), {} XML index(es), {} spatial index(es), {} full-text catalog(s), {} full-text index(es), {} foreign key(s), {} default(s) and {} check constraint(s).",
+                    report.keys, report.indexes, report.xml_indexes, report.spatial_indexes, report.fulltext_catalogs, report.fulltext_indexes, report.foreign_keys, report.defaults, report.checks
                 )));
                 self.emit(Event::Message(format!(
                     "Created {} view(s), {} procedure(s), {} function(s) and {} trigger(s).",

@@ -251,6 +251,7 @@ impl<'a> Engine<'a> {
             if let Some(Some(v)) = vals.get(k) {
                 let col = &t.columns[ci];
                 let nv = coerce_store(v, &col.ty, &tname, &col.name)?;
+                self.check_xml_store(col, &nv)?;
                 if col.identity.is_some() {
                     if !ident_on {
                         return Err(SqlError::new(544, format!("Cannot insert explicit value for identity column in table '{}' when IDENTITY_INSERT is set to OFF.", t.name)));
@@ -301,6 +302,7 @@ impl<'a> Engine<'a> {
             if col.default.is_some() {
                 let v = self.eval_default(&col)?;
                 row[ci] = coerce_store(&v, &col.ty, &tname, &col.name)?;
+                self.check_xml_store(&col, &row[ci])?;
             }
         }
         self.finish_row(t, &mut row, "INSERT")?;
@@ -1520,6 +1522,7 @@ impl<'a> Engine<'a> {
                     Tgt::Col(ci) => {
                         let col = &t.columns[*ci];
                         new[*ci] = coerce_store(&v, &col.ty, &tname, &col.name)?;
+                        self.check_xml_store(col, &new[*ci])?;
                     }
                     Tgt::Var(var) => self.set_var(var, v)?,
                 }
@@ -1766,6 +1769,7 @@ impl<'a> Engine<'a> {
                             for (ci, v) in vals {
                                 upd_cols[ci] = true;
                                 new[ci] = coerce_store(&v, &t.columns[ci].ty, &tname, &t.columns[ci].name)?;
+                                self.check_xml_store(&t.columns[ci], &new[ci])?;
                             }
                             for &c in &ts_cols {
                                 new[c] = self.next_rowversion();
@@ -1808,6 +1812,7 @@ impl<'a> Engine<'a> {
                                 }
                                 upd_cols[ci] = true;
                                 new[ci] = coerce_store(&v, &t.columns[ci].ty, &tname, &t.columns[ci].name)?;
+                                self.check_xml_store(&t.columns[ci], &new[ci])?;
                             }
                         }
                         self.finish_row(t, &mut new, "UPDATE")?;

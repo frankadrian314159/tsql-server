@@ -75,7 +75,7 @@ The query language is a subset of XQuery: absolute and relative paths (`/a/b`, `
 joined by `and` / `or`, `not()`, an existence test), numbers, strings, `+ - * div mod`, and `data`, `string`, `number`, `count`,
 `sum`, `not`, `concat`, `contains`, `starts-with`, `string-length`, `empty`, `exists` and the `xs:` casts. `sql:column("t.c")` and
 `sql:variable("@v")` are bound by the SQL parser to the column or variable. Not supported: FLWOR, `if`, written-out axes,
-typed xml, user functions.
+user functions; typed values (the validation of typed columns is in [xml-schema.md](xml-schema.md)).
 
 * `.value` returns the first item's text converted to the type (NULL if none; error 9400 for malformed xml, 2225 for a query
   that is not supported), `.exist` is 1 or 0, `.query` the items as xml text.

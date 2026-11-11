@@ -52,5 +52,17 @@ random bytes do about once in two million times; it then converts to text as a s
 
 `STBuffer`, `STUnion`, `STIntersection`, `STDifference`, `STConvexHull`, `STEnvelope`, `STCentroid`, `STGeometryN`,
 `STInteriorRingN`, `STExteriorRing`, `STTouches`, `STOverlaps`, `STCrosses`, `STDisjoint`, `STRelate`, `STSrid` as a setter,
-`STAsBinary`, `STGeomFromWKB`, GML and spatial indexes (`CREATE SPATIAL INDEX` is not parsed; AdventureWorks' spatial index is skipped on a
-restore). `sys.spatial_reference_systems` does not exist.
+`STAsBinary`, `STGeomFromWKB` and GML. `sys.spatial_reference_systems` does not exist.
+
+## Spatial indexes
+
+`CREATE SPATIAL INDEX name ON table (col) [USING GEOMETRY_GRID | GEOGRAPHY_GRID | GEOMETRY_AUTO_GRID | GEOGRAPHY_AUTO_GRID]
+[WITH (BOUNDING_BOX = (xmin, ymin, xmax, ymax) | (XMIN = .., ..), GRIDS = (LOW, MEDIUM, HIGH, LOW) | (LEVEL_1 = HIGH, ..),
+CELLS_PER_OBJECT = n, ...)]` is a **declaration**, as XML indexes are: it is checked and kept in the catalog, and changes no result and
+no plan, since the spatial methods are evaluated on the values. It shows in `sys.indexes` (type 4, `SPATIAL`),
+`sys.index_columns`, `sys.spatial_indexes` and `sys.spatial_index_tessellations`, in the script of a table, and in backups.
+The checks: the column is a geometry or geography (6324), the table has a primary key (6332), the name is free (1913), the
+scheme fits the column (6327), a geography index has no bounding box (6328) and a geometry index has one (6329) in which the
+maximum is above the minimum (6330), and `CELLS_PER_OBJECT` is 1 to 8192 (6331; 16 is the default). The primary key and the column
+cannot be dropped while the index exists. The error numbers are this server's. Other options (`PAD_INDEX`, `FILLFACTOR`, `ONLINE` ...) are read and
+ignored.

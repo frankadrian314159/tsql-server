@@ -50,6 +50,15 @@ pub struct Doc {
     n: Vec<N>,
 }
 
+/// What a node of a parsed document is (see `Doc::view`).
+pub enum View<'a> {
+    Doc,
+    Elem { name: &'a str, attrs: &'a [(String, String)] },
+    Text(&'a str),
+    /// a comment or a processing instruction
+    Other,
+}
+
 /// Something a query returns.
 #[derive(Clone, Debug)]
 pub enum Item {
@@ -255,6 +264,26 @@ impl Doc {
         self.n.push(N { kind, parent: Some(parent), kids: vec![] });
         self.n[parent].kids.push(id);
         id
+    }
+
+    /// Read-only access to the tree, for the schema validator: what a node is.
+    pub fn view(&self, id: usize) -> View<'_> {
+        match &self.n[id].kind {
+            Kind::Doc => View::Doc,
+            Kind::Elem { name, attrs } => View::Elem { name, attrs },
+            Kind::Text(t) => View::Text(t),
+            Kind::Comment(_) => View::Other,
+            Kind::Pi(_) => View::Other,
+        }
+    }
+
+    /// The children of a node, in order.
+    pub fn kids(&self, id: usize) -> &[usize] {
+        &self.n[id].kids
+    }
+
+    pub fn parent(&self, id: usize) -> Option<usize> {
+        self.n[id].parent
     }
 
     fn is_elem(&self, id: usize) -> bool {

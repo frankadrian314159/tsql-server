@@ -17,6 +17,7 @@ pub mod auditing;
 pub mod bulk;
 pub mod ddltrig;
 pub mod ftddl;
+pub mod xmlschema;
 pub mod spatialfn;
 pub mod hashjoin;
 pub mod rls;
@@ -1028,6 +1029,10 @@ impl<'a> Engine<'a> {
             }
             Stmt::FullText(f) => {
                 self.exec_fulltext(f)?;
+                self.ses.last_error = 0;
+            }
+            Stmt::XmlSchema(x) => {
+                self.exec_xml_schema(x)?;
                 self.ses.last_error = 0;
             }
         }

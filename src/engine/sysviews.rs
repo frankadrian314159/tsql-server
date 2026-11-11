@@ -207,6 +207,20 @@ impl<'a> Engine<'a> {
                     }
                     Some(rs(&[("object_id", DataType::Int), ("name", nv()), ("parameter_id", DataType::Int), ("system_type_id", DataType::Int), ("user_type_id", DataType::Int), ("max_length", DataType::SmallInt), ("precision", DataType::TinyInt), ("scale", DataType::TinyInt), ("is_output", DataType::Bit), ("has_default_value", DataType::Bit), ("is_readonly", DataType::Bit)], rows))
                 }
+                "xml_schema_collections" => {
+                    let rows = db.xml_schemas.iter().map(|x| vec![Value::Int(x.id), Value::Int(db.schema_id(&x.schema)), Value::Null, sv(&x.name), Value::DateTime(x.created, DtKind::DateTime), Value::DateTime(x.created, DtKind::DateTime)]).collect();
+                    Some(rs(&[("xml_collection_id", DataType::Int), ("schema_id", DataType::Int), ("principal_id", DataType::Int), ("name", nv()), ("create_date", DataType::DateTime), ("modify_date", DataType::DateTime)], rows))
+                }
+                "xml_schema_namespaces" => {
+                    let mut rows = vec![];
+                    for x in &db.xml_schemas {
+                        let ns = crate::engine::xmlschema::compiled(&x.texts).map(|c| c.namespaces().to_vec()).unwrap_or_default();
+                        for (i, n) in ns.iter().enumerate() {
+                            rows.push(vec![Value::Int(x.id), sv(n), Value::Int(i as i32 + 1)]);
+                        }
+                    }
+                    Some(rs(&[("xml_collection_id", DataType::Int), ("name", nv()), ("xml_namespace_id", DataType::Int)], rows))
+                }
                 "fulltext_catalogs" => {
                     let rows = db.fulltext_catalogs.iter().enumerate().map(|(i, c)| vec![Value::Int(i as i32 + 5), sv(&c.name), Value::Null, Value::Bit(c.is_default), Value::Bit(c.accent_sensitive), Value::Int(1), Value::Int(0), Value::Int(1), Value::Bit(false)]).collect();
                     Some(rs(&[("fulltext_catalog_id", DataType::Int), ("name", nv()), ("path", nv()), ("is_default", DataType::Bit), ("is_accent_sensitivity_on", DataType::Bit), ("data_space_id", DataType::Int), ("file_id", DataType::Int), ("principal_id", DataType::Int), ("is_importing", DataType::Bit)], rows))
@@ -400,9 +414,52 @@ impl<'a> Engine<'a> {
                                 r[8] = Value::Int(3);
                                 rows.push(r);
                             }
+                            // spatial indexes are numbered from 257000
+                            for (k, x) in t.spatial_indexes.iter().enumerate() {
+                                let mut r = row(sv(&x.name), 257_000 + k as i32, "SPATIAL", false, false, &None);
+                                r[8] = Value::Int(4);
+                                rows.push(r);
+                            }
                         }
                     }
                     Some(rs(&[("object_id", DataType::Int), ("name", nv()), ("index_id", DataType::Int), ("type_desc", nv()), ("is_unique", DataType::Bit), ("is_primary_key", DataType::Bit), ("has_filter", DataType::Bit), ("filter_definition", DataType::NVarChar(MAX)), ("type", DataType::TinyInt), ("is_unique_constraint", DataType::Bit), ("is_disabled", DataType::Bit), ("fill_factor", DataType::TinyInt)], rows))
+                }
+                "spatial_indexes" => {
+                    let mut rows = vec![];
+                    for o in db.objects.values() {
+                        if let Object::Table(t) = o {
+                            for (k, x) in t.spatial_indexes.iter().enumerate() {
+                                let scheme = format!("{}_{}", if x.geography { "GEOGRAPHY" } else { "GEOMETRY" }, if x.auto { "AUTO_GRID" } else { "GRID" });
+                                rows.push(vec![Value::Int(t.object_id), sv(&x.name), Value::Int(257_000 + k as i32), Value::Int(4), sv("SPATIAL"), Value::Int(if x.geography { 2 } else { 1 }), sv(if x.geography { "GEOGRAPHY" } else { "GEOMETRY" }), Value::Int(if x.auto { 3 } else { if x.geography { 2 } else { 1 } }), sv(&scheme)]);
+                            }
+                        }
+                    }
+                    Some(rs(&[("object_id", DataType::Int), ("name", nv()), ("index_id", DataType::Int), ("type", DataType::TinyInt), ("type_desc", nv()), ("spatial_index_type", DataType::TinyInt), ("spatial_index_type_desc", nv()), ("tessellation_scheme_id", DataType::TinyInt), ("tessellation_scheme", nv())], rows))
+                }
+                "spatial_index_tessellations" => {
+                    let mut rows = vec![];
+                    for o in db.objects.values() {
+                        if let Object::Table(t) = o {
+                            for (k, x) in t.spatial_indexes.iter().enumerate() {
+                                let scheme = format!("{}_{}", if x.geography { "GEOGRAPHY" } else { "GEOMETRY" }, if x.auto { "AUTO_GRID" } else { "GRID" });
+                                let b = |i: usize| x.bbox.map(|b| Value::Float(b[i])).unwrap_or(Value::Null);
+                                let level = |n: u8| sv(match n { 1 => "LOW", 3 => "HIGH", _ => "MEDIUM" });
+                                let mut r = vec![Value::Int(t.object_id), Value::Int(257_000 + k as i32), sv(&scheme), b(0), b(1), b(2), b(3)];
+                                for g in x.grids {
+                                    r.push(Value::Int(g as i32));
+                                    r.push(level(g));
+                                }
+                                r.push(Value::Int(x.cells));
+                                rows.push(r);
+                            }
+                        }
+                    }
+                    let mut cols = vec![("object_id", DataType::Int), ("index_id", DataType::Int), ("tessellation_scheme", nv()), ("bounding_box_xmin", DataType::Float), ("bounding_box_ymin", DataType::Float), ("bounding_box_xmax", DataType::Float), ("bounding_box_ymax", DataType::Float)];
+                    for n in ["level_1_grid", "level_1_grid_desc", "level_2_grid", "level_2_grid_desc", "level_3_grid", "level_3_grid_desc", "level_4_grid", "level_4_grid_desc"] {
+                        cols.push((n, if n.ends_with("desc") { nv() } else { DataType::TinyInt }));
+                    }
+                    cols.push(("cells_per_object", DataType::Int));
+                    Some(rs(&cols, rows))
                 }
                 "xml_indexes" => {
                     let mut rows = vec![];
@@ -474,6 +531,9 @@ impl<'a> Engine<'a> {
                             }
                             for (k, x) in t.xml_indexes.iter().enumerate() {
                                 rows.push(vec![Value::Int(t.object_id), Value::Int(256_000 + k as i32), Value::Int(1), Value::Int(x.col as i32 + 1), Value::Bit(false), Value::Bit(false), Value::Int(0), Value::Int(0)]);
+                            }
+                            for (k, x) in t.spatial_indexes.iter().enumerate() {
+                                rows.push(vec![Value::Int(t.object_id), Value::Int(257_000 + k as i32), Value::Int(1), Value::Int(x.col as i32 + 1), Value::Bit(false), Value::Bit(false), Value::Int(0), Value::Int(0)]);
                             }
                             for i in &t.indexes {
                                 for (k, (c, desc)) in i.cols.iter().enumerate() {

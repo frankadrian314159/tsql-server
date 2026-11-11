@@ -390,6 +390,17 @@ impl Parser {
             self.i += 1;
             parts = vec!["float".into()];
         }
+        // xml(DOCUMENT dbo.sc), xml(CONTENT sc), xml(sc)
+        if parts.len() == 1 && parts[0].eq_ignore_ascii_case("xml") && self.is_op("(") && matches!(self.toks.get(self.i + 1).map(|t| &t.tok), Some(Tok::Id(_) | Tok::QId(_))) {
+            self.i += 1;
+            let document = self.accept_kw("DOCUMENT");
+            if !document {
+                self.accept_kw("CONTENT");
+            }
+            let name = self.name_parts()?;
+            self.expect_op(")")?;
+            return Ok(TypeRef { parts, args: vec![], xml_schema: Some((name, document)) });
+        }
         let mut args = vec![];
         if self.is_op("(") {
             self.i += 1;
@@ -411,7 +422,7 @@ impl Parser {
             }
             self.expect_op(")")?;
         }
-        Ok(TypeRef { parts, args })
+        Ok(TypeRef { parts, args, xml_schema: None })
     }
 
     // ------------------------------------------------------------ expressions
@@ -668,7 +679,7 @@ impl Parser {
                 self.i += 1;
                 if unicode {
                     // N'...' is an nvarchar value: casting it says so, and later code can tell it from a varchar literal
-                    return Ok(Expr::Cast { e: Box::new(Expr::Lit(Value::Str(s.clone()))), ty: TypeRef { parts: vec!["nvarchar".to_string()], args: vec![-1] }, try_: false, style: None });
+                    return Ok(Expr::Cast { e: Box::new(Expr::Lit(Value::Str(s.clone()))), ty: TypeRef { parts: vec!["nvarchar".to_string()], args: vec![-1], xml_schema: None }, try_: false, style: None });
                 }
                 Ok(Expr::Lit(Value::Str(s.clone())))
             }
@@ -2948,6 +2959,16 @@ impl Parser {
             return self.audit_stmt("DROP");
         }
         let what = self.advance().up;
+        if what == "XML" {
+            self.expect_kw("SCHEMA")?;
+            self.expect_kw("COLLECTION")?;
+            let mut if_exists = false;
+            if self.accept_kw("IF") {
+                self.expect_kw("EXISTS")?;
+                if_exists = true;
+            }
+            return Ok(Stmt::XmlSchema(Box::new(XmlSchemaStmt::Drop { name: self.name_parts()?, if_exists })));
+        }
         if what == "FULLTEXT" {
             let st = match self.advance().up.as_str() {
                 "CATALOG" => FullTextStmt::DropCatalog { name: self.ident()? },
@@ -3297,6 +3318,88 @@ impl Parser {
         Ok(cols)
     }
 
+    fn signed_number(&mut self) -> R<f64> {
+        let neg = self.accept_op("-");
+        self.accept_op("+");
+        let v = match self.advance().tok {
+            Tok::Int(i) => i as f64,
+            Tok::Dec(d) => d.to_string().parse::<f64>().map_err(|_| self.err())?,
+            Tok::Float(f) => f,
+            _ => return Err(self.err()),
+        };
+        Ok(if neg { -v } else { v })
+    }
+
+    /// The `WITH (...)` of CREATE SPATIAL INDEX: BOUNDING_BOX, GRIDS and CELLS_PER_OBJECT are kept, the rest is skipped.
+    fn spatial_options(&mut self, sp: &mut SpatialIndexSpec) -> R<()> {
+        self.expect_op("(")?;
+        while !self.is_op(")") && !self.is_eof() {
+            let key = self.advance().up;
+            self.expect_op("=")?;
+            match key.as_str() {
+                "BOUNDING_BOX" => {
+                    self.expect_op("(")?;
+                    let mut v = vec![];
+                    loop {
+                        // either the four numbers, or XMIN = n, YMIN = n, ...
+                        if matches!(self.tok().tok, Tok::Id(_)) && self.peek_is_op(1, "=") {
+                            self.i += 2;
+                        }
+                        v.push(self.signed_number()?);
+                        if !self.accept_op(",") {
+                            break;
+                        }
+                    }
+                    self.expect_op(")")?;
+                    if v.len() != 4 {
+                        return Err(self.err());
+                    }
+                    sp.bbox = Some([v[0], v[1], v[2], v[3]]);
+                }
+                "GRIDS" => {
+                    self.expect_op("(")?;
+                    let mut g = [2u8; 4];
+                    let mut k = 0;
+                    loop {
+                        if matches!(self.tok().tok, Tok::Id(_)) && self.peek_is_op(1, "=") {
+                            // LEVEL_n = density
+                            let lvl = self.advance().up;
+                            self.i += 1;
+                            k = lvl.trim_start_matches("LEVEL_").parse::<usize>().ok().filter(|n| (1..=4).contains(n)).ok_or_else(|| self.err())? - 1;
+                        }
+                        g[k.min(3)] = match self.advance().up.as_str() {
+                            "LOW" => 1,
+                            "MEDIUM" => 2,
+                            "HIGH" => 3,
+                            _ => return Err(self.err()),
+                        };
+                        k += 1;
+                        if !self.accept_op(",") {
+                            break;
+                        }
+                    }
+                    self.expect_op(")")?;
+                    sp.grids = Some(g);
+                }
+                "CELLS_PER_OBJECT" => match self.advance().tok {
+                    Tok::Int(n) => sp.cells = Some(n as i32),
+                    _ => return Err(self.err()),
+                },
+                _ => {
+                    if self.is_op("(") {
+                        self.skip_parens()?;
+                    } else {
+                        self.i += 1;
+                    }
+                }
+            }
+            if !self.accept_op(",") {
+                break;
+            }
+        }
+        self.expect_op(")")
+    }
+
     /// `CREATE | ALTER FULLTEXT CATALOG | INDEX`; the cursor is on FULLTEXT.
     fn fulltext_stmt(&mut self, alter: bool) -> R<Stmt> {
         self.expect_kw("FULLTEXT")?;
@@ -3414,6 +3517,19 @@ impl Parser {
         if self.is_kw("FULLTEXT") {
             return self.fulltext_stmt(alter);
         }
+        if self.is_kw("XML") && self.peek_kw(1, &["SCHEMA"]) {
+            self.i += 2;
+            self.expect_kw("COLLECTION")?;
+            let name = self.name_parts()?;
+            let st = if alter {
+                self.expect_kw("ADD")?;
+                XmlSchemaStmt::Alter { name, text: self.expr()? }
+            } else {
+                self.expect_kw("AS")?;
+                XmlSchemaStmt::Create { name, text: self.expr()? }
+            };
+            return Ok(Stmt::XmlSchema(Box::new(st)));
+        }
         let mut unique = false;
         if self.accept_kw("UNIQUE") {
             unique = true;
@@ -3432,6 +3548,11 @@ impl Parser {
         } else if self.is_kw("XML") && self.peek_kw(1, &["INDEX"]) {
             self.i += 1;
             xml_primary = Some(false);
+        }
+        // CREATE SPATIAL INDEX
+        let spatial_kw = self.is_kw("SPATIAL") && self.peek_kw(1, &["INDEX"]);
+        if spatial_kw {
+            self.i += 1;
         }
         let t = self.advance();
         let what = t.up.clone();
@@ -3490,10 +3611,18 @@ impl Parser {
                         x.secondary = secondary;
                     }
                 }
+                let mut spatial = if spatial_kw { Some(SpatialIndexSpec::default()) } else { None };
+                if let Some(sp) = spatial.as_mut() {
+                    if self.accept_kw("USING") {
+                        sp.tessellation = Some(self.ident()?.to_uppercase());
+                    }
+                }
                 let (mut include, mut filter) = (vec![], None);
                 while self.is_kw_any(&["INCLUDE", "WHERE", "WITH", "ON"]) {
                     let w = self.advance().up;
-                    if w == "WHERE" {
+                    if w == "WITH" && self.is_op("(") && spatial.is_some() {
+                        self.spatial_options(spatial.as_mut().unwrap())?;
+                    } else if w == "WHERE" {
                         filter = Some(self.expr_text()?);
                     } else if w == "INCLUDE" && self.is_op("(") {
                         self.i += 1;
@@ -3510,7 +3639,7 @@ impl Parser {
                         self.i += 1;
                     }
                 }
-                Ok(Stmt::CreateIndex { name, table, cols, unique, include, filter, xml })
+                Ok(Stmt::CreateIndex { name, table, cols, unique, include, filter, xml, spatial })
             }
             "VIEW" => {
                 let name = self.name_parts()?;

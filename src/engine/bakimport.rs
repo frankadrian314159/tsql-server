@@ -25,6 +25,9 @@ pub struct Report {
     pub keys: usize,
     pub indexes: usize,
     pub xml_indexes: usize,
+    pub spatial_indexes: usize,
+    pub fulltext_catalogs: usize,
+    pub fulltext_indexes: usize,
     pub foreign_keys: usize,
     pub defaults: usize,
     pub checks: usize,
@@ -197,7 +200,8 @@ pub fn convert(src: &str, out: &str) -> Result<Report, String> {
         report.tables += 1;
         report.rows += data.rows.len() as u64;
     }
-    create_keys(&mut conn, &tables, &computed_created, &mut report);
+    let catalogs = create_fulltext_catalogs(&mut conn, &mut bak, &mut report);
+    create_keys(&mut conn, &tables, &computed_created, &catalogs, &mut report);
     create_modules(&mut conn, &early_failed, &mut report);
     let of_kind = |k: &[&[u8; 2]]| -> Vec<&ModuleMeta> { modules.iter().filter(|m| k.contains(&&m.kind)).collect() };
     // functions that no definition was found for (encrypted) or that are not T-SQL
@@ -231,9 +235,27 @@ fn attempt(conn: &mut crate::Connection, sql: &str, what: String, problems: &mut
     }
 }
 
+/// The full-text catalogs of the backup, created; the result maps the id of each catalog that was created to its name.
+fn create_fulltext_catalogs<R: std::io::Read + std::io::Seek>(conn: &mut crate::Connection, bak: &mut Backup<R>, report: &mut Report) -> HashMap<u32, String> {
+    let mut out = HashMap::new();
+    match bak.ft_catalogs() {
+        Ok(cats) => {
+            for c in cats {
+                let sql = format!("CREATE FULLTEXT CATALOG {}{}{}", quote(&c.name), if c.accent_sensitive { "" } else { " WITH ACCENT_SENSITIVITY = OFF" }, if c.is_default { " AS DEFAULT" } else { "" });
+                if attempt(conn, &sql, format!("full-text catalog {}", c.name), &mut report.problems) {
+                    report.fulltext_catalogs += 1;
+                    out.insert(c.id, c.name);
+                }
+            }
+        }
+        Err(e) => report.problems.push(format!("the full-text catalogs could not be read: {}", e)),
+    }
+    out
+}
+
 /// Indexes, keys and constraints, once all rows are in: primary and unique keys and indexes, then defaults and checks, then
 /// the foreign keys (which need the keys they refer to).
-fn create_keys(conn: &mut crate::Connection, tables: &[TableMeta], computed: &std::collections::HashSet<(u32, u32)>, report: &mut Report) {
+fn create_keys(conn: &mut crate::Connection, tables: &[TableMeta], computed: &std::collections::HashSet<(u32, u32)>, catalogs: &HashMap<u32, String>, report: &mut Report) {
     let by_id: HashMap<u32, &TableMeta> = tables.iter().map(|t| (t.id, t)).collect();
     for t in tables {
         let tn = format!("{}.{}", t.schema, t.name);
@@ -287,9 +309,38 @@ fn create_keys(conn: &mut crate::Connection, tables: &[TableMeta], computed: &st
                 report.xml_indexes += 1;
             }
         }
+        // spatial indexes need the primary key. The backup's tessellation settings are not read (the sample has no spatial index to
+        // learn them from): a geography index gets the defaults, a geometry index the bounding box of the whole globe.
+        for (name, column) in &t.spatial_indexes {
+            let Some(col) = column_list(t, &[*column], computed) else {
+                report.problems.push(format!("spatial index {} on {} was not created: its column was not created", name, tn));
+                continue;
+            };
+            let geography = t.cols.iter().any(|c| c.colid == *column && matches!(c.ty, DataType::Geography));
+            let with = if geography { "" } else { " WITH (BOUNDING_BOX = (-180, -90, 180, 90))" };
+            let sql = format!("CREATE SPATIAL INDEX {} ON {} ({}){}", quote(name), qname(t), col[0], with);
+            if attempt(conn, &sql, format!("spatial index {} on {}", name, tn), &mut report.problems) {
+                report.spatial_indexes += 1;
+                report.problems.push(format!("spatial index {} on {} was created with default tessellation settings (the backup's are not read)", name, tn));
+            }
+        }
+        // the full-text index comes after the key it is built on
+        if let Some(f) = &t.fulltext {
+            let key = t.indexes.iter().find(|i| i.id == f.key_index).map(|i| i.name.clone());
+            let cols: Option<Vec<String>> = f.cols.iter().map(|(c, lang)| column_list(t, &[*c], computed).map(|n| format!("{} LANGUAGE {}", n[0], lang))).collect();
+            match (key, cols) {
+                (Some(key), Some(cols)) if !cols.is_empty() => {
+                    let catalog = catalogs.get(&f.catalog).map(|c| format!(" ON {}", quote(c))).unwrap_or_default();
+                    let sql = format!("CREATE FULLTEXT INDEX ON {} ({}) KEY INDEX {}{}", qname(t), cols.join(", "), quote(&key), catalog);
+                    if attempt(conn, &sql, format!("full-text index on {}", tn), &mut report.problems) {
+                        report.fulltext_indexes += 1;
+                    }
+                }
+                _ => report.problems.push(format!("full-text index on {} was not created: its key index or columns were not found", tn)),
+            }
+        }
         for (name, ty) in &t.other_indexes {
             let kind = match ty {
-                4 => "spatial index",
                 5 | 6 => "columnstore index",
                 7 => "hash index",
                 _ => "index of a kind that is not known",
@@ -452,10 +503,12 @@ mod tests {
             locs: Default::default(),
             indexes: vec![],
             xml_indexes: vec![],
+            spatial_indexes: vec![],
             other_indexes: vec![],
             foreign_keys: vec![],
             defaults: vec![],
             checks: vec![],
+            fulltext: None,
         };
         let long = "x".repeat(20_000);
         let rows = vec![

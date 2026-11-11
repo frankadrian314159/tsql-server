@@ -104,6 +104,15 @@ What comes over:
   again while a pass creates anything (a view of a view). Triggers are created after the rows are loaded, so loading does
   not fire them. In the sample, all 20 views, 10 procedures, 11 functions and 11 triggers (the database trigger included) are
   created, those that use the XML methods `.nodes()` and `.modify()` and full-text search among them;
+* full-text catalogs and indexes: the catalog (`sysclsobjs` class 32: name, and its status for default and accent
+  sensitivity, both set in the sample), and each index (`sysftinds`: the table and the number of its key index; `sysobjvalues`
+  class 42: the indexed columns and their language ids; `syssingleobjrefs` class 39: the catalog). In the sample, the catalog
+  and the 3 indexes (Document, JobCandidate, ProductReview) are created. Change tracking and the other flags of `sysftinds`
+  are not decoded: the index is created with `CHANGE_TRACKING AUTO`, and the meaning of the status bits of a catalog is
+  inferred from one sample;
+* spatial indexes: created on their column with default tessellation settings (a geometry index gets the bounding box
+  `(-180, -90, 180, 90)`), and a warning says so; the sample has no spatial index, so the form in which a backup keeps the
+  settings is not known and they are not read;
 * XML indexes, primary ones before the secondary ones built on them. This server records them in the catalog and does not
   build anything (see [optimizer.md](optimizer.md#xml-indexes)); in the sample, 8 of 8 are created;
 * `text`, `ntext` and `image` values, and `sql_variant` values of the types that are decoded (see below);
@@ -114,9 +123,10 @@ What comes over:
 What does not:
 
 * user-defined types (columns of an alias type get the base type), sequences, users and permissions, and CLR objects;
-* spatial, columnstore and hash indexes (the engine has no equivalent), full-text catalogs and indexes (the engine has the
-  declarations, but the system tables that hold them are not read), and filtered indexes lose their filter (their
-  definition is not read);
+* columnstore and hash indexes (the engine has no equivalent), and filtered indexes lose their filter (their definition is
+  not read);
+* XML schema collections and the typed xml columns that use them: the collections are stored as compiled components, not as
+  XSD text, and are not read, so such columns come over as untyped `xml` (their values are read as before);
 * referential actions other than `ON DELETE CASCADE` (the other bits of the status of a foreign key are not decoded, and
   a warning names a key that has any), descending key columns are read from a bit that no index of the sample uses
   (unverified);

@@ -28,6 +28,18 @@ impl<'a> Engine<'a> {
                     }
                     None => (DataType::Variant, None),
                 };
+                // a typed xml column names a schema collection that exists
+                let xml_schema = match c.ty.as_ref().and_then(|tr| tr.xml_schema.clone()) {
+                    Some((n, document)) => {
+                        let (dbn, sch, nm) = self.ddl_names(&n);
+                        let key = obj_key(&sch, &nm);
+                        if !self.srv.databases.get(&dbn).is_some_and(|d| d.xml_schemas.iter().any(|x| obj_key(&x.schema, &x.name) == key)) {
+                            return Err(SqlError::new(6903, format!("XML schema collection '{}' does not exist.", nm)));
+                        }
+                        Some((dbn, key, document))
+                    }
+                    None => None,
+                };
                 let identity = match &c.identity {
                     Some((s, i)) => {
                         let sv = self.const_i64(s)?;
@@ -65,6 +77,7 @@ impl<'a> Engine<'a> {
                     default_name: c.default.as_ref().map(|_| c.default_name.clone().unwrap_or_else(|| format!("DF__{}__{}__{:08X}", name, c.name, oid))),
                     computed: c.computed.clone().map(Arc::new),
                     user_type,
+                    xml_schema,
                     collation,
                     mask,
                     hidden: false,
@@ -345,7 +358,7 @@ impl<'a> Engine<'a> {
                     }
                 }
             }
-            Stmt::CreateIndex { name, table, cols, unique, include, filter, xml } => {
+            Stmt::CreateIndex { name, table, cols, unique, include, filter, xml, spatial } => {
                 let loc = self.locate(table);
                 let t = self.table_ref(&loc).cloned().ok_or_else(|| self.invalid_object(table))?;
                 self.check_alter(&loc, table.last().unwrap())?;
@@ -356,8 +369,11 @@ impl<'a> Engine<'a> {
                     if let Some(x) = xml {
                         return Self::create_xml_index(&mut t, name, cols, x);
                     }
+                    if let Some(sp) = spatial {
+                        return Self::create_spatial_index(&mut t, name, cols, sp);
+                    }
                     let idx: Vec<(usize, bool)> = cols.iter().map(|(c, d)| t.col_index(c).map(|i| (i, *d)).ok_or_else(|| SqlError::new(1911, format!("Column name '{}' does not exist in the target table or view.", c)))).collect::<Result<_>>()?;
-                    if t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name)) || t.all_keys().iter().any(|k| k.name.eq_ignore_ascii_case(name)) || t.xml_indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name)) {
+                    if t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name)) || t.all_keys().iter().any(|k| k.name.eq_ignore_ascii_case(name)) || t.xml_indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name)) || t.spatial_indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name)) {
                         return Err(SqlError::new(1913, format!("The operation failed because an index or statistics with name '{}' already exists on table '{}'.", name, t.name)));
                     }
                     // INCLUDE columns ride along in the index; they may not also be key columns
@@ -681,6 +697,9 @@ impl<'a> Engine<'a> {
                     t.uniques.retain(|k| !(k.is_index && k.name.eq_ignore_ascii_case(&idx)));
                     let mut found = t.indexes.len() != before;
                     // dropping a primary XML index drops the secondary indexes built on it
+                    let spatial_before = t.spatial_indexes.len();
+                    t.spatial_indexes.retain(|x| !x.name.eq_ignore_ascii_case(&idx));
+                    found |= t.spatial_indexes.len() != spatial_before;
                     if t.xml_indexes.iter().any(|x| x.name.eq_ignore_ascii_case(&idx)) {
                         t.xml_indexes.retain(|x| !x.name.eq_ignore_ascii_case(&idx) && !x.using.as_deref().is_some_and(|u| u.eq_ignore_ascii_case(&idx)));
                         found = true;
@@ -694,6 +713,53 @@ impl<'a> Engine<'a> {
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    /// `CREATE SPATIAL INDEX`: checked, then recorded (see `SpatialIndexDef`). The numbers of the errors are this server's.
+    fn create_spatial_index(t: &mut Table, name: &str, cols: &[(String, bool)], sp: &crate::ast::SpatialIndexSpec) -> Result<()> {
+        if cols.len() != 1 {
+            return Err(SqlError::new(6324, "A spatial index is built on exactly one geometry or geography column."));
+        }
+        let ci = t.col_index(&cols[0].0).ok_or_else(|| SqlError::new(1911, format!("Column name '{}' does not exist in the target table or view.", cols[0].0)))?;
+        let geography = match t.columns[ci].ty {
+            DataType::Geography => true,
+            DataType::Geometry => false,
+            _ => return Err(SqlError::new(6324, format!("Cannot create a spatial index on column '{}' of table '{}': it is not of the geometry or geography data type.", cols[0].0, t.name))),
+        };
+        if t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name)) || t.all_keys().iter().any(|k| k.name.eq_ignore_ascii_case(name)) || t.xml_indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name)) || t.spatial_indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name)) {
+            return Err(SqlError::new(1913, format!("The operation failed because an index or statistics with name '{}' already exists on table '{}'.", name, t.name)));
+        }
+        if t.pk.is_none() {
+            return Err(SqlError::new(6332, format!("Table '{}' needs to have a clustered primary key in order to create a spatial index on it.", t.name)));
+        }
+        let (scheme_geography, auto) = match sp.tessellation.as_deref() {
+            None => (geography, false),
+            Some("GEOMETRY_GRID") => (false, false),
+            Some("GEOGRAPHY_GRID") => (true, false),
+            Some("GEOMETRY_AUTO_GRID") => (false, true),
+            Some("GEOGRAPHY_AUTO_GRID") => (true, true),
+            Some(other) => return Err(SqlError::syntax(other)),
+        };
+        if scheme_geography != geography {
+            return Err(SqlError::new(6327, format!("The tessellation scheme {} does not fit column '{}', which is of the {} data type.", sp.tessellation.as_deref().unwrap_or(""), cols[0].0, if geography { "geography" } else { "geometry" })));
+        }
+        if geography && sp.bbox.is_some() {
+            return Err(SqlError::new(6328, "BOUNDING_BOX is for geometry indexes; a geography covers the globe."));
+        }
+        if !geography && sp.bbox.is_none() {
+            return Err(SqlError::new(6329, "A spatial index on a geometry column needs BOUNDING_BOX."));
+        }
+        if let Some(b) = sp.bbox {
+            if !(b[2] > b[0] && b[3] > b[1]) {
+                return Err(SqlError::new(6330, "BOUNDING_BOX needs xmax greater than xmin and ymax greater than ymin."));
+            }
+        }
+        let cells = sp.cells.unwrap_or(if auto { 8192 } else { 16 });
+        if !(1..=8192).contains(&cells) {
+            return Err(SqlError::new(6331, "CELLS_PER_OBJECT must be from 1 to 8192."));
+        }
+        t.spatial_indexes.push(crate::catalog::SpatialIndexDef { name: name.to_string(), col: ci, geography, auto, bbox: sp.bbox, grids: sp.grids.unwrap_or([2; 4]), cells });
         Ok(())
     }
 
@@ -998,8 +1064,8 @@ impl<'a> Engine<'a> {
                         if t.fulltext.as_ref().is_some_and(|f| f.key_index.eq_ignore_ascii_case(n)) {
                             return Err(SqlError::new(7653, format!("Cannot drop the index '{}': it is the key index of the full-text index of table '{}'.", n, t.name)));
                         }
-                        if !t.xml_indexes.is_empty() {
-                            return Err(SqlError::new(6332, format!("Table '{}' needs to have a clustered primary key in order to have an XML index on it; drop the XML indexes first.", t.name)));
+                        if !t.xml_indexes.is_empty() || !t.spatial_indexes.is_empty() {
+                            return Err(SqlError::new(6332, format!("Table '{}' needs to have a clustered primary key in order to have an XML or spatial index on it; drop those indexes first.", t.name)));
                         }
                         // referenced by FKs?
                         let tk = t.key();
@@ -1047,7 +1113,7 @@ impl<'a> Engine<'a> {
                         }
                     };
                     let in_key = t.all_keys().iter().any(|k| k.cols.contains(&ci)) || t.fks.iter().any(|f| f.cols.contains(&ci)) || t.checks.iter().any(|c| c.col.as_deref() == Some(n.as_str())) || t.indexes.iter().any(|i| i.cols.iter().any(|(c, _)| *c == ci));
-                    let in_key = in_key || t.xml_indexes.iter().any(|x| x.col == ci) || t.fulltext.as_ref().is_some_and(|f| f.cols.iter().any(|c| c.0 == ci));
+                    let in_key = in_key || t.xml_indexes.iter().any(|x| x.col == ci) || t.spatial_indexes.iter().any(|x| x.col == ci) || t.fulltext.as_ref().is_some_and(|f| f.cols.iter().any(|c| c.0 == ci));
                     if in_key {
                         return Err(SqlError::new(5074, format!("The object depends on column '{}'. ALTER TABLE DROP COLUMN failed because one or more objects access this column.", n)));
                     }
@@ -1084,6 +1150,11 @@ impl<'a> Engine<'a> {
                         }
                     }
                     for x in t.xml_indexes.iter_mut() {
+                        if x.col > ci {
+                            x.col -= 1;
+                        }
+                    }
+                    for x in t.spatial_indexes.iter_mut() {
                         if x.col > ci {
                             x.col -= 1;
                         }

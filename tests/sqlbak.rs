@@ -278,6 +278,10 @@ fn restore_database_from_a_sql_server_backup() {
     assert_eq!(n(&mut c, "SELECT COUNT(*) FROM aw.HumanResources.Employee WHERE OrganizationNode.IsDescendantOf(hierarchyid::Parse('/3/')) = 1 AND OrganizationLevel = 1"), "1");
     assert_eq!(n(&mut c, "SELECT DocumentLevel FROM aw.Production.Document WHERE DocumentNode = hierarchyid::Parse('/1/2/')"), "2");
     assert_eq!(n(&mut c, "SELECT COUNT(*) FROM sys.indexes WHERE name IN ('IX_Employee_OrganizationLevel_OrganizationNode', 'AK_Document_DocumentLevel_DocumentNode')"), "2");
+    // full-text catalog and indexes
+    assert_eq!(n(&mut c, "SELECT COUNT(*) FROM aw.sys.fulltext_catalogs WHERE name = 'AW2025FullTextCatalog'"), "1");
+    assert_eq!(n(&mut c, "SELECT COUNT(*) FROM aw.sys.fulltext_indexes"), "3");
+    assert_eq!(n(&mut c, "SELECT COUNT(*) FROM aw.sys.fulltext_index_columns"), "4");
     // geography values, read from the bytes of the backup
     assert_eq!(n(&mut c, "SELECT COUNT(*) FROM aw.Person.Address WHERE SpatialLocation IS NOT NULL"), n(&mut c, "SELECT COUNT(*) FROM aw.Person.Address"));
     assert_eq!(n(&mut c, "SELECT COUNT(*) FROM aw.Person.Address WHERE SpatialLocation.Lat BETWEEN -90 AND 90 AND SpatialLocation.Long BETWEEN -180 AND 180"), n(&mut c, "SELECT COUNT(*) FROM aw.Person.Address"));
@@ -301,4 +305,24 @@ fn restore_database_from_a_sql_server_backup() {
     // (the cascade test above deleted the 12 lines of order 43659)
     assert_eq!(n(&mut c, "SELECT COUNT(*) FROM aw2.Sales.SalesOrderDetail"), "121305");
     let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn full_text_catalogs_and_indexes_are_read() {
+    let Some(mut b) = open() else { return };
+    let ts = b.tables().unwrap();
+    let cats = b.ft_catalogs().unwrap();
+    assert_eq!(cats.len(), 1);
+    assert_eq!(cats[0].name, "AW2025FullTextCatalog");
+    let with: Vec<&TableMeta> = ts.iter().filter(|t| t.fulltext.is_some()).collect();
+    assert_eq!(with.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().len(), 3);
+    let doc = table(&ts, "Production", "Document").fulltext.as_ref().unwrap();
+    assert_eq!(doc.catalog, cats[0].id);
+    let names: Vec<&str> = doc.cols.iter().map(|(c, _)| table(&ts, "Production", "Document").cols.iter().find(|x| x.colid == *c).unwrap().name.as_str()).collect();
+    assert_eq!(names, vec!["DocumentSummary", "Document"]);
+    assert!(doc.cols.iter().all(|c| c.1 == 1033));
+    let key = table(&ts, "Production", "Document").indexes.iter().find(|i| i.id == doc.key_index).unwrap();
+    assert_eq!(key.name, "PK_Document_DocumentNode");
+    let review = table(&ts, "Production", "ProductReview").fulltext.as_ref().unwrap();
+    assert_eq!(table(&ts, "Production", "ProductReview").cols.iter().find(|x| x.colid == review.cols[0].0).unwrap().name, "Comments");
 }

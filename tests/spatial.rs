@@ -91,3 +91,71 @@ fn columns_variables_and_the_bytes_of_a_backup() {
     assert_eq!(first(&mut c, "SELECT t2.Lat FROM t2"), "1.5");
     assert_eq!(first(&mut c, "SELECT Long FROM t2"), "2.5");
 }
+
+#[test]
+fn spatial_indexes_are_declared_checked_and_listed() {
+    let mut c = conn();
+    script(
+        &mut c,
+        "CREATE TABLE geo (id INT NOT NULL CONSTRAINT pk_geo PRIMARY KEY, g geography NULL, m geometry NULL, n INT);
+         CREATE TABLE nopk (g geography);",
+    );
+    exec(&mut c, "CREATE SPATIAL INDEX six_g ON geo (g)");
+    exec(&mut c, "CREATE SPATIAL INDEX six_m ON geo (m) USING GEOMETRY_GRID WITH (BOUNDING_BOX = (-10, -20, 30.5, 40), GRIDS = (LOW, MEDIUM, HIGH, LOW), CELLS_PER_OBJECT = 64, PAD_INDEX = ON)");
+    exec(&mut c, "CREATE SPATIAL INDEX six_m2 ON geo (m) USING GEOMETRY_AUTO_GRID WITH (BOUNDING_BOX = (XMIN = 0, YMIN = 0, XMAX = 10, YMAX = 10))");
+    assert_eq!(rows(&mut c, "SELECT name, type_desc, spatial_index_type_desc, tessellation_scheme FROM sys.spatial_indexes ORDER BY name").iter().map(|r| r.join("/")).collect::<Vec<_>>(), vec!["six_g/SPATIAL/GEOGRAPHY/GEOGRAPHY_GRID", "six_m/SPATIAL/GEOMETRY/GEOMETRY_GRID", "six_m2/SPATIAL/GEOMETRY/GEOMETRY_AUTO_GRID"]);
+    assert_eq!(rows(&mut c, "SELECT t.bounding_box_xmin, t.bounding_box_ymax, t.level_1_grid_desc, t.level_3_grid_desc, t.cells_per_object FROM sys.spatial_index_tessellations t JOIN sys.indexes i ON i.object_id = t.object_id AND i.index_id = t.index_id WHERE i.name = 'six_m'")[0].join("/"), "-10/40/LOW/HIGH/64");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.indexes WHERE object_id = OBJECT_ID('geo') AND type = 4"), "3");
+    // what is checked
+    assert_eq!(err_no(&mut c, "CREATE SPATIAL INDEX x ON geo (n)"), 6324, "not a spatial column");
+    assert_eq!(err_no(&mut c, "CREATE SPATIAL INDEX x ON nopk (g)"), 6332, "needs a primary key");
+    assert_eq!(err_no(&mut c, "CREATE SPATIAL INDEX x ON geo (m)"), 6329, "geometry needs a bounding box");
+    assert_eq!(err_no(&mut c, "CREATE SPATIAL INDEX x ON geo (g) WITH (BOUNDING_BOX = (0, 0, 1, 1))"), 6328);
+    assert_eq!(err_no(&mut c, "CREATE SPATIAL INDEX x ON geo (g) USING GEOMETRY_GRID"), 6327);
+    assert_eq!(err_no(&mut c, "CREATE SPATIAL INDEX x ON geo (m) WITH (BOUNDING_BOX = (5, 0, 1, 1))"), 6330);
+    assert_eq!(err_no(&mut c, "CREATE SPATIAL INDEX six_g ON geo (g)"), 1913);
+    assert_eq!(err_no(&mut c, "CREATE INDEX six_g ON geo (n)"), 1913);
+    // dependencies
+    assert_eq!(err_no(&mut c, "ALTER TABLE geo DROP COLUMN g"), 5074);
+    assert_eq!(err_no(&mut c, "ALTER TABLE geo DROP CONSTRAINT pk_geo"), 6332);
+    exec(&mut c, "DROP INDEX six_g ON geo");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.spatial_indexes"), "2");
+    exec(&mut c, "ALTER TABLE geo DROP COLUMN g");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.spatial_indexes s JOIN sys.index_columns ic ON ic.object_id = s.object_id AND ic.index_id = s.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id WHERE c.name = 'm'"), "2", "the column numbers follow the dropped column");
+}
+
+#[test]
+fn scripts_and_backups_keep_spatial_and_full_text_indexes() {
+    use tsql_server::tools;
+    let mut c = conn();
+    script(
+        &mut c,
+        "CREATE TABLE places (id INT NOT NULL CONSTRAINT pk_places PRIMARY KEY, name NVARCHAR(50), loc geography, shape geometry);
+         CREATE SPATIAL INDEX six_loc ON places (loc);
+         CREATE SPATIAL INDEX six_shape ON places (shape) USING GEOMETRY_GRID WITH (BOUNDING_BOX = (0, 0, 100, 50), GRIDS = (HIGH, HIGH, MEDIUM, LOW), CELLS_PER_OBJECT = 32);
+         CREATE FULLTEXT CATALOG ftc;
+         CREATE FULLTEXT INDEX ON places (name LANGUAGE 1033) KEY INDEX pk_places ON ftc;",
+    );
+    let text = tools::script_table(&c.table_info("places").unwrap());
+    assert!(text.contains("CREATE SPATIAL INDEX [six_shape] ON [dbo].[places] ([shape]) USING GEOMETRY_GRID WITH (BOUNDING_BOX = (0, 0, 100, 50), GRIDS = (LEVEL_1 = HIGH, LEVEL_2 = HIGH, LEVEL_3 = MEDIUM, LEVEL_4 = LOW), CELLS_PER_OBJECT = 32);"), "{text}");
+    assert!(text.contains("CREATE FULLTEXT INDEX ON [dbo].[places] ([name] LANGUAGE 1033) KEY INDEX [pk_places] ON [ftc] WITH (CHANGE_TRACKING = AUTO);"), "{text}");
+    // a native backup brings them along
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("s.bak").to_string_lossy().replace('\\', "/");
+    exec(&mut c, "CREATE DATABASE sdb");
+    exec(&mut c, "USE sdb");
+    script(
+        &mut c,
+        "CREATE TABLE t (id INT NOT NULL CONSTRAINT pk_t PRIMARY KEY, g geography, s NVARCHAR(20));
+         CREATE SPATIAL INDEX sx ON t (g);
+         CREATE FULLTEXT CATALOG c1 AS DEFAULT;
+         CREATE FULLTEXT INDEX ON t (s) KEY INDEX pk_t;
+         INSERT INTO t VALUES (1, geography::Point(1, 2, 4326), N'hello world');",
+    );
+    exec(&mut c, &format!("BACKUP DATABASE sdb TO DISK = '{}' WITH INIT", f));
+    exec(&mut c, &format!("RESTORE DATABASE sdb2 FROM DISK = '{}'", f));
+    exec(&mut c, "USE sdb2");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.spatial_indexes"), "1");
+    assert_eq!(scalar(&mut c, "SELECT c.name FROM sys.fulltext_indexes i JOIN sys.fulltext_catalogs c ON c.fulltext_catalog_id = i.fulltext_catalog_id"), "c1");
+    assert_eq!(scalar(&mut c, "SELECT g.Lat FROM t"), "1");
+}

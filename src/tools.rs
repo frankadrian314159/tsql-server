@@ -351,6 +351,11 @@ pub fn script_table(t: &TableInfo) -> String {
         out.push_str(&format!("CREATE {}XML INDEX {} ON {} ({}){};
 ", if x.primary { "PRIMARY " } else { "" }, bracket(&x.name), t.quoted(), bracket(&x.column), using));
     }
+    for s in &t.extra_ddl {
+        out.push_str(s);
+        out.push_str(";
+");
+    }
     for f in &t.foreign_keys {
         let own = f.columns.iter().map(|c| bracket(c)).collect::<Vec<_>>().join(", ");
         let theirs = f.ref_columns.iter().map(|c| bracket(c)).collect::<Vec<_>>().join(", ");

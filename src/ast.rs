@@ -27,6 +27,9 @@ pub enum BinOp {
 pub struct TypeRef {
     pub parts: Vec<String>,
     pub args: Vec<i64>, // -1 == MAX
+    /// `xml(DOCUMENT sc)` / `xml(CONTENT sc)`: the schema collection and whether it is DOCUMENT
+    #[serde(default)]
+    pub xml_schema: Option<(Vec<String>, bool)>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -439,6 +442,25 @@ pub struct XmlIndexSpec {
     pub secondary: Option<char>,
 }
 
+/// What makes a `CREATE INDEX` a spatial index: `CREATE SPATIAL INDEX ... [USING scheme] [WITH (BOUNDING_BOX = ..., GRIDS = ...,
+/// CELLS_PER_OBJECT = n)]`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SpatialIndexSpec {
+    /// `GEOMETRY_GRID`, `GEOGRAPHY_GRID`, `GEOMETRY_AUTO_GRID` or `GEOGRAPHY_AUTO_GRID`
+    pub tessellation: Option<String>,
+    pub bbox: Option<[f64; 4]>,
+    pub grids: Option<[u8; 4]>,
+    pub cells: Option<i32>,
+}
+
+/// `CREATE | ALTER | DROP XML SCHEMA COLLECTION`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum XmlSchemaStmt {
+    Create { name: Name, text: Expr },
+    Alter { name: Name, text: Expr },
+    Drop { name: Name, if_exists: bool },
+}
+
 /// The full-text statements: catalogs and the index of a table.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum FullTextStmt {
@@ -465,6 +487,7 @@ pub enum FtAlter {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Stmt {
     FullText(Box<FullTextStmt>),
+    XmlSchema(Box<XmlSchemaStmt>),
     Query(Box<Query>),
     Insert(Box<Insert>),
     Update(Box<Update>),
@@ -499,7 +522,7 @@ pub enum Stmt {
     Kill(Expr),
     Reconfigure,
     CreateTable { name: Name, defs: Vec<TableDef>, versioning: Option<Versioning> },
-    CreateIndex { name: String, table: Name, cols: Vec<(String, bool)>, unique: bool, include: Vec<String>, filter: Option<(Expr, String)>, xml: Option<XmlIndexSpec> },
+    CreateIndex { name: String, table: Name, cols: Vec<(String, bool)>, unique: bool, include: Vec<String>, filter: Option<(Expr, String)>, xml: Option<XmlIndexSpec>, spatial: Option<SpatialIndexSpec> },
     CreateView { name: Name, cols: Option<Vec<String>>, query: Rc<Query>, text: String, or_alter: bool, alter: bool, check_option: bool },
     CreateProc { name: Name, params: Vec<Param>, body: Rc<Vec<Stmt>>, text: String, or_alter: bool, alter: bool },
     CreateFunction(Box<CreateFunction>),

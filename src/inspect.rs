@@ -109,6 +109,8 @@ pub struct TableInfo {
     pub triggers: Vec<String>,
     /// XML indexes, primary ones before the secondary ones built on them.
     pub xml_indexes: Vec<XmlIndexInfo>,
+    /// `CREATE SPATIAL INDEX` and `CREATE FULLTEXT INDEX` statements for what the table declares.
+    pub extra_ddl: Vec<String>,
     /// Slots in the heap: live rows plus deleted rows not yet collected. Cheap, approximate.
     pub approx_rows: usize,
 }
@@ -161,7 +163,10 @@ fn describe(db: &str, t: &Table) -> TableInfo {
         .enumerate()
         .map(|(i, c)| ColumnInfo {
             name: c.name.clone(),
-            ty: c.ty.to_string(),
+            ty: match &c.xml_schema {
+                Some((_, key, doc)) => format!("xml({} {})", if *doc { "DOCUMENT" } else { "CONTENT" }, key.split('.').map(|p| format!("[{}]", p)).collect::<Vec<_>>().join(".")),
+                None => c.ty.to_string(),
+            },
             nullable: c.nullable && !pk_cols.contains(&i),
             identity: c.identity,
             has_default: c.default.is_some(),
@@ -213,6 +218,32 @@ fn describe(db: &str, t: &Table) -> TableInfo {
             let mut x: Vec<XmlIndexInfo> = t.xml_indexes.iter().map(|x| XmlIndexInfo { name: x.name.clone(), column: col_name(x.col), primary: x.primary, using: x.using.clone(), secondary: x.secondary }).collect();
             x.sort_by_key(|x| !x.primary);
             x
+        },
+        extra_ddl: {
+            let q = |n: &str| format!("[{}]", n.replace(']', "]]"));
+            let tq = format!("{}.{}", q(&t.schema), q(&t.name));
+            let mut v = vec![];
+            for x in &t.spatial_indexes {
+                let scheme = format!("{}_{}", if x.geography { "GEOGRAPHY" } else { "GEOMETRY" }, if x.auto { "AUTO_GRID" } else { "GRID" });
+                let level = |g: u8| match g {
+                    1 => "LOW",
+                    3 => "HIGH",
+                    _ => "MEDIUM",
+                };
+                let mut opts = vec![];
+                if let Some(b) = x.bbox {
+                    opts.push(format!("BOUNDING_BOX = ({}, {}, {}, {})", b[0], b[1], b[2], b[3]));
+                }
+                opts.push(format!("GRIDS = (LEVEL_1 = {}, LEVEL_2 = {}, LEVEL_3 = {}, LEVEL_4 = {})", level(x.grids[0]), level(x.grids[1]), level(x.grids[2]), level(x.grids[3])));
+                opts.push(format!("CELLS_PER_OBJECT = {}", x.cells));
+                v.push(format!("CREATE SPATIAL INDEX {} ON {} ({}) USING {} WITH ({})", q(&x.name), tq, q(&col_name(x.col)), scheme, opts.join(", ")));
+            }
+            if let Some(f) = &t.fulltext {
+                let cols = f.cols.iter().map(|(c, l)| format!("{} LANGUAGE {}", q(&col_name(*c)), l)).collect::<Vec<_>>().join(", ");
+                let cat = f.catalog.as_ref().map(|c| format!(" ON {}", q(c))).unwrap_or_default();
+                v.push(format!("CREATE FULLTEXT INDEX ON {} ({}) KEY INDEX {}{} WITH (CHANGE_TRACKING = {})", tq, cols, q(&f.key_index), cat, f.tracking));
+            }
+            v
         },
         approx_rows: t.data.slot_count(),
     }

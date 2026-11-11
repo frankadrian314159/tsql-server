@@ -43,6 +43,8 @@ pub enum LogOp {
     DbBackupBase { db: String, ts: Option<u64>, sigs: BTreeMap<String, u64> },
     /// The row-level security policies of a database.
     DbPolicies { db: String, policies: Vec<crate::catalog::SecurityPolicy> },
+    /// The XML schema collections of a database.
+    DbXmlSchemas { db: String, schemas: Vec<crate::catalog::XmlSchemaCollection> },
     /// The full-text catalogs of a database.
     DbFtCatalogs { db: String, catalogs: Vec<crate::catalog::FtCatalog> },
     /// The database-scoped DDL triggers of a database.
@@ -410,6 +412,11 @@ pub fn apply_record(srv: &mut ServerState, rec: &WalRecord) {
             LogOp::DbPolicies { db, policies } => {
                 if let Some(d) = srv.databases.get_mut(db) {
                     d.policies = policies.clone();
+                }
+            }
+            LogOp::DbXmlSchemas { db, schemas } => {
+                if let Some(d) = srv.databases.get_mut(db) {
+                    d.xml_schemas = schemas.clone();
                 }
             }
             LogOp::DbFtCatalogs { db, catalogs } => {

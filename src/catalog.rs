@@ -22,6 +22,9 @@ pub struct Column {
     pub computed: Option<Arc<Expr>>,
     pub computed_text: Option<String>,
     pub user_type: Option<String>,
+    /// A typed xml column: (database, key of the schema collection, DOCUMENT rather than CONTENT).
+    #[serde(default)]
+    pub xml_schema: Option<(String, String, bool)>,
     /// Collation of a string column when it is not the default one (`None`: `SQL_Latin1_General_CP1_CI_AS`).
     pub collation: Option<String>,
     /// Dynamic data masking function (`default()`, `email()`, ...), shown to users without UNMASK.
@@ -44,7 +47,7 @@ pub struct Temporal {
 
 impl Column {
     pub fn simple(name: &str, ty: DataType) -> Column {
-        Column { name: name.to_string(), ty, nullable: true, identity: None, default: None, default_text: None, default_name: None, computed: None, computed_text: None, user_type: None, collation: None, mask: None, hidden: false }
+        Column { name: name.to_string(), ty, nullable: true, identity: None, default: None, default_text: None, default_name: None, computed: None, computed_text: None, user_type: None, xml_schema: None, collation: None, mask: None, hidden: false }
     }
 }
 
@@ -106,6 +109,33 @@ pub struct XmlIndexDef {
     pub using: Option<String>,
     /// a secondary index: `V` value, `P` path or `R` property
     pub secondary: Option<char>,
+}
+
+/// A spatial index. Like an XML index it has no structure of its own: spatial methods are evaluated on the values, so the index
+/// changes no result and no plan; it is kept so that scripts and backups that create one work, and shows in the catalog views.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SpatialIndexDef {
+    pub name: String,
+    /// the geometry or geography column
+    pub col: usize,
+    pub geography: bool,
+    /// `AUTO_GRID` tessellation
+    pub auto: bool,
+    /// geometry only: xmin, ymin, xmax, ymax
+    pub bbox: Option<[f64; 4]>,
+    /// the density of the four grid levels: 1 LOW, 2 MEDIUM, 3 HIGH
+    pub grids: [u8; 4],
+    pub cells: i32,
+}
+
+/// An XML schema collection: the text of its schema documents (see xsd.rs).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct XmlSchemaCollection {
+    pub id: i32,
+    pub schema: String,
+    pub name: String,
+    pub texts: Vec<String>,
+    pub created: chrono::NaiveDateTime,
 }
 
 /// A full-text catalog of a database. Like the full-text index (`FullTextDef`) it is a declaration: this server searches the text
@@ -230,6 +260,8 @@ pub struct Table {
     pub xml_indexes: Vec<XmlIndexDef>,
     #[serde(default)]
     pub fulltext: Option<FullTextDef>,
+    #[serde(default)]
+    pub spatial_indexes: Vec<SpatialIndexDef>,
 }
 
 /// A counter that clones share: the next identity value of a table, the current value of a sequence. A statement
@@ -289,6 +321,7 @@ impl Table {
             temporal: None,
             xml_indexes: vec![],
             fulltext: None,
+            spatial_indexes: vec![],
         }
     }
     pub fn col_index(&self, name: &str) -> Option<usize> {
@@ -575,6 +608,9 @@ pub struct Database {
     /// Full-text catalogs.
     #[serde(default)]
     pub fulltext_catalogs: Vec<FtCatalog>,
+    /// XML schema collections.
+    #[serde(default)]
+    pub xml_schemas: Vec<XmlSchemaCollection>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -689,6 +725,7 @@ impl Database {
             last_full_ts: None,
             backup_sigs: BTreeMap::new(),
             fulltext_catalogs: vec![],
+            xml_schemas: vec![],
         }
     }
 }

@@ -127,6 +127,24 @@ pub struct ColMeta {
     pub persisted: bool,
 }
 
+/// The full-text index of a table: the id of its key index (an index number of the table), the id of its catalog, and the
+/// indexed columns (column id, language id).
+#[derive(Debug, Clone)]
+pub struct FullTextMeta {
+    pub key_index: u32,
+    pub catalog: u32,
+    pub cols: Vec<(u32, i32)>,
+}
+
+/// A full-text catalog.
+#[derive(Debug, Clone)]
+pub struct FtCatalogMeta {
+    pub id: u32,
+    pub name: String,
+    pub is_default: bool,
+    pub accent_sensitive: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct TableMeta {
     pub id: u32,
@@ -144,12 +162,15 @@ pub struct TableMeta {
     pub indexes: Vec<IndexMeta>,
     /// XML indexes, primary ones first
     pub xml_indexes: Vec<XmlIndexMeta>,
-    /// indexes of other kinds (spatial, columnstore ...) as (name, type number); not read
+    /// spatial indexes: (name, column id); their tessellation settings are not read
+    pub spatial_indexes: Vec<(String, u32)>,
+    /// indexes of other kinds (columnstore ...) as (name, type number); not read
     pub other_indexes: Vec<(String, u8)>,
     /// FOREIGN KEY constraints that this table holds
     pub foreign_keys: Vec<ForeignKey>,
     pub defaults: Vec<Constraint>,
     pub checks: Vec<Constraint>,
+    pub fulltext: Option<FullTextMeta>,
 }
 
 type Key = (u8, u32, u32);
@@ -264,6 +285,7 @@ const SYSRSCOLS: u32 = 3;
 const SYSISCOLS: u32 = 55;
 const SYSIDXSTATS: u32 = 54;
 const SYSOBJVALUES: u32 = 60;
+const SYSFTINDS: u32 = 25;
 const SYSSINGLEOBJREFS: u32 = 74;
 #[cfg(test)]
 const SYSXPROPS: u32 = 49;
@@ -415,10 +437,12 @@ impl<R: Read + Seek> Backup<R> {
                     locs: HashMap::new(),
                     indexes: vec![],
                     xml_indexes: vec![],
+                    spatial_indexes: vec![],
                     other_indexes: vec![],
                     foreign_keys: vec![],
                     defaults: vec![],
                     checks: vec![],
+                    fulltext: None,
                 });
             } else if let Some(ty @ (b"D " | b"C " | b"F ")) = r.fixed(13, 2) {
                 // status int @9, pid @15, intprop @20 (the column of a default or column check)
@@ -590,6 +614,49 @@ impl<R: Read + Seek> Backup<R> {
         Ok(found)
     }
 
+    /// Full-text indexes: `sysftinds` (id int, indid int, status int ...: the table and the number of its key index), the columns
+    /// and their languages in `sysobjvalues` class 42 (objid the table, subobjid the column id, valnum the language id), and
+    /// the catalog in `syssingleobjrefs` class 39 (depid the table, indepid the id of the catalog in `sysclsobjs` class 32).
+    fn read_fulltext(&mut self, tables: &mut [TableMeta], by_id: &HashMap<u32, usize>) -> Res<()> {
+        let mut inds: Vec<(u32, u32)> = vec![];
+        self.each_record(SYSFTINDS, 1, true, &mut |r| inds.push((r.fu32(0), r.fu32(4))))?;
+        if inds.is_empty() {
+            return Ok(());
+        }
+        let mut cols: HashMap<u32, Vec<(u32, i32)>> = HashMap::new();
+        self.each_record(SYSOBJVALUES, 1, true, &mut |r| {
+            if r.fixed(0, 1).is_some_and(|c| c[0] == 42) {
+                cols.entry(r.fu32(1)).or_default().push((r.fu32(5), r.fu32(9) as i32));
+            }
+        })?;
+        let mut cats: HashMap<u32, u32> = HashMap::new();
+        self.each_record(SYSSINGLEOBJREFS, 1, true, &mut |r| {
+            if r.fixed(0, 1).is_some_and(|c| c[0] == 39) {
+                cats.insert(r.fu32(1), r.fu32(9));
+            }
+        })?;
+        for (tid, key_index) in inds {
+            let Some(&ti) = by_id.get(&tid) else { continue };
+            let mut c = cols.remove(&tid).unwrap_or_default();
+            c.sort_unstable();
+            tables[ti].fulltext = Some(FullTextMeta { key_index, catalog: cats.get(&tid).copied().unwrap_or(0), cols: c });
+        }
+        Ok(())
+    }
+
+    /// The full-text catalogs: `sysclsobjs` class 32 (the status has 0x1 for the default catalog and 0x2 for accent sensitivity;
+    /// both read from one sample, where both are set).
+    pub fn ft_catalogs(&mut self) -> Res<Vec<FtCatalogMeta>> {
+        let mut out = vec![];
+        self.each_record(SYSCLSOBJS, 1, true, &mut |r| {
+            if r.fixed(0, 1).is_some_and(|c| c[0] == 32) {
+                let status = r.fu32(5);
+                out.push(FtCatalogMeta { id: r.fu32(1), name: r.var(0).map(|(n, _)| utf16(n)).unwrap_or_default(), is_default: status & 1 != 0, accent_sensitive: status & 2 != 0 });
+            }
+        })?;
+        Ok(out)
+    }
+
     /// Indexes, foreign keys, defaults and checks of the tables.
     fn read_keys(
         &mut self,
@@ -634,9 +701,14 @@ impl<R: Read + Seek> Backup<R> {
                     let column = iscols.get(&(tid, indid)).and_then(|c| c.first()).map(|c| c.3).unwrap_or(0);
                     tables[ti].xml_indexes.push(XmlIndexMeta { name, column, primary: kind == 0, secondary: if kind == 0 { None } else { Some(kind as char) } });
                 }
+                4 => {
+                    let column = iscols.get(&(tid, indid)).and_then(|c| c.first()).map(|c| c.3).unwrap_or(0);
+                    tables[ti].spatial_indexes.push((name, column));
+                }
                 other => tables[ti].other_indexes.push((name, other)),
             }
         }
+        self.read_fulltext(tables, by_id)?;
         for t in tables.iter_mut() {
             t.indexes.sort_by_key(|i| i.id);
             // primary XML indexes before the secondary ones; the order of the catalog otherwise
