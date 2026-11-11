@@ -90,7 +90,7 @@ exactly as described in [docs/concurrency.md](docs/concurrency.md).
 | `catalog` | Databases, schemas, tables, views, procedures, functions, triggers, sequences, user types |
 | `persist` | Write-ahead log, checkpoints, crash recovery, data-directory locking |
 | `inspect`, `tools` | Catalog introspection (`table_info`, `objects`, …) and helpers for front ends: result grids, CSV import/export, SQL literals, table scripts |
-| `mtf.rs`, `mssqlbak.rs`, `xpress.rs`, `bakinfo.rs` | The container of native SQL Server `.bak` files: the Microsoft Tape Format reader, the compressed `MSSQLBAK` chunks and their Xpress Huffman decoder, and the `tsql-bakinfo` inspector (reader in progress; see [docs/backup.md](docs/backup.md)) |
+| `mtf.rs`, `mssqlbak.rs`, `xpress.rs`, `sqlbak.rs`, `binxml.rs`, `engine/bakimport.rs`, `bakinfo.rs` | Native SQL Server `.bak` files (restore of tables and rows; see [docs/backup.md](docs/backup.md)): the Microsoft Tape Format reader, the compressed `MSSQLBAK` chunks and their Xpress Huffman decoder, pages and system tables, binary XML, the import into this server, and the `tsql-bakinfo` inspector |
 | `tds/`, `serve.rs` | The TDS 7.4 listener (`tds::Listener`) and the `tsql-serve` program: packets, login, batches, RPC, transaction-manager requests, token streams, data type encoding |
 | `main.rs`, `gui/` | The `tsql` shell, and the optional `tsql-gui` desktop app (cargo feature `gui`) |
 | `security` | Logins, users, roles, permission resolution |

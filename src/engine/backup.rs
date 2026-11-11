@@ -59,6 +59,12 @@ enum Frame {
     End { frames: u64, tables: u64, rows: u64 },
 }
 
+/// True when the file is a backup written by SQL Server (an `MSSQLBAK` file or a Microsoft Tape Format one).
+fn is_sqlserver_backup(path: &str) -> bool {
+    let mut head = [0u8; 8];
+    File::open(path).and_then(|mut f| f.read_exact(&mut head)).is_ok() && (crate::mssqlbak::is_bak(&head) || crate::mtf::is_mtf(&head))
+}
+
 fn io_fail(path: &str, what: &str, e: impl std::fmt::Display) -> SqlError {
     SqlError::with(3201, 16, 1, format!("Cannot {} backup device '{}'. Operating system error: {}.", what, path, e))
 }
@@ -467,6 +473,9 @@ impl<'a> Engine<'a> {
     pub fn exec_restore(&mut self, r: &RestoreStmt) -> Result<()> {
         self.check_backup_options(&r.opts, "RESTORE")?;
         let path = self.backup_path(&r.path)?;
+        if is_sqlserver_backup(&path) {
+            return self.restore_sqlserver(r, &path);
+        }
         match r.kind {
             RestoreKind::VerifyOnly => {
                 let (_, frames, tables, rows) = verify(&path)?;
@@ -508,6 +517,78 @@ impl<'a> Engine<'a> {
                 }
             }
             RestoreKind::Log => self.restore_log(r, &path),
+        }
+    }
+
+    /// A backup written by SQL Server: read its tables, convert them to a backup of this server's format in a temporary
+    /// file, and restore that (see `bakimport`).
+    fn restore_sqlserver(&mut self, r: &RestoreStmt, path: &str) -> Result<()> {
+        let unreadable = |why: String| SqlError::with(3241, 16, 1, format!("The media family on device '{}' is incorrectly formed: {}. SQL Server cannot process this media family.", path, why));
+        match r.kind {
+            RestoreKind::Log => Err(SqlError::with(3154, 16, 1, "Log backups of SQL Server cannot be restored by this server; only full database backups can.")),
+            RestoreKind::VerifyOnly | RestoreKind::HeaderOnly => {
+                let f = File::open(path).map_err(|e| io_fail(path, "open", e))?;
+                let mut ex = match crate::mssqlbak::Expanded::open(BufReader::new(f)) {
+                    Ok(Ok(ex)) => ex,
+                    Ok(Err(why)) => return Err(unreadable(why)),
+                    Err(e) => return Err(io_fail(path, "read", e)),
+                };
+                // every chunk must expand: this checks the whole file
+                for i in 0..ex.layout.chunks.len() {
+                    ex.chunk(i).map_err(|e| unreadable(e.to_string()))?;
+                }
+                let scan = crate::mtf::scan(&mut ex).map_err(|e| io_fail(path, "read", e))?;
+                if let Some(p) = scan.problem {
+                    return Err(unreadable(p));
+                }
+                let set = scan.blocks.iter().find(|b| &b.kind == b"SSET").ok_or_else(|| unreadable("it has no backup set".to_string()))?;
+                if r.kind == RestoreKind::VerifyOnly {
+                    self.emit(Event::Message(format!("The backup set on file 1 is valid. ({} chunk(s), {} byte(s) expanded)", ex.layout.chunks.len(), ex.layout.total)));
+                    return Ok(());
+                }
+                let db = crate::sqlbak::Backup::open(ex).map(|b| b.db_name.clone()).unwrap_or_default();
+                let when = set.date_at(88).and_then(|d| chrono::NaiveDateTime::parse_from_str(&d, "%Y-%m-%d %H:%M:%S").ok()).unwrap_or_default();
+                let dt = |t: chrono::NaiveDateTime| Value::DateTime(t, crate::types::DtKind::DateTime);
+                let cols = ["BackupName", "BackupDescription", "BackupType", "UserName", "DatabaseName", "BackupStartDate", "SoftwareVersionMajor"];
+                let types = vec![DataType::NVarChar(128), DataType::NVarChar(255), DataType::TinyInt, DataType::NVarChar(128), DataType::NVarChar(128), DataType::DateTime, DataType::Int];
+                let row = vec![Value::Str(set.string_at(64)), Value::Str(set.string_at(68)), Value::Int(1), Value::Str(set.string_at(76)), Value::Str(db), dt(when), Value::Int(set.u8_at(93) as i32)];
+                self.emit(Event::Rows(ResultSet { columns: cols.iter().map(|c| c.to_string()).collect(), types, rows: vec![row] }));
+                if !self.ses.nocount {
+                    self.emit(Event::RowCount(1));
+                }
+                self.ses.rowcount = 1;
+                Ok(())
+            }
+            RestoreKind::Database => {
+                self.backup_preflight("RESTORE DATABASE")?;
+                if r.db.as_deref().unwrap_or("").is_empty() {
+                    return Err(SqlError::with(102, 15, 1, "Incorrect syntax near 'FROM': RESTORE DATABASE needs a database name."));
+                }
+                let tmp = std::env::temp_dir().join(format!("tsql-import-{}-{}.tbak", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)));
+                let tmp_path = tmp.to_string_lossy().to_string();
+                let started = std::time::Instant::now();
+                let report = super::bakimport::convert(path, &tmp_path).map_err(|why| {
+                    let _ = std::fs::remove_file(&tmp);
+                    unreadable(why)
+                })?;
+                self.emit(Event::Message(format!(
+                    "Read the SQL Server backup of database '{}': {} table(s), {} row(s) in {:.1} seconds.",
+                    report.database,
+                    report.tables,
+                    report.rows,
+                    started.elapsed().as_secs_f64()
+                )));
+                for (table, col, n) in &report.skipped {
+                    self.emit(Event::Message(format!("Warning: {} value(s) of {}.{} are stored in a form that is not read yet (large objects, XML) and were set to NULL.", n, table, col)));
+                }
+                if !report.computed.is_empty() {
+                    let list: Vec<String> = report.computed.iter().map(|(t, c)| format!("{}.{}", t, c)).collect();
+                    self.emit(Event::Message(format!("Warning: computed column(s) were not created: {}.", list.join(", "))));
+                }
+                let out = self.restore_full(r, &tmp_path);
+                let _ = std::fs::remove_file(&tmp);
+                out
+            }
         }
     }
 

@@ -84,9 +84,18 @@ and the tests that use it run.
 | Phase | State |
 | --- | --- |
 | 1. The container: expand the compressed chunks and walk the Microsoft Tape Format stream; `tsql-bakinfo` | done |
-| 2. The database image: 8 KiB pages, system tables, rows, the types of the columns | in progress (the layouts below are verified) |
-| 3. Rebuilding the database in this server (`RESTORE` of such a file) | not started |
+| 2. The database image: 8 KiB pages, system tables, the layout of records, rows (`src/sqlbak.rs`) | done for the common types; large objects and `xml` not yet |
+| 3. `RESTORE DATABASE x FROM DISK = 'file.bak'`, `RESTORE VERIFYONLY`, `RESTORE HEADERONLY` (`src/engine/bakimport.rs`) | tables and rows; keys, indexes, defaults, views and procedures not yet |
 | 4. Pages changed while the backup ran (needs the log), differential and log backups | not started |
+
+`RESTORE DATABASE` of a SQL Server backup reads the tables and rows, builds them in a scratch in-memory server with `CREATE
+TABLE` and `INSERT`, writes that database as a backup of this server's own format and restores that file, so permissions,
+`REPLACE`, `NORECOVERY` and durability behave as for any restore. The sample (760,167 rows in 71 tables) restores in about
+15 seconds in a release build. What comes over: schemas, tables with their column types, nullability and identity properties,
+and all rows (computed columns are not created), including `xml` values that are stored in the row. What does not yet: primary
+keys and other constraints, indexes, defaults, views, procedures, functions and triggers, and values stored off the row
+(large `varbinary(max)`, `nvarchar(max)`, `xml`, `text`, `image`), which come over as NULL with a warning that names the
+column and the count. The `MOVE` options are ignored.
 
 ### What a recent backup looks like
 
@@ -118,9 +127,28 @@ pages in file order; the page number of each is in its own header (offset 32), s
   the variable data. `sysschobjs` (objects), `syscolpars` (columns), `sysidxstats`, `sysiscols`, `sysrowsets`, `sysobjvalues`
   decode with the fixed lengths implied by the `pminlen` field of their pages (checked: the sample has 3,457 objects, 73 of
   them user tables).
+* **The layout of a record is in `sysrscols`**, not in the order of the columns: per rowset and column it gives the offset in
+  the record (variable-length columns have offsets from 0xFFFF down), the null bit (counted from 1) and, for bit columns,
+  the bit within the shared byte. The columns are numbered the way the b-tree stores them: **the clustered key columns first,
+  in key order, then the others by column id**, with computed columns left out; `sysiscols` gives the key (`intprop` is the
+  column id, `tinyprop1` the position in the key). Bit columns of one table share bytes.
 * Some runs of pages (a few hundred of 25,600 in the sample) look like noise: their first 32 bytes are random but the page
   id at offset 32 is right. What they are is not yet known (they sit between text pages of one object); rows stored there
   cannot be read until it is understood.
+
+### XML columns
+
+The stored form of `xml` is SQL Server's binary XML, decoded by `src/binxml.rs` (the tokens are listed there). Untyped XML is
+a plain token stream (names, qualified names, elements, attributes, text) and decodes completely: all 901 values of the
+sample that are stored in the row came out as the XML they were (`<EVENT_INSTANCE><EventType>CREATE_TABLE</EventType>...`).
+XML bound to a schema collection (typed XML) stores each value in the form of its type: strings and years as text, decimals and
+the integer types derived from them as precision, scale, a sign byte (0 is negative) and a 16-byte mantissa, a real as `03` and
+four bytes, a date as a `datetimeoffset` printed with `Z` or the offset. The sample's 19,972 `Person.Demographics` and 701
+`Sales.Store.Demographics` values decode to the XML of AdventureWorks (negative `TotalPurchaseYTD` values, `2003-09-01Z`). **Other
+type codes are not known** (`xs:boolean`, `dateTime`, `time`, `double`, `base64Binary`, lists, ...): one in a value makes
+the whole value an error, which leaves it NULL with the warning instead of writing it wrongly. The type codes seen so far
+are in `typed_value`; more can be added from a backup that uses them. XML values stored off the row (long documents) need
+the large-object reader below.
 
 ### The inspector
 

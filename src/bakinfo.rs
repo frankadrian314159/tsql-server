@@ -9,9 +9,10 @@ use tsql_server::mssqlbak;
 use tsql_server::mtf::{self, Block};
 
 fn usage() -> ! {
-    eprintln!("usage: tsql-bakinfo FILE.bak [--hex N] [--all] [--extract OUT]");
+    eprintln!("usage: tsql-bakinfo FILE.bak [--hex N] [--all] [--extract OUT] [--tables]");
     eprintln!("  --hex N  also show the first N bytes of every stream other than padding");
     eprintln!("  --all    list every block (by default a long run of blocks of one kind is summarised)");
+    eprintln!("  --tables  read the database in the backup and list its tables with their row counts (compressed backups)");
     eprintln!("  --extract OUT  write the expanded stream (Microsoft Tape Format) of a compressed backup to OUT");
     std::process::exit(2);
 }
@@ -62,11 +63,13 @@ fn main() {
     let mut hex_bytes = 0usize;
     let mut all = false;
     let mut extract = None;
+    let mut tables = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--hex" => hex_bytes = args.next().and_then(|n| n.parse().ok()).unwrap_or_else(|| usage()),
             "--all" => all = true,
+            "--tables" => tables = true,
             "--extract" => extract = Some(args.next().unwrap_or_else(|| usage())),
             "-h" | "--help" => usage(),
             _ if path.is_none() => path = Some(a),
@@ -123,6 +126,10 @@ fn main() {
             }
             w.flush().unwrap();
             println!("wrote {} bytes to {}", ex.layout.total, out);
+        }
+        if tables {
+            list_tables(ex);
+            return;
         }
         report(&mut ex, &path, hex_bytes, all);
     } else {
@@ -189,4 +196,38 @@ fn report<R: Read + Seek>(r: &mut R, path: &str, hex_bytes: usize, all: bool) {
         }
         None => println!("the container is well formed"),
     }
+}
+
+fn list_tables<R: Read + Seek>(ex: mssqlbak::Expanded<R>) {
+    let mut b = match tsql_server::sqlbak::Backup::open(ex) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("tsql-bakinfo: {}", e);
+            std::process::exit(1);
+        }
+    };
+    println!("database '{}': {} page(s) in the backup", b.db_name, b.page_count());
+    let tables = match b.tables() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("tsql-bakinfo: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let (mut total, mut bad) = (0usize, 0usize);
+    for t in &tables {
+        match b.rows(t) {
+            Ok(r) => {
+                total += r.rows.len();
+                let flag = if r.rows.len() as u64 != t.rows { bad += 1; "  <-- the catalog says " } else { "" };
+                let skipped: Vec<String> = r.skipped.iter().map(|(c, n)| format!("{}: {}", c, n)).collect();
+                println!("{:<44} {:>3} column(s) {:>8} row(s){}{}{}", format!("{}.{}", t.schema, t.name), t.cols.len(), r.rows.len(), flag, if flag.is_empty() { String::new() } else { t.rows.to_string() }, if skipped.is_empty() { String::new() } else { format!("  not decoded: {}", skipped.join(", ")) });
+            }
+            Err(e) => {
+                bad += 1;
+                println!("{}.{}: {}", t.schema, t.name, e);
+            }
+        }
+    }
+    println!("{} table(s), {} row(s); {} table(s) do not match the catalog", tables.len(), total, bad);
 }

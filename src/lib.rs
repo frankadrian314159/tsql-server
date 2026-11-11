@@ -9,6 +9,7 @@
 //! ```
 pub mod ast;
 pub mod audit;
+pub mod binxml;
 pub mod catalog;
 pub mod convert;
 pub mod collation;
@@ -25,6 +26,7 @@ pub mod parser;
 pub mod persist;
 pub mod prof;
 pub mod security;
+pub mod sqlbak;
 pub mod storage;
 pub mod tds;
 pub mod tools;
