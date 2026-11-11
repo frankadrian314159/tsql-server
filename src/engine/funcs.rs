@@ -1998,7 +1998,7 @@ impl<'a> Engine<'a> {
             "TYPE_NAME" | "TYPE_ID" => {
                 need_range(name, &a, 1, 1)?;
                 // the system types as sys.types lists them, then the database's own
-                const SYS_TYPES: [(&str, i64); 31] = [("int", 56), ("bigint", 127), ("smallint", 52), ("tinyint", 48), ("bit", 104), ("decimal", 106), ("numeric", 108), ("money", 60), ("smallmoney", 122), ("float", 62), ("real", 59), ("char", 175), ("varchar", 167), ("nchar", 239), ("nvarchar", 231), ("text", 35), ("ntext", 99), ("binary", 173), ("varbinary", 165), ("image", 34), ("date", 40), ("time", 41), ("datetime", 61), ("smalldatetime", 58), ("datetime2", 42), ("datetimeoffset", 43), ("uniqueidentifier", 36), ("xml", 241), ("sql_variant", 98), ("timestamp", 189), ("hierarchyid", 128)];
+                const SYS_TYPES: [(&str, i64); 33] = [("int", 56), ("bigint", 127), ("smallint", 52), ("tinyint", 48), ("bit", 104), ("decimal", 106), ("numeric", 108), ("money", 60), ("smallmoney", 122), ("float", 62), ("real", 59), ("char", 175), ("varchar", 167), ("nchar", 239), ("nvarchar", 231), ("text", 35), ("ntext", 99), ("binary", 173), ("varbinary", 165), ("image", 34), ("date", 40), ("time", 41), ("datetime", 61), ("smalldatetime", 58), ("datetime2", 42), ("datetimeoffset", 43), ("uniqueidentifier", 36), ("xml", 241), ("sql_variant", 98), ("timestamp", 189), ("hierarchyid", 128), ("geometry", 129), ("geography", 130)];
                 let user: Vec<(String, i64)> = self.srv.databases.get(&self.ses.db.to_lowercase()).map(|d| d.types.values().map(|u| (u.name.clone(), u.type_id as i64)).collect()).unwrap_or_default();
                 if a[0].is_null() {
                     Value::Null
@@ -2061,6 +2061,8 @@ impl<'a> Engine<'a> {
                     },
                 }
             }
+            // the methods of geometry and geography (see spatial.rs)
+            n if super::spatialfn::is_spatial_call(n, &a) => self.spatial_call(n, &a)?,
             // the methods of hierarchyid (see hierarchyid.rs)
             "HID_GETLEVEL" | "HID_TOSTRING" | "HID_GETANCESTOR" | "HID_GETDESCENDANT" | "HID_ISDESCENDANTOF" | "HID_GETREPARENTEDVALUE" | "HID_S_GETROOT" | "HID_S_PARSE" => {
                 use crate::hierarchyid as h;
@@ -2338,6 +2340,7 @@ impl<'a> Engine<'a> {
                     return Ok(Rowset::new(col(if big { DataType::BigInt } else { DataType::Int }), rows));
                 }
                 "OPENJSON" => return self.openjson(&args, with),
+                "OPENXML" => return self.openxml(&args, with),
                 "FN_HELPCOLLATIONS" => {
                     // the collations this server implements: every sensitivity combination of the common families
                     let mut rows = vec![];
@@ -2415,6 +2418,81 @@ impl<'a> Engine<'a> {
         }
         let t = fr.tables.get(&var).cloned().ok_or_else(|| SqlError::new(208, "Invalid return table."))?;
         Ok(Rowset::from_table(&t, &f.name))
+    }
+
+    /// `OPENXML(handle, rowpattern [, flags]) [WITH (col type [pattern], ...) | WITH table]`. Without WITH the result is the edge
+    /// table. A column with no pattern reads the attribute (flags 0, 1) or the child element (flags 2) of its name; flags 3
+    /// try the attribute first.
+    fn openxml(&mut self, args: &[Value], with: Option<&Vec<(String, TypeRef, Option<String>)>>) -> Result<Rowset> {
+        if args.len() < 2 {
+            return Err(SqlError::new(174, "The OPENXML function requires 2 argument(s)."));
+        }
+        let handle = args[0].as_i64().ok_or_else(|| SqlError::new(6602, "The XML document handle is not valid."))? as i32;
+        let text = self.ses.xml_docs.get(&handle).cloned().ok_or_else(|| SqlError::new(6602, "The XML document handle is not valid."))?;
+        let doc = crate::xmlpath::Doc::parse(&text).ok_or_else(|| SqlError::new(6603, "XML parsing error: the document is not well-formed."))?;
+        let flags = args.get(2).and_then(|v| v.as_i64()).unwrap_or(0);
+        let col = |name: &str, ty: DataType| ColMeta { qual: None, name: name.into(), ty: Some(ty), denied: None, hidden: false, coll: None, mask: None };
+        // the columns: the WITH list, or the columns of the named table, or the edge table
+        let mut spec: Vec<(String, DataType, Option<String>)> = vec![];
+        if let Some(w) = with {
+            for (n, tr, p) in w {
+                spec.push((n.clone(), self.resolve_type(tr)?, p.clone()));
+            }
+        } else if let Some(t) = args.get(3).filter(|v| !v.is_null()) {
+            let parts: Vec<String> = s(t).split('\u{1}').map(|p| p.to_string()).collect();
+            let loc = self.locate(&parts);
+            let tab = self.table_ref(&loc).ok_or_else(|| SqlError::new(208, format!("Invalid object name '{}'.", parts.join("."))))?;
+            for c in tab.columns.iter() {
+                spec.push((c.name.clone(), c.ty.clone(), None));
+            }
+        }
+        if with.is_none() && args.get(3).is_none_or(|v| v.is_null()) {
+            let cols = vec![
+                col("id", DataType::BigInt),
+                col("parentid", DataType::BigInt),
+                col("nodetype", DataType::Int),
+                col("localname", DataType::NVarChar(MAX)),
+                col("prefix", DataType::NVarChar(MAX)),
+                col("namespaceuri", DataType::NVarChar(MAX)),
+                col("datatype", DataType::NVarChar(MAX)),
+                col("prev", DataType::BigInt),
+                col("text", DataType::NText),
+            ];
+            let opt = |o: Option<i64>| o.map(Value::BigInt).unwrap_or(Value::Null);
+            let rows = doc
+                .edges()
+                .into_iter()
+                .map(|e| vec![Value::BigInt(e.id), opt(e.parent), Value::Int(e.nodetype), Value::Str(e.local), e.prefix.map(Value::Str).unwrap_or(Value::Null), Value::Null, Value::Null, opt(e.prev), e.text.map(Value::Str).unwrap_or(Value::Null)])
+                .collect();
+            return Ok(Rowset::new(Schema::new(cols), rows));
+        }
+        let pattern = s(&args[1]);
+        let items = doc.select(&pattern, &[]).map_err(|m| SqlError::new(6603, format!("XPath error: {}", m)))?;
+        let cols: Vec<ColMeta> = spec.iter().map(|(n, t, _)| col(n, t.clone())).collect();
+        let mut rows = vec![];
+        for it in &items {
+            let mut row = vec![];
+            for (n, ty, path) in &spec {
+                let first = |p: &str| -> Result<Option<crate::xmlpath::Item>> { Ok(doc.select_at(it, p).map_err(|m| SqlError::new(6603, format!("XPath error: {}", m)))?.into_iter().next()) };
+                let found = match path {
+                    Some(p) => first(p)?,
+                    None => {
+                        let attr = if flags & 2 == 0 || flags & 1 != 0 { first(&format!("@{}", n))? } else { None };
+                        match attr {
+                            Some(a) => Some(a),
+                            None if flags & 2 != 0 => first(n)?,
+                            None => None,
+                        }
+                    }
+                };
+                row.push(match found {
+                    Some(item) => cast(&Value::Str(doc.string_of(&item)), ty, None)?,
+                    None => Value::Null,
+                });
+            }
+            rows.push(row);
+        }
+        Ok(Rowset::new(Schema::new(cols), rows))
     }
 
     fn openjson(&mut self, args: &[Value], with: Option<&Vec<(String, TypeRef, Option<String>)>>) -> Result<Rowset> {

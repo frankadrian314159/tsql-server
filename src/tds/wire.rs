@@ -210,7 +210,7 @@ impl Wire {
             DataType::Guid => Wire::Guid,
             DataType::Xml => Wire::Xml,
             // sent as the bytes it is stored as
-            DataType::HierarchyId => Wire::VarBinary(PLP),
+            DataType::HierarchyId | DataType::Geometry | DataType::Geography => Wire::VarBinary(PLP),
             DataType::Variant | DataType::Other(_) => Wire::NVarChar(PLP),
         }
     }
@@ -495,7 +495,8 @@ pub fn write_value(out: &mut Vec<u8>, w: &Wire, v: &Value) {
         }
         Wire::Binary(_) | Wire::VarBinary(_) => {
             let bytes = match v {
-                Value::Bin(b) => b.clone(),
+                // a geometry or geography leaves the server as SQL Server's bytes, without the kind flag
+                Value::Bin(b) => crate::spatial::external(b),
                 o => convert::to_str(o).into_bytes(),
             };
             if w.is_plp() {

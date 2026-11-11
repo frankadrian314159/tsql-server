@@ -439,8 +439,32 @@ pub struct XmlIndexSpec {
     pub secondary: Option<char>,
 }
 
+/// The full-text statements: catalogs and the index of a table.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum FullTextStmt {
+    CreateCatalog { name: String, default: bool, accent_sensitive: bool },
+    /// `REBUILD`, `REORGANIZE`, `AS DEFAULT`
+    AlterCatalog { name: String, action: String },
+    DropCatalog { name: String },
+    CreateIndex { table: Name, cols: Vec<(String, Option<i32>)>, key_index: Option<String>, catalog: Option<String>, tracking: Option<String> },
+    AlterIndex { table: Name, action: FtAlter },
+    DropIndex { table: Name },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum FtAlter {
+    Enable,
+    Disable,
+    SetTracking(String),
+    AddCols(Vec<(String, Option<i32>)>),
+    DropCols(Vec<String>),
+    /// `START/STOP/PAUSE/RESUME UPDATE/FULL/INCREMENTAL POPULATION`: nothing to do, there is no population
+    Population,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Stmt {
+    FullText(Box<FullTextStmt>),
     Query(Box<Query>),
     Insert(Box<Insert>),
     Update(Box<Update>),

@@ -66,6 +66,19 @@ pub enum Atom {
     Bool(bool),
 }
 
+/// A row of the edge table of `OPENXML` (see `Doc::edges`).
+#[derive(Clone, Debug)]
+pub struct Edge {
+    pub id: i64,
+    pub parent: Option<i64>,
+    /// 1 element, 2 attribute, 3 text, 7 processing instruction, 8 comment
+    pub nodetype: i32,
+    pub local: String,
+    pub prefix: Option<String>,
+    pub prev: Option<i64>,
+    pub text: Option<String>,
+}
+
 /// The value of a `sql:column()` or `sql:variable()`.
 #[derive(Clone, Debug)]
 pub enum Arg {
@@ -362,6 +375,50 @@ impl Doc {
             }
         }
         Ok(r)
+    }
+
+    /// Evaluate a query with `ctx` as the context item (no retry at the top-level element): a column pattern of `OPENXML`.
+    pub fn select_at(&self, ctx: &Item, query: &str) -> Res<Vec<Item>> {
+        let e = parse_query(query)?;
+        Ev { doc: self, args: &[] }.eval(&e, &Focus { item: Some(ctx.clone()), pos: 1, size: 1 })
+    }
+
+    /// The document as the edge table of `OPENXML`: elements, attributes, text, comments and processing instructions in
+    /// document order, an attribute's value as a text node below it. The ids are numbered one after another; SQL Server
+    /// leaves gaps in its numbering, so only the shape of the table is the same.
+    pub fn edges(&self) -> Vec<Edge> {
+        fn walk(d: &Doc, node: usize, parent: Option<i64>, out: &mut Vec<Edge>) {
+            let mut prev: Option<i64> = None;
+            for &k in &d.n[node].kids {
+                let id = out.len() as i64;
+                let split = |name: &str| match name.split_once(':') {
+                    Some((p, l)) => (Some(p.to_string()), l.to_string()),
+                    None => (None, name.to_string()),
+                };
+                match &d.n[k].kind {
+                    Kind::Elem { name, attrs } => {
+                        let (prefix, local) = split(name);
+                        out.push(Edge { id, parent, nodetype: 1, local, prefix, prev, text: None });
+                        for (an, av) in attrs {
+                            let aid = out.len() as i64;
+                            let (prefix, local) = split(an);
+                            out.push(Edge { id: aid, parent: Some(id), nodetype: 2, local, prefix, prev: None, text: None });
+                            let tid = out.len() as i64;
+                            out.push(Edge { id: tid, parent: Some(aid), nodetype: 3, local: "#text".into(), prefix: None, prev: None, text: Some(av.clone()) });
+                        }
+                        walk(d, k, Some(id), out);
+                    }
+                    Kind::Text(t) => out.push(Edge { id, parent, nodetype: 3, local: "#text".into(), prefix: None, prev, text: Some(t.clone()) }),
+                    Kind::Comment(t) => out.push(Edge { id, parent, nodetype: 8, local: "#comment".into(), prefix: None, prev, text: Some(t.clone()) }),
+                    Kind::Pi(t) => out.push(Edge { id, parent, nodetype: 7, local: t.split_whitespace().next().unwrap_or("").to_string(), prefix: None, prev, text: Some(t.clone()) }),
+                    Kind::Doc => continue,
+                }
+                prev = Some(id);
+            }
+        }
+        let mut out = vec![];
+        walk(self, 0, None, &mut out);
+        out
     }
 
     /// The nodes a path selects, each as the xml text of an element (what `.nodes()` hands out).

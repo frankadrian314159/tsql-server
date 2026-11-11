@@ -85,6 +85,8 @@ fn type_sql(ty: &DataType) -> String {
         DataType::Xml => "xml".into(),
         DataType::Variant => "sql_variant".into(),
         DataType::HierarchyId => "hierarchyid".into(),
+        DataType::Geometry => "geometry".into(),
+        DataType::Geography => "geography".into(),
         DataType::Other(n) => n.clone(),
     }
 }

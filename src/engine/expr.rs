@@ -100,7 +100,13 @@ impl<'a> Engine<'a> {
             Expr::Paren(x) => self.ev(x, env),
             Expr::Var(n) => self.get_var(n),
             Expr::SysVar(n) => self.sysvar(n),
-            Expr::Col(parts) => env.lookup(parts),
+            Expr::Col(parts) => match env.lookup(parts) {
+                Err(e) if e.number == 207 && parts.len() >= 2 && matches!(parts.last().unwrap().to_uppercase().as_str(), "STSRID" | "STX" | "STY" | "LAT" | "LONG") => {
+                    let call = Expr::Func(Box::new(FuncCall { name: format!("HID_{}", parts.last().unwrap().to_uppercase()), schema: None, parts: vec![], args: vec![Expr::Col(parts[..parts.len() - 1].to_vec())], distinct: false, star: false, over: None, within: None }));
+                    self.ev(&call, env).map_err(|_| e)
+                }
+                other => other,
+            },
             Expr::Star(_) => Err(SqlError::new(102, "Incorrect syntax near '*'.")),
             Expr::Neg(x) => {
                 let v = self.ev(x, env)?;

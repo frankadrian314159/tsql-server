@@ -99,6 +99,7 @@ pub fn is_ddl_stmt(st: &Stmt) -> bool {
         | Stmt::Backup(_)
         | Stmt::Restore(_)
         | Stmt::Dbcc { .. }
+        | Stmt::FullText(_)
         | Stmt::DropIndex { .. } => true,
         Stmt::Security(s) => matches!(
             **s,

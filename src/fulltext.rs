@@ -86,7 +86,7 @@ pub fn stem(w: &str) -> String {
 }
 
 #[derive(Debug, Clone)]
-enum Term {
+pub enum Term {
     /// a word, or the words of a phrase (`None` stands for a noise word, which matches any one word)
     Words(Vec<Option<String>>),
     Prefix(String),

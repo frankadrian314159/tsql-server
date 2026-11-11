@@ -510,6 +510,10 @@ impl<'a> Engine<'a> {
                     if parts.len() == 1 && parts[0].starts_with('$') {
                         return Ok(());
                     }
+                    // col.STX, col.Lat: a member of a geometry or geography column
+                    if parts.len() >= 2 && matches!(parts[parts.len() - 1].to_uppercase().as_str(), "STSRID" | "STX" | "STY" | "LAT" | "LONG") {
+                        return self.validate_columns(&Expr::Col(parts[..parts.len() - 1].to_vec()), schema, outer);
+                    }
                     return Err(SqlError::new(207, format!("Invalid column name '{}'.", parts[parts.len() - 1])));
                 }
             }

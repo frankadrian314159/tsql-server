@@ -16,6 +16,8 @@ pub mod bakimport;
 pub mod auditing;
 pub mod bulk;
 pub mod ddltrig;
+pub mod ftddl;
+pub mod spatialfn;
 pub mod hashjoin;
 pub mod rls;
 pub mod stream;
@@ -211,6 +213,9 @@ pub struct SessionState {
     pub trigger_stack: Vec<TriggerCtx>,
     /// `EVENTDATA()` of the DDL or logon trigger being run (innermost last).
     pub eventdata: Vec<String>,
+    /// Documents prepared with `sp_xml_preparedocument` for `OPENXML`: handle -> xml text.
+    pub xml_docs: HashMap<i32, String>,
+    pub xml_next: i32,
     /// Text of the batch being run (for `EVENTDATA()`'s command text).
     pub batch_text: String,
     /// Audit records already written for the current statement (one per action and object).
@@ -280,6 +285,8 @@ impl SessionState {
             cte_stack: vec![],
             trigger_stack: vec![],
             eventdata: vec![],
+            xml_docs: HashMap::new(),
+            xml_next: 1,
             batch_text: String::new(),
             audit_seen: Default::default(),
             capture: vec![],
@@ -1017,6 +1024,10 @@ impl<'a> Engine<'a> {
             | Stmt::Drop { .. }
             | Stmt::DropIndex { .. } => {
                 self.exec_ddl(st)?;
+                self.ses.last_error = 0;
+            }
+            Stmt::FullText(f) => {
+                self.exec_fulltext(f)?;
                 self.ses.last_error = 0;
             }
         }

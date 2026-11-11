@@ -45,6 +45,8 @@ fn type_info(t: &DataType) -> (i32, i32, i32, i32) {
         DataType::Xml => (241, -1, 0, 0),
         // the user type id; its system type (the CLR types) is 240
         DataType::HierarchyId => (128, 892, 0, 0),
+        DataType::Geometry => (129, -1, 0, 0),
+        DataType::Geography => (130, -1, 0, 0),
         _ => (98, 8016, 0, 0),
     }
 }
@@ -181,7 +183,7 @@ impl<'a> Engine<'a> {
                         if let Object::Table(t) = o {
                             for (i, c) in t.columns.iter().enumerate() {
                                 let (st, ml, p, s) = type_info(&c.ty);
-                                rows.push(vec![Value::Int(t.object_id), sv(&c.name), Value::Int(i as i32 + 1), Value::Int(if matches!(c.ty, DataType::HierarchyId) { 240 } else { st }), Value::Int(st), Value::Int(ml), Value::Int(p), Value::Int(s), Value::Bit(c.nullable), Value::Bit(c.identity.is_some()), Value::Bit(c.computed.is_some()), if c.ty.is_string() { sv(c.collation.as_deref().unwrap_or(&db.collation_or_default())) } else { Value::Null }, Value::Int(if c.default_name.is_some() { t.object_id * 1000 + 500 + i as i32 } else { 0 })]);
+                                rows.push(vec![Value::Int(t.object_id), sv(&c.name), Value::Int(i as i32 + 1), Value::Int(if matches!(c.ty, DataType::HierarchyId | DataType::Geometry | DataType::Geography) { 240 } else { st }), Value::Int(st), Value::Int(ml), Value::Int(p), Value::Int(s), Value::Bit(c.nullable), Value::Bit(c.identity.is_some()), Value::Bit(c.computed.is_some()), if c.ty.is_string() { sv(c.collation.as_deref().unwrap_or(&db.collation_or_default())) } else { Value::Null }, Value::Int(if c.default_name.is_some() { t.object_id * 1000 + 500 + i as i32 } else { 0 })]);
                             }
                         }
                     }
@@ -204,6 +206,41 @@ impl<'a> Engine<'a> {
                         }
                     }
                     Some(rs(&[("object_id", DataType::Int), ("name", nv()), ("parameter_id", DataType::Int), ("system_type_id", DataType::Int), ("user_type_id", DataType::Int), ("max_length", DataType::SmallInt), ("precision", DataType::TinyInt), ("scale", DataType::TinyInt), ("is_output", DataType::Bit), ("has_default_value", DataType::Bit), ("is_readonly", DataType::Bit)], rows))
+                }
+                "fulltext_catalogs" => {
+                    let rows = db.fulltext_catalogs.iter().enumerate().map(|(i, c)| vec![Value::Int(i as i32 + 5), sv(&c.name), Value::Null, Value::Bit(c.is_default), Value::Bit(c.accent_sensitive), Value::Int(1), Value::Int(0), Value::Int(1), Value::Bit(false)]).collect();
+                    Some(rs(&[("fulltext_catalog_id", DataType::Int), ("name", nv()), ("path", nv()), ("is_default", DataType::Bit), ("is_accent_sensitivity_on", DataType::Bit), ("data_space_id", DataType::Int), ("file_id", DataType::Int), ("principal_id", DataType::Int), ("is_importing", DataType::Bit)], rows))
+                }
+                "fulltext_indexes" => {
+                    let mut rows = vec![];
+                    for o in db.objects.values() {
+                        if let Object::Table(t) = o {
+                            if let Some(f) = &t.fulltext {
+                                let cat = f.catalog.as_ref().and_then(|c| db.fulltext_catalogs.iter().position(|x| x.name.eq_ignore_ascii_case(c))).map(|p| Value::Int(p as i32 + 5)).unwrap_or(Value::Null);
+                                let key = t.index_specs().iter().position(|s| s.name.eq_ignore_ascii_case(&f.key_index)).map(|p| p as i32 + 1).unwrap_or(1);
+                                let (st, sd) = match f.tracking.as_str() {
+                                    "MANUAL" => ("M", "MANUAL"),
+                                    "OFF" => ("O", "OFF"),
+                                    _ => ("A", "AUTO"),
+                                };
+                                rows.push(vec![Value::Int(t.object_id), Value::Int(key), cat, Value::Bit(f.enabled), sv(st), sv(sd), Value::Bit(true), Value::Null]);
+                            }
+                        }
+                    }
+                    Some(rs(&[("object_id", DataType::Int), ("unique_index_id", DataType::Int), ("fulltext_catalog_id", DataType::Int), ("is_enabled", DataType::Bit), ("change_tracking_state", DataType::Char(1)), ("change_tracking_state_desc", nv()), ("has_crawl_completed", DataType::Bit), ("crawl_type", DataType::Char(1))], rows))
+                }
+                "fulltext_index_columns" => {
+                    let mut rows = vec![];
+                    for o in db.objects.values() {
+                        if let Object::Table(t) = o {
+                            if let Some(f) = &t.fulltext {
+                                for (c, lang) in &f.cols {
+                                    rows.push(vec![Value::Int(t.object_id), Value::Int(*c as i32 + 1), Value::Null, Value::Int(*lang), Value::Bit(false)]);
+                                }
+                            }
+                        }
+                    }
+                    Some(rs(&[("object_id", DataType::Int), ("column_id", DataType::Int), ("type_column_id", DataType::Int), ("language_id", DataType::Int), ("statistical_semantics", DataType::Bit)], rows))
                 }
                 "security_policies" => {
                     let rows = db.policies.iter().map(|p| vec![sv(&p.name), Value::Int(p.object_id), Value::Bit(p.enabled), sv(&p.schema)]).collect();
@@ -286,7 +323,7 @@ impl<'a> Engine<'a> {
                     ))
                 }
                 "types" | "systypes" => {
-                    let builtin = [("int", 56), ("bigint", 127), ("smallint", 52), ("tinyint", 48), ("bit", 104), ("decimal", 106), ("numeric", 108), ("money", 60), ("smallmoney", 122), ("float", 62), ("real", 59), ("char", 175), ("varchar", 167), ("nchar", 239), ("nvarchar", 231), ("text", 35), ("ntext", 99), ("binary", 173), ("varbinary", 165), ("image", 34), ("date", 40), ("time", 41), ("datetime", 61), ("smalldatetime", 58), ("datetime2", 42), ("datetimeoffset", 43), ("uniqueidentifier", 36), ("xml", 241), ("sql_variant", 98), ("timestamp", 189), ("hierarchyid", 128)];
+                    let builtin = [("int", 56), ("bigint", 127), ("smallint", 52), ("tinyint", 48), ("bit", 104), ("decimal", 106), ("numeric", 108), ("money", 60), ("smallmoney", 122), ("float", 62), ("real", 59), ("char", 175), ("varchar", 167), ("nchar", 239), ("nvarchar", 231), ("text", 35), ("ntext", 99), ("binary", 173), ("varbinary", 165), ("image", 34), ("date", 40), ("time", 41), ("datetime", 61), ("smalldatetime", 58), ("datetime2", 42), ("datetimeoffset", 43), ("uniqueidentifier", 36), ("xml", 241), ("sql_variant", 98), ("timestamp", 189), ("hierarchyid", 128), ("geometry", 129), ("geography", 130)];
                     // (max_length, precision, scale) of each system type
                     let size = |n: &str| -> (i32, i32, i32) {
                         match n {
@@ -312,6 +349,7 @@ impl<'a> Engine<'a> {
                             "xml" => (-1, 0, 0),
                             "sql_variant" => (8016, 0, 0),
                             "hierarchyid" => (892, 0, 0),
+                            "geometry" | "geography" => (-1, 0, 0),
                             _ => (8, 0, 0),
                         }
                     };

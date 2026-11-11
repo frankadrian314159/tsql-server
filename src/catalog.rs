@@ -108,6 +108,28 @@ pub struct XmlIndexDef {
     pub secondary: Option<char>,
 }
 
+/// A full-text catalog of a database. Like the full-text index (`FullTextDef`) it is a declaration: this server searches the text
+/// with a scan (see fulltext.rs), so neither changes a result; they are kept so that scripts and backups that create them work.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FtCatalog {
+    pub name: String,
+    pub is_default: bool,
+    pub accent_sensitive: bool,
+}
+
+/// The full-text index of a table.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FullTextDef {
+    pub catalog: Option<String>,
+    /// the unique single-column index that identifies the rows
+    pub key_index: String,
+    /// the indexed columns and the language (LCID) of each; 0 is the neutral language
+    pub cols: Vec<(usize, i32)>,
+    /// `AUTO`, `MANUAL` or `OFF`
+    pub tracking: String,
+    pub enabled: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Trigger {
     pub name: String,
@@ -206,6 +228,8 @@ pub struct Table {
     pub temporal: Option<Temporal>,
     #[serde(default)]
     pub xml_indexes: Vec<XmlIndexDef>,
+    #[serde(default)]
+    pub fulltext: Option<FullTextDef>,
 }
 
 /// A counter that clones share: the next identity value of a table, the current value of a sequence. A statement
@@ -264,6 +288,7 @@ impl Table {
             is_temp: false,
             temporal: None,
             xml_indexes: vec![],
+            fulltext: None,
         }
     }
     pub fn col_index(&self, name: &str) -> Option<usize> {
@@ -547,6 +572,9 @@ pub struct Database {
     /// Signature of each table's column definition at that backup (a differential includes every row of a table whose
     /// definition has changed since).
     pub backup_sigs: BTreeMap<String, u64>,
+    /// Full-text catalogs.
+    #[serde(default)]
+    pub fulltext_catalogs: Vec<FtCatalog>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -660,6 +688,7 @@ impl Database {
             audit_specs: vec![],
             last_full_ts: None,
             backup_sigs: BTreeMap::new(),
+            fulltext_catalogs: vec![],
         }
     }
 }

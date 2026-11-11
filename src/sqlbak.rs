@@ -938,6 +938,8 @@ pub fn col_type(xtype: u8, length: i16, prec: u8, scale: u8, utype: u32) -> Data
         98 => DataType::Variant,
         // the CLR types share a type number; hierarchyid is user type 128, geometry and geography are kept in their binary form
         240 if utype == 128 => DataType::HierarchyId,
+        240 if utype == 129 => DataType::Geometry,
+        240 if utype == 130 => DataType::Geography,
         _ => DataType::VarBinary(crate::types::MAX),
     }
 }

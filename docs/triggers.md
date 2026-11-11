@@ -98,13 +98,36 @@ Error 2225 carries the reason for a query or statement that is not supported or 
 for these (2256, 2260 and others) are not used. XML indexes can be created but are only recorded (see
 [optimizer.md](optimizer.md#xml-indexes)).
 
+## OPENXML
+
+`sp_xml_preparedocument @h OUTPUT, @xml` parses a document and gives its handle (per session; error 6603 if it is not
+well-formed), `sp_xml_removedocument @h` frees it (6602 for a handle that is not valid). `OPENXML(@h, 'rowpattern' [, flags])`
+then has one row for each node the pattern selects, with a `WITH (col type ['colpattern'], ...)` list, or `WITH tablename` (the
+columns of that table, matched by name), or with no `WITH` the edge table (`id, parentid, nodetype, localname, prefix,
+namespaceuri, datatype, prev, text`). A column with no pattern reads the attribute of its name (flags 0 and 1), the child
+element (flags 2) or the attribute and then the element (flags 3); a pattern is a path from the row node (`'@id'`, `'../@id'`,
+`'Name'`, `'text()'`, `'.'`). Not supported: the `@mp:` meta-properties, the namespace argument of
+`sp_xml_preparedocument`, and `datatype`/`namespaceuri` in the edge table (they are NULL). The ids of the edge table are numbered
+one after another; SQL Server leaves gaps in its numbering, so only the shape of the table is the same.
+
 ## Full-text search
 
 `CONTAINS(col | (c1, c2) | *, 'condition' [, LANGUAGE n])`, `FREETEXT(...)`, `CONTAINSTABLE(table, cols, 'condition' [, LANGUAGE n]
 [, top])` and `FREETEXTTABLE(...)` (`src/fulltext.rs`). The two tables have the columns `KEY` (the single-column key of the table) and
-`RANK`. There is no full-text index: a text is tokenised and matched when a row is looked at, so a search is a scan, and
-`CREATE FULLTEXT INDEX` and `CREATE FULLTEXT CATALOG` are not supported (nothing needs them, and there is no error 7601 for a table
-without one). `*` is every text column of the table (of every table in the row, in the predicate form).
+`RANK`. A text is tokenised and matched when a row is looked at, so a search is a scan. `*` is every text column of the table
+(of every table in the row, in the predicate form).
+
+`CREATE | ALTER | DROP FULLTEXT CATALOG` and `CREATE | ALTER | DROP FULLTEXT INDEX` (`src/engine/ftddl.rs`) are **declarations**: they
+are checked and kept in the catalog (`sys.fulltext_catalogs`, `sys.fulltext_indexes`, `sys.fulltext_index_columns`) so that scripts
+and backups that create them run, and they change no result. The checks: the key index must be a unique, non-nullable,
+single-column index (7653), the columns must be character, binary or xml (7654), one index per table (7611), the catalog must
+exist (7608) and not exist twice (7609), `ALTER` needs an index (7612), `ADD`/`DROP` of a column that is/is not in it (7613,
+7614), at least one column stays (7615), a catalog with indexes is not dropped (7610), and a column or the key index of a
+full-text index cannot be dropped. `LANGUAGE`, `CHANGE_TRACKING`, `STOPLIST` and population commands are read; only the
+language and the tracking mode are kept. **A predicate on a table that has no full-text index is not an error here** (SQL
+Server gives 7601), so the scan-based search stays usable without the declaration. The catalogs, unlike the indexes, are not
+part of a transaction (a rolled-back `CREATE FULLTEXT CATALOG` stays). A restore from a SQL Server backup does not import
+full-text indexes (see [backup.md](backup.md)); the numbers of the errors above are this server's, not SQL Server's.
 
 A condition understands words (case does not matter), `"phrases"`, prefix terms (`"comp*"`), `AND`, `OR`, `AND NOT` (and `&`,
 `|`, `&!`), parentheses, `NEAR` (`a NEAR b`, `a ~ b`, `NEAR((a, b), distance, TRUE)`), `FORMSOF(INFLECTIONAL, word)` (words with the

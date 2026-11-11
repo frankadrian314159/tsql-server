@@ -672,6 +672,10 @@ impl<'a> Engine<'a> {
                         }
                     }
                     let mut t = self.take_table(&loc).unwrap();
+                    if t.fulltext.as_ref().is_some_and(|f| f.key_index.eq_ignore_ascii_case(&idx)) {
+                        self.put_table(&loc, t);
+                        return Err(SqlError::new(7653, format!("Cannot drop the index '{}': it is the key index of a full-text index.", idx)));
+                    }
                     let before = t.indexes.len();
                     t.indexes.retain(|i| !i.name.eq_ignore_ascii_case(&idx));
                     t.uniques.retain(|k| !(k.is_index && k.name.eq_ignore_ascii_case(&idx)));
@@ -991,6 +995,9 @@ impl<'a> Engine<'a> {
                 for n in names {
                     let mut found = false;
                     if t.pk.as_ref().map(|k| k.name.eq_ignore_ascii_case(n)).unwrap_or(false) {
+                        if t.fulltext.as_ref().is_some_and(|f| f.key_index.eq_ignore_ascii_case(n)) {
+                            return Err(SqlError::new(7653, format!("Cannot drop the index '{}': it is the key index of the full-text index of table '{}'.", n, t.name)));
+                        }
                         if !t.xml_indexes.is_empty() {
                             return Err(SqlError::new(6332, format!("Table '{}' needs to have a clustered primary key in order to have an XML index on it; drop the XML indexes first.", t.name)));
                         }
@@ -1040,7 +1047,7 @@ impl<'a> Engine<'a> {
                         }
                     };
                     let in_key = t.all_keys().iter().any(|k| k.cols.contains(&ci)) || t.fks.iter().any(|f| f.cols.contains(&ci)) || t.checks.iter().any(|c| c.col.as_deref() == Some(n.as_str())) || t.indexes.iter().any(|i| i.cols.iter().any(|(c, _)| *c == ci));
-                    let in_key = in_key || t.xml_indexes.iter().any(|x| x.col == ci);
+                    let in_key = in_key || t.xml_indexes.iter().any(|x| x.col == ci) || t.fulltext.as_ref().is_some_and(|f| f.cols.iter().any(|c| c.0 == ci));
                     if in_key {
                         return Err(SqlError::new(5074, format!("The object depends on column '{}'. ALTER TABLE DROP COLUMN failed because one or more objects access this column.", n)));
                     }
@@ -1079,6 +1086,13 @@ impl<'a> Engine<'a> {
                     for x in t.xml_indexes.iter_mut() {
                         if x.col > ci {
                             x.col -= 1;
+                        }
+                    }
+                    if let Some(f) = t.fulltext.as_mut() {
+                        for c in f.cols.iter_mut() {
+                            if c.0 > ci {
+                                c.0 -= 1;
+                            }
                         }
                     }
                 }

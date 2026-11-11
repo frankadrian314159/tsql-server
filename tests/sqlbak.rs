@@ -278,6 +278,12 @@ fn restore_database_from_a_sql_server_backup() {
     assert_eq!(n(&mut c, "SELECT COUNT(*) FROM aw.HumanResources.Employee WHERE OrganizationNode.IsDescendantOf(hierarchyid::Parse('/3/')) = 1 AND OrganizationLevel = 1"), "1");
     assert_eq!(n(&mut c, "SELECT DocumentLevel FROM aw.Production.Document WHERE DocumentNode = hierarchyid::Parse('/1/2/')"), "2");
     assert_eq!(n(&mut c, "SELECT COUNT(*) FROM sys.indexes WHERE name IN ('IX_Employee_OrganizationLevel_OrganizationNode', 'AK_Document_DocumentLevel_DocumentNode')"), "2");
+    // geography values, read from the bytes of the backup
+    assert_eq!(n(&mut c, "SELECT COUNT(*) FROM aw.Person.Address WHERE SpatialLocation IS NOT NULL"), n(&mut c, "SELECT COUNT(*) FROM aw.Person.Address"));
+    assert_eq!(n(&mut c, "SELECT COUNT(*) FROM aw.Person.Address WHERE SpatialLocation.Lat BETWEEN -90 AND 90 AND SpatialLocation.Long BETWEEN -180 AND 180"), n(&mut c, "SELECT COUNT(*) FROM aw.Person.Address"));
+    assert_eq!(n(&mut c, "SELECT SpatialLocation.STGeometryType() FROM aw.Person.Address WHERE AddressID = 1"), "Point");
+    assert!(n(&mut c, "SELECT a.SpatialLocation.STDistance(b.SpatialLocation) FROM aw.Person.Address a, aw.Person.Address b WHERE a.AddressID = 1 AND b.AddressID = 2").parse::<f64>().unwrap() > 0.0);
+    assert_eq!(n(&mut c, "SELECT TYPE_NAME(user_type_id) FROM aw.sys.columns WHERE object_id = OBJECT_ID('aw.Person.Address') AND name = 'SpatialLocation'"), "geography");
     // views and a procedure that shred xml with .nodes() and search with full-text functions
     assert_eq!(n(&mut c, "SELECT COUNT(*) FROM aw.Sales.vPersonDemographics"), n(&mut c, "SELECT COUNT(*) FROM aw.Person.Person WHERE Demographics IS NOT NULL"));
     assert!(n(&mut c, "SELECT COUNT(*) FROM aw.HumanResources.vJobCandidateEducation").parse::<i64>().unwrap() > 0);

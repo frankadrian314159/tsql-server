@@ -414,11 +414,52 @@ pub fn coerce_store(v: &Value, t: &DataType, table: &str, col: &str) -> Result<V
     }
 }
 
+/// A geometry or geography made from text or from SQL Server's bytes.
+fn to_spatial(v: &Value, kind: crate::spatial::Kind) -> Result<Value> {
+    use crate::spatial::{self as sp, Kind};
+    let name = if kind == Kind::Geography { "geography" } else { "geometry" };
+    let bad = |m: String| SqlError::new(6522, format!("A .NET Framework error occurred during execution of user-defined routine or aggregate \"{}\": {}.", name, m));
+    let shape = match v {
+        Value::Str(s) => {
+            let shape = sp::parse_wkt(s).map_err(bad)?;
+            if kind == Kind::Geography {
+                sp::check_geography(&shape).map_err(bad)?;
+            }
+            sp::Spatial { kind, srid: if kind == Kind::Geography { 4326 } else { 0 }, shape }
+        }
+        Value::Bin(b) => {
+            let mut s = sp::Spatial::from_bytes(b, kind).map_err(bad)?;
+            s.kind = kind;
+            if kind == Kind::Geography {
+                sp::check_geography(&s.shape).map_err(bad)?;
+            }
+            s
+        }
+        _ => return Err(not_allowed(v, name)),
+    };
+    Ok(Value::Bin(shape.to_internal()))
+}
+
 fn cast_inner(v: &Value, t: &DataType, style: Option<i32>, strict: bool) -> Result<Value> {
     if v.is_null() {
         return Ok(Value::Null);
     }
+    // a geometry or geography converted to a string is its text, converted to binary it is SQL Server's bytes
+    if let Value::Bin(b) = v {
+        if let Some(kind) = crate::spatial::kind_of(b) {
+            match t {
+                DataType::Char(_) | DataType::VarChar(_) | DataType::NChar(_) | DataType::NVarChar(_) | DataType::Text | DataType::NText => {
+                    let s = crate::spatial::Spatial::from_bytes(b, kind).map_err(|m| SqlError::new(6522, m))?;
+                    return to_string_type(&Value::Str(s.text()), t, style, strict);
+                }
+                DataType::Binary(_) | DataType::VarBinary(_) | DataType::Image => return to_binary(&Value::Bin(crate::spatial::external(b)), t, style, strict),
+                _ => {}
+            }
+        }
+    }
     match t {
+        DataType::Geometry => to_spatial(v, crate::spatial::Kind::Geometry),
+        DataType::Geography => to_spatial(v, crate::spatial::Kind::Geography),
         DataType::TinyInt | DataType::SmallInt | DataType::Int | DataType::BigInt => to_int(v, t),
         DataType::Bit => to_bit(v),
         DataType::Decimal(p, s) => to_dec(v, *p, *s, false),

@@ -41,6 +41,9 @@ pub enum DataType {
     Variant,
     /// the binary form of a node of a tree (see hierarchyid.rs); a value is `Value::Bin`
     HierarchyId,
+    /// planar and round-earth spatial values (see spatial.rs); a value is `Value::Bin`
+    Geometry,
+    Geography,
     Other(String),
 }
 
@@ -99,7 +102,9 @@ impl DataType {
             "xml" => DataType::Xml,
             "hierarchyid" => DataType::HierarchyId,
             "sql_variant" => DataType::Variant,
-            "geography" | "geometry" | "json" | "cursor" => DataType::Other(n),
+            "geometry" => DataType::Geometry,
+            "geography" => DataType::Geography,
+            "json" | "cursor" => DataType::Other(n),
             _ => return Err(SqlError::new(2715, format!("Column, parameter, or variable #1: Cannot find data type {}.", name))),
         })
     }
@@ -151,6 +156,8 @@ impl DataType {
             DataType::Xml => "xml",
             DataType::Variant => "sql_variant",
             DataType::HierarchyId => "hierarchyid",
+            DataType::Geometry => "geometry",
+            DataType::Geography => "geography",
             DataType::Other(_) => "other",
         }
     }

@@ -114,7 +114,8 @@ What comes over:
 What does not:
 
 * user-defined types (columns of an alias type get the base type), sequences, users and permissions, and CLR objects;
-* spatial, columnstore and hash indexes (the engine has no equivalent), and filtered indexes lose their filter (their
+* spatial, columnstore and hash indexes (the engine has no equivalent), full-text catalogs and indexes (the engine has the
+  declarations, but the system tables that hold them are not read), and filtered indexes lose their filter (their
   definition is not read);
 * referential actions other than `ON DELETE CASCADE` (the other bits of the status of a foreign key are not decoded, and
   a warning names a key that has any), descending key columns are read from a bit that no index of the sample uses

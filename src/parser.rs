@@ -36,7 +36,14 @@ const STMT_START: &[&str] = &[
 const NILADIC: &[&str] = &["CURRENT_TIMESTAMP", "CURRENT_USER", "SESSION_USER", "SYSTEM_USER", "USER", "CURRENT_DATE"];
 const DATEPART_FUNCS: &[&str] = &["DATEADD", "DATEDIFF", "DATEDIFF_BIG", "DATEPART", "DATENAME", "DATETRUNC", "DATE_BUCKET"];
 /// The methods of the hierarchyid type (see hierarchyid.rs), written `expr.GetLevel()`.
-const HID_METHODS: &[&str] = &["GETLEVEL", "TOSTRING", "GETANCESTOR", "GETDESCENDANT", "ISDESCENDANTOF", "GETREPARENTEDVALUE"];
+const HID_METHODS: &[&str] = &[
+    "GETLEVEL", "TOSTRING", "GETANCESTOR", "GETDESCENDANT", "ISDESCENDANTOF", "GETREPARENTEDVALUE",
+    // the methods of geometry and geography (see spatial.rs); they travel the same way
+    "STASTEXT", "STNUMPOINTS", "STGEOMETRYTYPE", "STISEMPTY", "STISVALID", "STLENGTH", "STAREA", "STDISTANCE", "STINTERSECTS", "STCONTAINS", "STWITHIN", "STEQUALS", "STNUMGEOMETRIES", "STSTARTPOINT", "STENDPOINT", "STPOINTN",
+    "STSRID", "STX", "STY", "LAT", "LONG",
+];
+/// The members of the spatial types that are written without parentheses: `@g.STX`, `@g.Lat`.
+const SPATIAL_PROPS: &[&str] = &["STSRID", "STX", "STY", "LAT", "LONG"];
 const RESERVED_OK_AS_FUNC: &[&str] = &["LEFT", "RIGHT", "USER", "CURRENT", "KEY", "PERCENT", "DOUBLE", "PRECISION", "FILE", "OFFSETS", "PLAN", "RULE", "READ", "LOAD", "UPDATE", "TRUNCATE", "CONTAINS", "FREETEXT"];
 
 pub struct Parser {
@@ -619,6 +626,10 @@ impl Parser {
             } else if self.is_op(".") && self.peek_kw(1, &["VALUE", "EXIST", "QUERY"]) && self.peek_is_op(2, "(") {
                 self.i += 1;
                 e = self.xml_method(e)?;
+            } else if self.is_op(".") && self.peek_kw(1, SPATIAL_PROPS) && !self.peek_is_op(2, "(") {
+                self.i += 1;
+                let m = self.ident()?;
+                e = Expr::Func(Box::new(FuncCall { name: format!("HID_{}", m.to_uppercase()), schema: None, parts: vec![], args: vec![e], distinct: false, star: false, over: None, within: None }));
             } else if self.is_op(".") && self.peek_kw(1, HID_METHODS) && self.peek_is_op(2, "(") {
                 self.i += 1;
                 let m = self.ident()?;
@@ -831,6 +842,22 @@ impl Parser {
             self.i += 2;
             let m = self.ident()?;
             return self.hid_call(None, &m);
+        }
+        // geometry::Point(1, 2, 0), geography::STGeomFromText('...', 4326)
+        if parts.len() == 1 && (parts[0].eq_ignore_ascii_case("geometry") || parts[0].eq_ignore_ascii_case("geography")) && self.is_op(":") && self.peek_is_op(1, ":") {
+            self.i += 2;
+            let m = self.ident()?;
+            self.expect_op("(")?;
+            let mut args = vec![];
+            if !self.is_op(")") {
+                args.push(self.expr()?);
+                while self.accept_op(",") {
+                    args.push(self.expr()?);
+                }
+            }
+            self.expect_op(")")?;
+            let name = format!("SP_S_{}_{}", parts[0].to_uppercase(), m.to_uppercase());
+            return Ok(Expr::Func(Box::new(FuncCall { name, schema: None, parts: vec![], args, distinct: false, star: false, over: None, within: None })));
         }
         if self.is_op("(") {
             // column.GetLevel(), column.GetAncestor(1), ...
@@ -1689,7 +1716,16 @@ impl Parser {
                 }
                 self.expect_op(")")?;
                 let mut with = None;
-                if self.is_kw("WITH") && self.peek_is_op(1, "(") && name.last().map(|n| n.eq_ignore_ascii_case("OPENJSON")).unwrap_or(false) {
+                // OPENXML(h, pattern [, flags]) WITH tablename: the table is passed as a fourth argument
+                if self.is_kw("WITH") && !self.peek_is_op(1, "(") && name.last().is_some_and(|n| n.eq_ignore_ascii_case("OPENXML")) {
+                    self.i += 1;
+                    let table = self.name_parts()?;
+                    while args.len() < 3 {
+                        args.push(Expr::Lit(Value::Int(0)));
+                    }
+                    args.push(Expr::Lit(Value::Str(table.join("\u{1}"))));
+                }
+                if self.is_kw("WITH") && self.peek_is_op(1, "(") && name.last().map(|n| n.eq_ignore_ascii_case("OPENJSON") || n.eq_ignore_ascii_case("OPENXML")).unwrap_or(false) {
                     self.i += 2;
                     let mut w = vec![];
                     loop {
@@ -2912,6 +2948,17 @@ impl Parser {
             return self.audit_stmt("DROP");
         }
         let what = self.advance().up;
+        if what == "FULLTEXT" {
+            let st = match self.advance().up.as_str() {
+                "CATALOG" => FullTextStmt::DropCatalog { name: self.ident()? },
+                "INDEX" => {
+                    self.expect_kw("ON")?;
+                    FullTextStmt::DropIndex { table: self.name_parts()? }
+                }
+                other => return Err(SqlError::syntax(other)),
+            };
+            return Ok(Stmt::FullText(Box::new(st)));
+        }
         if what == "INDEX" {
             let mut if_exists = false;
             if self.accept_kw("IF") {
@@ -3206,9 +3253,166 @@ impl Parser {
         Ok(Stmt::Audit(Box::new(stmt)))
     }
 
+    /// The language of a full-text column: an LCID, or the name of a language (those the server knows; others are neutral).
+    fn ft_language(&mut self) -> R<i32> {
+        match self.advance().tok {
+            Tok::Int(n) => Ok(n as i32),
+            Tok::Hex(b) => Ok(b.iter().fold(0i32, |a, x| a << 8 | *x as i32)),
+            Tok::Str(s) | Tok::Id(s) | Tok::QId(s) => Ok(match s.to_lowercase().as_str() {
+                "english" => 1033,
+                "german" => 1031,
+                "french" => 1036,
+                "spanish" => 3082,
+                "italian" => 1040,
+                _ => 0,
+            }),
+            _ => Err(self.err()),
+        }
+    }
+
+    /// `(col [TYPE COLUMN c] [LANGUAGE l] [STATISTICAL_SEMANTICS], ...)`
+    fn ft_columns_def(&mut self) -> R<Vec<(String, Option<i32>)>> {
+        self.expect_op("(")?;
+        let mut cols = vec![];
+        loop {
+            let c = self.ident()?;
+            let mut lang = None;
+            loop {
+                if self.accept_kw("LANGUAGE") {
+                    lang = Some(self.ft_language()?);
+                } else if self.accept_kw("TYPE") {
+                    self.expect_kw("COLUMN")?;
+                    self.ident()?;
+                } else if self.accept_kw("STATISTICAL_SEMANTICS") {
+                } else {
+                    break;
+                }
+            }
+            cols.push((c, lang));
+            if !self.accept_op(",") {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        Ok(cols)
+    }
+
+    /// `CREATE | ALTER FULLTEXT CATALOG | INDEX`; the cursor is on FULLTEXT.
+    fn fulltext_stmt(&mut self, alter: bool) -> R<Stmt> {
+        self.expect_kw("FULLTEXT")?;
+        let what = self.advance().up;
+        let st = match (what.as_str(), alter) {
+            ("CATALOG", false) => {
+                let name = self.ident()?;
+                let (mut default, mut accent) = (false, true);
+                while !self.at_eos() && !self.is_kw_any(&["CREATE", "ALTER", "DROP", "SELECT", "INSERT", "UPDATE", "DELETE", "EXEC", "EXECUTE", "IF", "BEGIN", "PRINT", "DECLARE", "SET", "USE"]) {
+                    if self.accept_kw("AS") {
+                        self.expect_kw("DEFAULT")?;
+                        default = true;
+                    } else if self.accept_kw("ACCENT_SENSITIVITY") {
+                        self.accept_op("=");
+                        accent = self.advance().up == "ON";
+                    } else if self.is_op("(") {
+                        self.skip_parens()?;
+                    } else {
+                        self.i += 1;
+                    }
+                }
+                FullTextStmt::CreateCatalog { name, default, accent_sensitive: accent }
+            }
+            ("CATALOG", true) => {
+                let name = self.ident()?;
+                let action = if self.accept_kw("AS") {
+                    self.expect_kw("DEFAULT")?;
+                    "DEFAULT".to_string()
+                } else {
+                    self.advance().up
+                };
+                while !self.at_eos() && !self.is_kw_any(&["CREATE", "ALTER", "DROP", "SELECT", "INSERT", "UPDATE", "DELETE", "EXEC", "EXECUTE", "IF", "BEGIN", "PRINT", "DECLARE", "SET", "USE"]) {
+                    self.i += 1;
+                }
+                FullTextStmt::AlterCatalog { name, action }
+            }
+            ("INDEX", false) => {
+                self.expect_kw("ON")?;
+                let table = self.name_parts()?;
+                let cols = if self.is_op("(") { self.ft_columns_def()? } else { vec![] };
+                let (mut key_index, mut catalog, mut tracking) = (None, None, None);
+                if self.accept_kw("KEY") {
+                    self.expect_kw("INDEX")?;
+                    key_index = Some(self.ident()?);
+                }
+                if self.accept_kw("ON") {
+                    if self.accept_op("(") {
+                        catalog = Some(self.ident()?);
+                        while !self.is_op(")") && !self.is_eof() {
+                            self.i += 1;
+                        }
+                        self.expect_op(")")?;
+                    } else {
+                        catalog = Some(self.ident()?);
+                    }
+                }
+                if self.accept_kw("WITH") {
+                    let paren = self.accept_op("(");
+                    while !self.at_eos() && !self.is_kw_any(&["CREATE", "ALTER", "DROP", "SELECT", "INSERT", "UPDATE", "DELETE", "EXEC", "EXECUTE", "IF", "BEGIN", "PRINT", "DECLARE", "SET", "USE"]) && !(paren && self.is_op(")")) {
+                        if self.accept_kw("CHANGE_TRACKING") {
+                            self.accept_op("=");
+                            tracking = Some(self.advance().up);
+                        } else {
+                            self.i += 1;
+                        }
+                    }
+                    if paren {
+                        self.expect_op(")")?;
+                    }
+                }
+                FullTextStmt::CreateIndex { table, cols, key_index, catalog, tracking }
+            }
+            ("INDEX", true) => {
+                self.expect_kw("ON")?;
+                let table = self.name_parts()?;
+                let action = match self.advance().up.as_str() {
+                    "ENABLE" => FtAlter::Enable,
+                    "DISABLE" => FtAlter::Disable,
+                    "SET" => {
+                        self.expect_kw("CHANGE_TRACKING")?;
+                        self.accept_op("=");
+                        FtAlter::SetTracking(self.advance().up)
+                    }
+                    "ADD" => FtAlter::AddCols(self.ft_columns_def()?),
+                    "DROP" => {
+                        self.expect_op("(")?;
+                        let mut cols = vec![];
+                        loop {
+                            cols.push(self.ident()?);
+                            if !self.accept_op(",") {
+                                break;
+                            }
+                        }
+                        self.expect_op(")")?;
+                        FtAlter::DropCols(cols)
+                    }
+                    "START" | "STOP" | "PAUSE" | "RESUME" => FtAlter::Population,
+                    _ => return Err(self.err()),
+                };
+                // [WITH NO POPULATION] and the words of START ... POPULATION
+                while !self.at_eos() && !self.is_kw_any(&["CREATE", "ALTER", "DROP", "SELECT", "INSERT", "UPDATE", "DELETE", "EXEC", "EXECUTE", "IF", "BEGIN", "PRINT", "DECLARE", "SET", "USE"]) {
+                    self.i += 1;
+                }
+                FullTextStmt::AlterIndex { table, action }
+            }
+            _ => return Err(SqlError::syntax(&what)),
+        };
+        Ok(Stmt::FullText(Box::new(st)))
+    }
+
     fn create_object(&mut self, or_alter: bool, alter: bool, start: usize) -> R<Stmt> {
         if self.audit_ahead() {
             return self.audit_stmt("CREATE");
+        }
+        if self.is_kw("FULLTEXT") {
+            return self.fulltext_stmt(alter);
         }
         let mut unique = false;
         if self.accept_kw("UNIQUE") {

@@ -8,6 +8,27 @@ impl<'a> Engine<'a> {
     /// Returns Ok(None) if `name` is not a known system procedure.
     pub fn exec_sysproc(&mut self, name: &str, args: &[SysArg]) -> Flow<Option<Value>> {
         match name {
+            // documents for OPENXML (see funcs.rs `openxml`)
+            "sp_xml_preparedocument" => {
+                let text = args.get(1).filter(|a| !a.1.is_null()).map(|a| convert::to_str(&a.1)).unwrap_or_default();
+                if crate::xmlpath::Doc::parse(&text).is_none() {
+                    return Err(SqlError::new(6603, "XML parsing error: the document is not well-formed.").into());
+                }
+                let h = self.ses.xml_next;
+                self.ses.xml_next += 1;
+                self.ses.xml_docs.insert(h, text);
+                if let Some(ov) = args.first().and_then(|a| a.2.clone()) {
+                    self.set_var(&ov, Value::Int(h))?;
+                }
+                Ok(Some(Value::Int(0)))
+            }
+            "sp_xml_removedocument" => {
+                let h = args.first().and_then(|a| a.1.as_i64()).unwrap_or(0) as i32;
+                if self.ses.xml_docs.remove(&h).is_none() {
+                    return Err(SqlError::new(6602, "The XML document handle is not valid.").into());
+                }
+                Ok(Some(Value::Int(0)))
+            }
             "sp_executesql" => {
                 let mut stmt: Option<String> = None;
                 let mut decl: Option<String> = None;

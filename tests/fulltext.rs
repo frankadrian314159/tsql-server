@@ -114,3 +114,53 @@ fn a_search_procedure_in_the_style_of_adventureworks() {
     got.sort();
     assert_eq!(got, vec!["1", "2"]);
 }
+
+#[test]
+fn catalogs_and_indexes_can_be_declared_and_are_listed() {
+    let mut c = conn();
+    script(
+        &mut c,
+        "CREATE TABLE docs (id INT NOT NULL, title VARCHAR(60) NULL, body NVARCHAR(MAX) NULL, n INT NULL, CONSTRAINT pk_docs PRIMARY KEY (id));
+         CREATE UNIQUE INDEX ux_title ON docs (title);
+         INSERT INTO docs VALUES (1, 'a', 'the quick fox', 1);",
+    );
+    exec(&mut c, "CREATE FULLTEXT CATALOG ftc AS DEFAULT");
+    exec(&mut c, "CREATE FULLTEXT CATALOG other WITH ACCENT_SENSITIVITY = OFF");
+    assert_eq!(err_no(&mut c, "CREATE FULLTEXT CATALOG ftc"), 7609);
+    assert_eq!(rows(&mut c, "SELECT name, is_default, is_accent_sensitivity_on FROM sys.fulltext_catalogs ORDER BY name").iter().map(|r| r.join("/")).collect::<Vec<_>>(), vec!["ftc/1/1", "other/0/0"]);
+    // what is checked
+    assert_eq!(err_no(&mut c, "CREATE FULLTEXT INDEX ON docs (body) KEY INDEX nope"), 7653);
+    assert_eq!(err_no(&mut c, "CREATE FULLTEXT INDEX ON docs (body) KEY INDEX ux_title"), 7653, "the key must not be nullable");
+    assert_eq!(err_no(&mut c, "CREATE FULLTEXT INDEX ON docs (n) KEY INDEX pk_docs"), 7654, "an int column cannot be indexed");
+    assert_eq!(err_no(&mut c, "CREATE FULLTEXT INDEX ON docs (body) KEY INDEX pk_docs ON missing"), 7608);
+    assert_eq!(err_no(&mut c, "ALTER FULLTEXT INDEX ON docs DISABLE"), 7612, "there is no index yet");
+    exec(&mut c, "CREATE FULLTEXT INDEX ON docs (title LANGUAGE 1033, body LANGUAGE 'English') KEY INDEX pk_docs ON other WITH (CHANGE_TRACKING = MANUAL, STOPLIST = SYSTEM)");
+    assert_eq!(err_no(&mut c, "CREATE FULLTEXT INDEX ON docs (body) KEY INDEX pk_docs"), 7611, "one index per table");
+    assert_eq!(rows(&mut c, "SELECT fi.is_enabled, fi.change_tracking_state_desc, fc.name FROM sys.fulltext_indexes fi JOIN sys.fulltext_catalogs fc ON fc.fulltext_catalog_id = fi.fulltext_catalog_id WHERE fi.object_id = OBJECT_ID('docs')")[0].join("/"), "1/MANUAL/other");
+    assert_eq!(rows(&mut c, "SELECT column_id, language_id FROM sys.fulltext_index_columns WHERE object_id = OBJECT_ID('docs') ORDER BY column_id").iter().map(|r| r.join("/")).collect::<Vec<_>>(), vec!["2/1033", "3/1033"]);
+    // the search works as before
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM docs WHERE CONTAINS(body, 'fox')"), "1");
+    // changes
+    exec(&mut c, "ALTER FULLTEXT INDEX ON docs DISABLE");
+    exec(&mut c, "ALTER FULLTEXT INDEX ON docs SET CHANGE_TRACKING AUTO");
+    exec(&mut c, "ALTER FULLTEXT INDEX ON docs ENABLE");
+    exec(&mut c, "ALTER FULLTEXT INDEX ON docs DROP (title)");
+    assert_eq!(err_no(&mut c, "ALTER FULLTEXT INDEX ON docs DROP (title)"), 7614);
+    assert_eq!(err_no(&mut c, "ALTER FULLTEXT INDEX ON docs DROP (body)"), 7615);
+    exec(&mut c, "ALTER FULLTEXT INDEX ON docs ADD (title)");
+    assert_eq!(err_no(&mut c, "ALTER FULLTEXT INDEX ON docs ADD (title)"), 7613);
+    exec(&mut c, "ALTER FULLTEXT INDEX ON docs START FULL POPULATION");
+    assert_eq!(scalar(&mut c, "SELECT change_tracking_state_desc FROM sys.fulltext_indexes WHERE object_id = OBJECT_ID('docs')"), "AUTO");
+    // dependencies
+    assert_eq!(err_no(&mut c, "ALTER TABLE docs DROP COLUMN body"), 5074);
+    assert_eq!(err_no(&mut c, "ALTER TABLE docs DROP CONSTRAINT pk_docs"), 7653);
+    assert_eq!(err_no(&mut c, "DROP FULLTEXT CATALOG other"), 7610);
+    exec(&mut c, "ALTER FULLTEXT CATALOG ftc REBUILD");
+    exec(&mut c, "ALTER FULLTEXT CATALOG other AS DEFAULT");
+    assert_eq!(scalar(&mut c, "SELECT name FROM sys.fulltext_catalogs WHERE is_default = 1"), "other");
+    exec(&mut c, "DROP FULLTEXT INDEX ON docs");
+    assert_eq!(err_no(&mut c, "DROP FULLTEXT INDEX ON docs"), 7612);
+    exec(&mut c, "DROP FULLTEXT CATALOG other");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.fulltext_catalogs"), "1");
+    assert_eq!(err_no(&mut c, "DROP FULLTEXT CATALOG other"), 7608);
+}

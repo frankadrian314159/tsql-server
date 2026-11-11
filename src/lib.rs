@@ -34,6 +34,7 @@ pub mod types;
 pub mod xmlpath;
 pub mod fulltext;
 pub mod hierarchyid;
+pub mod spatial;
 pub mod xpress;
 
 use catalog::ServerState;
