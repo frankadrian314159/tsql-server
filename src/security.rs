@@ -35,6 +35,9 @@ pub struct Login {
     pub bad_count: u32,
     #[serde(default)]
     pub locked_until: Option<chrono::NaiveDateTime>,
+    /// A login that authenticates outside the server: "WINDOWS" (Kerberos/SSPI) or "EXTERNAL" (Azure AD). It has no password.
+    #[serde(default)]
+    pub external: Option<String>,
 }
 
 /// Why a password does not meet the policy, or `None` when it does: at least 8 characters, at least three of
@@ -67,7 +70,7 @@ impl Login {
             Some(p) => hash_password(&salt, p),
             None => vec![],
         };
-        Login { name: name.to_string(), salt, hash, disabled: false, default_db: "master".into(), check_policy: false, check_expiration: false, must_change: false, password_set: Some(chrono::Local::now().naive_local()), bad_count: 0, locked_until: None }
+        Login { name: name.to_string(), salt, hash, disabled: false, default_db: "master".into(), check_policy: false, check_expiration: false, must_change: false, password_set: Some(chrono::Local::now().naive_local()), bad_count: 0, locked_until: None, external: None }
     }
     pub fn set_password(&mut self, pw: &str) {
         self.hash = hash_password(&self.salt, pw);

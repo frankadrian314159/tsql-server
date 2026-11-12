@@ -195,6 +195,37 @@ impl Server {
         Ok(conn)
     }
 
+    /// Connect as a login that authenticates outside the server (`CREATE LOGIN ... FROM WINDOWS` or `FROM EXTERNAL
+    /// PROVIDER`), once Kerberos or Azure AD has established who the client is. `names` are the forms the identity can take
+    /// (`DOMAIN\user`, `user@REALM`, `user@contoso.com`), most specific first; the first that names an external login is
+    /// used.
+    pub fn connect_external(&self, names: &[String]) -> Result<Connection, SqlError> {
+        let shown = names.first().cloned().unwrap_or_default();
+        let login = {
+            let g = self.shared.state.read().unwrap_or_else(|e| e.into_inner());
+            let found = names.iter().find_map(|n| g.security.logins.get(&n.to_lowercase()).filter(|l| l.external.is_some()).map(|l| l.name.clone()));
+            let r = match found {
+                Some(n) if g.security.logins.get(&n.to_lowercase()).is_some_and(|l| !l.disabled) => Ok(n),
+                _ => Err(SqlError::with(18456, 14, 1, format!("Login failed for user '{}'.", shown))),
+            };
+            if let Err(e) = &r {
+                if g.core.audit.is_active() {
+                    engine::auditing::login_event(&g, "LOGIN FAILED", &shown, 0, &e.message);
+                }
+            }
+            r?
+        };
+        let mut conn = self.session_for(&login);
+        {
+            let g = self.shared.state.read().unwrap_or_else(|e| e.into_inner());
+            if g.core.audit.is_active() {
+                engine::auditing::login_event(&g, "LOGIN SUCCEEDED", &conn.session.login, conn.session.spid, "Login succeeded for user");
+            }
+        }
+        conn.run_logon_triggers()?;
+        Ok(conn)
+    }
+
     fn check_login(g: &mut catalog::ServerState, login: &str, password: &str) -> Result<(), SqlError> {
         {
             let now = chrono::Local::now().naive_local();

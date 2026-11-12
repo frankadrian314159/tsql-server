@@ -3,14 +3,18 @@
 //! ```text
 //! tsql-serve [DATA_DIR] [--port N] [--bind ADDR] [--sa-password PW] [--pool-pages N]
 //!             [--tls-cert FILE --tls-key FILE | --no-tls] [--force-encryption] [--tls13] [--no-mars]
+//!             [--aad-tenant ID --aad-jwks FILE [--aad-audience URI]...]
+//!             [--kerberos [--kerberos-service SPN] [--kerberos-keytab FILE] [--allow-ntlm]]
 //! ```
-use tsql_server::tds::{Config, Encryption, Listener, TlsConfig};
+use tsql_server::tds::{AadConfig, AuthConfig, Config, Encryption, JwksSource, KerberosConfig, Listener, TlsConfig};
 use tsql_server::{Server, StorageOptions};
 
 fn usage() -> ! {
     eprintln!(
         "usage: tsql-serve [DATA_DIR] [--port N] [--bind ADDR] [--sa-password PW] [--pool-pages N]\n\
-                          [--tls-cert FILE --tls-key FILE | --no-tls] [--force-encryption] [--tls13] [--no-mars]\n\n\
+                          [--tls-cert FILE --tls-key FILE | --no-tls] [--force-encryption] [--tls13] [--no-mars]\n\
+                          [--aad-tenant ID --aad-jwks FILE [--aad-audience URI]...]\n\
+                          [--kerberos [--kerberos-service SPN] [--kerberos-keytab FILE] [--allow-ntlm]]\n\n\
          DATA_DIR        directory for the durable database (omitted: in-memory only)\n\
          --port N        TCP port (default 1433)\n\
          --bind ADDR     address to listen on (default 127.0.0.1)\n\
@@ -22,7 +26,14 @@ fn usage() -> ! {
          --no-tls        do not offer TLS at all\n\
          --tls13         also offer TLS 1.3 (TLS 1.2 only by default)\n\
          --no-mars       do not grant MARS (multiple active result sets) to clients that ask for it\n\
-         --force-encryption  refuse clients that cannot use TLS and encrypt every session"
+         --force-encryption  refuse clients that cannot use TLS and encrypt every session\n\
+         --aad-tenant ID --aad-jwks FILE  accept Azure AD access tokens of tenant ID, checked against the signing keys\n\
+                         in FILE (a JWKS document); --aad-audience URI (repeatable) sets the accepted audience\n\
+         --kerberos      accept Kerberos (integrated) logins; needs a build with kerberos-windows, kerberos-linux or\n\
+                         kerberos-macos (see docs/authentication.md)\n\
+         --kerberos-service SPN   the service principal (e.g. MSSQLSvc/host.example.com:1433)\n\
+         --kerberos-keytab FILE   the keytab holding its key (Linux, macOS)\n\
+         --allow-ntlm    Windows: also accept the NTLM fallback of Negotiate"
     );
     std::process::exit(2)
 }
@@ -36,6 +47,8 @@ fn main() {
     let (mut cert, mut key, mut no_tls, mut force) = (None::<String>, None::<String>, false, false);
     let mut tls13 = false;
     let mut mars = true;
+    let (mut aad_tenant, mut aad_jwks, mut aad_aud) = (None::<String>, None::<String>, Vec::<String>::new());
+    let (mut kerberos, mut krb_service, mut krb_keytab, mut allow_ntlm) = (false, None::<String>, None::<String>, false);
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -49,6 +62,13 @@ fn main() {
             "--force-encryption" => force = true,
             "--tls13" => tls13 = true,
             "--no-mars" => mars = false,
+            "--aad-tenant" => aad_tenant = Some(args.next().unwrap_or_else(|| usage())),
+            "--aad-jwks" => aad_jwks = Some(args.next().unwrap_or_else(|| usage())),
+            "--aad-audience" => aad_aud.push(args.next().unwrap_or_else(|| usage())),
+            "--kerberos" => kerberos = true,
+            "--kerberos-service" => krb_service = Some(args.next().unwrap_or_else(|| usage())),
+            "--kerberos-keytab" => krb_keytab = Some(args.next().unwrap_or_else(|| usage())),
+            "--allow-ntlm" => allow_ntlm = true,
             "-h" | "--help" => usage(),
             other if !other.starts_with('-') && dir.is_none() => dir = Some(other.to_string()),
             _ => usage(),
@@ -96,6 +116,23 @@ fn main() {
         std::process::exit(2);
     }
     cfg.mars = mars;
+    let mut auth = AuthConfig::default();
+    match (aad_tenant, aad_jwks) {
+        (Some(tenant), Some(jwks)) => auth.aad = Some(AadConfig { tenant, audiences: aad_aud, jwks: JwksSource::File(jwks.into()) }),
+        (None, None) => {}
+        _ => {
+            eprintln!("--aad-tenant and --aad-jwks go together");
+            std::process::exit(2);
+        }
+    }
+    if kerberos {
+        if !tsql_server::tds::auth::kerberos_built_in() {
+            eprintln!("--kerberos: this build has no Kerberos support; build with --features kerberos-windows, kerberos-linux or kerberos-macos (docs/authentication.md)");
+            std::process::exit(2);
+        }
+        auth.kerberos = Some(KerberosConfig { service: krb_service, keytab: krb_keytab.map(Into::into), allow_ntlm });
+    }
+    cfg.auth = auth;
     let listener = match Listener::bind(server, (bind.as_str(), port), cfg) {
         Ok(l) => l,
         Err(e) => {

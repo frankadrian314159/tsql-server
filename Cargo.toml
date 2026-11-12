@@ -35,6 +35,13 @@ prof = []
 # link the mimalloc allocator into the binaries (needs a C compiler to build); `cargo build --release --features fast-alloc`
 fast-alloc = ["dep:mimalloc"]
 gui = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:rfd"]
+# Kerberos (integrated) authentication, one feature per platform; see docs/authentication.md
+#   Windows: cargo build --release --features kerberos-windows        (SSPI, no extra software)
+#   Linux:   cargo build --release --features kerberos-linux          (GSSAPI: needs libkrb5-dev / krb5-devel)
+#   macOS:   cargo build --release --features kerberos-macos          (GSS.framework, part of macOS)
+kerberos-windows = ["dep:windows-sys"]
+kerberos-linux = []
+kerberos-macos = []
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
@@ -59,6 +66,9 @@ mimalloc = { version = "0.1", optional = true }
 # TLS for the TDS listener (pure Rust crypto provider, no C toolchain needed)
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# RS256 signature check of Azure AD access tokens (already part of the build through rustls)
+ring = "0.17"
+windows-sys = { version = "0.59", optional = true, features = ["Win32_Foundation", "Win32_Security_Authentication_Identity", "Win32_Security_Credentials"] }
 
 [dev-dependencies]
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }

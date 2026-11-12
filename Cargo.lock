@@ -3777,6 +3777,7 @@ dependencies = [
  "rcgen",
  "regex",
  "rfd",
+ "ring",
  "rustls 0.23.46",
  "serde",
  "serde_json",
@@ -3788,6 +3789,7 @@ dependencies = [
  "tokio-util",
  "unicode-normalization",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

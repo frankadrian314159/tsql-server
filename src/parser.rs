@@ -3804,6 +3804,15 @@ impl Parser {
                 let name = self.ident()?;
                 let (mut password, mut default_db) = (None, None);
                 let mut opts = LoginOpts::default();
+                if self.accept_kw("FROM") {
+                    if self.accept_kw("WINDOWS") {
+                        opts.external = Some("WINDOWS".into());
+                    } else {
+                        self.expect_kw("EXTERNAL")?;
+                        self.expect_kw("PROVIDER")?;
+                        opts.external = Some("EXTERNAL".into());
+                    }
+                }
                 if self.accept_kw("WITH") {
                     loop {
                         self.login_option(&mut password, &mut default_db, &mut opts)?;

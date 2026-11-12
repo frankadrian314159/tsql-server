@@ -34,6 +34,7 @@ on its own threads (one per client) and returns a handle with `local_addr()`, `w
 | Environment changes | database (`USE`), packet size, language, collation, transaction descriptors |
 | Bulk load | `INSERT BULK` and the bulk-load message (`bcp`, `SqlBulkCopy`, the JDBC `SQLServerBulkCopy`, tiberius `bulk_insert`); see [Bulk load](#bulk-load) |
 | Server cursors | `sp_cursoropen`, `sp_cursorprepare`, `sp_cursorexecute`, `sp_cursorprepexec`, `sp_cursorfetch`, `sp_cursoroption`, `sp_cursorclose`, `sp_cursorunprepare`; see [Server cursors](#server-cursors) |
+| Azure AD, Kerberos | opt-in: access-token logins (`--aad-tenant`, `--aad-jwks`) and Kerberos logins (`--kerberos`, a build with `kerberos-windows`, `kerberos-linux` or `kerberos-macos`); see [authentication.md](authentication.md) |
 | MARS | a client that asks for Multiple Active Result Sets (`MultipleActiveResultSets=True`) gets it; see [MARS](#mars) |
 | Metadata queries | `SET FMTONLY ON` (describes a result without running it), `sp_tablecollations_100`, a procedure call without `EXEC` at the start of a batch |
 | Types | bit, tinyint … bigint, decimal/numeric, money, smallmoney, float, real, char/varchar/text, nchar/nvarchar/ntext, binary/varbinary/image, timestamp, date, time, datetime, smalldatetime, datetime2, datetimeoffset, uniqueidentifier, xml, `sql_variant` (sent with its base type), `hierarchyid`, `geometry` and `geography` (as CLR user-defined types: the client gets the type name and the serialized bytes), and the legacy `text`, `ntext` and `image` (as the old text-pointer types); `(max)` types use partially length-prefixed values |
@@ -129,7 +130,7 @@ commands in a row) and by hand-written frames (`tests/tds_raw.rs`).
 
 ## Not supported
 
-* Integrated (Windows/Kerberos/NTLM) and Azure AD authentication.
+* Group-based logins and NTLM-only domains; see [authentication.md](authentication.md) for what Azure AD and Kerberos do cover.
 * Query notifications and table-valued parameters (the engine has no table types).
 * Keyset and dynamic cursors that see later changes, and updatable server cursors.
 * `ANSI_NULLS OFF`, `QUOTED_IDENTIFIER OFF` and the like: the SET options are recorded (`@@OPTIONS`) but the engine always

@@ -647,6 +647,10 @@ pub struct LoginOpts {
     pub must_change: bool,
     pub unlock: bool,
     pub old_password: Option<String>,
+    /// `FROM WINDOWS` ("WINDOWS") or `FROM EXTERNAL PROVIDER` ("EXTERNAL"): a login that authenticates outside the server
+    /// (Kerberos or Azure AD) and has no password.
+    #[serde(default)]
+    pub external: Option<String>,
 }
 
 /// Where a trigger administration statement looks for its triggers.

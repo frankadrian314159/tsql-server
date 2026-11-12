@@ -8,15 +8,21 @@
 //! `hierarchyid`, spatial and the legacy `text`/`ntext`/`image` among them), and TLS 1.2 (1.3 on request; see [`TlsConfig`];
 //! the login is always encrypted when the client supports TLS, the whole session when the client asks for it or the
 //! listener requires it), and MARS (the session multiplex protocol, see `mars.rs`; requests still run one at a time). Not
-//! supported: integrated/Windows/AAD authentication, table-valued parameters, and server cursors that see later changes (a
+//! supported: group-based Windows logins (see `auth.rs` for the Azure AD and Kerberos logins that are), table-valued parameters, and server cursors that see later changes (a
 //! cursor is a snapshot).
+pub mod auth;
 mod bulk;
 mod cursor;
+#[cfg(all(unix, any(feature = "kerberos-linux", feature = "kerberos-macos")))]
+mod gssapi;
 mod mars;
+#[cfg(all(windows, feature = "kerberos-windows"))]
+mod sspi;
 mod rpc;
 mod tls;
 pub mod wire;
 
+pub use auth::{AadConfig, AuthConfig, JwksSource, KerberosConfig};
 pub use tls::{Encryption, TlsConfig};
 
 use crate::{Connection, Event, Server, SqlError, Streamed};
@@ -31,6 +37,7 @@ use wire::*;
 const T_BATCH: u8 = 1;
 const T_RPC: u8 = 3;
 const T_REPLY: u8 = 4;
+const T_FEDAUTH: u8 = 8;
 const T_ATTN: u8 = 6;
 const T_BULK: u8 = 7;
 const T_TM: u8 = 14;
@@ -705,9 +712,23 @@ fn prelogin_mars(p: &[u8]) -> bool {
     false
 }
 
-fn prelogin_reply(encryption: u8, mars: bool) -> Vec<u8> {
+/// Whether the client's pre-login message announces federated authentication (option 6, FEDAUTHREQUIRED).
+fn prelogin_fedauth(p: &[u8]) -> bool {
+    let mut i = 0;
+    while i < p.len() && p[i] != 0xFF {
+        let Some(entry) = p.get(i..i + 5) else { return false };
+        if entry[0] == 6 {
+            let off = u16::from_be_bytes([entry[1], entry[2]]) as usize;
+            return p.get(off).copied() == Some(1);
+        }
+        i += 5;
+    }
+    false
+}
+
+fn prelogin_reply(encryption: u8, mars: bool, fedauth: bool) -> Vec<u8> {
     // options: VERSION, ENCRYPTION, INSTOPT, MARS, terminator
-    let table_len = 4 * 5 + 1;
+    let table_len = 5 * (4 + fedauth as usize) + 1;
     let mut table = vec![];
     let mut data = vec![];
     let mut add = |token: u8, bytes: &[u8]| {
@@ -720,6 +741,9 @@ fn prelogin_reply(encryption: u8, mars: bool) -> Vec<u8> {
     add(1, &[encryption]);
     add(2, &[0]);
     add(4, &[mars as u8]);
+    if fedauth {
+        add(6, &[1]);
+    }
     table.push(0xFF);
     table.extend(data);
     table
@@ -732,8 +756,42 @@ struct Login {
     password: String,
     database: String,
     sspi: bool,
+    /// The client's first SSPI token (Kerberos or NTLM), when it asks for integrated authentication.
+    sspi_token: Vec<u8>,
+    /// The FEDAUTH feature (Azure AD), when there is one.
+    fedauth: Option<FedAuth>,
     /// OptionFlags2 `fODBC` or TypeFlags `fOLEDB`: the driver wants the ANSI defaults.
     ansi_defaults: bool,
+}
+
+/// The FEDAUTH feature of Login7.
+struct FedAuth {
+    /// 1: the client brings an access token; 2: it wants to be told where to get one (ADAL/MSAL).
+    library: u8,
+    token: Option<Vec<u8>>,
+}
+
+fn parse_feature_ext(p: &[u8], mut at: usize) -> Option<FedAuth> {
+    let mut found = None;
+    loop {
+        let id = *p.get(at)?;
+        if id == 0xFF {
+            return found;
+        }
+        let len = u32::from_le_bytes(p.get(at + 1..at + 5)?.try_into().ok()?) as usize;
+        let data = p.get(at + 5..at + 5 + len)?;
+        if id == 2 && !data.is_empty() {
+            let library = data[0] >> 1;
+            let token = if library == 1 && data.len() >= 5 {
+                let n = u32::from_le_bytes(data[1..5].try_into().ok()?) as usize;
+                data.get(5..5 + n).map(|t| t.to_vec())
+            } else {
+                None
+            };
+            found = Some(FedAuth { library, token });
+        }
+        at += 5 + len;
+    }
 }
 
 fn parse_login7(p: &[u8]) -> R<Login> {
@@ -745,7 +803,8 @@ fn parse_login7(p: &[u8]) -> R<Login> {
     let _flags1 = rd.u8()?;
     let flags2 = rd.u8()?;
     let type_flags = rd.u8()?;
-    rd.take(36 - 27)?;
+    let flags3 = rd.u8()?;
+    rd.take(36 - 28)?;
     // offset table: (offset, length-in-characters) pairs
     fn pair(rd: &mut Rd) -> R<(usize, usize)> {
         Ok((rd.u16()? as usize, rd.u16()? as usize))
@@ -755,19 +814,30 @@ fn parse_login7(p: &[u8]) -> R<Login> {
     let pass = pair(&mut rd)?;
     let _app = pair(&mut rd)?;
     let _server = pair(&mut rd)?;
-    let _ext = pair(&mut rd)?;
+    let ext = pair(&mut rd)?;
     let _clt = pair(&mut rd)?;
     let _lang = pair(&mut rd)?;
     let db = pair(&mut rd)?;
     rd.take(6)?; // client id
     let sspi = pair(&mut rd)?;
+    let _atch = pair(&mut rd)?;
+    let _chpw = pair(&mut rd)?;
+    let sspi_long = rd.u32().unwrap_or(0) as usize;
     let text = |(off, n): (usize, usize)| -> R<Vec<u8>> {
         let end = off + n * 2;
         p.get(off..end).map(|s| s.to_vec()).ok_or_else(|| "login field out of range".to_string())
     };
     // the password is obfuscated: nibbles swapped, then XOR 0xA5
     let pw: Vec<u8> = text(pass)?.into_iter().map(|b| (b ^ 0xA5).rotate_left(4)).collect();
-    Ok(Login { tds_version, packet_size, user: decode_utf16(&text(user)?), password: decode_utf16(&pw), database: decode_utf16(&text(db)?), sspi: sspi.1 > 0, ansi_defaults: flags2 & 0x02 != 0 || type_flags & 0x10 != 0 })
+    let sspi_len = if sspi.1 == 0xFFFF && sspi_long > 0 { sspi_long } else { sspi.1 };
+    let sspi_token = if sspi_len > 0 { p.get(sspi.0..sspi.0 + sspi_len).map(|t| t.to_vec()).unwrap_or_default() } else { vec![] };
+    // OptionFlags3 bit 4: ibExtension points to a 4-byte offset of the feature block
+    let fedauth = if flags3 & 0x10 != 0 && ext.1 == 4 {
+        p.get(ext.0..ext.0 + 4).and_then(|b| parse_feature_ext(p, u32::from_le_bytes(b.try_into().unwrap()) as usize))
+    } else {
+        None
+    };
+    Ok(Login { tds_version, packet_size, user: decode_utf16(&text(user)?), password: decode_utf16(&pw), database: decode_utf16(&text(db)?), sspi: sspi_len > 0, sspi_token, fedauth, ansi_defaults: flags2 & 0x02 != 0 || type_flags & 0x10 != 0 })
 }
 
 fn login_failure(t: &mut Transport, number: i32, state: u8, class: u8, text: &str) -> io::Result<()> {
@@ -795,6 +865,113 @@ fn refused(why: &str) {
     eprintln!("tsql-serve: closing a connection during login: {}", why);
 }
 
+/// Report a failed external login to the client and the operator.
+fn external_failure(t: &mut Transport, why: &str) -> io::Result<Option<Connection>> {
+    refused(why);
+    login_failure(t, 18456, 1, 14, &format!("Login failed. {}", why))?;
+    Ok(None)
+}
+
+/// The FEDAUTHINFO token: where the client gets an access token (the security token service) and for which resource.
+fn fedauth_info(sts: &str, spn: &str) -> Vec<u8> {
+    let (sts16, spn16): (Vec<u8>, Vec<u8>) = (sts.encode_utf16().flat_map(|c| c.to_le_bytes()).collect(), spn.encode_utf16().flat_map(|c| c.to_le_bytes()).collect());
+    let first = 4 + 2 * 9;
+    let mut body = vec![];
+    body.extend_from_slice(&2u32.to_le_bytes());
+    for (id, len, off) in [(1u8, sts16.len(), first), (2u8, spn16.len(), first + sts16.len())] {
+        body.push(id);
+        body.extend_from_slice(&(len as u32).to_le_bytes());
+        body.extend_from_slice(&(off as u32).to_le_bytes());
+    }
+    body.extend_from_slice(&sts16);
+    body.extend_from_slice(&spn16);
+    let mut out = vec![0xEE];
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend(body);
+    out
+}
+
+/// Login with an Azure AD access token. `Ok(None)`: refused (the client has been told).
+fn aad_login(server: &Server, t: &mut Transport, cfg: &Config, fa: &FedAuth) -> io::Result<Option<Connection>> {
+    let Some(aad) = &cfg.auth.aad else {
+        return external_failure(t, "Azure Active Directory authentication is not enabled on this server.");
+    };
+    let raw = match (fa.library, &fa.token) {
+        (1, Some(tok)) => tok.clone(),
+        (1, None) => return external_failure(t, "The login carried no access token."),
+        (2, _) => {
+            // the client fetches the token itself: say where, then read it from the FEDAUTH token message
+            let mut out = fedauth_info(&format!("https://login.microsoftonline.com/{}", aad.tenant), aad.audiences.first().map(|s| s.as_str()).unwrap_or("https://database.windows.net/"));
+            done(&mut out, 0xFD, DONE_MORE, 0);
+            t.send(T_REPLY, &out)?;
+            let (kind, _, data) = t.read_message()?;
+            let token = (kind == T_FEDAUTH && data.len() >= 8)
+                .then(|| {
+                    let n = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+                    data.get(8..8 + n).map(|x| x.to_vec())
+                })
+                .flatten();
+            match token {
+                Some(tok) => tok,
+                None => return external_failure(t, "The federated authentication token message was not understood."),
+            }
+        }
+        _ => return external_failure(t, "This federated authentication library is not supported."),
+    };
+    match auth::validate_aad_token(aad, &auth::token_text(&raw)) {
+        Ok(names) => match server.connect_external(&names) {
+            Ok(c) => Ok(Some(c)),
+            Err(e) => {
+                refused(&format!("Azure AD identity {:?} has no login: {}", names, e.message));
+                login_failure(t, e.number, 1, 14, &e.message)?;
+                Ok(None)
+            }
+        },
+        Err(why) => external_failure(t, &format!("The access token was not accepted: {}.", why)),
+    }
+}
+
+/// Login with Kerberos (SSPI or GSSAPI): run the exchange, with the client's first token already in hand.
+fn kerberos_login(server: &Server, t: &mut Transport, cfg: &Config, first: &[u8], last_token: &mut Vec<u8>) -> io::Result<Option<Connection>> {
+    let Some(k) = &cfg.auth.kerberos else {
+        return external_failure(t, "Integrated (Windows) authentication is not enabled on this server; use a SQL Server login.");
+    };
+    let mut acceptor = match auth::new_acceptor(k) {
+        Ok(a) => a,
+        Err(e) => return external_failure(t, &format!("Integrated authentication is not available: {}.", e)),
+    };
+    let mut token = first.to_vec();
+    for _ in 0..8 {
+        match acceptor.step(&token) {
+            Err(e) => return external_failure(t, &format!("Integrated authentication failed: {}.", e)),
+            Ok((out, Some(names))) => {
+                *last_token = out;
+                return match server.connect_external(&names) {
+                    Ok(c) => Ok(Some(c)),
+                    Err(e) => {
+                        refused(&format!("Kerberos identity {:?} has no login: {}", names, e.message));
+                        login_failure(t, e.number, 1, 14, &e.message)?;
+                        Ok(None)
+                    }
+                };
+            }
+            Ok((out, None)) => {
+                // another round: the token goes to the client in an SSPI message, its answer comes back as type 17
+                let mut m = vec![0xED];
+                m.extend_from_slice(&(out.len() as u16).to_le_bytes());
+                m.extend_from_slice(&out);
+                t.send(T_REPLY, &m)?;
+                let (kind, _, data) = t.read_message()?;
+                if kind != T_SSPI {
+                    return external_failure(t, "An SSPI message was expected.");
+                }
+                token = data;
+            }
+        }
+    }
+    external_failure(t, "The integrated authentication exchange did not finish.")
+}
+
 fn handshake(server: &Server, mut t: Transport, cfg: &Config) -> io::Result<Option<Session>> {
     let bad = |e: String| io::Error::new(io::ErrorKind::InvalidData, e);
     let (kind, _, pre) = t.read_message()?;
@@ -807,7 +984,8 @@ fn handshake(server: &Server, mut t: Transport, cfg: &Config) -> io::Result<Opti
     trace(&format!("answering PRELOGIN with encryption {}", answer));
     let mars = cfg.mars && prelogin_mars(&pre);
     trace(&format!("client asks for MARS: {}; answering {}", prelogin_mars(&pre), mars));
-    t.send(T_REPLY, &prelogin_reply(answer, mars))?;
+    let fedauth = cfg.auth.aad.is_some() && prelogin_fedauth(&pre);
+    t.send(T_REPLY, &prelogin_reply(answer, mars, fedauth))?;
     if answer == 3 {
         refused("the server requires encryption and the client does not offer it");
         return Ok(None); // the client cannot encrypt and the server insists: it will close the connection
@@ -841,20 +1019,34 @@ fn handshake(server: &Server, mut t: Transport, cfg: &Config) -> io::Result<Opti
     trace(&format!("LOGIN7, {} bytes", payload.len()));
     let login = parse_login7(&payload).map_err(bad)?;
     trace(&format!("login as '{}', TDS version {:#x}, packet size {}, database '{}'", login.user, login.tds_version, login.packet_size, login.database));
-    if login.sspi {
-        login_failure(&mut t, 18452, 1, 14, "Login failed. Integrated (Windows) authentication is not supported; use a SQL Server login.")?;
-        return Ok(None);
-    }
     if login.tds_version < 0x7200_0000 {
         refused(&format!("the client asked for TDS version {:#x}; this server needs 7.2 or later (0x72000000)", login.tds_version));
         login_failure(&mut t, 18456, 1, 14, "This server requires TDS 7.2 or later.")?;
         return Ok(None);
     }
-    let conn = match server.connect_as(&login.user, &login.password) {
-        Ok(c) => c,
-        Err(e) => {
-            login_failure(&mut t, e.number, 1, 14, &e.message)?;
-            return Ok(None);
+    // who the client is: an Azure AD token, a Kerberos exchange, or a SQL login and password
+    let mut sspi_final: Vec<u8> = vec![];
+    let mut fedauth_ack = false;
+    let conn = if let Some(fa) = &login.fedauth {
+        match aad_login(server, &mut t, cfg, fa)? {
+            Some(c) => {
+                fedauth_ack = true;
+                c
+            }
+            None => return Ok(None),
+        }
+    } else if login.sspi {
+        match kerberos_login(server, &mut t, cfg, &login.sspi_token, &mut sspi_final)? {
+            Some(c) => c,
+            None => return Ok(None),
+        }
+    } else {
+        match server.connect_as(&login.user, &login.password) {
+            Ok(c) => c,
+            Err(e) => {
+                login_failure(&mut t, e.number, 1, 14, &e.message)?;
+                return Ok(None);
+            }
         }
     };
     let mut s = Session { t, conn, db: String::new(), prepared: HashMap::new(), next_handle: 0, tx_descriptor: 0, tx_counter: 0, in_tx: false, bulk: None, cursors: HashMap::new(), next_cursor: 0 };
@@ -887,6 +1079,12 @@ fn handshake(server: &Server, mut t: Transport, cfg: &Config) -> io::Result<Opti
     info_token(&mut out, 5703, "Changed language setting to us_english.");
     envchange(&mut out, 7, &COLLATION, &[], true);
     envchange(&mut out, 4, packet.to_string().as_bytes(), DEFAULT_PACKET.to_string().as_bytes(), false);
+    if !sspi_final.is_empty() {
+        // the last SSPI token (Kerberos mutual authentication) rides in front of the login acknowledgement
+        out.push(0xED);
+        out.extend_from_slice(&(sspi_final.len() as u16).to_le_bytes());
+        out.extend_from_slice(&sspi_final);
+    }
     // LOGINACK
     let mut ack = vec![1u8];
     ack.extend_from_slice(&TDS_74.to_be_bytes());
@@ -895,6 +1093,13 @@ fn handshake(server: &Server, mut t: Transport, cfg: &Config) -> io::Result<Opti
     out.push(0xAD);
     out.extend_from_slice(&(ack.len() as u16).to_le_bytes());
     out.extend_from_slice(&ack);
+    if fedauth_ack {
+        // FEATUREEXTACK: the FEDAUTH feature (id 2) is accepted
+        out.push(0xAE);
+        out.push(0x02);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.push(0xFF);
+    }
     done(&mut out, 0xFD, 0, 0);
     s.t.send(T_REPLY, &out)?;
     s.t.packet_size = packet;
@@ -1017,6 +1222,8 @@ fn serve_connection(server: Server, stream: TcpStream, cfg: Arc<Config>) {
 pub struct Config {
     /// Whether a client that asks for MARS (Multiple Active Result Sets) gets it.
     pub mars: bool,
+    /// Azure AD and Kerberos (off by default).
+    pub auth: AuthConfig,
     /// Largest packet size granted to clients.
     pub max_packet: usize,
     /// The server certificate; without one the listener answers "encryption not supported".
@@ -1027,7 +1234,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { max_packet: 32767, tls: None, encryption: Encryption::Optional, mars: true }
+        Config { max_packet: 32767, tls: None, encryption: Encryption::Optional, mars: true, auth: AuthConfig::default() }
     }
 }
 

@@ -247,6 +247,7 @@ impl<'a> Engine<'a> {
                     }
                 }
                 let mut l = Login::new(name, password.as_deref());
+                l.external = opts.external.clone();
                 l.check_policy = policy;
                 l.check_expiration = opts.check_expiration.unwrap_or(policy);
                 l.must_change = opts.must_change;

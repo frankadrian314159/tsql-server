@@ -68,10 +68,6 @@ impl Transport {
         self.packet_size = self.packet_size.saturating_sub(HEADER).max(512);
     }
 
-    pub(super) fn is_mars(&self) -> bool {
-        self.mux.is_some()
-    }
-
     /// Whether a request is waiting that needs no read from the socket.
     pub(super) fn has_ready(&self) -> bool {
         self.mux.as_ref().map(|m| !m.ready.is_empty()).unwrap_or(false)

@@ -799,7 +799,7 @@ impl<'a> Engine<'a> {
                     Some(rs(&[("object_id", DataType::Int), ("type_desc", nv())], rows))
                 }
                 "server_principals" => {
-                    let rows = self.srv.security.logins.values().enumerate().map(|(i, l)| vec![sv(&l.name), Value::Int(i as i32 + 1), sv("S"), Value::Bit(l.disabled)]).collect();
+                    let rows = self.srv.security.logins.values().enumerate().map(|(i, l)| vec![sv(&l.name), Value::Int(i as i32 + 1), sv(match l.external.as_deref() { Some("WINDOWS") => "U", Some(_) => "E", None => "S" }), Value::Bit(l.disabled)]).collect();
                     Some(rs(&[("name", nv()), ("principal_id", DataType::Int), ("type", DataType::Char(1)), ("is_disabled", DataType::Bit)], rows))
                 }
                 "database_permissions" => {
