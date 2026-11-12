@@ -9,11 +9,6 @@ use std::ffi::c_void;
 use std::os::raw::c_int;
 use std::ptr::null_mut;
 
-#[cfg(all(feature = "kerberos-linux", not(target_os = "linux")))]
-compile_error!("the feature kerberos-linux builds only for Linux; use kerberos-windows or kerberos-macos here");
-#[cfg(all(feature = "kerberos-macos", not(target_os = "macos")))]
-compile_error!("the feature kerberos-macos builds only for macOS; use kerberos-windows or kerberos-linux here");
-
 #[repr(C)]
 struct Buffer {
     length: usize,

@@ -14,6 +14,14 @@
 //!   and `kerberos-macos`).
 use std::path::PathBuf;
 
+// each Kerberos feature builds on its own platform only
+#[cfg(all(feature = "kerberos-windows", not(windows)))]
+compile_error!("the feature kerberos-windows builds only for Windows; use kerberos-linux or kerberos-macos here");
+#[cfg(all(feature = "kerberos-linux", not(target_os = "linux")))]
+compile_error!("the feature kerberos-linux builds only for Linux; use kerberos-windows or kerberos-macos here");
+#[cfg(all(feature = "kerberos-macos", not(target_os = "macos")))]
+compile_error!("the feature kerberos-macos builds only for macOS; use kerberos-windows or kerberos-linux here");
+
 /// What the listener accepts besides SQL logins; both are off by default.
 #[derive(Clone, Debug, Default)]
 pub struct AuthConfig {

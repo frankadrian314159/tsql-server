@@ -94,7 +94,14 @@ The keytab holds the key of the service principal (`ktadd -k /etc/mssql.keytab M
 `ktpass` on a domain controller for Active Directory). Without `--kerberos-service` every principal in the keytab is accepted.
 Clients get a ticket with `kinit` and connect with integrated security (`sqlcmd -E`, the Microsoft ODBC driver with
 `Trusted_Connection=yes`, JDBC with `integratedSecurity=true;authenticationScheme=JavaKerberos`). Under WSL the same commands
-apply; build in the Linux file system (not under `/mnt/c`) for speed.
+apply, with the project in the Linux file system (a build under `/mnt/c` is slow). From a Windows prompt, for a distribution
+named `Ubuntu-24.04`:
+
+```text
+wsl -d Ubuntu-24.04 -u root -- bash -c "apt-get update && apt-get install -y libkrb5-dev libgssapi-krb5-2 krb5-user rsync curl build-essential"
+wsl -d Ubuntu-24.04 -u root -- bash -c "curl -sSf https://sh.rustup.rs | sh -s -- -y"
+wsl -d Ubuntu-24.04 -u root -- bash -c "rsync -a --exclude target --exclude .git /mnt/c/path/to/tsql-server/ /root/tsql/ && cd /root/tsql && /root/.cargo/bin/cargo build --release --features kerberos-linux"
+```
 
 Tested under WSL 2 (Ubuntu 24.04, MIT Kerberos 1.20, OpenJDK 21) with a local KDC and the Microsoft JDBC driver 12.8 as the
 client: `sudo bash scripts/kerberos/setup-kdc.sh` makes the realm `TSQL.TEST` with users `alice` and `carol` and the service
@@ -106,7 +113,8 @@ no login) is refused with 18456, and a client with **no ticket** cannot start th
 ### macOS
 
 `kerberos-macos` links `GSS.framework`, which exports the same GSSAPI functions as MIT Kerberos, so it uses the same code as
-Linux (`src/tds/gssapi.rs`). The commands are those of Linux with the macOS feature:
+Linux (`src/tds/gssapi.rs`). `bash scripts/kerberos/build-macos.sh` builds it and prints how to run it (Xcode command line
+tools and Rust are all it needs); by hand, the commands are those of Linux with the macOS feature:
 
 ```text
 cargo build --release --features kerberos-macos
