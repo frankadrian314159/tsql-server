@@ -389,7 +389,13 @@ impl Parser {
         self.is_kw_any(STMT_START)
     }
     fn name_parts(&mut self) -> R<Vec<String>> {
-        let mut parts = vec![self.ident()?];
+        // `..name` (no database, no schema), as client libraries write a procedure of the current database
+        let mut parts = if self.is_op(".") && self.peek_is_op(1, ".") {
+            self.i += 2;
+            vec![String::new(), String::new(), self.ident()?]
+        } else {
+            vec![self.ident()?]
+        };
         while self.is_op(".") {
             self.i += 1;
             if self.is_op(".") {

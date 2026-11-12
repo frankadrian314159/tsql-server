@@ -276,6 +276,16 @@ impl Connection {
         BatchResult { events: eng.out }
     }
 
+    /// Execute statements that are already parsed as one batch (a driver that builds statements itself, like the bulk load
+    /// of the TDS listener, avoids the text).
+    pub fn execute_stmts(&mut self, stmts: &[crate::ast::Stmt]) -> BatchResult {
+        let shared = &self.server.shared;
+        let guard = SrvGuard::new(&shared.state);
+        let mut eng = Engine::new(guard, &mut self.session);
+        eng.run_parsed("(bulk load)", stmts);
+        BatchResult { events: eng.out }
+    }
+
     /// Execute a single batch, reporting its output to `sink` as it is produced instead of collecting it: messages,
     /// errors and row counts as [`Streamed::Event`], and the rows of a plain `SELECT` over a big table or join one at
     /// a time (`Header`, `Row`..., `End`), so the result set is never held in memory. `sink` returns false when the

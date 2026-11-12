@@ -228,6 +228,29 @@ impl<'a> Engine<'a> {
                 self.emit_rowset(Rowset::from_rows(&["TABLE_QUALIFIER".into(), "TABLE_OWNER".into(), "TABLE_NAME".into(), "COLUMN_NAME".into(), "TYPE_NAME".into(), "ORDINAL_POSITION".into(), "IS_NULLABLE".into()], rows));
                 Ok(Some(Value::Int(0)))
             }
+            // the collations of the columns of a table, which bulk copy asks for before it sends rows
+            "sp_tablecollations_100" | "sp_tablecollations" => {
+                let n = args.first().map(|a| convert::to_str(&a.1)).unwrap_or_default();
+                // `.[t]` (no schema) and `[s].[t]`
+                let parts: Vec<String> = n.split('.').map(|p| p.trim().trim_matches(|c| c == '[' || c == ']').to_string()).filter(|p| !p.is_empty()).collect();
+                let loc = self.locate(&parts);
+                let t = self.table_ref(&loc).cloned().ok_or_else(|| self.invalid_object(&parts))?;
+                let rows: Vec<Row> = t
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let text = matches!(c.ty, DataType::Char(_) | DataType::VarChar(_) | DataType::NChar(_) | DataType::NVarChar(_) | DataType::Text | DataType::NText);
+                        let coll = c.collation.clone().unwrap_or_else(|| "SQL_Latin1_General_CP1_CI_AS".to_string());
+                        vec![Value::Int(i as i32 + 1), Value::Str(c.name.clone()), if text { Value::Bin(vec![0x09, 0x04, 0xD0, 0x00, 0x34]) } else { Value::Null }, if text { Value::Str(coll) } else { Value::Null }]
+                    })
+                    .collect();
+                let mut rs = Rowset::from_rows(&["colid".into(), "name".into(), "tds_collation".into(), "collation_name".into()], rows);
+                rs.schema.cols[0].ty = Some(DataType::SmallInt);
+                rs.schema.cols[2].ty = Some(DataType::Binary(5));
+                self.emit_rowset(rs);
+                Ok(Some(Value::Int(0)))
+            }
             "sp_databases" => {
                 let rows: Vec<Row> = self.srv.databases.values().map(|d| vec![Value::Str(d.name.clone()), Value::Int(0), Value::Null]).collect();
                 self.emit_rowset(Rowset::from_rows(&["DATABASE_NAME".into(), "DATABASE_SIZE".into(), "REMARKS".into()], rows));

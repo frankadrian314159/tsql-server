@@ -8,6 +8,7 @@
 //! whole session when the client asks for it or the listener requires it). Not supported: integrated/Windows/AAD
 //! authentication, bulk load, server cursors, MARS and the `sql_variant`/`text`/`ntext`/`image` wire types (they are
 //! sent as `nvarchar(max)`, `varchar(max)`, ...).
+mod bulk;
 mod rpc;
 mod tls;
 pub mod wire;
@@ -70,32 +71,53 @@ impl Transport {
         Ok(())
     }
 
+    /// Read one packet: its type, status byte, payload, and whether it ends the message.
+    fn read_packet(&mut self) -> io::Result<(u8, u8, Vec<u8>, bool)> {
+        let mut h = [0u8; 8];
+        self.stream.read_exact(&mut h)?;
+        let len = u16::from_be_bytes([h[2], h[3]]) as usize;
+        if len < 8 || !matches!(h[0], 1..=8 | 14 | 16 | 17 | 18) || h[1] > 0x1F {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "not a TDS packet"));
+        }
+        let mut data = vec![0u8; len - 8];
+        self.stream.read_exact(&mut data)?;
+        Ok((h[0], h[1], data, h[1] & 1 != 0))
+    }
+
     /// Read one complete message (packets up to and including the one marked end-of-message).
     fn read_message(&mut self) -> io::Result<(u8, u8, Vec<u8>)> {
-        let mut data = vec![];
-        let mut kind = 0;
-        let mut first_status = 0;
-        loop {
-            let mut h = [0u8; 8];
-            self.stream.read_exact(&mut h)?;
-            let len = u16::from_be_bytes([h[2], h[3]]) as usize;
-            if len < 8 || !matches!(h[0], 1..=8 | 14 | 16 | 17 | 18) || h[1] > 0x1F {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "not a TDS packet"));
+        match self.read_request()? {
+            Request::Message(kind, status, data) => Ok((kind, status, data)),
+            Request::Bulk(first, _) => {
+                // a bulk load message where something else was expected: read it whole
+                let mut data = first;
+                loop {
+                    let (_, _, d, eom) = self.read_packet()?;
+                    data.extend_from_slice(&d);
+                    if eom {
+                        return Ok((T_BULK, 0, data));
+                    }
+                }
             }
-            if data.is_empty() {
-                kind = h[0];
-                first_status = h[1];
-            }
-            let start = data.len();
-            data.resize(start + len - 8, 0);
-            self.stream.read_exact(&mut data[start..])?;
+        }
+    }
+
+    /// Read the next request. A message is read whole, except a bulk load, which can be far bigger than memory and is
+    /// handed over after its first packet to be read as it is decoded.
+    fn read_request(&mut self) -> io::Result<Request> {
+        let (kind, status, mut data, mut eom) = self.read_packet()?;
+        if kind == T_BULK && !eom {
+            return Ok(Request::Bulk(data, false));
+        }
+        while !eom {
+            let (_, _, d, e) = self.read_packet()?;
+            data.extend_from_slice(&d);
+            eom = e;
             if data.len() > MAX_MESSAGE {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "message too large"));
             }
-            if h[1] & 1 != 0 {
-                return Ok((kind, first_status, data));
-            }
         }
+        Ok(Request::Message(kind, status, data))
     }
 
     /// Send the full packets of a reply that is not finished yet (the rest waits for more data or for `send`), so a
@@ -156,6 +178,14 @@ impl Transport {
     }
 }
 
+/// A request as `Transport::read_request` hands it over.
+enum Request {
+    /// A whole message: type, status of its first packet, payload.
+    Message(u8, u8, Vec<u8>),
+    /// The first packet of a bulk load message (and whether it is the last).
+    Bulk(Vec<u8>, bool),
+}
+
 // ----------------------------------------------------------------------------- tokens
 fn done(out: &mut Vec<u8>, token: u8, status: u16, count: u64) {
     out.push(token);
@@ -210,6 +240,7 @@ fn colmetadata(out: &mut Vec<u8>, names: &[String], wires: &[Wire]) {
         out.extend_from_slice(&0u32.to_le_bytes()); // user type
         out.extend_from_slice(&0x0009u16.to_le_bytes()); // nullable, update status unknown
         write_typeinfo(out, w);
+        write_table_name(out, w);
         put_bvar(out, n);
     }
 }
@@ -355,6 +386,8 @@ struct Session {
     tx_descriptor: u64,
     tx_counter: u64,
     in_tx: bool,
+    /// The target named by `INSERT BULK`, waiting for the data message that follows it.
+    bulk: Option<bulk::BulkTarget>,
 }
 
 impl Session {
@@ -394,6 +427,9 @@ impl Session {
         let sql = rd.utf16(rd.left() / 2)?;
         if tracing() {
             trace(&format!("batch: {:?}", sql));
+        }
+        if let Some(target) = bulk::parse_insert_bulk(&sql) {
+            return Ok(self.insert_bulk(target));
         }
         let mut out = vec![];
         let mut live = Live::new(Reply::Batch);
@@ -755,7 +791,7 @@ fn handshake(server: &Server, mut t: Transport, cfg: &Config) -> io::Result<Opti
             return Ok(None);
         }
     };
-    let mut s = Session { t, conn, db: String::new(), prepared: HashMap::new(), next_handle: 0, tx_descriptor: 0, tx_counter: 0, in_tx: false };
+    let mut s = Session { t, conn, db: String::new(), prepared: HashMap::new(), next_handle: 0, tx_descriptor: 0, tx_counter: 0, in_tx: false, bulk: None };
     if !login.database.is_empty() {
         let r = s.conn.execute(&format!("USE {}", crate::tools::bracket(&login.database)));
         if r.first_error().is_some() {
@@ -839,8 +875,23 @@ fn serve_connection(server: Server, stream: TcpStream, cfg: Arc<Config>) {
         if !wait_readable(&probe, &mut s.conn) {
             return;
         }
-        let (kind, status, payload) = match s.t.read_message() {
-            Ok(m) => m,
+        let (kind, status, payload) = match s.t.read_request() {
+            Ok(Request::Message(k, st, p)) => (k, st, p),
+            Ok(Request::Bulk(first, eom)) => {
+                trace(&format!("bulk load, first packet {} bytes", first.len()));
+                let out = s.bulk_load(first, eom).unwrap_or_else(|msg| {
+                    eprintln!("tsql-serve: a bulk load could not be processed: {}", msg);
+                    let mut out = vec![];
+                    error_token(&mut out, &SqlError::new(4832, format!("Bulk load: {}", msg)));
+                    done(&mut out, 0xFD, DONE_ERROR, 0);
+                    out
+                });
+                if let Err(e) = s.t.send(T_REPLY, &out) {
+                    trace(&format!("sending the reply failed: {} ({:?})", e, e.kind()));
+                    return;
+                }
+                continue;
+            }
             Err(e) => {
                 trace(&format!("the client's connection ended: {} ({:?})", e, e.kind()));
                 return;
@@ -863,10 +914,8 @@ fn serve_connection(server: Server, stream: TcpStream, cfg: Arc<Config>) {
                 Ok(out)
             }
             T_BULK => {
-                let mut out = vec![];
-                error_token(&mut out, &SqlError::new(4004, "Bulk load is not supported by this server."));
-                done(&mut out, 0xFD, DONE_ERROR, 0);
-                Ok(out)
+                // a bulk load that fitted in one packet
+                s.bulk_load(payload, true)
             }
             other => {
                 eprintln!("tsql-serve: closing a session: unsupported packet type {}", other);

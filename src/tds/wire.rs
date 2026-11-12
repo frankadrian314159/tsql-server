@@ -152,6 +152,15 @@ pub enum Wire {
     Dto(u8),
     Guid,
     Xml,
+    /// `sql_variant`: a value carries its own base type
+    Variant,
+    /// A CLR user-defined type, which is how SQL Server sends `hierarchyid` (0), `geometry` (1) and `geography` (2): the
+    /// bytes of the value, as partially length-prefixed chunks.
+    Udt(u8),
+    /// The legacy large object types `text`, `ntext` and `image`.
+    Text,
+    NText,
+    Image,
 }
 
 /// A parsed TYPE_INFO: the type, and whether it is one of the fixed-length types whose values carry no length byte.
@@ -163,7 +172,12 @@ pub struct Ti {
 
 impl Wire {
     fn is_plp(&self) -> bool {
-        matches!(self, Wire::VarChar(PLP) | Wire::NVarChar(PLP) | Wire::VarBinary(PLP) | Wire::Xml)
+        matches!(self, Wire::VarChar(PLP) | Wire::NVarChar(PLP) | Wire::VarBinary(PLP) | Wire::Xml | Wire::Udt(_))
+    }
+
+    /// Does a column of this type carry the name of its table in COLMETADATA (the legacy large objects do)?
+    pub fn has_table_name(&self) -> bool {
+        matches!(self, Wire::Text | Wire::NText | Wire::Image)
     }
 
     /// The wire type that carries a column of SQL type `dt`; `observed` is the longest value in the column
@@ -195,11 +209,11 @@ impl Wire {
             DataType::VarChar(n) => var(*n, 1).map(Wire::VarChar).unwrap_or(Wire::VarChar(PLP)),
             DataType::NChar(n) => var(*n, 2).map(|l| if *n >= 0 && l as i32 == *n * 2 { Wire::NChar(l) } else { Wire::NVarChar(l) }).unwrap_or(Wire::NVarChar(PLP)),
             DataType::NVarChar(n) => var(*n, 2).map(Wire::NVarChar).unwrap_or(Wire::NVarChar(PLP)),
-            DataType::Text => Wire::VarChar(PLP),
-            DataType::NText => Wire::NVarChar(PLP),
+            DataType::Text => Wire::Text,
+            DataType::NText => Wire::NText,
             DataType::Binary(n) => var(*n, 1).map(|l| if *n >= 0 && l as i32 == *n { Wire::Binary(l) } else { Wire::VarBinary(l) }).unwrap_or(Wire::VarBinary(PLP)),
             DataType::VarBinary(n) => var(*n, 1).map(Wire::VarBinary).unwrap_or(Wire::VarBinary(PLP)),
-            DataType::Image => Wire::VarBinary(PLP),
+            DataType::Image => Wire::Image,
             DataType::Timestamp => Wire::Binary(8),
             DataType::Date => Wire::Date,
             DataType::Time(s) => Wire::Time((*s).min(7)),
@@ -209,9 +223,11 @@ impl Wire {
             DataType::DateTimeOffset(s) => Wire::Dto((*s).min(7)),
             DataType::Guid => Wire::Guid,
             DataType::Xml => Wire::Xml,
-            // sent as the bytes it is stored as
-            DataType::HierarchyId | DataType::Geometry | DataType::Geography => Wire::VarBinary(PLP),
-            DataType::Variant | DataType::Other(_) => Wire::NVarChar(PLP),
+            DataType::HierarchyId => Wire::Udt(0),
+            DataType::Geometry => Wire::Udt(1),
+            DataType::Geography => Wire::Udt(2),
+            DataType::Variant => Wire::Variant,
+            DataType::Other(_) => Wire::NVarChar(PLP),
         }
     }
 
@@ -243,7 +259,29 @@ impl Wire {
             Wire::Dto(s) => format!("datetimeoffset({})", s),
             Wire::Guid => "uniqueidentifier".into(),
             Wire::Xml => "xml".into(),
+            Wire::Variant => "sql_variant".into(),
+            Wire::Udt(0) => "hierarchyid".into(),
+            Wire::Udt(1) => "geometry".into(),
+            Wire::Udt(_) => "geography".into(),
+            Wire::Text => "varchar(max)".into(),
+            Wire::NText => "nvarchar(max)".into(),
+            Wire::Image => "varbinary(max)".into(),
         }
+    }
+}
+
+/// The name, and the assembly-qualified name, of the CLR type that carries `hierarchyid`, `geometry` or `geography`.
+fn udt_names(kind: u8) -> (&'static str, &'static str) {
+    let (name, class) = match kind {
+        0 => ("hierarchyid", "SqlHierarchyId"),
+        1 => ("geometry", "SqlGeometry"),
+        _ => ("geography", "SqlGeography"),
+    };
+    let _ = class;
+    match kind {
+        0 => (name, "Microsoft.SqlServer.Types.SqlHierarchyId, Microsoft.SqlServer.Types, Version=11.0.0.0, Culture=neutral, PublicKeyToken=89845dcd8080cc91"),
+        1 => (name, "Microsoft.SqlServer.Types.SqlGeometry, Microsoft.SqlServer.Types, Version=11.0.0.0, Culture=neutral, PublicKeyToken=89845dcd8080cc91"),
+        _ => (name, "Microsoft.SqlServer.Types.SqlGeography, Microsoft.SqlServer.Types, Version=11.0.0.0, Culture=neutral, PublicKeyToken=89845dcd8080cc91"),
     }
 }
 
@@ -270,7 +308,7 @@ pub fn write_typeinfo(out: &mut Vec<u8>, w: &Wire) {
     match w {
         Wire::Bit => out.extend_from_slice(&[0x68, 1]),
         Wire::Int(n) => out.extend_from_slice(&[0x26, *n]),
-        Wire::Dec(p, s) => out.extend_from_slice(&[0x6C, dec_len(*p) as u8, *p, *s]),
+        Wire::Dec(p, s) => out.extend_from_slice(&[0x6C, 17, *p, *s]),
         Wire::Money(n) => out.extend_from_slice(&[0x6E, *n]),
         Wire::Float(n) => out.extend_from_slice(&[0x6D, *n]),
         Wire::Char(n) | Wire::VarChar(n) | Wire::NChar(n) | Wire::NVarChar(n) => {
@@ -294,6 +332,37 @@ pub fn write_typeinfo(out: &mut Vec<u8>, w: &Wire) {
         Wire::Dto(s) => out.extend_from_slice(&[0x2B, *s]),
         Wire::Guid => out.extend_from_slice(&[0x24, 16]),
         Wire::Xml => out.extend_from_slice(&[0xF1, 0]),
+        Wire::Variant => {
+            out.push(0x62);
+            out.extend_from_slice(&8009u32.to_le_bytes());
+        }
+        Wire::Udt(kind) => {
+            let (name, assembly) = udt_names(*kind);
+            out.push(0xF0);
+            out.extend_from_slice(&PLP.to_le_bytes());
+            put_bvar(out, "");
+            put_bvar(out, "sys");
+            put_bvar(out, name);
+            put_usvar(out, assembly);
+        }
+        Wire::Text | Wire::NText => {
+            out.push(if matches!(w, Wire::Text) { 0x23 } else { 0x63 });
+            out.extend_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+            out.extend_from_slice(&COLLATION);
+        }
+        Wire::Image => {
+            out.push(0x22);
+            out.extend_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+        }
+    }
+}
+
+/// What follows the TYPE_INFO of a column in COLMETADATA when the type is one of the legacy large objects: the name of
+/// the table it belongs to (not known here, so it is empty).
+pub fn write_table_name(out: &mut Vec<u8>, w: &Wire) {
+    if w.has_table_name() {
+        out.push(1);
+        put_usvar(out, "");
     }
 }
 
@@ -361,8 +430,49 @@ pub fn read_typeinfo(rd: &mut Rd) -> R<Ti> {
             }
             var(Wire::Xml)
         }
+        0x62 => {
+            rd.u32()?;
+            var(Wire::Variant)
+        }
+        0xF0 => {
+            rd.u16()?;
+            rd.bvarchar()?;
+            rd.bvarchar()?;
+            let name = rd.bvarchar()?;
+            let n = rd.u16()? as usize;
+            rd.utf16(n)?;
+            var(match name.to_ascii_lowercase().as_str() {
+                "hierarchyid" => Wire::Udt(0),
+                "geometry" => Wire::Udt(1),
+                "geography" => Wire::Udt(2),
+                // another CLR type: its bytes can still be carried
+                _ => Wire::VarBinary(PLP),
+            })
+        }
+        0x23 | 0x63 => {
+            rd.u32()?;
+            rd.take(5)?;
+            // a table name follows in COLMETADATA, which the caller of a column list skips (`skip_table_name`)
+            var(if tok == 0x23 { Wire::Text } else { Wire::NText })
+        }
+        0x22 => {
+            rd.u32()?;
+            var(Wire::Image)
+        }
         other => Err(format!("unsupported parameter type 0x{:02X}", other)),
     }
+}
+
+/// Skip the table name that follows the TYPE_INFO of a legacy large object column in COLMETADATA.
+pub fn skip_table_name(rd: &mut Rd, w: &Wire) -> R<()> {
+    if w.has_table_name() {
+        let parts = rd.u8()?;
+        for _ in 0..parts {
+            let n = rd.u16()? as usize;
+            rd.utf16(n)?;
+        }
+    }
+    Ok(())
 }
 
 // ----------------------------------------------------------------------------- values: writing
@@ -401,7 +511,11 @@ fn put_plp(out: &mut Vec<u8>, bytes: &[u8]) {
 /// Write one value of type `w` (the length prefix included).
 pub fn write_value(out: &mut Vec<u8>, w: &Wire, v: &Value) {
     if v.is_null() {
-        if w.is_plp() {
+        if matches!(w, Wire::Variant) {
+            out.extend_from_slice(&0u32.to_le_bytes());
+        } else if w.has_table_name() {
+            out.push(0);
+        } else if w.is_plp() {
             out.extend_from_slice(&u64::MAX.to_le_bytes());
         } else if matches!(w, Wire::Char(_) | Wire::VarChar(_) | Wire::NChar(_) | Wire::NVarChar(_) | Wire::Binary(_) | Wire::VarBinary(_)) {
             out.extend_from_slice(&0xFFFFu16.to_le_bytes());
@@ -511,6 +625,34 @@ pub fn write_value(out: &mut Vec<u8>, w: &Wire, v: &Value) {
             put_utf16(&mut bytes, &convert::to_str(v));
             put_plp(out, &bytes);
         }
+        Wire::Udt(_) => {
+            let bytes = match v {
+                Value::Bin(b) => crate::spatial::external(b),
+                o => convert::to_str(o).into_bytes(),
+            };
+            put_plp(out, &bytes);
+        }
+        Wire::Text | Wire::NText | Wire::Image => {
+            let bytes = match w {
+                Wire::Text => to_cp1252(&convert::to_str(v)),
+                Wire::NText => {
+                    let mut b = vec![];
+                    put_utf16(&mut b, &convert::to_str(v));
+                    b
+                }
+                _ => match v {
+                    Value::Bin(b) => b.clone(),
+                    o => convert::to_str(o).into_bytes(),
+                },
+            };
+            // a text pointer (16 bytes) and a timestamp (8), which clients keep and never use here, then the length
+            out.push(16);
+            out.extend_from_slice(&[0x01; 16]);
+            out.extend_from_slice(&[0u8; 8]);
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(&bytes);
+        }
+        Wire::Variant => write_variant(out, v),
         Wire::Date => {
             let d = match as_type(v, &DataType::Date) {
                 Value::Date(d) => d,
@@ -618,6 +760,31 @@ fn time_from(b: &[u8], scale: u8) -> NaiveTime {
 /// Read one value of the given type.
 pub fn read_value(rd: &mut Rd, ti: &Ti) -> R<Value> {
     let w = &ti.w;
+    match w {
+        Wire::Variant => return read_variant(rd),
+        Wire::Text | Wire::NText | Wire::Image => {
+            let ptr = rd.u8()? as usize;
+            if ptr == 0 {
+                return Ok(Value::Null);
+            }
+            rd.take(ptr)?;
+            rd.take(8)?;
+            let n = rd.u32()? as usize;
+            let d = rd.take(n)?;
+            return Ok(match w {
+                Wire::Text => Value::Str(from_cp1252(d)),
+                Wire::NText => Value::Str(decode_utf16(d)),
+                _ => Value::Bin(d.to_vec()),
+            });
+        }
+        Wire::Udt(_) => {
+            return Ok(match read_plp(rd)? {
+                None => Value::Null,
+                Some(d) => Value::Bin(d),
+            })
+        }
+        _ => {}
+    }
     // length of the value in bytes, or None for NULL
     let len = if ti.fixed {
         Some(match w {
@@ -713,6 +880,161 @@ pub fn read_value(rd: &mut Rd, ti: &Ti) -> R<Value> {
             Value::Dto(DateTime::<FixedOffset>::from_naive_utc_and_offset(utc, tz))
         }
         Wire::Guid => Value::Guid(Uuid::from_bytes_le(b.try_into().map_err(|_| short())?)),
+        Wire::Variant | Wire::Udt(_) | Wire::Text | Wire::NText | Wire::Image => unreachable!("handled above"),
+    })
+}
+
+// ----------------------------------------------------------------------------- sql_variant
+/// A `sql_variant` value: its total length, its base type, the base type's properties, then the value's bytes.
+fn write_variant(out: &mut Vec<u8>, v: &Value) {
+    let mut body = vec![];
+    let mut put_str = |body: &mut Vec<u8>, bytes: &[u8], base: u8| {
+        body.push(base);
+        body.push(7);
+        body.extend_from_slice(&COLLATION);
+        body.extend_from_slice(&(bytes.len().min(8000) as u16).to_le_bytes());
+        body.extend_from_slice(&bytes[..bytes.len().min(8000)]);
+    };
+    match v {
+        Value::Int(i) => {
+            body.extend_from_slice(&[0x38, 0]);
+            body.extend_from_slice(&i.to_le_bytes());
+        }
+        Value::BigInt(i) => {
+            body.extend_from_slice(&[0x7F, 0]);
+            body.extend_from_slice(&i.to_le_bytes());
+        }
+        Value::Bit(b) => body.extend_from_slice(&[0x32, 0, *b as u8]),
+        Value::Float(f) => {
+            body.extend_from_slice(&[0x3E, 0]);
+            body.extend_from_slice(&f.to_le_bytes());
+        }
+        Value::Dec(d) => {
+            let p = d.precision().clamp(1, 38) as u8;
+            body.extend_from_slice(&[0x6A, 2, p, d.s]);
+            body.push(if d.m < 0 { 0 } else { 1 });
+            body.extend_from_slice(&d.m.unsigned_abs().to_le_bytes()[..dec_len(p) - 1]);
+        }
+        Value::Str(s) => {
+            let mut b = vec![];
+            put_utf16(&mut b, s);
+            put_str(&mut body, &b, 0xE7);
+        }
+        Value::Bin(b) => {
+            body.extend_from_slice(&[0xA5, 2]);
+            body.extend_from_slice(&(b.len().min(8000) as u16).to_le_bytes());
+            body.extend_from_slice(&b[..b.len().min(8000)]);
+        }
+        Value::Date(d) => {
+            body.extend_from_slice(&[0x28, 0]);
+            put_date(&mut body, d);
+        }
+        Value::Time(t) => {
+            body.extend_from_slice(&[0x29, 1, 7]);
+            put_time(&mut body, t, 7);
+        }
+        Value::DateTime(d, DtKind::DateTime2) => {
+            body.extend_from_slice(&[0x2A, 1, 7]);
+            put_time(&mut body, &d.time(), 7);
+            put_date(&mut body, &d.date());
+        }
+        Value::DateTime(d, _) => {
+            body.extend_from_slice(&[0x3D, 0]);
+            let days = (d.date() - base_1900()).num_days() as i32;
+            let nanos = d.time().num_seconds_from_midnight() as u64 * 1_000_000_000 + (d.time().nanosecond() % 1_000_000_000) as u64;
+            let ticks = ((nanos * 3 + 5_000_000) / 10_000_000).min(25_919_999) as u32;
+            body.extend_from_slice(&days.to_le_bytes());
+            body.extend_from_slice(&ticks.to_le_bytes());
+        }
+        Value::Dto(d) => {
+            let utc = d.naive_utc();
+            body.extend_from_slice(&[0x2B, 1, 7]);
+            put_time(&mut body, &utc.time(), 7);
+            put_date(&mut body, &utc.date());
+            body.extend_from_slice(&((d.offset().local_minus_utc() / 60) as i16).to_le_bytes());
+        }
+        Value::Guid(g) => {
+            body.extend_from_slice(&[0x24, 0]);
+            body.extend_from_slice(&g.to_bytes_le());
+        }
+        Value::Null => {
+            out.extend_from_slice(&0u32.to_le_bytes());
+            return;
+        }
+    }
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body);
+}
+
+fn read_variant(rd: &mut Rd) -> R<Value> {
+    let total = rd.u32()? as usize;
+    if total == 0 {
+        return Ok(Value::Null);
+    }
+    let body = rd.take(total)?;
+    let mut r = Rd::new(body);
+    let base = r.u8()?;
+    let props = r.u8()? as usize;
+    let p = r.take(props)?;
+    let rest = &body[r.p..];
+    let short = || "sql_variant value is shorter than its type requires".to_string();
+    Ok(match base {
+        0x38 => Value::Int(i32::from_le_bytes(rest.get(..4).ok_or_else(short)?.try_into().unwrap())),
+        0x30 => Value::Int(*rest.first().ok_or_else(short)? as i32),
+        0x34 => Value::Int(i16::from_le_bytes(rest.get(..2).ok_or_else(short)?.try_into().unwrap()) as i32),
+        0x7F => Value::BigInt(i64::from_le_bytes(rest.get(..8).ok_or_else(short)?.try_into().unwrap())),
+        0x32 => Value::Bit(*rest.first().ok_or_else(short)? != 0),
+        0x3E => Value::Float(f64::from_le_bytes(rest.get(..8).ok_or_else(short)?.try_into().unwrap())),
+        0x3B => Value::Float(f32::from_le_bytes(rest.get(..4).ok_or_else(short)?.try_into().unwrap()) as f64),
+        0x6A | 0x6C => {
+            let s = *p.get(1).ok_or_else(short)?;
+            if rest.len() < 2 || rest.len() > 17 {
+                return Err(short());
+            }
+            let mut raw = [0u8; 16];
+            raw[..rest.len() - 1].copy_from_slice(&rest[1..]);
+            let m = u128::from_le_bytes(raw) as i128;
+            Value::Dec(Dec::new(if rest[0] == 0 { -m } else { m }, s))
+        }
+        0xE7 | 0xEF => Value::Str(decode_utf16(rest)),
+        0xA7 | 0xAF => Value::Str(from_cp1252(rest)),
+        0xA5 | 0xAD => Value::Bin(rest.to_vec()),
+        0x28 => Value::Date(date_from(rest.get(..3).ok_or_else(short)?)?),
+        0x29 => {
+            let s = *p.first().ok_or_else(short)?;
+            Value::Time(time_from(rest, s.min(7)))
+        }
+        0x2A => {
+            let s = (*p.first().ok_or_else(short)?).min(7);
+            let tl = time_len(s);
+            Value::DateTime(NaiveDateTime::new(date_from(rest.get(tl..tl + 3).ok_or_else(short)?)?, time_from(&rest[..tl], s)), DtKind::DateTime2)
+        }
+        0x3D => {
+            let days = i32::from_le_bytes(rest.get(..4).ok_or_else(short)?.try_into().unwrap()) as i64;
+            let ticks = u32::from_le_bytes(rest.get(4..8).ok_or_else(short)?.try_into().unwrap()) as i64;
+            let ms = (ticks * 10 + 1) / 3;
+            Value::DateTime(base_1900().and_hms_opt(0, 0, 0).unwrap() + chrono::Duration::days(days) + chrono::Duration::milliseconds(ms), DtKind::DateTime)
+        }
+        0x3A => {
+            let days = u16::from_le_bytes(rest.get(..2).ok_or_else(short)?.try_into().unwrap()) as i64;
+            let mins = u16::from_le_bytes(rest.get(2..4).ok_or_else(short)?.try_into().unwrap()) as i64;
+            Value::DateTime(base_1900().and_hms_opt(0, 0, 0).unwrap() + chrono::Duration::days(days) + chrono::Duration::minutes(mins), DtKind::SmallDateTime)
+        }
+        0x2B => {
+            let s = (*p.first().ok_or_else(short)?).min(7);
+            let tl = time_len(s);
+            let utc = NaiveDateTime::new(date_from(rest.get(tl..tl + 3).ok_or_else(short)?)?, time_from(&rest[..tl], s));
+            let off = i16::from_le_bytes(rest.get(tl + 3..tl + 5).ok_or_else(short)?.try_into().unwrap()) as i32 * 60;
+            Value::Dto(DateTime::<FixedOffset>::from_naive_utc_and_offset(utc, FixedOffset::east_opt(off).ok_or("bad time zone offset")?))
+        }
+        0x24 => Value::Guid(Uuid::from_bytes_le(rest.try_into().map_err(|_| short())?)),
+        0x3C => {
+            let hi = i32::from_le_bytes(rest.get(..4).ok_or_else(short)?.try_into().unwrap()) as i64;
+            let lo = u32::from_le_bytes(rest.get(4..8).ok_or_else(short)?.try_into().unwrap()) as i64;
+            Value::Dec(Dec::new(((hi << 32) | lo) as i128, 4))
+        }
+        0x7A => Value::Dec(Dec::new(i32::from_le_bytes(rest.get(..4).ok_or_else(short)?.try_into().unwrap()) as i128, 4)),
+        other => return Err(format!("unsupported sql_variant base type 0x{:02X}", other)),
     })
 }
 

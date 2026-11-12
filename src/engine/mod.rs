@@ -225,6 +225,8 @@ pub struct SessionState {
     pub leaf_seen: std::collections::HashSet<String>,
     pub leaf_cache: HashMap<String, spill::RowsRef>,
     pub in_query: bool,
+    /// `SET FMTONLY ON`: queries describe their result and return no rows, other statements are not run.
+    pub fmtonly: bool,
     /// While a statement writes through a view WITH CHECK OPTION: the base table, the filter of the view and the nesting level.
     pub view_check: Option<(String, Expr, i32)>,
     /// Table hints of the statement being run, by table object id (see `Engine::collect_hints`).
@@ -315,6 +317,7 @@ impl SessionState {
             leaf_seen: std::collections::HashSet::new(),
             leaf_cache: HashMap::new(),
             in_query: false,
+            fmtonly: false,
             view_check: None,
             hints: HashMap::new(),
             nowait: false,
@@ -628,6 +631,12 @@ impl<'a> Engine<'a> {
                 return;
             }
         };
+        self.run_parsed(sql, &stmts);
+    }
+
+    /// Run statements that are already parsed as a batch (`sql` is the text they came from, for the statistics and the
+    /// audit; it may be a description).
+    pub fn run_parsed(&mut self, sql: &str, stmts: &[Stmt]) {
         let started = std::time::Instant::now();
         if self.srv.core.audit.is_active() || stmts.iter().any(ddltrig::is_ddl_stmt) {
             self.ses.batch_text = sql.to_string();
@@ -636,7 +645,7 @@ impl<'a> Engine<'a> {
         self.ses.try_depth = 0;
         self.ses.strict = 0;
         self.ses.nest_level = 0;
-        let r = self.exec_stmts(&stmts);
+        let r = self.exec_stmts(stmts);
         if let Err(Interrupt::Error(e)) = r {
             self.report_error(e);
         }
@@ -701,6 +710,9 @@ impl<'a> Engine<'a> {
         }
         if self.ses.showplan && !matches!(st, Stmt::SetOpts(_)) {
             return self.exec_showplan(st);
+        }
+        if self.ses.fmtonly && !matches!(st, Stmt::SetOpts(_)) {
+            return self.exec_fmtonly(st);
         }
         if self.ses.nest_level == 0 {
             self.ses.plan.clear();
@@ -799,6 +811,30 @@ impl<'a> Engine<'a> {
                     }
                     return Err(other);
                 }
+            }
+        }
+    }
+
+    /// SET FMTONLY ON: a query gives the description of its result (its columns, no rows) and nothing else is run; this is how
+    /// client libraries (bulk copy among them) learn the shape of a table.
+    fn exec_fmtonly(&mut self, st: &Stmt) -> Flow<()> {
+        match st {
+            Stmt::Query(q) => {
+                self.ses.dry_run = true;
+                let r = self.exec_query(q, None);
+                self.ses.dry_run = false;
+                let mut rs = r?;
+                rs.rows = Vec::<Row>::new().into();
+                rs.suppress = false;
+                self.emit_rowset(rs);
+                Ok(())
+            }
+            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) | Stmt::Exec(_) | Stmt::ExecStr(_) | Stmt::BulkInsert(_) => Ok(()),
+            _ => {
+                self.ses.fmtonly = false;
+                let r = self.exec_stmt(st);
+                self.ses.fmtonly = true;
+                r
             }
         }
     }
@@ -1249,6 +1285,7 @@ impl<'a> Engine<'a> {
                         "XACT_ABORT" => self.ses.xact_abort = on,
                         "SHOWPLAN_TEXT" | "SHOWPLAN_ALL" => self.ses.showplan = on,
                         "OPTIMIZER" => self.ses.optimizer = on,
+                        "FMTONLY" => self.ses.fmtonly = on,
                         _ => {}
                     }
                 }
