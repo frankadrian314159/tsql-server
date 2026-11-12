@@ -84,7 +84,8 @@ impl<'a> Engine<'a> {
             collect_cluster(tr, &mut leaves, &mut conds);
         }
         let mut wconds: Vec<Expr> = vec![];
-        if let (Some(w), true) = (where_, self.ses.optimizer) {
+        // (a single table is read by `eval_table_ref` with the conditions already pushed down to it)
+        if let (Some(w), true) = (where_, self.ses.optimizer && leaves.len() > 1) {
             let mut c = vec![];
             split_conjuncts(w, &mut c);
             for e in c {
@@ -295,7 +296,7 @@ impl<'a> Engine<'a> {
         let reordered = order.iter().enumerate().any(|(i, &o)| i != o);
         {
             let names: Vec<String> = order.iter().map(|&i| leaves[i].aliases.first().cloned().unwrap_or_default()).collect();
-            self.ses.plan.push(format!("join order: {}{}", names.join(" -> "), if reordered { " (reordered from the query's order)" } else { "" }));
+            plan_note!(self, "join order: {}{}", names.join(" -> "), if reordered { " (reordered from the query's order)" } else { "" });
         }
 
         // join in the chosen order
@@ -368,7 +369,7 @@ impl<'a> Engine<'a> {
                     let alias = leaves[li].aliases.first().cloned().unwrap_or_default();
                     let ar = a.rows.len();
                     let joined = self.join_rowsets(kind, a, right, &on, outer)?;
-                    self.ses.plan.push(format!("join {}: {}; {} rows in, {} out", alias, if inl_note.is_empty() { method.to_string() } else { inl_note.clone() }, ar, joined.rows.len()));
+                    plan_note!(self, "join {}: {}; {} rows in, {} out", alias, if inl_note.is_empty() { method.to_string() } else { inl_note.clone() }, ar, joined.rows.len());
                     acc_est = if on.is_some() { acc_est.max(right_est) } else { acc_est * right_est };
                     acc = Some(joined);
                 }
@@ -561,7 +562,6 @@ impl<'a> Engine<'a> {
             self.ses.ordered_used = true;
         }
         let ps = pushed.len();
-        let desc = ap.describe();
         let mut schema = {
             crate::span!("table_schema");
             super::dml::table_schema(t, alias)
@@ -574,7 +574,7 @@ impl<'a> Engine<'a> {
         mark(&mut schema);
         if self.ses.dry_run {
             let est = self.estimate_table(t, alias, pushed);
-            self.ses.plan.push(format!("scan {} [{} rows]: {}{} ({} condition(s) pushed down) -> est {} rows", alias, total, desc, if ordered { ", read in index order" } else { "" }, ps, est as i64));
+            plan_note!(self, "scan {} [{} rows]: {}{} ({} condition(s) pushed down) -> est {} rows", alias, total, ap.describe(), if ordered { ", read in index order" } else { "" }, ps, est as i64);
             return Ok(Rowset::table_rows(t, alias, vec![]));
         }
         let rows: Vec<Row> = match limit {
@@ -609,7 +609,7 @@ impl<'a> Engine<'a> {
             }
         };
         crate::span!("plan_text_and_rowset");
-        self.ses.plan.push(format!("scan {} [{} rows]: {}{} ({} condition(s) pushed down) -> {} rows", alias, total, desc, if ordered { ", read in index order" } else { "" }, ps, rows.len()));
+        plan_note!(self, "scan {} [{} rows]: {}{} ({} condition(s) pushed down) -> {} rows", alias, total, ap.describe(), if ordered { ", read in index order" } else { "" }, ps, rows.len());
         let mut rs = Rowset::table_rows(t, alias, rows);
         mark(&mut rs.schema);
         Ok(rs)

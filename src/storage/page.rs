@@ -580,6 +580,31 @@ impl Pool {
     fn bt_put(&mut self, root: PageId, key: KeyVals, rid: u64, slot: Slot) -> R<(bool, bool)> {
         let mut path = vec![];
         let leaf = self.find_leaf(root, &|k, r| cmp_tk(k, r, &key, rid) == Ordering::Greater, &mut path)?;
+        Ok(self.put_leaf(root, leaf, Some(path), key, rid, slot)?.0)
+    }
+
+    /// `bt_put` for many entries (in any order; they are sorted first), keeping the leaf of the previous entry for
+    /// the next one when it belongs there too (see `bt_modify_run`). Returns how many entries were new, and whether
+    /// any was too big to stay in its leaf.
+    fn bt_put_run(&mut self, root: PageId, mut items: Vec<(KeyVals, u64, Slot)>) -> R<(u64, bool)> {
+        items.sort_by(|a, b| cmp_tk(&a.0, a.1, &b.0, b.1));
+        let (mut new, mut big) = (0u64, false);
+        let mut cur: Option<PageId> = None;
+        for (key, rid, slot) in items {
+            let leaf = match cur {
+                Some(l) if self.leaf_covers(l, &key, rid) => l,
+                _ => self.find_leaf(root, &|k, r| cmp_tk(k, r, &key, rid) == Ordering::Greater, &mut vec![])?,
+            };
+            let ((n, b), structural) = self.put_leaf(root, leaf, None, key, rid, slot)?;
+            new += n as u64;
+            big |= b;
+            cur = if structural { None } else { Some(leaf) };
+        }
+        Ok((new, big))
+    }
+
+    /// The work of `bt_put` once the leaf is known (see `modify_leaf`); also says whether the leaf was split.
+    fn put_leaf(&mut self, root: PageId, leaf: PageId, path: Option<Vec<(PageId, usize)>>, key: KeyVals, rid: u64, slot: Slot) -> R<((bool, bool), bool)> {
         let entry = LeafEntry::new(key, rid, slot);
         let big = entry.slen as usize > SPILL_AT;
         let size;
@@ -609,9 +634,22 @@ impl Pool {
             *est = Some((entries.len(), size));
         }
         if size > NODE_MAX {
+            let path = match path {
+                Some(p) => p,
+                None => {
+                    let mut p = vec![];
+                    let (k, r) = match &self.frame(leaf)?.node {
+                        Node::Leaf { entries, .. } => entries.first().map(|e| (e.key.clone(), e.rid)).ok_or("tree corrupt: an empty leaf is too big")?,
+                        _ => return Err("tree corrupt: expected a leaf".into()),
+                    };
+                    self.find_leaf(root, &|k2, r2| cmp_tk(k2, r2, &k, r) == Ordering::Greater, &mut p)?;
+                    p
+                }
+            };
             self.split_leaf(root, leaf, path)?;
+            return Ok(((!existed, big), true));
         }
-        Ok((!existed, big))
+        Ok(((!existed, big), false))
     }
 
     fn split_leaf(&mut self, root: PageId, leaf: PageId, path: Vec<(PageId, usize)>) -> R<()> {
@@ -718,6 +756,52 @@ impl Pool {
     fn bt_modify(&mut self, root: PageId, key: &KeyVals, rid: u64, create: bool, f: &mut dyn FnMut(&mut Slot) -> bool) -> R<ModOut> {
         let mut path = vec![];
         let leaf = self.find_leaf(root, &|k, r| cmp_tk(k, r, key, rid) == Ordering::Greater, &mut path)?;
+        self.modify_in_leaf(root, leaf, Some(path), key, rid, create, f)
+    }
+
+    /// Does the leaf `leaf` hold the place of `(key, rid)`: is the position inside the range of the keys the leaf
+    /// holds (or after them, in the rightmost leaf)? Then a descent from the root would end here.
+    fn leaf_covers(&mut self, leaf: PageId, key: &KeyVals, rid: u64) -> bool {
+        match self.frame(leaf) {
+            Ok(f) => match &f.node {
+                Node::Leaf { entries, next, .. } => match (entries.first(), entries.last()) {
+                    (Some(a), Some(z)) => cmp_tk(&a.key, a.rid, key, rid) != Ordering::Greater && (*next == NO_PAGE || cmp_tk(key, rid, &z.key, z.rid) != Ordering::Greater),
+                    _ => false,
+                },
+                _ => false,
+            },
+            Err(_) => false,
+        }
+    }
+
+    /// `bt_modify` for many row ids of one key (the heap of a table), in the order given. The leaf of the previous
+    /// slot is kept and used again for the next one when that slot belongs there too, which saves the descent from
+    /// the root for slots that are close together (a statement's rows are). Returns what each call did.
+    fn bt_modify_run(&mut self, root: PageId, key: &KeyVals, rids: &[u64], create: bool, f: &mut dyn FnMut(u64, &mut Slot) -> bool) -> R<Vec<ModOut>> {
+        let mut outs = Vec::with_capacity(rids.len());
+        let mut cur: Option<PageId> = None;
+        for &rid in rids {
+            let leaf = match cur {
+                Some(l) if self.leaf_covers(l, key, rid) => l,
+                _ => self.find_leaf(root, &|k, r| cmp_tk(k, r, key, rid) == Ordering::Greater, &mut vec![])?,
+            };
+            let mut g = |s: &mut Slot| f(rid, s);
+            let (out, structural) = self.modify_leaf(root, leaf, None, key, rid, create, &mut g)?;
+            cur = if structural { None } else { Some(leaf) };
+            outs.push(out);
+        }
+        Ok(outs)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn modify_in_leaf(&mut self, root: PageId, leaf: PageId, path: Option<Vec<(PageId, usize)>>, key: &KeyVals, rid: u64, create: bool, f: &mut dyn FnMut(&mut Slot) -> bool) -> R<ModOut> {
+        Ok(self.modify_leaf(root, leaf, path, key, rid, create, f)?.0)
+    }
+
+    /// The work of `bt_modify` once the leaf is known; `path` (the inner nodes down to it) is worked out again when it
+    /// is needed and not given. Also says whether the tree changed shape (a split or a merge).
+    #[allow(clippy::too_many_arguments)]
+    fn modify_leaf(&mut self, root: PageId, leaf: PageId, path: Option<Vec<(PageId, usize)>>, key: &KeyVals, rid: u64, create: bool, f: &mut dyn FnMut(&mut Slot) -> bool) -> R<(ModOut, bool)> {
         let mut out = ModOut::default();
         let size;
         {
@@ -732,7 +816,7 @@ impl Pool {
             let existed = pos < entries.len() && cmp_tk(&entries[pos].key, entries[pos].rid, key, rid) == Ordering::Equal;
             if !existed {
                 if !create {
-                    return Ok(out);
+                    return Ok((out, false));
                 }
                 let e = LeafEntry::new(key.clone(), rid, Slot::default());
                 base += e.est();
@@ -744,7 +828,7 @@ impl Pool {
             let changed = f(&mut entries[pos].slot);
             if !changed && !out.created {
                 *est = Some((entries.len(), base));
-                return Ok(out);
+                return Ok((out, false));
             }
             *dirty = true;
             if entries[pos].slot.versions.is_empty() {
@@ -759,12 +843,23 @@ impl Pool {
             }
             *est = Some((entries.len(), size));
         }
-        if size > NODE_MAX {
-            self.split_leaf(root, leaf, path)?;
-        } else if out.removed && leaf != root && size < MERGE_BELOW {
-            self.merge_leaf(root, leaf, path)?;
+        let restructure = size > NODE_MAX || (out.removed && leaf != root && size < MERGE_BELOW);
+        if restructure {
+            let path = match path {
+                Some(p) => p,
+                None => {
+                    let mut p = vec![];
+                    self.find_leaf(root, &|k, r| cmp_tk(k, r, key, rid) == Ordering::Greater, &mut p)?;
+                    p
+                }
+            };
+            if size > NODE_MAX {
+                self.split_leaf(root, leaf, path)?;
+            } else {
+                self.merge_leaf(root, leaf, path)?;
+            }
         }
-        Ok(out)
+        Ok((out, restructure))
     }
 
     fn bt_remove(&mut self, root: PageId, key: &KeyVals, rid: u64) -> R<bool> {
@@ -1343,6 +1438,20 @@ impl Tree {
         }
     }
 
+    /// `put` for many entries (see `Pool::bt_put_run`).
+    pub fn put_run(&self, items: Vec<(KeyVals, u64, Slot)>) {
+        let mut items = items;
+        while !items.is_empty() {
+            let rest = if items.len() > 512 { items.split_off(512) } else { vec![] };
+            let chunk = std::mem::replace(&mut items, rest);
+            let (new, big) = self.st().run(|p| p.bt_put_run(self.root, chunk));
+            if big {
+                self.has_ovf.store(true, AtOrd::Relaxed);
+            }
+            self.entries.fetch_add(new, AtOrd::Relaxed);
+        }
+    }
+
     pub fn put(&self, key: KeyVals, rid: u64, slot: Slot) {
         let (new, big) = self.st().run(|p| p.bt_put(self.root, key, rid, slot));
         if big {
@@ -1365,6 +1474,28 @@ impl Tree {
             self.entries.fetch_sub(1, AtOrd::Relaxed);
         }
         out.found
+    }
+
+    /// `modify` for many slots of one key (see `Pool::bt_modify_run`): `f` is told which row id it is called for.
+    /// Returns, per row id, whether the slot existed (or was created).
+    pub fn modify_run(&self, key: &KeyVals, rids: &[u64], create: bool, mut f: impl FnMut(u64, &mut Slot) -> bool) -> Vec<bool> {
+        let mut found = Vec::with_capacity(rids.len());
+        // in chunks, so that one big statement does not keep the page pool from other sessions for long
+        for chunk in rids.chunks(512) {
+            let outs = self.st().run(|p| p.bt_modify_run(self.root, key, chunk, create, &mut f));
+            for out in outs {
+                if out.big {
+                    self.has_ovf.store(true, AtOrd::Relaxed);
+                }
+                if out.created && !out.removed {
+                    self.entries.fetch_add(1, AtOrd::Relaxed);
+                } else if out.removed && !out.created {
+                    self.entries.fetch_sub(1, AtOrd::Relaxed);
+                }
+                found.push(out.found);
+            }
+        }
+        found
     }
 
     pub fn remove(&self, key: &KeyVals, rid: u64) {
@@ -1483,6 +1614,91 @@ mod tests {
         });
         back.reverse();
         assert_eq!(back, want);
+    }
+
+    /// The batch calls give the same tree as the single ones: random batches of `modify_run` (creating, replacing and
+    /// emptying slots, so leaves split and merge in the middle of a batch) and of `put_run`, against a map, with a
+    /// cache so small that the pages are evicted all the time.
+    #[test]
+    fn batch_modify_and_put_match_a_btreemap_under_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PageStore::open(&dir.path().join("b.db"), true, 16, None).unwrap();
+        let heap = Tree::new(&store);
+        let index = Tree::new(&store);
+        let mut seed = 777u64;
+        let mut hmodel: BTreeMap<u64, usize> = BTreeMap::new();
+        let mut imodel: BTreeMap<(i32, u64), ()> = BTreeMap::new();
+        let hk = key(0);
+        let heap_dump = |t: &Tree| {
+            let mut out = vec![];
+            t.scan(&|_, _| true, true, &mut |_, r, s| {
+                if let Some(Value::Str(p)) = s.versions.first().and_then(|v| v.row.as_ref()).map(|r| r[1].clone()) {
+                    out.push((r, p.len()));
+                }
+                true
+            });
+            out
+        };
+        for step in 0..400 {
+            // a batch of row ids, in no particular order, some of them repeated
+            let n = 1 + (lcg(&mut seed) % 60) as usize;
+            let base = lcg(&mut seed) % 900;
+            let mut rids: Vec<u64> = (0..n).map(|_| base + lcg(&mut seed) % 200).collect();
+            if step % 3 == 0 {
+                rids.sort_unstable();
+                rids.dedup();
+            }
+            match lcg(&mut seed) % 3 {
+                0 | 1 => {
+                    // create or replace; some slots are big enough to fill a leaf on their own
+                    let create = step % 5 != 4;
+                    let pad_of = |rid: u64| if rid % 41 == 0 { 3000 } else { ((rid * 7 + step as u64) % 60) as usize };
+                    let found = heap.modify_run(&hk, &rids, create, |rid, s| {
+                        *s = slot(rid as i32, pad_of(rid));
+                        true
+                    });
+                    for (i, rid) in rids.iter().enumerate() {
+                        let existed = hmodel.contains_key(rid);
+                        assert_eq!(found[i], existed || create, "step {}", step);
+                        if existed || create {
+                            hmodel.insert(*rid, pad_of(*rid));
+                        }
+                    }
+                }
+                _ => {
+                    // empty the slots: they are removed (and the leaves they were in merge)
+                    let found = heap.modify_run(&hk, &rids, false, |_, s| {
+                        s.versions.clear();
+                        true
+                    });
+                    for (i, rid) in rids.iter().enumerate() {
+                        assert_eq!(found[i], hmodel.contains_key(rid), "step {}", step);
+                        hmodel.remove(rid);
+                    }
+                }
+            }
+            // index entries: a run of puts (some of them already there)
+            let items: Vec<(KeyVals, u64, Slot)> = (0..n)
+                .map(|_| {
+                    let (k, r) = ((lcg(&mut seed) % 300) as i32, lcg(&mut seed) % 4);
+                    imodel.insert((k, r), ());
+                    (key(k), r, Slot::default())
+                })
+                .collect();
+            index.put_run(items);
+            if step % 20 == 0 {
+                assert_eq!(heap_dump(&heap), hmodel.iter().map(|(r, p)| (*r, *p)).collect::<Vec<_>>(), "heap at step {}", step);
+                assert_eq!(dump(&index), imodel.keys().copied().collect::<Vec<_>>(), "index at step {}", step);
+            }
+        }
+        assert_eq!(heap_dump(&heap), hmodel.iter().map(|(r, p)| (*r, *p)).collect::<Vec<_>>());
+        assert_eq!(dump(&index), imodel.keys().copied().collect::<Vec<_>>());
+        assert_eq!(heap.entries(), hmodel.len() as u64);
+        assert_eq!(index.entries(), imodel.len() as u64);
+        assert!(store.failed().is_none());
+        let st = store.stats();
+        // the leaves did merge and split in the middle of batches
+        assert!(st.evictions > 0 && st.merges > 0, "{:?}", st);
     }
 
     #[test]

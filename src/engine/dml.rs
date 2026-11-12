@@ -90,6 +90,12 @@ impl<'a> Engine<'a> {
     // ------------------------------------------------------------ INSERT
     pub fn exec_insert(&mut self, ins: &Insert) -> Result<()> {
         crate::span!("exec_insert");
+        // an INSERT through a view is run as an INSERT into its base table, on a copy of the statement (the copy of a big
+        // VALUES list is not free, so a plain table is not given one)
+        let through_view = matches!(&ins.target, Target::Table(name) if self.updatable_source(name, &ins.ctes).is_some());
+        if !through_view {
+            return self.with_ctes(&ins.ctes, |s| s.exec_insert_inner(ins));
+        }
         let mut ins = ins.clone();
         if let Some((base, filter)) = self.rewrite_insert_target(&mut ins) {
             self.set_view_check(&base, filter);
@@ -360,7 +366,10 @@ impl<'a> Engine<'a> {
         //
         // A SERIALIZABLE reader's key range is checked *after* the writes (see `apply_changes_latched`), not here.
         let latch = if matches!(loc, Loc::Db(..) | Loc::GTemp(_)) {
-            let (mut oids, cascade) = self.fk_component(t);
+            let (mut oids, cascade) = {
+                let fc = self.fk_component(t);
+                (fc.0.clone(), fc.1)
+            };
             if cascade {
                 oids.retain(|o| !self.ses.latched.contains(o));
                 if oids.is_empty() {
@@ -422,10 +431,12 @@ impl<'a> Engine<'a> {
                 }
             }
         }
+        // the old images only matter to a table that other tables reference (reading them is a lookup per row)
+        let refs = self.referencing_fks(t);
         let view = self.row_view(loc);
-        let olds: Vec<Row> = ch.updates.iter().map(|u| u.0).chain(ch.deletes.iter().copied()).filter_map(|rid| t.data.get(rid, &view)).collect();
+        let olds: Vec<Row> = if refs.is_empty() { vec![] } else { ch.updates.iter().map(|u| u.0).chain(ch.deletes.iter().copied()).filter_map(|rid| t.data.get(rid, &view)).collect() };
         if !olds.is_empty() {
-            for (_, _, fk) in self.referencing_fks(t) {
+            for (_, _, fk) in refs.iter() {
                 let idx: Vec<usize> = fk.ref_cols.iter().filter_map(|c| t.col_index(c)).collect();
                 if idx.len() != fk.ref_cols.len() {
                     continue;
@@ -445,7 +456,30 @@ impl<'a> Engine<'a> {
 
     /// Ids of the tables connected to `t` by foreign keys, in either direction, transitively (including `t`), and
     /// whether any foreign key among them has a cascading action (`ON DELETE/UPDATE CASCADE | SET NULL | SET DEFAULT`).
-    fn fk_component(&self, t: &Table) -> (Vec<i32>, bool) {
+    fn fk_component(&self, t: &Table) -> crate::catalog::FkComponent {
+        // The answer depends only on the catalog, so it is kept for as long as the catalog does not change (a
+        // temporary table is not in the catalog and is worked out every time).
+        let cache_key = (!t.is_temp).then(|| format!("{}|{}", t.db.to_lowercase(), t.key()));
+        if let Some(k) = &cache_key {
+            let c = self.srv.fk_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((ep, v)) = c.components.get(k) {
+                if *ep == self.srv.epoch {
+                    return v.clone();
+                }
+            }
+        }
+        let v = std::sync::Arc::new(self.compute_fk_component(t));
+        if let Some(k) = cache_key {
+            let mut c = self.srv.fk_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if c.components.len() > 4096 {
+                c.components.clear();
+            }
+            c.components.insert(k, (self.srv.epoch, v.clone()));
+        }
+        v
+    }
+
+    fn compute_fk_component(&self, t: &Table) -> (Vec<i32>, bool) {
         use std::collections::{HashMap, VecDeque};
         type K = (String, String);
         let mut adj: HashMap<K, Vec<K>> = HashMap::new();
@@ -567,14 +601,16 @@ impl<'a> Engine<'a> {
         {
             crate::span!("write_versions");
             let d = &*t.data;
+            let mut items: Vec<(RowId, Option<Row>)> = Vec::with_capacity(ch.updates.len());
             for (rid, row) in &ch.updates {
                 if let Some(old) = d.get(*rid, &view) {
                     applied.old_updated.push(old);
                 }
                 applied.new_updated.push(row.clone());
-                d.push_version(*rid, Some(row.clone()), stamp);
+                items.push((*rid, Some(row.clone())));
                 touched.push(*rid);
             }
+            d.push_versions(std::mem::take(&mut items), stamp);
             let mut dels: Vec<RowId> = ch.deletes.clone();
             dels.sort_unstable();
             dels.dedup();
@@ -582,15 +618,17 @@ impl<'a> Engine<'a> {
                 if let Some(old) = d.get(rid, &view) {
                     applied.deleted.push(old);
                 }
-                d.push_version(rid, None, stamp);
+                items.push((rid, None));
                 touched.push(rid);
             }
+            d.push_versions(std::mem::take(&mut items), stamp);
             for row in &ch.inserts {
                 let rid = d.alloc();
-                d.push_version(rid, Some(row.clone()), stamp);
+                items.push((rid, Some(row.clone())));
                 applied.inserted.push(row.clone());
                 touched.push(rid);
             }
+            d.push_versions(items, stamp);
         }
         if is_var {
             let d = &*t.data;
@@ -794,7 +832,28 @@ impl<'a> Engine<'a> {
     }
 
     /// All (db, key, fk) referencing the given table (including self references).
-    fn referencing_fks(&self, t: &Table) -> Vec<(String, String, FkDef)> {
+    fn referencing_fks(&self, t: &Table) -> crate::catalog::FkRefs {
+        let cache_key = (!t.is_temp).then(|| format!("{}|{}", t.db.to_lowercase(), t.key()));
+        if let Some(k) = &cache_key {
+            let c = self.srv.fk_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((ep, v)) = c.refs.get(k) {
+                if *ep == self.srv.epoch {
+                    return v.clone();
+                }
+            }
+        }
+        let v = std::sync::Arc::new(self.compute_referencing_fks(t));
+        if let Some(k) = cache_key {
+            let mut c = self.srv.fk_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if c.refs.len() > 4096 {
+                c.refs.clear();
+            }
+            c.refs.insert(k, (self.srv.epoch, v.clone()));
+        }
+        v
+    }
+
+    fn compute_referencing_fks(&self, t: &Table) -> Vec<(String, String, FkDef)> {
         let mut out = vec![];
         let tk = t.key();
         for (dn, db) in &self.srv.databases {
@@ -877,7 +936,7 @@ impl<'a> Engine<'a> {
             if batch.is_empty() {
                 break;
             }
-            for (dn, ck, fk) in &refs {
+            for (dn, ck, fk) in refs.iter() {
                 let ref_idx: Vec<usize> = fk.ref_cols.iter().filter_map(|c| t.col_index(c)).collect();
                 let mut keys: Vec<Vec<Value>> = vec![];
                 for &i in &batch {
@@ -975,7 +1034,7 @@ impl<'a> Engine<'a> {
         }
         let tk = t.key();
         let view = self.row_view(loc);
-        for (dn, ck, fk) in &refs {
+        for (dn, ck, fk) in refs.iter() {
             let ref_idx: Vec<usize> = fk.ref_cols.iter().filter_map(|c| t.col_index(c)).collect();
             if !ref_idx.iter().any(|&c| upd_cols.get(c).copied().unwrap_or(true)) {
                 continue;

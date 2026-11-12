@@ -487,6 +487,123 @@ impl TableData {
         }
     }
 
+    /// `push_version` for many slots of one statement. Same result as calling it for each item in turn, but the heap is
+    /// written in one pass (consecutive row ids share a leaf) and so is each index.
+    pub fn push_versions(&self, items: Vec<(RowId, Option<Row>)>, stamp: Stamp) {
+        if items.is_empty() {
+            return;
+        }
+        let rids: Vec<u64> = items.iter().map(|(r, _)| *r as u64).collect();
+        let mut keys: Vec<Vec<Option<KeyVals>>> = items
+            .iter()
+            .map(|(_, row)| match row {
+                Some(r) => self.specs.iter().map(|sp| sp.admits(r).then(|| extract(sp, r))).collect(),
+                None => vec![],
+            })
+            .collect();
+        let mut rows: Vec<Option<Row>> = items.into_iter().map(|(_, r)| r).collect();
+        let mut present: Vec<Vec<bool>> = Vec::with_capacity(rids.len());
+        let mut k = 0usize;
+        self.heap.modify_run(&heap_key(), &rids, true, |_, slot| {
+            let ks = &keys[k];
+            let mut pr = vec![false; ks.len()];
+            for (i, key) in ks.iter().enumerate() {
+                if let Some(key) = key {
+                    let sp = &self.specs[i];
+                    pr[i] = slot.versions.iter().any(|x| x.row.as_ref().is_some_and(|r| sp.admits(r) && extract(sp, r) == *key));
+                }
+            }
+            present.push(pr);
+            slot.versions.push(Version { row: rows[k].take(), stamp });
+            k += 1;
+            true
+        });
+        for i in 0..self.specs.len() {
+            let mut batch: Vec<(KeyVals, u64, Slot)> = vec![];
+            for (j, ks) in keys.iter_mut().enumerate() {
+                if let Some(key) = ks.get_mut(i).and_then(|k| k.take()) {
+                    if !present.get(j).and_then(|p| p.get(i)).copied().unwrap_or(false) {
+                        batch.push((key, rids[j], Slot::default()));
+                    }
+                }
+            }
+            if !batch.is_empty() {
+                self.indexes[i].put_run(batch);
+            }
+        }
+    }
+
+    /// `commit_slot` for many slots (any order, duplicates allowed).
+    pub fn commit_slots(&self, rowids: &[RowId], tx: TxId, ts: u64) {
+        let mut rids: Vec<u64> = rowids.iter().map(|&r| r as u64).collect();
+        rids.sort_unstable();
+        rids.dedup();
+        let mut unused: Vec<(u64, Vec<(usize, KeyVals)>)> = vec![];
+        self.heap.modify_run(&heap_key(), &rids, false, |rid, slot| {
+            let n = slot.versions.len();
+            let mut k = 0;
+            while k < n && slot.versions[n - 1 - k].stamp == Stamp::Tx(tx) {
+                k += 1;
+            }
+            if k == 0 {
+                return false;
+            }
+            let mut removed: Vec<Version> = vec![];
+            if k > 1 {
+                removed = slot.versions.drain(n - k..n - 1).collect();
+            }
+            if let Some(last) = slot.versions.last_mut() {
+                last.stamp = Stamp::Ts(ts);
+            }
+            if !removed.is_empty() {
+                let u = self.unused_keys(&removed, slot);
+                if !u.is_empty() {
+                    unused.push((rid, u));
+                }
+            }
+            true
+        });
+        for (rid, list) in unused {
+            for (i, key) in list {
+                self.indexes[i].remove(&key, rid);
+            }
+        }
+    }
+
+    /// `gc_slot` for many slots (any order, duplicates allowed).
+    pub fn gc_slots(&self, rowids: &[RowId], horizon: u64) {
+        let mut rids: Vec<u64> = rowids.iter().map(|&r| r as u64).collect();
+        rids.sort_unstable();
+        rids.dedup();
+        let mut unused: Vec<(u64, Vec<(usize, KeyVals)>)> = vec![];
+        self.heap.modify_run(&heap_key(), &rids, false, |rid, slot| self.gc_one(rid, slot, horizon, &mut unused));
+        for (rid, list) in unused {
+            for (i, key) in list {
+                self.indexes[i].remove(&key, rid);
+            }
+        }
+    }
+
+    fn gc_one(&self, rid: u64, slot: &mut Slot, horizon: u64, unused: &mut Vec<(u64, Vec<(usize, KeyVals)>)>) -> bool {
+        let keep_from = slot.versions.iter().rposition(|v| matches!(v.stamp, Stamp::Ts(t) if t <= horizon));
+        let Some(k) = keep_from else { return false };
+        let mut changed = false;
+        if k > 0 {
+            let removed: Vec<Version> = slot.versions.drain(..k).collect();
+            let u = self.unused_keys(&removed, slot);
+            if !u.is_empty() {
+                unused.push((rid, u));
+            }
+            changed = true;
+        }
+        // a lone committed delete marker means the row is gone for everyone
+        if slot.versions.len() == 1 && slot.versions[0].row.is_none() {
+            slot.versions.clear();
+            changed = true;
+        }
+        changed
+    }
+
     /// The index entries (index number, key) that only the `removed` versions needed, given the versions that remain.
     fn unused_keys(&self, removed: &[Version], remaining: &Slot) -> Vec<(usize, KeyVals)> {
         let mut out: Vec<(usize, KeyVals)> = vec![];

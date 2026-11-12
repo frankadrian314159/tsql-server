@@ -625,7 +625,7 @@ impl<'a> Engine<'a> {
                 None if from_rowset => format!("streaming rowset source [{} rows read]", scanned),
                 None => format!("streaming hash join [{} probe rows read]: {}", scanned, join_note),
             };
-            self.ses.plan.push(format!("{}, buffered ({}) -> {} rows", what, if rows.is_spilled() { format!("spilled; {} run(s)", spilled) } else { "in memory".to_string() }, rows.count()));
+            plan_note!(self, "{}, buffered ({}) -> {} rows", what, if rows.is_spilled() { format!("spilled; {} run(s)", spilled) } else { "in memory".to_string() }, rows.count());
             return Ok(Some(Rowset { schema: schema_out, rows, suppress: false, report_count: false }));
         }
         // the rows of a plain top-level SELECT go to the client as they leave the final sort or merge
@@ -639,7 +639,7 @@ impl<'a> Engine<'a> {
                 None if from_rowset => format!("streaming rowset source [{} rows read]", scanned),
                 None => format!("streaming hash join [{} probe rows read]: {}", scanned, join_note),
             };
-            self.ses.plan.push(format!("{}{}{}{}, rows streamed to the client -> {} rows", what, group_note, if sel.distinct { ", distinct by sort" } else { "" }, sort_note, sent));
+            plan_note!(self, "{}{}{}{}, rows streamed to the client -> {} rows", what, group_note, if sel.distinct { ", distinct by sort" } else { "" }, sort_note, sent);
             self.ses.rowcount = sent as i64;
             let mut rs = Rowset::empty();
             rs.suppress = true;
@@ -660,7 +660,7 @@ impl<'a> Engine<'a> {
             None if from_rowset => format!("streaming rowset source [{} rows read]", scanned),
             None => format!("streaming hash join [{} probe rows read]: {}", scanned, join_note),
         };
-        self.ses.plan.push(format!("{}{}{}{} -> {} rows", what, group_note, if sel.distinct { ", distinct by sort" } else { "" }, sort_note, out.len()));
+        plan_note!(self, "{}{}{}{} -> {} rows", what, group_note, if sel.distinct { ", distinct by sort" } else { "" }, sort_note, out.len());
         self.finish_rows(sel, order, offset, fetch, &cols, out, &[]).map(Some)
     }
 

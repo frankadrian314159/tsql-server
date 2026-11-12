@@ -98,3 +98,9 @@ fn main() {
     eprintln!("tsql-server listening on {} (TDS 7.4, {}); data: {}", listener.local_addr(), tls_note, dir.as_deref().unwrap_or("in memory"));
     listener.wait();
 }
+
+// The memory allocator of Windows is slow for the many small allocations of the engine; `--features fast-alloc` links mimalloc
+// instead (about a third less time on the benchmark; see docs/performance.md). It is C code, so it is not on by default.
+#[cfg(feature = "fast-alloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

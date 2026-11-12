@@ -32,6 +32,8 @@ required-features = ["gui"]
 default = []
 # span timing for finding hot spots (see src/prof.rs); `cargo run --release --features prof --example bench`
 prof = []
+# link the mimalloc allocator into the binaries (needs a C compiler to build); `cargo build --release --features fast-alloc`
+fast-alloc = ["dep:mimalloc"]
 gui = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:rfd"]
 
 [dependencies]
@@ -51,6 +53,7 @@ eframe = { version = "0.32.3", optional = true }
 egui = { version = "0.32.3", optional = true }
 egui_extras = { version = "0.32.3", optional = true }
 rfd = { version = "0.17.2", optional = true }
+mimalloc = { version = "0.1", optional = true }
 # TLS for the TDS listener (pure Rust crypto provider, no C toolchain needed)
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }

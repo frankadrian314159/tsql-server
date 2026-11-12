@@ -143,10 +143,7 @@ impl<'a> Engine<'a> {
             let mut seen = std::collections::HashSet::new();
             rids.retain(|r| seen.insert(*r));
             if let Some(t) = self.table_by_ref(tab) {
-                let d = &*t.data;
-                for r in rids.iter() {
-                    d.commit_slot(*r, id, ts);
-                }
+                t.data.commit_slots(rids, id, ts);
             }
         }
         core.finish_commit_ts(ts);
@@ -154,10 +151,7 @@ impl<'a> Engine<'a> {
         let horizon = core.horizon();
         for (tab, rids) in &rows {
             if let Some(t) = self.table_by_ref(tab) {
-                let d = &*t.data;
-                for r in rids {
-                    d.gc_slot(*r, horizon);
-                }
+                t.data.gc_slots(rids, horizon);
             }
         }
         core.locks.release_all(id);

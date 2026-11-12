@@ -52,7 +52,8 @@ SELECT
 ```
 
 From Rust: `conn.explain(sql)` returns the same lines, and `conn.last_plan()` returns the decisions (with actual
-row counts) of the statement that last ran. `SET OPTIMIZER OFF` switches the optimizer off for the session (every
+row counts) of the statement that last ran (at most the first 256 lines: a subquery that runs once per outer row would otherwise
+add a line for every row). `SET OPTIMIZER OFF` switches the optimizer off for the session (every
 table is scanned in the written order), which is how the equivalence tests get their baseline.
 
 ## Filtered and included-column indexes

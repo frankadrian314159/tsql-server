@@ -752,6 +752,22 @@ pub struct ServerState {
     pub temp_store: Arc<PageStore>,
     /// Memory budget and location for operators that spill to disk.
     pub work: crate::engine::spill::WorkMem,
+    /// Counts the changes made to the catalog: [`crate::engine::SrvGuard::cat_mut`] bumps it before handing out
+    /// the exclusive reference, so anything derived from the catalog and tagged with the epoch it was derived at
+    /// is current exactly while the epoch is unchanged.
+    pub epoch: u64,
+    /// What DML statements derive from the foreign keys of the catalog (see `engine/dml.rs`).
+    pub fk_cache: std::sync::Mutex<FkCache>,
+}
+
+/// Foreign-key facts about one table, valid for one catalog epoch.
+pub type FkRefs = std::sync::Arc<Vec<(String, String, FkDef)>>;
+pub type FkComponent = std::sync::Arc<(Vec<i32>, bool)>;
+
+#[derive(Default)]
+pub struct FkCache {
+    pub refs: HashMap<String, (u64, FkRefs)>,
+    pub components: HashMap<String, (u64, FkComponent)>,
 }
 
 impl ServerState {
@@ -767,6 +783,8 @@ impl ServerState {
             store: PageStore::memory(),
             temp_store: PageStore::memory(),
             work: crate::engine::spill::WorkMem::default(),
+            epoch: 0,
+            fk_cache: std::sync::Mutex::new(FkCache::default()),
         };
         for (i, n) in ["master", "tempdb", "model", "msdb"].iter().enumerate() {
             s.databases.insert(n.to_string(), Database::new(n, i as i32 + 1));

@@ -129,6 +129,71 @@ so, runs the statement again with a fresh view (the rule `UPDATE` already used f
 Writes to the same store still queue on the pool (updates scale to about 2x at 4 sessions, limited by that and by the
 catalog's per-table latches), as does any scan of a store with a page file.
 
+## Second round: row writes, planning and parsing
+
+Measured with `bench` on 100,000 rows, in memory, against the previous commit, as the median of three runs of each
+(seconds). The machine ran at different speeds during the session, so only the ratios mean anything.
+
+| Workload | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| `EXISTS` subquery over 100,000 outer rows | 2.55 | 1.90 | -25 % |
+| subquery in the select list | 0.042 | 0.034 | -19 % |
+| `sp_executesql` point lookups (20,000) | 0.96 | 0.81 | -16 % |
+| `UPDATE` every row (non-key column) | 1.69 | 1.48 | -13 % |
+| insert 100,000 rows (500 per statement) | 2.15 | 1.88 | -12 % |
+| point lookups by primary key (20,000) | 0.79 | 0.71 | -11 % |
+| 5,000 single-row inserts | 0.32 | 0.28 | -10 % |
+| delete a quarter of the rows | 0.49 | 0.45 | -8 % |
+| `UPDATE` every row (indexed column) | 2.44 | 2.54 | no change |
+| scans, aggregates, sorts, joins, windows | | | within +-5 % |
+| the whole benchmark | 20.3 | 18.7 | -8 % |
+
+1. **Row writes go in batches.** A statement used to write each row with its own descent of the heap tree and of
+   every index (and the commit stamped and collected each row with two more). `TableData::push_versions`, `commit_slots`
+   and `gc_slots` now hand the rows of a statement to `Tree::modify_run` and `Tree::put_run`, which take the page pool
+   once per 512 rows and keep the leaf of the previous row for the next one when it belongs there too. Rows that
+   are neighbours in the heap (a statement's rows are) therefore cost one descent per leaf. A split or a merge in
+   the middle of a batch works its way down from the root again, so the tree stays what single writes would make
+   (`batch_modify_and_put_match_a_btreemap_under_eviction` checks that against a map with a tiny cache).
+2. **Foreign-key facts are cached.** Every `INSERT`, `UPDATE` and `DELETE` walked every table of every database twice
+   (which tables refer to this one, and which tables are connected to it) before it wrote a row. The answers depend on
+   the catalog only, so they are kept with the catalog and tagged with `ServerState::epoch`, which `SrvGuard::cat_mut`
+   raises before it hands out the exclusive reference: any change to the catalog invalidates them. The old images of
+   the rows are no longer fetched (for the latch stripes) for a table that nothing refers to. With a few tables this
+   was worth about 5 microseconds a statement; with a database of hundreds of tables it was far more.
+3. **An `INSERT` no longer copies its own syntax tree** (a 500-row `VALUES` list) unless it goes through a view.
+4. **The plan text is limited to 256 lines per statement** (`PLAN_LINES`). A correlated subquery ran a scan per outer
+   row and added a formatted line to the plan for each, 185,000 lines for the `EXISTS` benchmark; the line is not even
+   built once the limit is reached. `last_plan()` and `SET SHOWPLAN_TEXT` show the first 256.
+5. **Correlated subqueries plan once per statement.** `plan_pushdown_outer` used to work out, for every outer row, which
+   conjunct of the `WHERE` clause belongs to which table and which comparisons take their value from the outer row. All
+   of that except the value is the same for every row, so `PushPlan` keeps it for the rest of the statement (it is
+   per statement, like the cache of uncorrelated subqueries, and is dropped when the statement ends). A `FROM` list of
+   one table no longer collects join conditions, and the description of the access path is built only when it is kept.
+6. **Parsing.** The tokenizer works on bytes (it used to collect every character with its offset first, and found each
+   operator by searching a list), and the parser stopped copying whole tokens to look at them (every identifier was
+   copied twice for each primary expression). A reference tokenizer stays in the tests and a random text comparison
+   checks that the new one produces the same tokens, or the same error, for 60,000 strings.
+
+### Measured and not done
+
+* **A cache of parsed statements keyed by their shape, with the literals taken out.** A point `SELECT` parses in about
+  3 times the time of copying its syntax tree, so filling in the literals of a cached tree instead of parsing again would
+  save about half of the parse time (about a tenth of a lookup). It needs a way to walk and change every kind of
+  expression, and the optimizer reads literals (`ORDER BY 1`, index keys, `TOP`), so a literal that was replaced by a
+  parameter could change a plan. Not worth that risk for the gain.
+* **A faster memory allocator.** Almost everything above is made of small allocations (a token, a column name, a row), and
+  the allocator of Windows is slow at them. The same benchmark linked with `mimalloc` instead, same machine and run
+  conditions (seconds): the whole run 20.4 -> 13.1 (-36 %); `count(*)` 0.17 -> 0.06; `ORDER BY` of all rows 0.50 -> 0.24;
+  `group by + order by` 0.34 -> 0.20; point lookups 0.78 -> 0.55; update of every row 1.67 -> 1.03; eight sessions doing
+  lookups 145,000 -> 230,000 statements per second. That is more than everything in this section together. It is
+  an opt-in feature, because `mimalloc` is C code and needs a C compiler to build (the TLS provider was chosen to
+  avoid that): `cargo build --release --features fast-alloc` links it into `tsql`, `tsql-serve`, `tsql-gui` and the
+  `bench` example (the library sets no allocator). A default build is unchanged and pure Rust. Re-measured with the
+  feature on the final code: the whole benchmark 18.4 -> 11.9 seconds.
+* **Updating an indexed column** (the slowest write, about 14 microseconds a row) did not get faster: each changed row
+  still removes one index entry and adds another, and those are spread over the index, so there is no leaf to keep.
+
 ## Where the time goes now
 
 A point lookup by primary key costs about 20 microseconds from `Connection::execute`: parsing 5-10 (statements with

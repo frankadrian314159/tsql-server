@@ -47,7 +47,7 @@ const SPATIAL_PROPS: &[&str] = &["STSRID", "STX", "STY", "LAT", "LONG"];
 const RESERVED_OK_AS_FUNC: &[&str] = &["LEFT", "RIGHT", "USER", "CURRENT", "KEY", "PERCENT", "DOUBLE", "PRECISION", "FILE", "OFFSETS", "PLAN", "RULE", "READ", "LOAD", "UPDATE", "TRUNCATE", "CONTAINS", "FREETEXT"];
 
 pub struct Parser {
-    toks: Vec<Token>,
+    toks: std::rc::Rc<Vec<Token>>,
     i: usize,
     src: String,
     /// How deeply expressions and queries are nested at this point (see `MAX_NEST`).
@@ -113,7 +113,7 @@ pub fn parse_expr_str(sql: &str) -> R<Expr> {
 
 impl Parser {
     pub fn new(sql: &str) -> R<Parser> {
-        Ok(Parser { toks: tokenize(sql)?, i: 0, src: sql.to_string(), depth: 0 })
+        Ok(Parser { toks: std::rc::Rc::new(tokenize(sql)?), i: 0, src: sql.to_string(), depth: 0 })
     }
 
     // ---------------------------------------------------------------- helpers
@@ -122,6 +122,28 @@ impl Parser {
     }
     fn peek(&self, k: usize) -> &Token {
         &self.toks[(self.i + k).min(self.toks.len() - 1)]
+    }
+    /// The text of the current token when it is a variable (a copy is made only then).
+    fn var_tok(&self) -> Option<String> {
+        match &self.tok().tok {
+            Tok::Var(v) => Some(v.clone()),
+            _ => None,
+        }
+    }
+    /// The text of the current token when it is a string literal.
+    fn str_tok(&self) -> Option<String> {
+        match &self.tok().tok {
+            Tok::Str(v) => Some(v.clone()),
+            _ => None,
+        }
+    }
+    /// Take the current token and give its upper-cased text (`advance` copies the whole token).
+    fn advance_up(&mut self) -> String {
+        let up = self.toks[self.i].up.clone();
+        if self.toks[self.i].tok != Tok::Eof {
+            self.i += 1;
+        }
+        up
     }
     fn advance(&mut self) -> Token {
         let t = self.toks[self.i].clone();
@@ -244,8 +266,8 @@ impl Parser {
             let mut kind = if filter { PredKind::Filter } else { PredKind::BlockAfterInsert };
             let mut explicit = false;
             if !filter && self.is_kw_any(&["AFTER", "BEFORE"]) {
-                let when = self.advance().up;
-                let op = self.advance().up;
+                let when = self.advance_up();
+                let op = self.advance_up();
                 explicit = true;
                 kind = match (when.as_str(), op.as_str()) {
                     ("AFTER", "INSERT") => PredKind::BlockAfterInsert,
@@ -279,7 +301,7 @@ impl Parser {
             loop {
                 let k = self.ident()?.to_uppercase();
                 self.expect_op("=")?;
-                let v = self.advance().up;
+                let v = self.advance_up();
                 if k == "STATE" {
                     state = Some(v == "ON");
                 }
@@ -477,7 +499,7 @@ impl Parser {
 
     fn predicate(&mut self) -> R<Expr> {
         let left = self.add_expr()?;
-        if let Tok::Op(o) = self.tok().tok.clone() {
+        if let Tok::Op(o) = self.tok().tok {
             let op = match o {
                 "=" => Some(BinOp::Eq),
                 "<>" | "!=" => Some(BinOp::Ne),
@@ -656,7 +678,8 @@ impl Parser {
     }
 
     fn primary(&mut self) -> R<Expr> {
-        let t = self.tok().clone();
+        let toks = self.toks.clone();
+        let t = &toks[self.i];
         match &t.tok {
             Tok::Int(v) => {
                 self.i += 1;
@@ -1186,7 +1209,7 @@ impl Parser {
 
     fn frame_bound(&mut self) -> R<Bound> {
         if self.accept_kw("UNBOUNDED") {
-            let d = self.advance().up;
+            let d = self.advance_up();
             return Ok(if d == "PRECEDING" { Bound::UnboundedPreceding } else { Bound::UnboundedFollowing });
         }
         if self.accept_kw("CURRENT") {
@@ -1194,7 +1217,7 @@ impl Parser {
             return Ok(Bound::CurrentRow);
         }
         let e = self.expr()?;
-        let d = self.advance().up;
+        let d = self.advance_up();
         Ok(if d == "PRECEDING" { Bound::Preceding(Box::new(e)) } else { Bound::Following(Box::new(e)) })
     }
 
@@ -1296,12 +1319,12 @@ impl Parser {
 
     fn for_clause(&mut self) -> R<ForClause> {
         self.i += 1;
-        let json = self.advance().up == "JSON";
+        let json = self.advance_up() == "JSON";
         let mut fc = ForClause { json, mode: String::new(), name: None, root: None, without_array_wrapper: false, include_null: false, xml_type: false };
         if self.is_kw_any(&["RAW", "AUTO", "PATH", "EXPLICIT"]) {
-            fc.mode = self.advance().up;
+            fc.mode = self.advance_up();
             if self.accept_op("(") {
-                if let Tok::Str(s) = self.tok().tok.clone() {
+                if let Some(s) = self.str_tok() {
                     fc.name = Some(s);
                     self.i += 1;
                 }
@@ -1309,12 +1332,12 @@ impl Parser {
             }
         }
         while self.accept_op(",") {
-            let w = self.advance().up;
+            let w = self.advance_up();
             match w.as_str() {
                 "ROOT" => {
                     let mut r = "root".to_string();
                     if self.accept_op("(") {
-                        if let Tok::Str(s) = self.tok().tok.clone() {
+                        if let Some(s) = self.str_tok() {
                             r = s;
                             self.i += 1;
                         }
@@ -1367,7 +1390,7 @@ impl Parser {
     fn query_expr(&mut self) -> R<QueryBody> {
         let mut left = self.query_term()?;
         while self.is_kw_any(&["UNION", "EXCEPT"]) {
-            let op = if self.advance().up == "UNION" { SetOp::Union } else { SetOp::Except };
+            let op = if self.advance_up() == "UNION" { SetOp::Union } else { SetOp::Except };
             let all = self.accept_kw("ALL");
             let right = self.query_term()?;
             left = QueryBody::SetOp { op, all, left: Box::new(left), right: Box::new(right) };
@@ -1441,7 +1464,7 @@ impl Parser {
             let mut g = self.group_items()?;
             if self.is_kw("WITH") && self.peek_kw(1, &["ROLLUP", "CUBE"]) {
                 self.i += 1;
-                let kind = self.advance().up;
+                let kind = self.advance_up();
                 let exprs: Vec<Expr> = g
                     .into_iter()
                     .filter_map(|x| if let GroupItem::Expr(e) = x { Some(e) } else { None })
@@ -1458,7 +1481,7 @@ impl Parser {
         let mut items = vec![];
         loop {
             if self.is_kw_any(&["ROLLUP", "CUBE"]) && self.peek_is_op(1, "(") {
-                let rollup = self.advance().up == "ROLLUP";
+                let rollup = self.advance_up() == "ROLLUP";
                 self.expect_op("(")?;
                 let mut a = vec![self.expr()?];
                 while self.accept_op(",") {
@@ -1512,7 +1535,8 @@ impl Parser {
     }
 
     fn select_item(&mut self) -> R<SelectItem> {
-        let t = self.tok().clone();
+        let toks = self.toks.clone();
+        let t = &toks[self.i];
         let n1 = self.peek(1).clone();
         let n1_eq = matches!(n1.tok, Tok::Op("="));
         let is_nonreserved_id = |t: &Token| match &t.tok {
@@ -1521,8 +1545,8 @@ impl Parser {
             _ => false,
         };
         if is_nonreserved_id(&t) && n1_eq {
-            let alias = match t.tok {
-                Tok::Id(s) | Tok::QId(s) | Tok::Str(s) => s,
+            let alias = match &t.tok {
+                Tok::Id(s) | Tok::QId(s) | Tok::Str(s) => s.clone(),
                 _ => unreachable!(),
             };
             self.i += 2;
@@ -1567,7 +1591,7 @@ impl Parser {
             }
         } else if self.alias_ok() {
             alias = Some(self.ident()?);
-        } else if let Tok::Str(s) = self.tok().tok.clone() {
+        } else if let Some(s) = self.str_tok() {
             self.i += 1;
             alias = Some(s);
         }
@@ -1588,7 +1612,7 @@ impl Parser {
                 self.i += 1;
                 kind = JoinKind::Inner;
             } else if self.is_kw_any(&["LEFT", "RIGHT", "FULL"]) {
-                kind = match self.advance().up.as_str() {
+                kind = match self.advance_up().as_str() {
                     "LEFT" => JoinKind::Left,
                     "RIGHT" => JoinKind::Right,
                     _ => JoinKind::Full,
@@ -1699,7 +1723,7 @@ impl Parser {
                 node = self.table_source()?;
                 self.expect_op(")")?;
             }
-        } else if let Tok::Var(v) = self.tok().tok.clone() {
+        } else if let Some(v) = self.var_tok() {
             self.i += 1;
             if self.is_op(".") && self.peek_kw(1, &["NODES"]) {
                 self.i += 2;
@@ -1742,7 +1766,7 @@ impl Parser {
                     loop {
                         let cn = self.ident()?;
                         let ty = self.parse_type()?;
-                        let path = if let Tok::Str(s) = self.tok().tok.clone() {
+                        let path = if let Some(s) = self.str_tok() {
                             self.i += 1;
                             Some(s)
                         } else {
@@ -1868,7 +1892,8 @@ impl Parser {
     }
 
     fn stmt_inner(&mut self) -> R<Stmt> {
-        let t = self.tok().clone();
+        let toks = self.toks.clone();
+        let t = &toks[self.i];
         match &t.tok {
             Tok::Id(_) => {
                 match t.up.as_str() {
@@ -1929,7 +1954,7 @@ impl Parser {
                         Ok(Stmt::Use(self.ident()?))
                     }
                     "COMMIT" | "ROLLBACK" | "SAVE" => {
-                        let w = self.advance().up;
+                        let w = self.advance_up();
                         if !(self.accept_kw("TRAN") || self.accept_kw("TRANSACTION")) {
                             self.accept_kw("WORK");
                         }
@@ -1962,9 +1987,9 @@ impl Parser {
                         self.expect_op(")")?;
                         let mut opts = vec![];
                         if self.accept_kw("WITH") {
-                            opts.push(self.advance().up);
+                            opts.push(self.advance_up());
                             while self.accept_op(",") {
-                                opts.push(self.advance().up);
+                                opts.push(self.advance_up());
                             }
                         }
                         Ok(Stmt::RaiseError { args, opts })
@@ -1997,14 +2022,14 @@ impl Parser {
                         Ok(Stmt::Reconfigure)
                     }
                     "OPEN" | "CLOSE" | "DEALLOCATE" => {
-                        let op = self.advance().up;
+                        let op = self.advance_up();
                         self.accept_kw("GLOBAL");
                         Ok(Stmt::CursorOp { op, name: self.ident()?.to_lowercase() })
                     }
                     "FETCH" => self.st_fetch(),
                     "EXEC" | "EXECUTE" if self.peek_kw(1, &["AS"]) && self.peek_kw(2, &["USER", "LOGIN"]) => {
                         self.i += 2;
-                        let login = self.advance().up == "LOGIN";
+                        let login = self.advance_up() == "LOGIN";
                         self.expect_op("=")?;
                         let name = match self.advance().tok {
                             Tok::Str(s) | Tok::Id(s) | Tok::QId(s) => s,
@@ -2066,11 +2091,11 @@ impl Parser {
                                 let name = self.ident()?.to_uppercase();
                                 let mut val = String::new();
                                 if self.is_kw_any(&["ON", "OFF"]) {
-                                    val = self.advance().up;
+                                    val = self.advance_up();
                                 } else if self.accept_op("=") {
-                                    val = self.advance().up;
+                                    val = self.advance_up();
                                 } else if name == "RECOVERY" {
-                                    val = self.advance().up;
+                                    val = self.advance_up();
                                 }
                                 options.push((name, val));
                                 if !self.accept_op(",") {
@@ -2268,7 +2293,7 @@ impl Parser {
     }
 
     fn perm_stmt(&mut self) -> R<Stmt> {
-        let kind = match self.advance().up.as_str() {
+        let kind = match self.advance_up().as_str() {
             "GRANT" => PermKind::Grant,
             "DENY" => PermKind::Deny,
             _ => PermKind::Revoke,
@@ -2282,7 +2307,7 @@ impl Parser {
         loop {
             let mut words: Vec<String> = vec![];
             while !self.is_eof() && !self.is_op(",") && !self.is_op("(") && !self.is_kw_any(&["ON", "TO", "FROM"]) {
-                words.push(self.advance().up);
+                words.push(self.advance_up());
             }
             if words.is_empty() {
                 return Err(self.err());
@@ -2311,7 +2336,7 @@ impl Parser {
         if self.accept_kw("ON") {
             // optional class prefix: OBJECT::, SCHEMA::, DATABASE::
             if self.peek_is_op(1, ":") && self.peek_is_op(2, ":") {
-                let class = self.advance().up;
+                let class = self.advance_up();
                 self.i += 2;
                 match class.as_str() {
                     "SCHEMA" => target = PermTargetAst::Schema(self.ident()?),
@@ -2416,7 +2441,7 @@ impl Parser {
 
     // ---- DML
     fn target(&mut self) -> R<Target> {
-        if let Tok::Var(v) = self.tok().tok.clone() {
+        if let Some(v) = self.var_tok() {
             self.i += 1;
             return Ok(Target::Var(v.to_lowercase()));
         }
@@ -2516,7 +2541,7 @@ impl Parser {
     fn set_items(&mut self) -> R<Vec<SetItem>> {
         let mut sets = vec![];
         loop {
-            if let Tok::Var(v) = self.tok().tok.clone() {
+            if let Some(v) = self.var_tok() {
                 self.i += 1;
                 let op = self.assign_op().ok_or_else(|| self.err())?;
                 let e = self.expr()?;
@@ -2664,7 +2689,7 @@ impl Parser {
         self.i += 1;
         let mut decls = vec![];
         loop {
-            if let Tok::Var(v) = self.tok().tok.clone() {
+            if let Some(v) = self.var_tok() {
                 self.i += 1;
                 let name = v.to_lowercase();
                 self.accept_kw("AS");
@@ -2709,7 +2734,7 @@ impl Parser {
 
     fn st_set(&mut self) -> R<Stmt> {
         self.i += 1;
-        if let Tok::Var(v) = self.tok().tok.clone() {
+        if let Some(v) = self.var_tok() {
             self.i += 1;
             // SET @x.modify('...')
             if self.is_op(".") && self.peek_kw(1, &["MODIFY"]) {
@@ -2732,20 +2757,20 @@ impl Parser {
                 "TRANSACTION" => {
                     self.expect_kw("ISOLATION")?;
                     self.expect_kw("LEVEL")?;
-                    let mut words = vec![self.advance().up];
+                    let mut words = vec![self.advance_up()];
                     while self.is_kw_any(&["UNCOMMITTED", "COMMITTED", "READ", "REPEATABLE", "SNAPSHOT", "SERIALIZABLE"]) {
-                        words.push(self.advance().up);
+                        words.push(self.advance_up());
                     }
                     opts.push(SetOpt::Isolation(words.join(" ")));
                 }
                 "IDENTITY_INSERT" => {
                     let tbl = self.name_parts()?;
-                    let on = self.advance().up == "ON";
+                    let on = self.advance_up() == "ON";
                     opts.push(SetOpt::IdentityInsert(tbl, on));
                 }
                 "STATISTICS" => {
                     self.advance();
-                    let v = self.advance().up;
+                    let v = self.advance_up();
                     opts.push(SetOpt::Flag("STATISTICS".into(), v));
                 }
                 "ROWCOUNT" | "DATEFIRST" | "TEXTSIZE" | "LOCK_TIMEOUT" | "DEADLOCK_PRIORITY" | "LANGUAGE" | "DATEFORMAT" | "CONTEXT_INFO" => {
@@ -2832,9 +2857,9 @@ impl Parser {
         let mut orient = "NEXT".to_string();
         let mut arg = None;
         if self.is_kw_any(&["NEXT", "PRIOR", "FIRST", "LAST"]) {
-            orient = self.advance().up;
+            orient = self.advance_up();
         } else if self.is_kw_any(&["ABSOLUTE", "RELATIVE"]) {
-            orient = self.advance().up;
+            orient = self.advance_up();
             arg = Some(self.expr()?);
         }
         self.accept_kw("FROM");
@@ -2869,13 +2894,13 @@ impl Parser {
             return Ok(Stmt::ExecStr(parts));
         }
         let mut retvar = None;
-        if let Tok::Var(v) = self.tok().tok.clone() {
+        if let Some(v) = self.var_tok() {
             if self.peek_is_op(1, "=") {
                 retvar = Some(v.to_lowercase());
                 self.i += 2;
             }
         }
-        let (name, is_var) = if let Tok::Var(v) = self.tok().tok.clone() {
+        let (name, is_var) = if let Some(v) = self.var_tok() {
             self.i += 1;
             (vec![v.to_lowercase()], true)
         } else {
@@ -2884,7 +2909,7 @@ impl Parser {
         let mut args = vec![];
         while !self.at_eos() && !(self.is_stmt_start()) {
             let mut aname = None;
-            if let Tok::Var(v) = self.tok().tok.clone() {
+            if let Some(v) = self.var_tok() {
                 if self.peek_is_op(1, "=") {
                     aname = Some(v.to_lowercase());
                     self.i += 2;
@@ -2958,7 +2983,7 @@ impl Parser {
         if self.audit_ahead() {
             return self.audit_stmt("DROP");
         }
-        let what = self.advance().up;
+        let what = self.advance_up();
         if what == "XML" {
             self.expect_kw("SCHEMA")?;
             self.expect_kw("COLLECTION")?;
@@ -2970,7 +2995,7 @@ impl Parser {
             return Ok(Stmt::XmlSchema(Box::new(XmlSchemaStmt::Drop { name: self.name_parts()?, if_exists })));
         }
         if what == "FULLTEXT" {
-            let st = match self.advance().up.as_str() {
+            let st = match self.advance_up().as_str() {
                 "CATALOG" => FullTextStmt::DropCatalog { name: self.ident()? },
                 "INDEX" => {
                     self.expect_kw("ON")?;
@@ -3033,7 +3058,7 @@ impl Parser {
         if parens {
             self.expect_op("(")?;
         }
-        while let Tok::Var(v) = self.tok().tok.clone() {
+        while let Some(v) = self.var_tok() {
             self.i += 1;
             self.accept_kw("AS");
             let ty = self.parse_type()?;
@@ -3043,7 +3068,7 @@ impl Parser {
                 default = Some(self.expr()?);
             }
             while self.is_kw_any(&["OUT", "OUTPUT", "READONLY", "VARYING"]) {
-                match self.advance().up.as_str() {
+                match self.advance_up().as_str() {
                     "OUT" | "OUTPUT" => out = true,
                     "READONLY" => readonly = true,
                     _ => {}
@@ -3155,7 +3180,7 @@ impl Parser {
         }
         self.expect_kw("ON")?;
         let object = if self.peek_is_op(1, ":") && self.peek_is_op(2, ":") {
-            let class = self.advance().up;
+            let class = self.advance_up();
             self.i += 2;
             match class.as_str() {
                 "SCHEMA" => ObjSel::Schema(self.ident()?),
@@ -3253,7 +3278,7 @@ impl Parser {
                         self.ident()?;
                     }
                     while self.is_kw_any(&["ADD", "DROP"]) {
-                        let is_add = self.advance().up == "ADD";
+                        let is_add = self.advance_up() == "ADD";
                         let items = self.audit_items()?;
                         if is_add {
                             add.extend(items);
@@ -3334,7 +3359,7 @@ impl Parser {
     fn spatial_options(&mut self, sp: &mut SpatialIndexSpec) -> R<()> {
         self.expect_op("(")?;
         while !self.is_op(")") && !self.is_eof() {
-            let key = self.advance().up;
+            let key = self.advance_up();
             self.expect_op("=")?;
             match key.as_str() {
                 "BOUNDING_BOX" => {
@@ -3363,11 +3388,11 @@ impl Parser {
                     loop {
                         if matches!(self.tok().tok, Tok::Id(_)) && self.peek_is_op(1, "=") {
                             // LEVEL_n = density
-                            let lvl = self.advance().up;
+                            let lvl = self.advance_up();
                             self.i += 1;
                             k = lvl.trim_start_matches("LEVEL_").parse::<usize>().ok().filter(|n| (1..=4).contains(n)).ok_or_else(|| self.err())? - 1;
                         }
-                        g[k.min(3)] = match self.advance().up.as_str() {
+                        g[k.min(3)] = match self.advance_up().as_str() {
                             "LOW" => 1,
                             "MEDIUM" => 2,
                             "HIGH" => 3,
@@ -3403,7 +3428,7 @@ impl Parser {
     /// `CREATE | ALTER FULLTEXT CATALOG | INDEX`; the cursor is on FULLTEXT.
     fn fulltext_stmt(&mut self, alter: bool) -> R<Stmt> {
         self.expect_kw("FULLTEXT")?;
-        let what = self.advance().up;
+        let what = self.advance_up();
         let st = match (what.as_str(), alter) {
             ("CATALOG", false) => {
                 let name = self.ident()?;
@@ -3414,7 +3439,7 @@ impl Parser {
                         default = true;
                     } else if self.accept_kw("ACCENT_SENSITIVITY") {
                         self.accept_op("=");
-                        accent = self.advance().up == "ON";
+                        accent = self.advance_up() == "ON";
                     } else if self.is_op("(") {
                         self.skip_parens()?;
                     } else {
@@ -3429,7 +3454,7 @@ impl Parser {
                     self.expect_kw("DEFAULT")?;
                     "DEFAULT".to_string()
                 } else {
-                    self.advance().up
+                    self.advance_up()
                 };
                 while !self.at_eos() && !self.is_kw_any(&["CREATE", "ALTER", "DROP", "SELECT", "INSERT", "UPDATE", "DELETE", "EXEC", "EXECUTE", "IF", "BEGIN", "PRINT", "DECLARE", "SET", "USE"]) {
                     self.i += 1;
@@ -3461,7 +3486,7 @@ impl Parser {
                     while !self.at_eos() && !self.is_kw_any(&["CREATE", "ALTER", "DROP", "SELECT", "INSERT", "UPDATE", "DELETE", "EXEC", "EXECUTE", "IF", "BEGIN", "PRINT", "DECLARE", "SET", "USE"]) && !(paren && self.is_op(")")) {
                         if self.accept_kw("CHANGE_TRACKING") {
                             self.accept_op("=");
-                            tracking = Some(self.advance().up);
+                            tracking = Some(self.advance_up());
                         } else {
                             self.i += 1;
                         }
@@ -3475,13 +3500,13 @@ impl Parser {
             ("INDEX", true) => {
                 self.expect_kw("ON")?;
                 let table = self.name_parts()?;
-                let action = match self.advance().up.as_str() {
+                let action = match self.advance_up().as_str() {
                     "ENABLE" => FtAlter::Enable,
                     "DISABLE" => FtAlter::Disable,
                     "SET" => {
                         self.expect_kw("CHANGE_TRACKING")?;
                         self.accept_op("=");
-                        FtAlter::SetTracking(self.advance().up)
+                        FtAlter::SetTracking(self.advance_up())
                     }
                     "ADD" => FtAlter::AddCols(self.ft_columns_def()?),
                     "DROP" => {
@@ -3562,7 +3587,7 @@ impl Parser {
                 let defs = self.table_body()?;
                 let mut versioning = None;
                 while self.is_kw_any(&["ON", "WITH", "TEXTIMAGE_ON"]) {
-                    let with = self.advance().up == "WITH";
+                    let with = self.advance_up() == "WITH";
                     if with && self.is_op("(") {
                         if let Some(v) = self.table_with_options()? {
                             versioning = Some(v);
@@ -3599,7 +3624,7 @@ impl Parser {
                     let using = self.ident()?;
                     let mut secondary = None;
                     if self.accept_kw("FOR") {
-                        secondary = match self.advance().up.as_str() {
+                        secondary = match self.advance_up().as_str() {
                             "VALUE" => Some('V'),
                             "PATH" => Some('P'),
                             "PROPERTY" => Some('R'),
@@ -3619,7 +3644,7 @@ impl Parser {
                 }
                 let (mut include, mut filter) = (vec![], None);
                 while self.is_kw_any(&["INCLUDE", "WHERE", "WITH", "ON"]) {
-                    let w = self.advance().up;
+                    let w = self.advance_up();
                     if w == "WITH" && self.is_op("(") && spatial.is_some() {
                         self.spatial_options(spatial.as_mut().unwrap())?;
                     } else if w == "WHERE" {
@@ -3691,9 +3716,9 @@ impl Parser {
                 } else if !self.accept_kw("AFTER") {
                     self.expect_kw("FOR")?;
                 }
-                let mut events = vec![self.advance().up];
+                let mut events = vec![self.advance_up()];
                 while self.accept_op(",") {
-                    events.push(self.advance().up);
+                    events.push(self.advance_up());
                 }
                 if self.accept_kw("WITH") {
                     self.i += 1;
@@ -3842,7 +3867,7 @@ impl Parser {
                 }
             } else if self.is_kw("NO") && self.peek_kw(1, &["MINVALUE", "MAXVALUE", "CYCLE", "CACHE"]) {
                 self.i += 1;
-                if self.advance().up == "CYCLE" {
+                if self.advance_up() == "CYCLE" {
                     o.cycle = Some(false);
                 }
             } else if self.accept_kw("CYCLE") {
@@ -3865,7 +3890,7 @@ impl Parser {
         let (mut ret_type, mut ret_table, mut ret_var, mut inline_flag) = (None, None, None, false);
         if self.accept_kw("TABLE") {
             inline_flag = true;
-        } else if let Tok::Var(v) = self.tok().tok.clone() {
+        } else if let Some(v) = self.var_tok() {
             self.i += 1;
             ret_var = Some(v.to_lowercase());
             self.expect_kw("TABLE")?;
@@ -3942,14 +3967,14 @@ impl Parser {
         let (mut on_delete, mut on_update) = ("NO ACTION".to_string(), "NO ACTION".to_string());
         while self.is_kw("ON") && self.peek_kw(1, &["DELETE", "UPDATE"]) {
             self.i += 1;
-            let which = self.advance().up;
+            let which = self.advance_up();
             let act = if self.accept_kw("NO") {
                 self.expect_kw("ACTION")?;
                 "NO ACTION".to_string()
             } else if self.accept_kw("SET") {
-                format!("SET {}", self.advance().up)
+                format!("SET {}", self.advance_up())
             } else {
-                self.advance().up
+                self.advance_up()
             };
             if which == "DELETE" {
                 on_delete = act;
@@ -4236,7 +4261,7 @@ impl Parser {
             return Ok(Stmt::AlterTable { name, action: AlterAction::AddDefs(defs) });
         }
         if self.accept_kw("DROP") {
-            let what = self.advance().up;
+            let what = self.advance_up();
             let mut if_ex = false;
             if self.accept_kw("IF") {
                 self.expect_kw("EXISTS")?;
@@ -4283,7 +4308,7 @@ impl Parser {
             if self.accept_kw("WITH") {
                 self.advance();
             }
-            let enable = self.advance().up == "CHECK";
+            let enable = self.advance_up() == "CHECK";
             self.expect_kw("CONSTRAINT")?;
             let cn = if self.accept_kw("ALL") { None } else { Some(self.ident()?) };
             return Ok(Stmt::AlterTable { name, action: AlterAction::CheckConstraint { name: cn, enable } });

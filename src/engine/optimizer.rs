@@ -370,101 +370,80 @@ impl<'a> Engine<'a> {
         if !self.ses.optimizer {
             return vec![];
         }
-        struct Leaf {
-            alias: String,
-            cols: Vec<String>,
-            preserved: bool,
-        }
-        fn leaves(eng: &Engine, tr: &TableRef, preserved: bool, out: &mut Vec<Leaf>, opaque: &mut bool) {
-            match tr {
-                TableRef::Table { name, alias, .. } => {
-                    let loc = eng.locate(name);
-                    let a = alias.clone().unwrap_or_else(|| name.last().unwrap().clone());
-                    match eng.table_ref(&loc) {
-                        Some(t) if name.len() > 1 || !eng.ses.cte_stack.iter().any(|m| m.contains_key(&name[0].to_lowercase())) => {
-                            out.push(Leaf { alias: a.to_lowercase(), cols: t.columns.iter().map(|c| c.name.to_lowercase()).collect(), preserved });
-                        }
-                        _ => *opaque = true,
-                    }
+        // A correlated subquery is planned once per outer row, always the same way but for the values taken from the
+        // outer row: what does not depend on them is worked out once per statement (see `PushPlan`).
+        if let Some(o) = outer {
+            let key = (from.as_ptr() as usize, w as *const Expr as usize);
+            let plan = match self.ses.push_plans.get(&key) {
+                Some(p) => p.clone(),
+                None => {
+                    let p = std::sync::Arc::new(self.build_push_plan(from, w));
+                    self.ses.push_plans.insert(key, p.clone());
+                    p
                 }
-                TableRef::Join { kind, left, right, .. } => {
-                    let lp = preserved && !matches!(kind, JoinKind::Right | JoinKind::Full);
-                    let rp = preserved && !matches!(kind, JoinKind::Left | JoinKind::Full | JoinKind::CrossApply | JoinKind::OuterApply);
-                    leaves(eng, left, lp, out, opaque);
-                    leaves(eng, right, rp, out, opaque);
-                }
-                _ => *opaque = true,
-            }
+            };
+            return plan.instantiate(o);
         }
-        let mut ls: Vec<Leaf> = vec![];
+        let mut ls: Vec<PdLeaf> = vec![];
         let mut opaque = false;
         for tr in from {
-            leaves(self, tr, true, &mut ls, &mut opaque);
+            pd_leaves(self, tr, true, &mut ls, &mut opaque);
         }
         let mut conj = vec![];
         split_conjuncts(w, &mut conj);
         let mut out: Vec<(String, Vec<Expr>)> = vec![];
-        'next: for c in conj {
-            let bound: Option<Expr> = match outer {
-                Some(o) if !opaque => {
-                    let local = |p: &[String]| -> bool {
-                        if p.len() >= 2 {
-                            let q = p[p.len() - 2].to_lowercase();
-                            ls.iter().any(|l| l.alias == q)
-                        } else {
-                            let n = p[0].to_lowercase();
-                            ls.iter().any(|l| l.cols.contains(&n))
-                        }
-                    };
-                    bind_outer(c, &local, o)
-                }
-                _ => None,
-            };
-            let c: &Expr = bound.as_ref().unwrap_or(c);
-            if !is_pushable(c) {
-                continue;
-            }
-            let mut refs = vec![];
-            col_refs(c, &mut refs);
-            if refs.is_empty() {
-                continue;
-            }
-            let mut owner: Option<usize> = None;
-            for r in refs {
-                let idx = if r.len() >= 2 {
-                    let q = r[r.len() - 2].to_lowercase();
-                    match ls.iter().position(|l| l.alias == q) {
-                        Some(i) => i,
-                        None => continue 'next,
-                    }
-                } else {
-                    if opaque {
-                        continue 'next;
-                    }
-                    let n = r[0].to_lowercase();
-                    let hits: Vec<usize> = ls.iter().enumerate().filter(|(_, l)| l.cols.contains(&n)).map(|(i, _)| i).collect();
-                    if hits.len() != 1 {
-                        continue 'next;
-                    }
-                    hits[0]
-                };
-                match owner {
-                    None => owner = Some(idx),
-                    Some(o) if o == idx => {}
-                    _ => continue 'next,
-                }
-            }
-            let Some(o) = owner else { continue };
-            if !ls[o].preserved {
-                continue;
-            }
-            let alias = ls[o].alias.clone();
-            match out.iter_mut().find(|(a, _)| *a == alias) {
-                Some((_, v)) => v.push(c.clone()),
-                None => out.push((alias, vec![c.clone()])),
+        for c in conj {
+            if let Some(o) = pd_owner(c, &ls, opaque) {
+                push_cond(&mut out, &ls[o].alias, c.clone());
             }
         }
         out
+    }
+
+    fn build_push_plan(&self, from: &[TableRef], w: &Expr) -> PushPlan {
+        let mut ls: Vec<PdLeaf> = vec![];
+        let mut opaque = false;
+        for tr in from {
+            pd_leaves(self, tr, true, &mut ls, &mut opaque);
+        }
+        let mut conj = vec![];
+        split_conjuncts(w, &mut conj);
+        let is_local = |p: &[String]| -> bool {
+            if p.len() >= 2 {
+                let q = p[p.len() - 2].to_lowercase();
+                ls.iter().any(|l| l.alias == q)
+            } else {
+                let n = p[0].to_lowercase();
+                ls.iter().any(|l| l.cols.contains(&n))
+            }
+        };
+        fn strip(e: &Expr) -> &Expr {
+            match e {
+                Expr::Paren(a) => strip(a),
+                _ => e,
+            }
+        }
+        let mut plans = vec![];
+        for c in conj {
+            let plain = pd_owner(c, &ls, opaque).map(|o| ls[o].alias.clone());
+            let mut cands = vec![];
+            if let (false, Expr::Binary(op, a, b)) = (opaque, c) {
+                if matches!(op, BinOp::Eq | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
+                    // the outer column may be on either side; the left one is tried first, as `bind_outer` does
+                    for (outer_left, side, other) in [(true, a, b), (false, b, a)] {
+                        if let Expr::Col(p) = strip(side) {
+                            if !is_local(p) {
+                                let probe = if outer_left { Expr::Binary(*op, Box::new(Expr::Lit(Value::Null)), other.clone()) } else { Expr::Binary(*op, other.clone(), Box::new(Expr::Lit(Value::Null))) };
+                                let owner = pd_owner(&probe, &ls, opaque).map(|o| ls[o].alias.clone());
+                                cands.push(BindCand { op: *op, outer_left, path: p.clone(), local: (**other).clone(), owner });
+                            }
+                        }
+                    }
+                }
+            }
+            plans.push(ConjPlan { expr: c.clone(), plain, cands });
+        }
+        PushPlan { conj: plans }
     }
 
     /// Apply already-planned table conditions to freshly scanned rows.
@@ -572,34 +551,127 @@ impl<'a> Engine<'a> {
     }
 }
 
-/// A comparison `local_expr <op> outer_column` (either way round) with the outer column replaced by its value in
-/// `outer`; `None` when `c` is not of that form.
-fn bind_outer(c: &Expr, is_local: &dyn Fn(&[String]) -> bool, outer: &Env<'_>) -> Option<Expr> {
-    fn strip(e: &Expr) -> &Expr {
-        match e {
-            Expr::Paren(a) => strip(a),
-            _ => e,
+/// A table of a FROM clause, as `plan_pushdown_outer` sees it.
+struct PdLeaf {
+    alias: String,
+    cols: Vec<String>,
+    preserved: bool,
+}
+
+fn pd_leaves(eng: &Engine, tr: &TableRef, preserved: bool, out: &mut Vec<PdLeaf>, opaque: &mut bool) {
+    match tr {
+        TableRef::Table { name, alias, .. } => {
+            let loc = eng.locate(name);
+            let a = alias.clone().unwrap_or_else(|| name.last().unwrap().clone());
+            match eng.table_ref(&loc) {
+                Some(t) if name.len() > 1 || !eng.ses.cte_stack.iter().any(|m| m.contains_key(&name[0].to_lowercase())) => {
+                    out.push(PdLeaf { alias: a.to_lowercase(), cols: t.columns.iter().map(|c| c.name.to_lowercase()).collect(), preserved });
+                }
+                _ => *opaque = true,
+            }
         }
+        TableRef::Join { kind, left, right, .. } => {
+            let lp = preserved && !matches!(kind, JoinKind::Right | JoinKind::Full);
+            let rp = preserved && !matches!(kind, JoinKind::Left | JoinKind::Full | JoinKind::CrossApply | JoinKind::OuterApply);
+            pd_leaves(eng, left, lp, out, opaque);
+            pd_leaves(eng, right, rp, out, opaque);
+        }
+        _ => *opaque = true,
     }
-    let Expr::Binary(op, a, b) = c else { return None };
-    if !matches!(op, BinOp::Eq | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
+}
+
+/// The table (index into `ls`) whose rows alone decide the condition `c`, when `c` can be applied while that table
+/// is read: it must be evaluable per row, mention columns of one table only, and that table must not be on the
+/// null-supplying side of an outer join.
+fn pd_owner(c: &Expr, ls: &[PdLeaf], opaque: bool) -> Option<usize> {
+    if !is_pushable(c) {
         return None;
     }
-    let conv = |x: &Expr| -> Option<Expr> {
-        if let Expr::Col(p) = strip(x) {
-            if !is_local(p) {
-                if let Ok(v) = outer.lookup(p) {
-                    return Some(Expr::Lit(v));
+    let mut refs = vec![];
+    col_refs(c, &mut refs);
+    if refs.is_empty() {
+        return None;
+    }
+    let mut owner: Option<usize> = None;
+    for r in refs {
+        let idx = if r.len() >= 2 {
+            let q = r[r.len() - 2].to_lowercase();
+            ls.iter().position(|l| l.alias == q)?
+        } else {
+            if opaque {
+                return None;
+            }
+            let n = r[0].to_lowercase();
+            let hits: Vec<usize> = ls.iter().enumerate().filter(|(_, l)| l.cols.contains(&n)).map(|(i, _)| i).collect();
+            if hits.len() != 1 {
+                return None;
+            }
+            hits[0]
+        };
+        match owner {
+            None => owner = Some(idx),
+            Some(o) if o == idx => {}
+            _ => return None,
+        }
+    }
+    let o = owner?;
+    ls[o].preserved.then_some(o)
+}
+
+fn push_cond(out: &mut Vec<(String, Vec<Expr>)>, alias: &str, c: Expr) {
+    match out.iter_mut().find(|(a, _)| a == alias) {
+        Some((_, v)) => v.push(c),
+        None => out.push((alias.to_string(), vec![c])),
+    }
+}
+
+/// What `plan_pushdown_outer` finds out about the WHERE clause of a correlated subquery that does not depend on the
+/// outer row, kept for the rest of the statement: for each conjunct, the table it belongs to as it is, and, for a
+/// comparison with a column that is not the subquery's own, where the outer value goes and the table it then belongs to.
+pub struct PushPlan {
+    conj: Vec<ConjPlan>,
+}
+
+struct ConjPlan {
+    expr: Expr,
+    plain: Option<String>,
+    cands: Vec<BindCand>,
+}
+
+struct BindCand {
+    op: BinOp,
+    /// the outer column is the left operand
+    outer_left: bool,
+    path: Vec<String>,
+    /// the other operand
+    local: Expr,
+    owner: Option<String>,
+}
+
+impl PushPlan {
+    /// The conditions to push for the outer row `o`: the same as planning the clause against that row from scratch.
+    fn instantiate(&self, o: &Env<'_>) -> Vec<(String, Vec<Expr>)> {
+        let mut out: Vec<(String, Vec<Expr>)> = vec![];
+        for cp in &self.conj {
+            let mut bound: Option<(&Option<String>, Expr)> = None;
+            for cand in &cp.cands {
+                if let Ok(v) = o.lookup(&cand.path) {
+                    let (l, r) = if cand.outer_left { (Expr::Lit(v), cand.local.clone()) } else { (cand.local.clone(), Expr::Lit(v)) };
+                    bound = Some((&cand.owner, Expr::Binary(cand.op, Box::new(l), Box::new(r))));
+                    break;
+                }
+            }
+            match bound {
+                Some((Some(alias), e)) => push_cond(&mut out, alias, e),
+                Some((None, _)) => {}
+                None => {
+                    if let Some(alias) = &cp.plain {
+                        push_cond(&mut out, alias, cp.expr.clone());
+                    }
                 }
             }
         }
-        None
-    };
-    if let Some(l) = conv(a) {
-        return Some(Expr::Binary(*op, Box::new(l), b.clone()));
+        out
     }
-    if let Some(r) = conv(b) {
-        return Some(Expr::Binary(*op, a.clone(), Box::new(r)));
-    }
-    None
 }
+

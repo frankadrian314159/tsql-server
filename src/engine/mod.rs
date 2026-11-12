@@ -1,4 +1,17 @@
 //! The T-SQL execution engine: sessions, statements, procedures, transactions.
+/// The most lines of plan text one statement keeps (see `Session::plan`): a correlated subquery runs its scan once
+/// per outer row, and a line for each would cost more than the scan and grow without bound.
+pub const PLAN_LINES: usize = 256;
+
+/// Add a line to the plan text, unless the statement already has `PLAN_LINES` of them (the line is then not even built).
+macro_rules! plan_note {
+    ($s:expr, $($arg:tt)*) => {
+        if $s.ses.plan.len() < $crate::engine::PLAN_LINES {
+            $s.ses.plan.push(format!($($arg)*));
+        }
+    };
+}
+
 pub mod ddl;
 pub mod dml;
 pub mod expr;
@@ -189,6 +202,8 @@ pub struct SessionState {
     /// Results of subqueries that do not depend on the enclosing row, for the statement being run (see `Engine::sub_rows`).
     /// `None` where caching is not safe: outside a statement, and while an IF or WHILE condition is evaluated.
     pub sub_cache: Option<HashMap<usize, Option<query::Rowset>>>,
+    /// Per statement: what planning a correlated subquery finds out that does not depend on the outer row.
+    pub push_plans: HashMap<(usize, usize), std::sync::Arc<optimizer::PushPlan>>,
     /// While a statement writes through a view WITH CHECK OPTION: the base table, the filter of the view and the nesting level.
     pub view_check: Option<(String, Expr, i32)>,
     /// Table hints of the statement being run, by table object id (see `Engine::collect_hints`).
@@ -268,6 +283,7 @@ impl SessionState {
             stream_to_buf: false,
             preeval: None,
             sub_cache: None,
+            push_plans: HashMap::new(),
             view_check: None,
             hints: HashMap::new(),
             nowait: false,
@@ -372,7 +388,9 @@ impl<'a> SrvGuard<'a> {
             let g = self.lock.write().unwrap_or_else(|e| e.into_inner());
             let _ = self.w.set(g);
         }
-        &mut **self.w.get_mut().unwrap()
+        let s = &mut **self.w.get_mut().unwrap();
+        s.epoch += 1;
+        s
     }
 }
 
@@ -682,8 +700,10 @@ impl<'a> Engine<'a> {
             }
             self.ses.audit_seen.borrow_mut().clear();
             let saved = self.ses.sub_cache.replace(HashMap::new());
+            let saved_plans = std::mem::take(&mut self.ses.push_plans);
             let mut r = self.exec_inner(st);
             self.ses.sub_cache = saved;
+            self.ses.push_plans = saved_plans;
             self.ses.view_check = None;
             if r.is_ok() && ddltrig::is_ddl_stmt(st) {
                 r = self.fire_ddl_triggers(st);

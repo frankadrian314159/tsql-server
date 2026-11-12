@@ -383,7 +383,7 @@ impl<'a> Engine<'a> {
                 let rk_of = |r: &Row| if any_coll(&sc) { key_of(&keyed(r, &sc)) } else { key_of(r) };
                 if self.setop_needs_spill(&l.rows, &r.rows) {
                     let rows = self.set_op_external(op, *all, &l.rows, &r.rows, &rk_of)?;
-                    self.ses.plan.push(format!("{:?}{} by external sort -> {} rows", op, if *all { " ALL" } else { "" }, rows.count()));
+                    plan_note!(self, "{:?}{} by external sort -> {} rows", op, if *all { " ALL" } else { "" }, rows.count());
                     return Ok(Rowset { schema, rows, suppress: false, report_count: false });
                 }
                 let lrows = (*l.rows).clone();
