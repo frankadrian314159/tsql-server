@@ -334,7 +334,8 @@ fn commits_from_many_sessions_share_log_forces_and_survive_a_crash() {
     }
     let forces = s.log_forces() - before;
     eprintln!("log forces for 1600 commits: {}", forces);
-    assert!(forces <= 1600, "{} forces for 1600 commits", forces);
+    // the commits of sessions that are at it together share a force (without that every commit would force the log itself)
+    assert!(forces < 1600, "{} forces for 1600 commits", forces);
     assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM g"), "1600");
     drop(c);
     s.simulate_crash();

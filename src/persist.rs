@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 const MAGIC: &[u8; 8] = b"TSQLSNP5";
 
@@ -113,9 +113,80 @@ fn parse_frames(buf: &[u8]) -> Vec<WalRecord> {
     out
 }
 
+/// The log file, written in the order the batches were taken (see `Persist::take_batch`). A write waits for its turn, so
+/// the bytes of a commit that was taken earlier are always in the file before those of a later one, even when the
+/// writers are different sessions that run outside the persist latch.
+struct WalFile {
+    state: Mutex<WalState>,
+    turn: Condvar,
+}
+
+struct WalState {
+    file: File,
+    /// The ticket whose write is next.
+    next: u64,
+}
+
+impl WalFile {
+    fn lock(&self) -> std::sync::MutexGuard<'_, WalState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Write `bytes` (and force them to disk when `sync`) when it is the turn of `ticket`.
+    fn write(&self, ticket: u64, bytes: &[u8], sync: bool) -> io::Result<()> {
+        let mut g = self.lock();
+        while g.next != ticket {
+            g = self.turn.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        let r = (|| {
+            if !bytes.is_empty() {
+                g.file.write_all(bytes)?;
+            }
+            if sync {
+                g.file.sync_data()?;
+            }
+            Ok(())
+        })();
+        g.next += 1;
+        self.turn.notify_all();
+        r
+    }
+
+    /// Wait until every ticket before `ticket` has been written.
+    fn wait_for(&self, ticket: u64) {
+        let mut g = self.lock();
+        while g.next < ticket {
+            g = self.turn.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// Log bytes taken out of a `Persist` to be written and forced by a session that no longer holds its latch.
+pub struct LogBatch {
+    /// The last log record the batch (and everything before it) covers.
+    pub upto: u64,
+    ticket: u64,
+    bytes: Vec<u8>,
+    wal: Arc<WalFile>,
+}
+
+impl LogBatch {
+    /// Write the batch and force the log to disk; gives the number of the last record covered.
+    pub fn force(self) -> Result<u64, String> {
+        self.wal.write(self.ticket, &self.bytes, true).map(|_| self.upto).map_err(|e| format!("I/O error: {}", e))
+    }
+}
+
 pub struct Persist {
     pub dir: PathBuf,
-    wal: File,
+    wal: Arc<WalFile>,
+    /// Frames appended by commits and not yet written to the file: a commit only adds its frame here (under the latch,
+    /// which is cheap), and the session that forces the log for the group writes them all (see `take_batch`). Writing
+    /// each frame as it came would make every commit wait for the force in progress, as a write to a file that is being
+    /// forced blocks on Windows, so no two commits would ever share one.
+    pending: Vec<u8>,
+    /// The next ticket for a write to the file.
+    ticket: u64,
     pub wal_len: u64,
     pub lsn: u64,
     pub checkpoint_threshold: u64,
@@ -209,18 +280,37 @@ impl Persist {
         if let Some(e) = store.failed() {
             return Err(crate::error::SqlError::with(824, 24, 2, format!("Recovery failed: {}", e)));
         }
-        let p = Persist { dir: dir.to_path_buf(), wal, wal_len: good as u64, lsn, checkpoint_threshold: 16 * 1024 * 1024, _lock: lock };
+        let wal = Arc::new(WalFile { state: Mutex::new(WalState { file: wal, next: 0 }), turn: Condvar::new() });
+        let p = Persist { dir: dir.to_path_buf(), wal, pending: vec![], ticket: 0, wal_len: good as u64, lsn, checkpoint_threshold: 16 * 1024 * 1024, _lock: lock };
         Ok((p, srv))
     }
 
-    /// A handle on the log file for forcing it to disk without holding the persist latch, and the number of the
-    /// last record written (everything up to it is on disk once the handle has been synced).
-    pub fn sync_handle(&self) -> Result<(u64, File), crate::error::SqlError> {
-        Ok((self.lsn, self.wal.try_clone().map_err(io_err)?))
+    /// Take every frame appended so far out of the latch, to be written and forced by `LogBatch::force` with the latch
+    /// released: the commits that arrive meanwhile add to the next batch instead of waiting for this one.
+    pub fn take_batch(&mut self) -> LogBatch {
+        let ticket = self.ticket;
+        self.ticket += 1;
+        LogBatch { upto: self.lsn, ticket, bytes: std::mem::take(&mut self.pending), wal: self.wal.clone() }
     }
 
-    /// Append a frame (and force it to disk when `sync`); returns its log sequence number.
+    /// Write the frames that wait in memory to the file (and force it when `sync`).
+    fn flush_pending(&mut self, sync: bool) -> Result<(), crate::error::SqlError> {
+        let ticket = self.ticket;
+        self.ticket += 1;
+        let bytes = std::mem::take(&mut self.pending);
+        self.wal.write(ticket, &bytes, sync).map_err(io_err)
+    }
+
+    /// Append a frame and write it to the file at once (and force it to disk when `sync`); returns its log sequence
+    /// number.
     pub fn append(&mut self, ts: u64, next_object_id: i32, next_rowversion: u64, ops: Vec<LogOp>, sync: bool) -> Result<u64, crate::error::SqlError> {
+        let lsn = self.append_buffered(ts, next_object_id, next_rowversion, ops)?;
+        self.flush_pending(sync)?;
+        Ok(lsn)
+    }
+
+    /// Append a frame to the batch the next force writes (see `take_batch`); returns its log sequence number.
+    pub fn append_buffered(&mut self, ts: u64, next_object_id: i32, next_rowversion: u64, ops: Vec<LogOp>) -> Result<u64, crate::error::SqlError> {
         self.lsn += 1;
         let rec = WalRecord { lsn: self.lsn, ts, wall: chrono::Utc::now().timestamp_micros(), next_object_id, next_rowversion, ops };
         let payload = postcard::to_allocvec(&rec).map_err(|e| crate::error::SqlError::with(9002, 17, 1, format!("log serialisation failed: {}", e)))?;
@@ -228,10 +318,7 @@ impl Persist {
         frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         frame.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
         frame.extend_from_slice(&payload);
-        self.wal.write_all(&frame).map_err(io_err)?;
-        if sync {
-            self.wal.sync_data().map_err(io_err)?;
-        }
+        self.pending.extend_from_slice(&frame);
         self.wal_len += frame.len() as u64;
         Ok(self.lsn)
     }
@@ -245,6 +332,7 @@ impl Persist {
         if self.wal_len == 0 {
             return Ok(());
         }
+        self.flush_pending(false)?;
         std::fs::create_dir_all(self.archive_dir()).map_err(io_err)?;
         let target = self.archive_dir().join(format!("wal-{:020}.log", self.lsn));
         std::fs::copy(self.dir.join("wal.log"), &target).map_err(io_err)?;
@@ -255,12 +343,18 @@ impl Persist {
     pub fn log_records_after(&self, ts: u64) -> Result<Vec<WalRecord>, crate::error::SqlError> {
         let mut files: Vec<PathBuf> = std::fs::read_dir(self.archive_dir()).map(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "log")).collect()).unwrap_or_default();
         files.sort();
-        files.push(self.dir.join("wal.log"));
+        let live = self.dir.join("wal.log");
+        files.push(live.clone());
+        // what a session is writing right now must be in the file before it is read
+        self.wal.wait_for(self.ticket);
         let mut by_lsn: BTreeMap<u64, WalRecord> = BTreeMap::new();
         for f in files {
             let mut buf = vec![];
             if File::open(&f).and_then(|mut h| h.read_to_end(&mut buf)).is_err() {
                 continue;
+            }
+            if f == live {
+                buf.extend_from_slice(&self.pending);
             }
             for rec in parse_frames(&buf) {
                 if rec.ts > ts {
@@ -306,11 +400,22 @@ impl Persist {
         if srv.databases.values().any(|d| d.recovery_full && d.log_chain_ts.is_some()) {
             self.archive_wal()?;
         }
-        self.wal.set_len(0).map_err(io_err)?;
-        self.wal.seek(SeekFrom::Start(0)).map_err(io_err)?;
-        self.wal.sync_data().map_err(io_err)?;
+        self.flush_pending(false)?;
+        {
+            let mut g = self.wal.lock();
+            g.file.set_len(0).map_err(io_err)?;
+            g.file.seek(SeekFrom::Start(0)).map_err(io_err)?;
+            g.file.sync_data().map_err(io_err)?;
+        }
         self.wal_len = 0;
         Ok(())
+    }
+}
+
+impl Drop for Persist {
+    fn drop(&mut self) {
+        // frames of commits that were never forced still belong in the file when the server is shut down cleanly
+        let _ = self.flush_pending(true);
     }
 }
 

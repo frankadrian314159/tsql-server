@@ -126,8 +126,8 @@ value under a lock it had just been granted: in a read-modify-write test, increm
 runs. After taking the locks a read now checks whether any of those rows was committed after the statement began and, if
 so, runs the statement again with a fresh view (the rule `UPDATE` already used for its own rows).
 
-Writes to the same store still queue on the pool (updates scale to about 2x at 4 sessions, limited by that and by the
-catalog's per-table latches), as does any scan of a store with a page file.
+Writes to the same store queued on the pool (updates scaled to about 2x at 4 sessions); the pool was split by tree
+afterwards, see *Third round* below.
 
 ## Second round: row writes, planning and parsing
 
@@ -194,10 +194,41 @@ Measured with `bench` on 100,000 rows, in memory, against the previous commit, a
 * **Updating an indexed column** (the slowest write, about 14 microseconds a row) did not get faster: each changed row
   still removes one index entry and adds another, and those are spread over the index, so there is no leaf to keep.
 
+## Third round: group commit and a buffer pool per tree
+
+Measured with a throwaway program (statements per second, sessions on different rows; the machine is the same one as
+above, with 12 threads). "Table per thread" means each session writes a table of its own.
+
+| | Before | After |
+| --- | ---: | ---: |
+| durable, single-row updates, 1 / 2 / 4 / 8 sessions | 1,260 / 1,410 / 1,440 / 1,440 | 1,250 / 1,490 / 2,870 / 5,180 |
+| in memory, table per thread, 1 / 4 / 8 sessions | 20,000 / 39,000 / 54,000 | 20,400 / 54,000 / 91,000 |
+| in memory, one table, 1 / 4 / 8 sessions | 20,000 / 50,000 / 49,000 | 18,000 / 57,000 / 58,000 |
+| in memory, lookups, 1 / 4 / 8 sessions | 31,000 / 88,000 / 151,000 | 31,000 / 96,000 / 162,000 |
+
+1. **Group commit did not group.** The log counter showed one force per commit however many sessions committed together.
+   Every commit wrote its record to the log file while holding the commit lock, and a write to a file that another
+   thread is forcing waits for the force on Windows, so each commit waited for the previous one's force, and the
+   leader/follower code in `Core::sync_log` never had a second record to cover. Records are now added to a buffer in
+   memory under the lock, and the leader writes the batch and forces it outside every lock (`Persist::take_batch`,
+   `LogBatch::force`), so eight sessions share forces (about four commits per force) and durable throughput grows with
+   the number of sessions. The batches carry tickets, so the file gets them in the order they were taken whoever
+   writes them. The test of the concurrency suite now asserts that forces are fewer than commits.
+2. **One lock for the whole buffer pool.** Every tree operation took the pool exclusively, so above four sessions the
+   calls that touch it (the row lookup of an update, writing the versions, stamping them at commit) slowed down by 2 to 5
+   times in the profile, and a session reading a page from disk blocked every other. The pool is now a cache per tree,
+   each behind its own lock (see [storage.md](storage.md)), over a small shared page table, and the pages are read and
+   written by position outside the mutex of that table. Sessions that work on different tables (or on a table and the
+   indexes of another) no longer wait for each other, which is what the "table per thread" row shows.
+   Not changed: sessions that write **the same table** still take turns on its heap tree, so that row is where it was
+   (the limit is one tree, not the pool); and several sessions that miss the cache in the same tree wait for each
+   other's disk reads, because the tree stays locked while a page is read. Both would need latches on single leaves.
+
 ## Where the time goes now
 
 A point lookup by primary key costs about 20 microseconds from `Connection::execute`: parsing 5-10 (statements with
 different literals are parsed afresh; identical text hits the parse cache), planning and scan setup 10, execution
 a few. A correlated subquery costs about 11 microseconds per outer row, mostly the same per-query planning. Both would
 need a cache of plans keyed by statement shape. A durable single-row commit costs one disk flush (about 0.5 ms);
-sessions that commit together share it (group commit). Read throughput scales with the number of cores; writers to one store still take its page pool exclusively.
+sessions that commit together share it (group commit). Read throughput scales with the number of cores, and so does the
+write throughput of sessions that work on different tables; writers to one table take turns on its heap.

@@ -154,7 +154,7 @@ impl<'a> Engine<'a> {
         }
         let (oid, rv) = (self.srv.core.object_id(), self.srv.core.rowversion());
         let mut g = self.srv.persist();
-        let lsn = g.as_mut().unwrap().append(ts, oid, rv, ops, false)?;
+        let lsn = g.as_mut().unwrap().append_buffered(ts, oid, rv, ops)?;
         Ok(Some(lsn))
     }
 
@@ -162,12 +162,13 @@ impl<'a> Engine<'a> {
     pub fn sync_log(&mut self, lsn: u64) -> Result<()> {
         let srv: &ServerState = &self.srv;
         srv.core.sync_log(lsn, || {
-            // the force happens outside the persist latch, so other sessions can keep appending during it
-            let (upto, file) = match srv.persist().as_ref() {
-                Some(p) => p.sync_handle().map_err(|e| e.message.clone())?,
+            // the frames of every commit so far are taken out under the persist latch; they are written and forced
+            // outside it, so other sessions can keep appending (to the next batch) during the force
+            let batch = match srv.persist().as_mut() {
+                Some(p) => p.take_batch(),
                 None => return Err("no log".to_string()),
             };
-            file.sync_data().map(|_| upto).map_err(|e| format!("I/O error: {}", e))
+            batch.force()
         })
         .map_err(|e| SqlError::with(3314, 21, 1, format!("I/O error: {}", e)))
     }

@@ -34,6 +34,13 @@ SQL Server).
 
 The **buffer pool** caches decoded pages (`pool_pages` of them, default 16,384 = 128 MiB; clock replacement).
 When it is full the least recently used page that no operation is using is written back (if modified) and dropped.
+The pool is made of one **cache per tree**, each behind its own lock: every page belongs to exactly one tree, so an
+operation takes the lock of its own tree and nothing else, and work on different trees (different tables, or a table
+and its indexes) goes on at the same time. The trees share the size of the pool (a tree that is over it evicts one of
+its own pages, or one of another tree that is not busy) and the page table, which is behind a small mutex held for
+one step at a time (choosing a block, looking one up); a page is read from and written to the file by position, outside
+that mutex, so reads and writes of different pages overlap. Within one tree operations still take turns (a
+checkpoint holds every tree, in a fixed order). The format of the files is the same as before.
 A server therefore needs memory for the pool, the page table (8 bytes per page, about 0.1 % of the data size) and
 the catalog, **not** for the data. A cold start reads nothing: pages are loaded when a query touches them.
 `sys.dm_os_buffer_pool` and `Server::storage_stats()` report cache size, page reads/writes, hits and evictions

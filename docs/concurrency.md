@@ -132,10 +132,14 @@ advances the real counter atomically, so it does not need to write the table bac
 ### Commit protocol
 
 1. Under the commit lock the transaction takes the next commit timestamp and appends its redo record to the log, so
-   the log is in timestamp order. The lock is held for the append only, not for the disk force.
-2. **Group commit:** the session waits until its record is on disk. One waiting session (the leader) forces the log
-   for every record written so far; sessions that arrive during the force are covered by the next one, so commits that
-   overlap share forces (`Server::log_forces` counts them). A failed force fails every waiting commit.
+   the log is in timestamp order. The record is added to a buffer in memory (`Persist::append_buffered`); the lock is
+   held for that only, not for any write to the file.
+2. **Group commit:** the session waits until its record is on disk. One waiting session (the leader) takes the buffer,
+   writes it and forces the log, with no lock held, so the sessions that arrive during the force add their records to
+   the next batch and are covered by the next force (`Server::log_forces` counts them). Batches are written in the order
+   they were taken (a ticket per batch), so a checkpoint or a log read never overtakes one. A failed force fails every
+   waiting commit. (Writing each record to the file as it was appended made every commit wait for the force in
+   progress, since a write to a file that is being forced blocks on Windows: commits never shared a force.)
 3. The transaction stamps every row version it wrote with its timestamp.
 4. The timestamp is published as the clock only when it *and every earlier timestamp* have been stamped
    (`Core::finish_commit_ts`), so a snapshot, which reads the clock when it starts, never sees half a commit, even

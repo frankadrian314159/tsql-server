@@ -31,10 +31,9 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtOrd};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtOrd};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 pub const PAGE_SIZE: usize = 8192;
 const HDR: usize = 8;
@@ -61,6 +60,47 @@ pub const MAX_KEY_BYTES: usize = 1700;
 pub const DEFAULT_POOL_PAGES: usize = 16384; // 128 MiB of pages
 
 type R<T> = Result<T, String>;
+
+/// Read exactly `buf.len()` bytes at `off` without moving a file cursor, so that many threads can use one handle.
+fn pread(f: &File, buf: &mut [u8], off: u64) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0;
+        while done < buf.len() {
+            let n = f.seek_read(&mut buf[done..], off + done as u64)?;
+            if n == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            done += n;
+        }
+        Ok(())
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        f.read_exact_at(buf, off)
+    }
+}
+
+/// Write all of `buf` at `off` without moving a file cursor.
+fn pwrite(f: &File, buf: &[u8], off: u64) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0;
+        while done < buf.len() {
+            let n = f.seek_write(&buf[done..], off + done as u64)?;
+            done += n;
+        }
+        Ok(())
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        f.write_all_at(buf, off)
+    }
+}
 
 pub type TKey = (KeyVals, u64);
 
@@ -206,28 +246,94 @@ impl Hits {
     }
 }
 
-struct Pool {
+/// The state of the page file that every tree shares: which blocks hold which pages, which are free, and the file
+/// itself. It is behind its own mutex, taken for a short step at a time (allocating a page, reading or writing one) by
+/// code that already holds the lock of the tree it works on, and never the other way round.
+struct Meta {
     file: Option<File>,
     durable: bool,
-    capacity: usize,
     table: Vec<PEntry>,
     free_ids: Vec<PageId>,
     nblocks: u64,
     free_blocks: Vec<u64>,
     pending_free: Vec<u64>,
+    stats: StoreStats,
+}
+
+/// What the trees of a store share (see `PageStore`).
+struct Shared {
+    meta: Mutex<Meta>,
+    /// Is there a page file? (a store without one keeps every page cached, so its reads never need a tree exclusively)
+    has_file: bool,
+    /// How many frames the trees together may keep, and how many they keep.
+    capacity: AtomicUsize,
+    cached: AtomicUsize,
+    hits: Hits,
+    failed: Mutex<Option<String>>,
+    broken: AtomicBool,
+    /// The page file for reading and writing pages (positionally, outside the `Meta` mutex), and how often it was.
+    io: Option<File>,
+    reads: AtomicU64,
+    writes: AtomicU64,
+    /// The cache of every tree, by the page number of its root (which never changes).
+    pools: Mutex<HashMap<PageId, Arc<TreePool>>>,
+}
+
+/// The cached pages of one tree. Every page belongs to exactly one tree, so the trees need not wait for each other:
+/// an operation takes the lock of its own tree only.
+type TreePool = RwLock<Pool>;
+
+struct Pool {
+    sh: Arc<Shared>,
     frames: HashMap<PageId, Frame>,
     order: VecDeque<PageId>,
     pinned: Vec<PageId>,
-    stats: StoreStats,
-    hits: Hits,
-    failed: Option<String>,
 }
 
-impl Pool {
-    fn evicting(&self) -> bool {
-        self.file.is_some()
+impl Shared {
+    fn meta(&self) -> MutexGuard<'_, Meta> {
+        self.meta.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn fail(&self, e: String) {
+        let mut f = self.failed.lock().unwrap_or_else(|e| e.into_inner());
+        if f.is_none() {
+            *f = Some(e);
+        }
+        self.broken.store(true, AtOrd::SeqCst);
+    }
+
+    fn pool_list(&self) -> Vec<(PageId, Arc<TreePool>)> {
+        let mut v: Vec<(PageId, Arc<TreePool>)> = self.pools.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(k, p)| (*k, p.clone())).collect();
+        v.sort_unstable_by_key(|(k, _)| *k);
+        v
+    }
+
+    fn over_capacity(&self) -> bool {
+        self.cached.load(AtOrd::Relaxed) > self.capacity.load(AtOrd::Relaxed)
+    }
+
+    /// Make room by evicting a page of another tree whose lock is free (a tree that is busy is skipped, so this never
+    /// waits for a lock while holding one).
+    fn evict_elsewhere(&self) -> R<bool> {
+        let mut list = self.pool_list();
+        // the trees with the most cached pages first
+        list.sort_by_key(|(_, p)| std::cmp::Reverse(p.try_read().map(|g| g.frames.len()).unwrap_or(0)));
+        for (_, p) in list {
+            if let Ok(mut g) = p.try_write() {
+                if g.frames.is_empty() {
+                    continue;
+                }
+                if g.evict_one()? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+}
+
+impl Meta {
     // ---- ids and blocks
     fn alloc_id(&mut self) -> PageId {
         if let Some(i) = self.free_ids.pop() {
@@ -239,7 +345,6 @@ impl Pool {
     }
 
     fn free_id(&mut self, id: PageId) {
-        self.frames.remove(&id);
         let e = self.table[id as usize];
         if e.phys != NO_BLOCK {
             if e.protected {
@@ -260,10 +365,8 @@ impl Pool {
         self.nblocks - 1
     }
 
-    fn write_bytes(&mut self, id: PageId, bytes: &[u8]) -> R<()> {
-        if bytes.len() > BODY {
-            return Err(format!("page {} image of {} bytes exceeds the page size", id, bytes.len()));
-        }
+    /// Choose the block that page `id` is written to next (a page of the last checkpoint is never overwritten).
+    fn plan_write(&mut self, id: PageId) -> u64 {
         let e = self.table[id as usize];
         let phys = if e.phys == NO_BLOCK {
             self.alloc_block()
@@ -274,36 +377,84 @@ impl Pool {
             e.phys
         };
         self.table[id as usize] = PEntry { phys, protected: false };
-        let f = self.file.as_mut().ok_or("no page file")?;
-        let mut buf = vec![0u8; PAGE_SIZE];
-        buf[0..4].copy_from_slice(&crc32fast::hash(bytes).to_le_bytes());
-        buf[4..8].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
-        buf[HDR..HDR + bytes.len()].copy_from_slice(bytes);
-        f.seek(SeekFrom::Start(phys * PAGE_SIZE as u64)).map_err(|e| format!("page write failed: {}", e))?;
-        f.write_all(&buf).map_err(|e| format!("page write failed: {}", e))?;
-        self.stats.writes += 1;
-        Ok(())
+        phys
     }
 
-    fn read_bytes(&mut self, id: PageId) -> R<Vec<u8>> {
+    /// The block page `id` is in.
+    fn locate(&self, id: PageId) -> R<u64> {
         let e = *self.table.get(id as usize).ok_or_else(|| format!("page {} does not exist", id))?;
         if e.phys == NO_BLOCK {
             return Err(format!("page {} has no block", id));
         }
-        let f = self.file.as_mut().ok_or("no page file")?;
+        Ok(e.phys)
+    }
+}
+
+impl Pool {
+    fn new(sh: Arc<Shared>) -> Pool {
+        Pool { sh, frames: HashMap::new(), order: VecDeque::new(), pinned: vec![] }
+    }
+
+    fn evicting(&self) -> bool {
+        self.sh.has_file
+    }
+
+    // ---- ids and blocks (see `Meta`)
+    fn alloc_id(&mut self) -> PageId {
+        self.sh.meta().alloc_id()
+    }
+
+    fn free_id(&mut self, id: PageId) {
+        self.drop_frame(id);
+        self.sh.meta().free_id(id);
+    }
+
+    /// Write the image of page `id` to its block. Only the choice of the block is made under the `Meta` mutex; the page
+    /// is written after it is released (nothing else touches this page: its tree is locked by the caller).
+    fn write_bytes(&mut self, id: PageId, bytes: &[u8]) -> R<()> {
+        if bytes.len() > BODY {
+            return Err(format!("page {} image of {} bytes exceeds the page size", id, bytes.len()));
+        }
+        let phys = self.sh.meta().plan_write(id);
         let mut buf = vec![0u8; PAGE_SIZE];
-        f.seek(SeekFrom::Start(e.phys * PAGE_SIZE as u64)).map_err(|e| format!("page read failed: {}", e))?;
-        f.read_exact(&mut buf).map_err(|e| format!("page {} read failed: {}", id, e))?;
+        buf[0..4].copy_from_slice(&crc32fast::hash(bytes).to_le_bytes());
+        buf[4..8].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+        buf[HDR..HDR + bytes.len()].copy_from_slice(bytes);
+        let f = self.sh.io.as_ref().ok_or("no page file")?;
+        pwrite(f, &buf, phys * PAGE_SIZE as u64).map_err(|e| format!("page write failed: {}", e))?;
+        self.sh.writes.fetch_add(1, AtOrd::Relaxed);
+        Ok(())
+    }
+
+    fn read_bytes(&mut self, id: PageId) -> R<Vec<u8>> {
+        let phys = self.sh.meta().locate(id)?;
+        let f = self.sh.io.as_ref().ok_or("no page file")?;
+        let mut buf = vec![0u8; PAGE_SIZE];
+        pread(f, &mut buf, phys * PAGE_SIZE as u64).map_err(|e| format!("page {} read failed: {}", id, e))?;
         let crc = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         let len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
         if len > BODY || crc32fast::hash(&buf[HDR..HDR + len]) != crc {
-            return Err(format!("page {} (block {}) failed its checksum: the database is corrupt", id, e.phys));
+            return Err(format!("page {} (block {}) failed its checksum: the database is corrupt", id, phys));
         }
-        self.stats.reads += 1;
+        self.sh.reads.fetch_add(1, AtOrd::Relaxed);
         Ok(buf[HDR..HDR + len].to_vec())
     }
 
     // ---- frames
+    fn put_frame(&mut self, id: PageId, f: Frame) {
+        if self.frames.insert(id, f).is_none() {
+            self.sh.cached.fetch_add(1, AtOrd::Relaxed);
+        }
+    }
+
+    fn drop_frame(&mut self, id: PageId) -> Option<Frame> {
+        let f = self.frames.remove(&id);
+        if f.is_some() {
+            self.sh.cached.fetch_sub(1, AtOrd::Relaxed);
+        }
+        f
+    }
+
     fn decode(&mut self, id: PageId) -> R<(Node, Vec<PageId>)> {
         let bytes = self.read_bytes(id)?;
         let img: Image = postcard::from_bytes(&bytes).map_err(|e| format!("page {} is corrupt: {}", id, e))?;
@@ -350,14 +501,14 @@ impl Pool {
     fn frame(&mut self, id: PageId) -> R<&mut Frame> {
         if !self.frames.contains_key(&id) {
             let (node, chains) = self.decode(id)?;
-            self.frames.insert(id, Frame { node, dirty: false, refbit: AtomicBool::new(true), chains, est: None });
+            self.put_frame(id, Frame { node, dirty: false, refbit: AtomicBool::new(true), chains, est: None });
             self.touch_new(id);
             self.pinned.push(id);
-            if self.frames.len() > self.capacity {
-                self.evict_one()?;
+            if self.sh.over_capacity() {
+                self.make_room()?;
             }
         } else {
-            self.hits.add();
+            self.sh.hits.add();
             if !self.pinned.contains(&id) {
                 self.pinned.push(id);
             }
@@ -369,10 +520,18 @@ impl Pool {
 
     fn new_frame(&mut self, node: Node) -> PageId {
         let id = self.alloc_id();
-        self.frames.insert(id, Frame { node, dirty: true, refbit: AtomicBool::new(true), chains: vec![], est: None });
+        self.put_frame(id, Frame { node, dirty: true, refbit: AtomicBool::new(true), chains: vec![], est: None });
         self.touch_new(id);
         self.pinned.push(id);
         id
+    }
+
+    /// Evict one page, from this tree if it has one to spare and from another tree otherwise.
+    fn make_room(&mut self) -> R<bool> {
+        if self.evict_one()? {
+            return Ok(true);
+        }
+        self.sh.evict_elsewhere()
     }
 
     fn evict_one(&mut self) -> R<bool> {
@@ -406,16 +565,16 @@ impl Pool {
                 continue;
             }
             self.flush_frame(id)?;
-            self.frames.remove(&id);
-            self.stats.evictions += 1;
+            self.drop_frame(id);
+            self.sh.meta().stats.evictions += 1;
             return Ok(true);
         }
         Ok(false)
     }
 
     fn trim(&mut self) -> R<()> {
-        while self.evicting() && self.frames.len() > self.capacity {
-            if !self.evict_one()? {
+        while self.evicting() && self.sh.over_capacity() {
+            if !self.make_room()? {
                 break;
             }
         }
@@ -505,7 +664,7 @@ impl Pool {
             if !f.refbit.load(AtOrd::Relaxed) {
                 f.refbit.store(true, AtOrd::Relaxed);
             }
-            self.hits.add();
+            self.sh.hits.add();
             match &f.node {
                 Node::Leaf { .. } => return Some(f),
                 Node::Inner { keys, children, .. } => {
@@ -954,7 +1113,7 @@ impl Pool {
                 children.remove(sep_idx + 1);
             }
         }
-        self.stats.merges += 1;
+        self.sh.meta().stats.merges += 1;
         self.collapse(root, &mut path)
     }
 
@@ -1104,11 +1263,18 @@ impl Pool {
     }
 
     // ---- checkpoint support
-    fn flush_all(&mut self) -> R<()> {
+    /// Write every dirty page of this tree to the file (the caller syncs the file).
+    fn flush_dirty(&mut self) -> R<()> {
         let ids: Vec<PageId> = self.frames.iter().filter(|(_, f)| f.dirty).map(|(i, _)| *i).collect();
         for id in ids {
             self.flush_frame(id)?;
         }
+        Ok(())
+    }
+}
+
+impl Meta {
+    fn sync_file(&self) -> R<()> {
         if let Some(f) = &self.file {
             f.sync_all().map_err(|e| format!("page file sync failed: {}", e))?;
         }
@@ -1119,7 +1285,7 @@ impl Pool {
         StoreImage { table: self.table.iter().map(|e| e.phys).collect() }
     }
 
-    fn commit_checkpoint(&mut self) {
+    fn commit_checkpoint(&mut self) -> R<()> {
         for e in self.table.iter_mut() {
             if e.phys != NO_BLOCK {
                 e.protected = true;
@@ -1127,9 +1293,7 @@ impl Pool {
         }
         let pend = std::mem::take(&mut self.pending_free);
         self.free_blocks.extend(pend);
-        if let Err(e) = self.shrink_file() {
-            self.failed = Some(e);
-        }
+        self.shrink_file()
     }
 
     /// Move pages from the end of the file into free blocks nearer its start, so that the end can be cut off.
@@ -1161,11 +1325,9 @@ impl Pool {
         for ((phys, id), dest) in high.into_iter().zip(dests) {
             let mut buf = vec![0u8; PAGE_SIZE];
             {
-                let f = self.file.as_mut().ok_or("no page file")?;
-                f.seek(SeekFrom::Start(phys * PAGE_SIZE as u64)).map_err(|e| format!("page read failed: {}", e))?;
-                f.read_exact(&mut buf).map_err(|e| format!("page read failed: {}", e))?;
-                f.seek(SeekFrom::Start(dest * PAGE_SIZE as u64)).map_err(|e| format!("page write failed: {}", e))?;
-                f.write_all(&buf).map_err(|e| format!("page write failed: {}", e))?;
+                let f = self.file.as_ref().ok_or("no page file")?;
+                pread(f, &mut buf, phys * PAGE_SIZE as u64).map_err(|e| format!("page read failed: {}", e))?;
+                pwrite(f, &buf, dest * PAGE_SIZE as u64).map_err(|e| format!("page write failed: {}", e))?;
             }
             let was_protected = self.table[id].protected;
             self.table[id] = PEntry { phys: dest, protected: false };
@@ -1207,21 +1369,21 @@ fn keys_len(n: &Node) -> usize {
 }
 
 // ------------------------------------------------------------------- store
-/// A page file plus its buffer pool. Cheap to share (`Arc`); all access is serialised by an internal lock.
+/// A page file plus the buffer pool of its trees. Cheap to share (`Arc`). Each tree has a cache of its own pages behind
+/// its own lock (so work on different trees, the tables and the indexes, goes on side by side); what they share is the
+/// page table and the file (see `Meta`), which are held for one page at a time.
 pub struct PageStore {
-    pool: RwLock<Pool>,
-    /// Is there a page file? (a store without one keeps every page cached, so its reads never need the pool exclusively)
-    has_file: bool,
+    sh: Arc<Shared>,
     closing: AtomicBool,
 }
 
 impl PageStore {
     /// A store that lives entirely in memory.
     pub fn memory() -> Arc<PageStore> {
-        Arc::new(PageStore::from_pool(None, false, usize::MAX, StoreImage::default()))
+        Arc::new(PageStore::from_parts(None, false, usize::MAX, StoreImage::default()))
     }
 
-    fn from_pool(file: Option<File>, durable: bool, capacity: usize, image: StoreImage) -> PageStore {
+    fn from_parts(file: Option<File>, durable: bool, capacity: usize, image: StoreImage) -> PageStore {
         let nblocks = match &file {
             Some(f) => f.metadata().map(|m| m.len() / PAGE_SIZE as u64).unwrap_or(0),
             None => 0,
@@ -1230,23 +1392,20 @@ impl PageStore {
         let free_ids: Vec<PageId> = (0..table.len()).filter(|&i| table[i].phys == NO_BLOCK).map(|i| i as PageId).rev().collect();
         let used: std::collections::HashSet<u64> = table.iter().filter(|e| e.phys != NO_BLOCK).map(|e| e.phys).collect();
         let free_blocks: Vec<u64> = (0..nblocks).filter(|b| !used.contains(b)).rev().collect();
+        let io = file.as_ref().and_then(|f| f.try_clone().ok());
         PageStore {
-            has_file: file.is_some(),
-            pool: RwLock::new(Pool {
-                file,
-                durable,
-                capacity: capacity.max(8),
-                table,
-                free_ids,
-                nblocks,
-                free_blocks,
-                pending_free: vec![],
-                frames: HashMap::new(),
-                order: VecDeque::new(),
-                pinned: vec![],
-                stats: StoreStats::default(),
+            sh: Arc::new(Shared {
+                io,
+                reads: AtomicU64::new(0),
+                writes: AtomicU64::new(0),
+                has_file: file.is_some(),
+                meta: Mutex::new(Meta { file, durable, table, free_ids, nblocks, free_blocks, pending_free: vec![], stats: StoreStats::default() }),
+                capacity: AtomicUsize::new(capacity.max(8)),
+                cached: AtomicUsize::new(0),
                 hits: Hits::default(),
-                failed: None,
+                failed: Mutex::new(None),
+                broken: AtomicBool::new(false),
+                pools: Mutex::new(HashMap::new()),
             }),
             closing: AtomicBool::new(false),
         }
@@ -1261,22 +1420,19 @@ impl PageStore {
         if image.is_none() {
             file.set_len(0).map_err(io)?;
         }
-        Ok(Arc::new(PageStore::from_pool(Some(file), durable, capacity_pages, image.unwrap_or_default())))
+        Ok(Arc::new(PageStore::from_parts(Some(file), durable, capacity_pages, image.unwrap_or_default())))
     }
 
-    /// Run `f` with the pool held shared (so readers do not wait for one another). `f` returns `None` when it needs
-    /// a page that is not cached; the caller then retries through [`PageStore::run`].
-    fn read<T: Default>(&self, f: impl FnOnce(&Pool) -> Option<T>) -> Option<T> {
-        let p = self.pool.read().unwrap_or_else(|e| e.into_inner());
-        if p.failed.is_some() {
-            return Some(T::default());
-        }
-        f(&p)
+    /// The cache of the tree whose root is `root` (made when there is none yet).
+    fn pool_for(&self, root: PageId) -> Arc<TreePool> {
+        let mut m = self.sh.pools.lock().unwrap_or_else(|e| e.into_inner());
+        m.entry(root).or_insert_with(|| Arc::new(RwLock::new(Pool::new(self.sh.clone())))).clone()
     }
 
-    fn run<T: Default>(&self, f: impl FnOnce(&mut Pool) -> R<T>) -> T {
-        let mut p = self.pool.write().unwrap_or_else(|e| e.into_inner());
-        if p.failed.is_some() {
+    /// Run `f` on the cache of one tree, which is held for the whole call.
+    fn run_in<T: Default>(&self, pool: &TreePool, f: impl FnOnce(&mut Pool) -> R<T>) -> T {
+        let mut p = pool.write().unwrap_or_else(|e| e.into_inner());
+        if self.sh.broken.load(AtOrd::Relaxed) {
             return T::default();
         }
         p.pinned.clear();
@@ -1286,15 +1442,25 @@ impl PageStore {
         match (r, t) {
             (Ok(v), Ok(())) => v,
             (Err(e), _) | (_, Err(e)) => {
-                p.failed = Some(e);
+                self.sh.fail(e);
                 T::default()
             }
         }
     }
 
+    /// Run `f` with the cache of one tree held shared (so readers do not wait for one another). `f` returns `None` when
+    /// it needs a page that is not cached; the caller then retries through `run_in`.
+    fn read_in<T: Default>(&self, pool: &TreePool, f: impl FnOnce(&Pool) -> Option<T>) -> Option<T> {
+        let p = pool.read().unwrap_or_else(|e| e.into_inner());
+        if self.sh.broken.load(AtOrd::Relaxed) {
+            return Some(T::default());
+        }
+        f(&p)
+    }
+
     /// The first storage error since the store was opened, if any. Once set, the store refuses all work.
     pub fn failed(&self) -> Option<String> {
-        self.pool.read().unwrap_or_else(|e| e.into_inner()).failed.clone()
+        self.sh.failed.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Stop freeing pages when trees are dropped (the process is shutting down).
@@ -1303,47 +1469,74 @@ impl PageStore {
     }
 
     pub fn stats(&self) -> StoreStats {
-        let p = self.pool.read().unwrap_or_else(|e| e.into_inner());
-        let mut s = p.stats;
-        s.hits = p.hits.total();
-        s.pool_capacity = if p.capacity == usize::MAX { 0 } else { p.capacity };
-        s.pages_cached = p.frames.len();
-        s.pages_live = p.table.iter().filter(|e| e.phys != NO_BLOCK).count() + p.frames.iter().filter(|(i, _)| p.table[**i as usize].phys == NO_BLOCK).count();
-        s.file_blocks = p.nblocks;
-        s.free_blocks = p.free_blocks.len();
+        // the pages that are cached and were never written have no block yet (found before the page table is taken)
+        let mut unwritten: Vec<PageId> = vec![];
+        for (_, p) in self.sh.pool_list() {
+            let g = p.read().unwrap_or_else(|e| e.into_inner());
+            unwritten.extend(g.frames.keys().copied());
+        }
+        let m = self.sh.meta();
+        let mut s = m.stats;
+        s.hits = self.sh.hits.total();
+        s.reads = self.sh.reads.load(AtOrd::Relaxed);
+        s.writes = self.sh.writes.load(AtOrd::Relaxed);
+        let cap = self.sh.capacity.load(AtOrd::Relaxed);
+        s.pool_capacity = if cap == usize::MAX { 0 } else { cap };
+        s.pages_cached = self.sh.cached.load(AtOrd::Relaxed);
+        s.pages_live = m.table.iter().filter(|e| e.phys != NO_BLOCK).count() + unwritten.iter().filter(|i| m.table.get(**i as usize).is_some_and(|e| e.phys == NO_BLOCK)).count();
+        s.file_blocks = m.nblocks;
+        s.free_blocks = m.free_blocks.len();
         s
     }
 
     /// Change the cache size (in pages); excess pages are written back and dropped.
     pub fn set_capacity(&self, pages: usize) {
-        self.run(|p| {
-            p.capacity = pages.max(8);
-            Ok(())
-        });
+        self.sh.capacity.store(pages.max(8), AtOrd::Relaxed);
+        for (_, p) in self.sh.pool_list() {
+            self.run_in(&p, |_| Ok(()));
+        }
     }
 
     /// Write every dirty page and sync the file; returns the page table to store in the checkpoint.
     pub fn prepare_checkpoint(&self) -> Result<StoreImage, SqlError> {
-        let mut p = self.pool.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(e) = &p.failed {
-            return Err(SqlError::with(823, 24, 2, format!("The page store has failed: {}", e)));
+        let fail = |e: String| SqlError::with(823, 24, 2, format!("The page store has failed: {}", e));
+        if let Some(e) = self.failed() {
+            return Err(fail(e));
         }
-        p.pinned.clear();
+        // every tree is held (in a fixed order) so that the page table matches the pages that are written
+        let list = self.sh.pool_list();
+        let mut guards: Vec<std::sync::RwLockWriteGuard<'_, Pool>> = list.iter().map(|(_, p)| p.write().unwrap_or_else(|e| e.into_inner())).collect();
+        for g in guards.iter_mut() {
+            g.pinned.clear();
+        }
         // compaction is only for the durable store; a failure to compact is a failure of the store
-        let r = if p.durable { p.compact() } else { Ok(()) };
-        if let Err(e) = r.and_then(|_| p.flush_all()) {
-            p.failed = Some(e.clone());
+        let durable = self.sh.meta().durable;
+        let mut r = if durable { self.sh.meta().compact() } else { Ok(()) };
+        if r.is_ok() {
+            for g in guards.iter_mut() {
+                r = g.flush_dirty();
+                if r.is_err() {
+                    break;
+                }
+            }
+        }
+        let r = r.and_then(|_| self.sh.meta().sync_file());
+        if let Err(e) = r {
+            self.sh.fail(e.clone());
             return Err(SqlError::with(823, 24, 2, e));
         }
-        Ok(p.image())
+        Ok(self.sh.meta().image())
     }
 
     /// Call after the checkpoint file naming the image is durable: its blocks become protected and
     /// superseded blocks are released.
     pub fn commit_checkpoint(&self) {
-        let mut p = self.pool.write().unwrap_or_else(|e| e.into_inner());
-        if p.durable {
-            p.commit_checkpoint();
+        let mut m = self.sh.meta();
+        if m.durable {
+            if let Err(e) = m.commit_checkpoint() {
+                drop(m);
+                self.sh.fail(e);
+            }
         }
     }
 }
@@ -1357,6 +1550,8 @@ pub struct Tree {
     /// Next row id to hand out (heap trees only); shared by every handle of the tree.
     next_id: AtomicU64,
     store: Option<Arc<PageStore>>,
+    /// The cache of this tree's pages (shared by every handle of the tree).
+    pool: Option<Arc<TreePool>>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -1369,8 +1564,10 @@ pub struct TreeDesc {
 
 impl Tree {
     pub fn new(store: &Arc<PageStore>) -> Tree {
-        let root = store.run(|p| Ok(p.new_tree()));
-        Tree { root, entries: AtomicU64::new(0), has_ovf: AtomicBool::new(false), next_id: AtomicU64::new(0), store: Some(store.clone()) }
+        let pool = Arc::new(RwLock::new(Pool::new(store.sh.clone())));
+        let root = store.run_in(&pool, |p| Ok(p.new_tree()));
+        store.sh.pools.lock().unwrap_or_else(|e| e.into_inner()).insert(root, pool.clone());
+        Tree { root, entries: AtomicU64::new(0), has_ovf: AtomicBool::new(false), next_id: AtomicU64::new(0), store: Some(store.clone()), pool: Some(pool) }
     }
 
     pub fn desc(&self) -> TreeDesc {
@@ -1378,7 +1575,8 @@ impl Tree {
     }
 
     pub fn from_desc(d: TreeDesc, store: Option<Arc<PageStore>>) -> Tree {
-        Tree { root: d.root, entries: AtomicU64::new(d.entries), has_ovf: AtomicBool::new(d.has_ovf), next_id: AtomicU64::new(d.next_id), store }
+        let pool = store.as_ref().map(|s| s.pool_for(d.root));
+        Tree { root: d.root, entries: AtomicU64::new(d.entries), has_ovf: AtomicBool::new(d.has_ovf), next_id: AtomicU64::new(d.next_id), store, pool }
     }
 
     pub fn store(&self) -> Option<&Arc<PageStore>> {
@@ -1408,6 +1606,16 @@ impl Tree {
         self.entries.load(AtOrd::Relaxed)
     }
 
+    /// Run `f` on this tree's cache, held exclusively.
+    fn run<T: Default>(&self, f: impl FnOnce(&mut Pool) -> R<T>) -> T {
+        self.st().run_in(self.pool.as_ref().expect("tree is not attached to a page store"), f)
+    }
+
+    /// Run `f` on this tree's cache, held shared (see `PageStore::read_in`).
+    fn rd<T: Default>(&self, f: impl FnOnce(&Pool) -> Option<T>) -> Option<T> {
+        self.st().read_in(self.pool.as_ref().expect("tree is not attached to a page store"), f)
+    }
+
     fn st(&self) -> &Arc<PageStore> {
         self.store.as_ref().expect("tree is not attached to a page store")
     }
@@ -1416,7 +1624,7 @@ impl Tree {
     pub fn with<T>(&self, key: &KeyVals, rid: u64, f: impl FnOnce(Option<&Slot>) -> T) -> T {
         let mut f = Some(f);
         let mut out = None;
-        let hit = self.st().read(|p| {
+        let hit = self.rd(|p| {
             p.ro_peek(self.root, key, rid, &mut |s| {
                 if let Some(f) = f.take() {
                     out = Some(f(s));
@@ -1424,7 +1632,7 @@ impl Tree {
             })
         });
         if hit.is_none() {
-            self.st().run(|p| {
+            self.run(|p| {
                 p.bt_peek(self.root, key, rid, &mut |s| {
                     if let Some(f) = f.take() {
                         out = Some(f(s));
@@ -1444,7 +1652,7 @@ impl Tree {
         while !items.is_empty() {
             let rest = if items.len() > 512 { items.split_off(512) } else { vec![] };
             let chunk = std::mem::replace(&mut items, rest);
-            let (new, big) = self.st().run(|p| p.bt_put_run(self.root, chunk));
+            let (new, big) = self.run(|p| p.bt_put_run(self.root, chunk));
             if big {
                 self.has_ovf.store(true, AtOrd::Relaxed);
             }
@@ -1453,7 +1661,7 @@ impl Tree {
     }
 
     pub fn put(&self, key: KeyVals, rid: u64, slot: Slot) {
-        let (new, big) = self.st().run(|p| p.bt_put(self.root, key, rid, slot));
+        let (new, big) = self.run(|p| p.bt_put(self.root, key, rid, slot));
         if big {
             self.has_ovf.store(true, AtOrd::Relaxed);
         }
@@ -1464,7 +1672,7 @@ impl Tree {
 
     /// Change a slot in place (see `bt_modify`); returns whether the slot existed (or was created).
     pub fn modify(&self, key: &KeyVals, rid: u64, create: bool, mut f: impl FnMut(&mut Slot) -> bool) -> bool {
-        let out = self.st().run(|p| p.bt_modify(self.root, key, rid, create, &mut f));
+        let out = self.run(|p| p.bt_modify(self.root, key, rid, create, &mut f));
         if out.big {
             self.has_ovf.store(true, AtOrd::Relaxed);
         }
@@ -1482,7 +1690,7 @@ impl Tree {
         let mut found = Vec::with_capacity(rids.len());
         // in chunks, so that one big statement does not keep the page pool from other sessions for long
         for chunk in rids.chunks(512) {
-            let outs = self.st().run(|p| p.bt_modify_run(self.root, key, chunk, create, &mut f));
+            let outs = self.run(|p| p.bt_modify_run(self.root, key, chunk, create, &mut f));
             for out in outs {
                 if out.big {
                     self.has_ovf.store(true, AtOrd::Relaxed);
@@ -1499,23 +1707,22 @@ impl Tree {
     }
 
     pub fn remove(&self, key: &KeyVals, rid: u64) {
-        if self.st().run(|p| p.bt_remove(self.root, key, rid)) {
+        if self.run(|p| p.bt_remove(self.root, key, rid)) {
             self.entries.fetch_sub(1, AtOrd::Relaxed);
         }
     }
 
     /// See `Pool::bt_scan`.
     pub fn scan(&self, first_true: &dyn Fn(&KeyVals, u64) -> bool, forward: bool, visit: &mut dyn FnMut(&KeyVals, u64, &Slot) -> bool) {
-        let st = self.st();
-        if !st.has_file && st.read(|p| p.ro_scan(self.root, first_true, forward, &mut *visit)).is_some() {
+        if !self.st().sh.has_file && self.rd(|p| p.ro_scan(self.root, first_true, forward, &mut *visit)).is_some() {
             return;
         }
-        st.run(|p| p.bt_scan(self.root, first_true, forward, visit));
+        self.run(|p| p.bt_scan(self.root, first_true, forward, visit));
     }
 
     /// Keys of a leaf at relative position `frac` (0..1) plus the last key of the leaf before it.
     pub fn sample_leaf(&self, frac: f64) -> (Option<KeyVals>, Vec<KeyVals>) {
-        self.st().run(|p| p.sample_leaf(self.root, frac))
+        self.run(|p| p.sample_leaf(self.root, frac))
     }
 }
 
@@ -1524,7 +1731,12 @@ impl Drop for Tree {
         if let Some(s) = &self.store {
             if !s.closing.load(AtOrd::SeqCst) {
                 let (root, ovf) = (self.root, self.has_ovf.load(AtOrd::Relaxed));
-                s.run(|p| p.free_tree(root, ovf));
+                self.run(|p| p.free_tree(root, ovf));
+                // the page numbers are free for another tree now: its cache must not be found under this one's root
+                let mut pools = s.sh.pools.lock().unwrap_or_else(|e| e.into_inner());
+                if pools.get(&root).is_some_and(|p| self.pool.as_ref().is_some_and(|q| Arc::ptr_eq(p, q))) {
+                    pools.remove(&root);
+                }
             }
         }
     }
@@ -1699,6 +1911,73 @@ mod tests {
         let st = store.stats();
         // the leaves did merge and split in the middle of batches
         assert!(st.evictions > 0 && st.merges > 0, "{:?}", st);
+    }
+
+    /// Trees have a cache each but share the pool's size: threads that each work on a tree of their own, with a cache
+    /// far too small for all of them (so pages of other trees are evicted), keep every tree intact, a checkpoint in
+    /// the middle sees a consistent store, and the trees together stay within the pool.
+    #[test]
+    fn trees_on_different_threads_share_one_small_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PageStore::open(&dir.path().join("m.db"), true, 24, None).unwrap();
+        let trees: Vec<Arc<Tree>> = (0..6).map(|_| Arc::new(Tree::new(&store))).collect();
+        let hs: Vec<_> = trees
+            .iter()
+            .enumerate()
+            .map(|(n, t)| {
+                let t = t.clone();
+                std::thread::spawn(move || {
+                    let mut seed = 1000 + n as u64;
+                    let mut model: BTreeMap<(i32, u64), usize> = BTreeMap::new();
+                    for step in 0..1500 {
+                        let k = (lcg(&mut seed) % 700) as i32;
+                        if lcg(&mut seed) % 4 == 0 {
+                            t.remove(&key(k), 0);
+                            model.remove(&(k, 0));
+                        } else {
+                            let pad = if lcg(&mut seed) % 60 == 0 { 2500 } else { (lcg(&mut seed) % 40) as usize };
+                            t.put(key(k), 0, slot(k, pad));
+                            model.insert((k, 0), pad);
+                        }
+                        if step % 300 == 0 {
+                            let want: Vec<(i32, u64)> = model.keys().copied().collect();
+                            assert_eq!(dump(&t), want, "tree {} at step {}", n, step);
+                        }
+                    }
+                    model
+                })
+            })
+            .collect();
+        // checkpoints while the threads work
+        for _ in 0..5 {
+            assert!(store.prepare_checkpoint().is_ok());
+            store.commit_checkpoint();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        for (n, h) in hs.into_iter().enumerate() {
+            let model = h.join().unwrap();
+            let want: Vec<(i32, u64)> = model.keys().copied().collect();
+            assert_eq!(dump(&trees[n]), want, "tree {}", n);
+            assert_eq!(trees[n].entries(), model.len() as u64);
+        }
+        assert!(store.failed().is_none(), "{:?}", store.failed());
+        let st = store.stats();
+        assert!(st.evictions > 0, "{:?}", st);
+        // every tree keeps at least the pages of one operation, so the pool may be exceeded by a few per tree
+        assert!(st.pages_cached <= 24 + 6 * 4, "{:?}", st);
+        // a checkpoint and a reopen find everything
+        let image = store.prepare_checkpoint().unwrap();
+        store.commit_checkpoint();
+        let descs: Vec<TreeDesc> = trees.iter().map(|t| t.desc()).collect();
+        let dumps: Vec<Vec<(i32, u64)>> = trees.iter().map(|t| dump(t)).collect();
+        drop(trees);
+        store.set_closing();
+        drop(store);
+        let store2 = PageStore::open(&dir.path().join("m.db"), true, 24, Some(image)).unwrap();
+        for (d, want) in descs.into_iter().zip(dumps) {
+            let t = Tree::from_desc(d, Some(store2.clone()));
+            assert_eq!(dump(&t), want);
+        }
     }
 
     #[test]
