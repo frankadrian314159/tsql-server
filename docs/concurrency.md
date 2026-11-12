@@ -129,6 +129,15 @@ statement runs. Statements from different sessions run **in parallel**; what the
 Identity columns and sequences are shared counters (`SharedCounter`): a statement works on a copy of the table and
 advances the real counter atomically, so it does not need to write the table back to the catalog.
 
+### Waiting for a writer
+
+A reader under READ COMMITTED (without row versioning) that meets a row another transaction has changed and not committed has
+to wait for it. A plain `SELECT` waits where it is, with the catalog released, and carries on with the same chunk of rows
+when the writer has ended (`Engine::waits_in_place`); the wait is subject to deadlock detection and `LOCK_TIMEOUT`.
+A statement that writes (and a read that keeps locks, `REPEATABLE READ`, `SERIALIZABLE`, `UPDLOCK`) gives up its work, waits
+and is run again, since its locks and the rows it has read must not be held across the wait.
+`Server::lock_waits()` and `Server::lock_wait_sites()` count the waits and say which place in the engine raised them.
+
 ### Commit protocol
 
 1. Under the commit lock the transaction takes the next commit timestamp and appends its redo record to the log, so

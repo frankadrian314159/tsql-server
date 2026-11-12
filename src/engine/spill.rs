@@ -32,7 +32,7 @@ pub struct WorkMem {
 impl Default for WorkMem {
     fn default() -> Self {
         let dir = std::env::var_os("TSQL_SPILL_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-        WorkMem { bytes: 64 << 20, stream_min_slots: 20_000, dir }
+        WorkMem { bytes: 256 << 20, stream_min_slots: 20_000, dir }
     }
 }
 

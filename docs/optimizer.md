@@ -51,6 +51,13 @@ SELECT
   |--join o: index nested-loop via ix_ord_cust; 0 rows in, 0 out
 ```
 
+An index range scan is only chosen when it covers at most 15 % of the index (tables of fewer than 2,000 rows are not measured):
+the fraction is estimated from one descent of the index (the position of each bound among the children of each node), and a
+bigger range is read with a full scan, which costs far less per row. The number of distinct keys of an index is remembered
+per prefix length while its size is within 5 %. In a `SELECT`, a correlated subquery is reused for outer rows with the same
+values in the columns it refers to, and a scan that comes again with the same access path and conditions is answered from
+the rows of the first time (the plan says `reused from an earlier scan`); see [performance.md](performance.md).
+
 From Rust: `conn.explain(sql)` returns the same lines, and `conn.last_plan()` returns the decisions (with actual
 row counts) of the statement that last ran (at most the first 256 lines: a subquery that runs once per outer row would otherwise
 add a line for every row). `SET OPTIMIZER OFF` switches the optimizer off for the session (every

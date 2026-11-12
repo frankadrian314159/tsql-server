@@ -69,7 +69,7 @@ impl<'a> Engine<'a> {
                     base / ndv * keys.len() as f64
                 }
             }
-            Access::Range { .. } => base / 3.0,
+            Access::Range { idx, lo, hi, .. } => base * t.data.range_fraction(idx, lo.as_ref().map(|(v, i)| (v.as_slice(), *i)), hi.as_ref().map(|(v, i)| (v.as_slice(), *i))),
             Access::Full => base * 0.33f64.powi(pushed.len().min(4) as i32),
         };
         est.clamp(1.0, base.max(1.0))
@@ -604,8 +604,33 @@ impl<'a> Engine<'a> {
             }
             None => {
                 crate::span!("scan_rows_flt");
+                // A scan that comes again with the very same access path and conditions (the inner side of a correlated
+                // subquery reads the tables of its FROM again for every outer row) is answered from the rows kept the
+                // second time, whatever the table. Only for a SELECT, whose tables do not change under it, and not when
+                // a table hint is in play (a hint can change how the rows are read and locked).
+                let cache_key = if self.ses.in_query && !guarded && matches!(loc, Loc::Db(..)) && self.ses.hints.is_empty() {
+                    let text = format!("{:?}", pushed);
+                    super::query::text_is_repeatable(&text).then(|| format!("{}|{}|{:?}|{}", t.object_id, alias, ap, text))
+                } else {
+                    None
+                };
+                if let Some(rows) = cache_key.as_ref().and_then(|k| self.ses.leaf_cache.get(k)) {
+                    let mut rs = Rowset::table_rows(t, alias, vec![]);
+                    rs.rows = rows.clone();
+                    plan_note!(self, "scan {} [{} rows]: reused from an earlier scan in the statement -> {} rows", alias, total, rs.rows.len());
+                    mark(&mut rs.schema);
+                    return Ok(rs);
+                }
                 let scanned = self.scan_rows_flt(loc, t, &ap, Some((&schema, pushed)))?;
-                scanned.into_iter().map(|r| r.1).collect()
+                let rows: Vec<Row> = scanned.into_iter().map(|r| r.1).collect();
+                if let Some(k) = cache_key {
+                    if !self.ses.leaf_seen.insert(k.clone()) && rows.len() <= 50_000 && self.ses.leaf_cache.len() < 64 {
+                        self.ses.leaf_cache.insert(k, rows.clone().into());
+                    } else if self.ses.leaf_seen.len() > 100_000 {
+                        self.ses.leaf_seen.clear();
+                    }
+                }
+                rows
             }
         };
         crate::span!("plan_text_and_rowset");

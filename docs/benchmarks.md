@@ -57,6 +57,10 @@ frames). Its checks tie the tables together: holding summaries equal the sum of 
 commissions equal the completed trades, account balances equal the initial balance plus sells minus buys minus
 commissions, and every trade has its history rows.
 
+Table hints written `WITH (UPDLOCK)` in a procedure used to stay in force for the later statements of the session, which made the
+read-only transactions of TPC-E lock every row they read (see [performance.md](performance.md)); with that fixed, 4 terminals
+complete 328 trade results per second against 152 before and 159 for one terminal.
+
 4 terminals, 5 seconds, 2 warehouses, in memory: 31,000 New-Orders per minute, one deadlock retry, all conditions hold;
 TPC-E about 156 Trade-Results per second, all invariants hold. With `--terminals 16 --warehouses 1 --pool 64` (a disk-backed
 server with a 64-page buffer pool, so pages are evicted while transactions run) nothing fails and every condition

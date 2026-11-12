@@ -178,7 +178,7 @@ Things that are **not** implemented, so you are not surprised:
 * **Optimizer** — heuristic and statistics-on-demand (distinct counts come from the indexes, exact for small ones and
   sampled for large ones);
   no histograms on unindexed columns, `OPTION (HASH JOIN | LOOP JOIN | FORCE ORDER)` and table hints are honoured (see
-  [docs/administration.md](docs/administration.md)), outer joins are not reordered, a correlated subquery is executed per outer row (an uncorrelated one once per statement)
+  [docs/administration.md](docs/administration.md)), outer joins are not reordered, a correlated subquery is executed per outer row (once per distinct combination of the outer values it refers to; an uncorrelated one once per statement)
   rather than being rewritten to a semi-join or a grouped join, and only parsed batches (not execution plans) are cached.
 * **Triggers on views** — `INSTEAD OF` triggers on views are not supported (`AFTER` triggers on tables are; a view that maps onto one table is updatable, with `WITH CHECK OPTION`).
 * **Tools** — the shell and the desktop app use one session each (see [docs/shell-and-gui.md](docs/shell-and-gui.md)).

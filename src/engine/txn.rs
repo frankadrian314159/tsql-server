@@ -29,8 +29,11 @@ pub fn tab_ref(loc: &Loc) -> Option<TabRef> {
 }
 
 impl<'a> Engine<'a> {
+    #[track_caller]
     pub fn blocked(&mut self, blockers: Vec<TxId>) -> SqlError {
         self.ses.blocked_on = blockers;
+        self.ses.blocked_nowait = self.ses.nowait;
+        self.ses.blocked_at = Some(std::panic::Location::caller());
         SqlError::new(BLOCKED, "lock wait required")
     }
 
@@ -290,6 +293,7 @@ impl<'a> Engine<'a> {
     }
 
     // ------------------------------------------------------------------ locks
+    #[track_caller]
     pub fn lock_table(&mut self, oid: i32, mode: Mode) -> Result<()> {
         let tx = self.ensure_tx()?;
         match self.srv.core.locks.acquire(tx, &Res::Table(oid), mode) {
@@ -298,11 +302,15 @@ impl<'a> Engine<'a> {
         }
     }
 
+    #[track_caller]
     pub fn lock_row(&mut self, oid: i32, rowid: RowId, mode: Mode) -> Result<()> {
         let tx = self.ensure_tx()?;
         match self.srv.core.locks.acquire(tx, &Res::Row(oid, rowid), mode) {
             Ok(()) => Ok(()),
-            Err(b) => Err(self.blocked(b)),
+            Err(b) => {
+                self.ses.blocked_oid = oid;
+                Err(self.blocked(b))
+            }
         }
     }
 
@@ -476,6 +484,14 @@ impl<'a> Engine<'a> {
             loop {
                 let mut chunk = t.data.scan_chunk(&view, after, 512, !h.readpast);
                 if let Some(w) = chunk.blocked_by {
+                    if self.waits_in_place(iso, h.write_lock) {
+                        // wait for the writer here and read the chunk again, instead of running the whole statement again
+                        self.ses.blocked_on = vec![w];
+                        self.ses.blocked_nowait = false;
+                        self.ses.blocked_at = Some(std::panic::Location::caller());
+                        self.wait_blocked()?;
+                        continue;
+                    }
                     return Err(self.blocked(vec![w]));
                 }
                 if h.readpast {
@@ -546,11 +562,20 @@ impl<'a> Engine<'a> {
             let mut rows: Vec<(RowId, Row)> = Vec::new();
             for &rid in chunk {
                 if view.mode == ViewMode::Committed {
-                    if let Some(w) = t.data.foreign_writer(rid, view.tx) {
+                    while let Some(w) = t.data.foreign_writer(rid, view.tx) {
                         if h.readpast {
-                            continue;
+                            break;
                         }
-                        return Err(self.blocked(vec![w]));
+                        if !self.waits_in_place(iso, h.write_lock) {
+                            return Err(self.blocked(vec![w]));
+                        }
+                        self.ses.blocked_on = vec![w];
+                        self.ses.blocked_nowait = false;
+                        self.ses.blocked_at = Some(std::panic::Location::caller());
+                        self.wait_blocked()?;
+                    }
+                    if h.readpast && t.data.foreign_writer(rid, view.tx).is_some() {
+                        continue;
                     }
                 }
                 if let Some(r) = t.data.get(rid, &view) {
@@ -658,12 +683,21 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    /// May a read that meets a row another transaction is changing wait for it where it is? A plain `SELECT` under READ
+    /// COMMITTED may: it holds no locks of its own that the wait could turn into a deadlock, and what it has read stays
+    /// valid at this isolation level, so it carries on from where it stopped instead of running again from the start (a
+    /// long scan that met a writer in each of its tries would never finish). Anything that writes, or keeps locks to the end
+    /// of the transaction, is run again as before.
+    fn waits_in_place(&self, iso: Isolation, write_lock: bool) -> bool {
+        self.ses.in_query && iso == Isolation::ReadCommitted && !write_lock && !self.ses.nowait
+    }
+
     /// Wait for the transactions in `ses.blocked_on` to finish. Errors on deadlock or timeout.
     pub fn wait_blocked(&mut self) -> Result<()> {
         let blockers = std::mem::take(&mut self.ses.blocked_on);
         let me = self.cur_tx();
         let timeout = self.ses.lock_timeout;
-        if timeout == 0 || self.ses.nowait {
+        if timeout == 0 || self.ses.blocked_nowait {
             if me != 0 {
                 self.srv.core.locks.cancel_pending(me);
             }
@@ -683,6 +717,7 @@ impl<'a> Engine<'a> {
         let core = self.srv.core.clone();
         let spid = self.ses.spid;
         let timed_out = self.srv.unlocked(|| core.wait_for_end(&blockers, dur, spid));
+        self.srv.core.note_lock_wait(self.ses.blocked_at.map(|l| format!("{}:{} {} table {}", l.file(), l.line(), self.ses.stmt_kind, self.ses.blocked_oid)).unwrap_or_default(), started.elapsed().as_nanos() as u64);
         if self.srv.core.is_killed(spid) {
             return Err(self.kill_error());
         }

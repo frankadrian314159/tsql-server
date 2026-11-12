@@ -875,6 +875,36 @@ impl TableData {
         out
     }
 
+    /// The fraction (0 to 1) of the entries of index `idx` whose key lies between the bounds (an estimate from the shape of
+    /// the tree: see `Tree::rank_fraction`).
+    pub fn range_fraction(&self, idx: usize, lo: Option<(&[Value], bool)>, hi: Option<(&[Value], bool)>) -> f64 {
+        let spec = &self.specs[idx];
+        let (lo_k, hi_k);
+        let (lo, hi) = if spec.has_colls() {
+            lo_k = lo.map(|(v, i)| (spec.xform(v), i));
+            hi_k = hi.map(|(v, i)| (spec.xform(v), i));
+            (lo_k.as_ref().map(|(v, i)| (v.as_slice(), *i)), hi_k.as_ref().map(|(v, i)| (v.as_slice(), *i)))
+        } else {
+            (lo, hi)
+        };
+        let tree = &self.indexes[idx];
+        let below = match lo {
+            None => 0.0,
+            Some((v, incl)) => tree.rank_fraction(&|k, _| {
+                let c = cmp_prefix(&k.0, v);
+                c == Ordering::Greater || (c == Ordering::Equal && incl)
+            }),
+        };
+        let up_to = match hi {
+            None => 1.0,
+            Some((v, incl)) => tree.rank_fraction(&|k, _| {
+                let c = cmp_prefix(&k.0, v);
+                c == Ordering::Greater || (c == Ordering::Equal && !incl)
+            }),
+        };
+        (up_to - below).clamp(0.0, 1.0)
+    }
+
     /// Row ids whose key (first columns) lies between the bounds, all at once.
     pub fn seek_range(&self, idx: usize, lo: Option<(&[Value], bool)>, hi: Option<(&[Value], bool)>, forward: bool) -> Vec<RowId> {
         let mut out = vec![];
@@ -919,6 +949,15 @@ impl TableData {
     /// Estimated number of distinct values of the first `prefix` key columns of an index: exact for
     /// small indexes, otherwise extrapolated from a sample of leaf pages.
     pub fn distinct_prefixes(&self, idx: usize, prefix: usize) -> usize {
+        if let Some(n) = self.indexes[idx].cached_ndv(prefix) {
+            return n;
+        }
+        let n = self.count_distinct_prefixes(idx, prefix);
+        self.indexes[idx].remember_ndv(prefix, n);
+        n
+    }
+
+    fn count_distinct_prefixes(&self, idx: usize, prefix: usize) -> usize {
         let tree = &self.indexes[idx];
         let total = tree.entries() as usize;
         let same = |a: &KeyVals, b: &KeyVals| cmp_prefix(&a.0[..prefix.min(a.0.len())], &b.0[..prefix.min(b.0.len())]) == Ordering::Equal;

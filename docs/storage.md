@@ -78,7 +78,7 @@ that is then copied several times.
 | `TOP n` / `OFFSET .. FETCH` with `ORDER BY` | the best `offset + n` rows are kept (up to 200,000), everything else is discarded as it is read | O(n) |
 | `TOP n` without `ORDER BY` | the scan stops after `n` rows | O(n) |
 | `DISTINCT` | rows are sorted by identity (spilling), the first arrival of each is kept, then the requested order is restored | `work_mem` |
-| `GROUP BY` (plain expressions) | rows are sorted by group key (spilling); each group is aggregated, filtered by `HAVING` and projected as soon as it is complete, then its rows are dropped; groups keep first-appearance order unless `ORDER BY` says otherwise | `work_mem` + the largest group |
+| `GROUP BY` (plain expressions) | when every aggregate is `COUNT`, `SUM`, `AVG`, `MIN` or `MAX` (not `DISTINCT`) each group is a first row plus a small state folded as rows arrive (plan: `group by hash`), if the groups fit in `work_mem`; otherwise rows are sorted by group key (spilling) and each group is aggregated, filtered by `HAVING` and projected as soon as it is complete, then its rows are dropped | `work_mem` + the largest group |
 
 ### Joins: streaming hash join with a grace fallback
 

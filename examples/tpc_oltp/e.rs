@@ -337,6 +337,9 @@ pub fn drive(server: &tsql_server::Server, cfg: Arc<Cfg>, terminals: usize, secs
                     }
                 }
             }
+            if t == 0 {
+                tsql_server::prof::report();
+            }
             tally
         }));
     }

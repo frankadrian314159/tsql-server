@@ -182,3 +182,135 @@ fn the_byte_tokenizer_reads_unicode_names_and_literals() {
     assert_eq!(err_no(&mut c, "SELECT 'unclosed"), 105);
     assert_eq!(err_no(&mut c, "SELECT 1 /* open"), 113);
 }
+
+// ---------------------------------------------------------------------------------------- decision-support paths
+
+/// Two servers with the same data: one that runs everything in memory, one with a tiny work-memory budget that
+/// sends every eligible query through the streaming and spilling executors.
+fn twin(setup: &str) -> (tsql_server::Connection, tsql_server::Connection) {
+    let a = tsql_server::Server::new();
+    let b = tsql_server::Server::new();
+    b.set_work_mem(2048, 0, None);
+    let (mut ca, mut cb) = (a.connect(), b.connect());
+    script(&mut ca, setup);
+    script(&mut cb, setup);
+    std::mem::forget(a);
+    std::mem::forget(b);
+    (ca, cb)
+}
+
+/// An `INSERT` of `n` rows into `table`, each made from its number `n` by the expressions in `select` (a recursive
+/// CTE makes the numbers).
+fn fill(table: &str, n: usize, select: &str) -> String {
+    format!("WITH nums(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM nums WHERE n < {n}) INSERT {table} SELECT {select} FROM nums OPTION (MAXRECURSION 0)")
+}
+
+fn sales_setup() -> String {
+    format!(
+        "CREATE TABLE s (id INT PRIMARY KEY, g INT, h VARCHAR(5), q INT, p DECIMAL(10,2), f FLOAT);
+         CREATE INDEX ix_s_g ON s (g);
+         {};
+         UPDATE s SET q = NULL WHERE id % 11 = 0;",
+        fill("s", 4000, "n, n % 7, CHAR(65 + n % 3), n % 13, (n % 100) * 1.25, n * 0.5")
+    )
+}
+
+#[test]
+fn aggregates_folded_as_rows_arrive_agree_with_the_ones_worked_out_from_kept_rows() {
+    let (mut mem, mut spill) = twin(&sales_setup());
+    for sql in [
+        "SELECT g, h, COUNT(*), COUNT(q), SUM(q), AVG(q), MIN(q), MAX(q), SUM(p), AVG(p), MIN(h), MAX(h), AVG(f) FROM s GROUP BY g, h ORDER BY g, h",
+        "SELECT g, SUM(p) / COUNT(*) AS m, SUM(q) * 2 + 1 FROM s GROUP BY g HAVING COUNT(*) > 100 AND MAX(q) >= 10 ORDER BY MAX(p) DESC, g",
+        "SELECT h, COUNT_BIG(*), SUM(CAST(q AS BIGINT)), AVG(CAST(p AS FLOAT)) FROM s WHERE id > 100 GROUP BY h ORDER BY h",
+        "SELECT g FROM s GROUP BY g HAVING SUM(q) IS NULL OR MIN(p) = 0 ORDER BY g",
+        "SELECT TOP 3 g, SUM(p) AS tot FROM s GROUP BY g ORDER BY tot DESC",
+        "SELECT g, COUNT(DISTINCT q), SUM(q) FROM s GROUP BY g ORDER BY g",
+        "SELECT g, STDEV(q), STRING_AGG(h, ',') FROM s WHERE id < 50 GROUP BY g ORDER BY g",
+    ] {
+        assert_eq!(rows(&mut mem, sql), rows(&mut spill, sql), "{sql}");
+    }
+    // with a tiny budget the groups are sorted and spilled; with room for them they are folded in a hash table
+    rows(&mut spill, "SELECT g, SUM(p) FROM s GROUP BY g");
+    assert!(spill.last_plan().iter().any(|l| l.contains("group by sort")), "{:?}", spill.last_plan());
+    let roomy = tsql_server::Server::new();
+    roomy.set_work_mem(256 << 20, 0, None);
+    let mut r = roomy.connect();
+    script(&mut r, &sales_setup());
+    assert_eq!(rows(&mut r, "SELECT g, SUM(p), AVG(q) FROM s GROUP BY g ORDER BY g"), rows(&mut mem, "SELECT g, SUM(p), AVG(q) FROM s GROUP BY g ORDER BY g"));
+    assert!(r.last_plan().iter().any(|l| l.contains("group by hash")), "{:?}", r.last_plan());
+}
+
+#[test]
+fn a_group_that_having_throws_away_never_raises_its_aggregate_error() {
+    let mut c = conn();
+    script(&mut c, "CREATE TABLE t (g INT, v INT); INSERT t VALUES (1, 2147483647), (1, 2147483647), (2, 5), (2, 6);");
+    // the sum of group 1 overflows; HAVING keeps only group 2, so the overflow is never asked for
+    assert_eq!(rows(&mut c, "SELECT g, SUM(v) FROM t GROUP BY g HAVING MIN(v) < 100"), vec![vec!["2".to_string(), "11".to_string()]]);
+    assert_eq!(err_no(&mut c, "SELECT g, SUM(v) FROM t GROUP BY g"), 8115);
+}
+
+#[test]
+fn a_cte_read_many_times_gives_the_same_rows_each_time() {
+    let mut c = conn();
+    script(&mut c, "CREATE TABLE t (g INT, v INT); INSERT t VALUES (1,1),(1,2),(2,3),(2,4),(3,5);");
+    // a correlated subquery over a CTE: the CTE is worked out once for the statement
+    assert_eq!(
+        rows(&mut c, "WITH tot AS (SELECT g, SUM(v) AS s FROM t GROUP BY g) SELECT a.g FROM tot a WHERE a.s > (SELECT AVG(b.s) FROM tot b WHERE b.g <= a.g) ORDER BY 1"),
+        vec![vec!["2".to_string()]]
+    );
+    // one that cannot be repeated is worked out every time
+    assert_eq!(scalar(&mut c, "WITH r AS (SELECT NEWID() AS x) SELECT COUNT(DISTINCT x) FROM (SELECT x FROM r UNION ALL SELECT x FROM r) u"), "2");
+}
+
+#[test]
+fn a_range_that_takes_in_most_of_a_table_is_read_in_full() {
+    let mut c = conn();
+    script(&mut c, "CREATE TABLE r (id INT PRIMARY KEY, d INT, pad VARCHAR(20)); CREATE INDEX ix_r_d ON r (d);");
+    exec(&mut c, &fill("r", 6000, "n, n, 'x'"));
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM r WHERE d <= 5900"), "5900");
+    assert!(c.last_plan().iter().any(|l| l.contains("full scan")), "{:?}", c.last_plan());
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM r WHERE d <= 300"), "300");
+    assert!(c.last_plan().iter().any(|l| l.contains("index range")), "{:?}", c.last_plan());
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM r WHERE d BETWEEN 100 AND 400"), "301");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM r WHERE d > 5990"), "10");
+}
+
+#[test]
+fn correlated_subqueries_in_a_join_see_each_outer_row() {
+    let mut c = conn();
+    script(
+        &mut c,
+        "CREATE TABLE cust (id INT PRIMARY KEY, demo INT);
+         CREATE TABLE demo (id INT PRIMARY KEY, kind VARCHAR(5));
+         CREATE TABLE sale (id INT PRIMARY KEY, cust INT, day INT);
+         CREATE TABLE cal (day INT PRIMARY KEY, yr INT, mo INT);
+         CREATE INDEX ix_sale_cust ON sale (cust);
+         CREATE INDEX ix_sale_day ON sale (day);",
+    );
+    exec(&mut c, &fill("demo", 40, "n, CHAR(65 + n % 4)"));
+    exec(&mut c, &fill("cust", 200, "n, n % 40 + 1"));
+    exec(&mut c, &fill("cal", 480, "n, 2000 + n / 12 % 4, n % 12 + 1"));
+    // sales of every seventh customer, on days that depend on the customer
+    exec(&mut c, &fill("sale", 28, "n, n * 7, (n * 13) % 480 + 1"));
+    let exists = "EXISTS (SELECT * FROM sale s, cal d WHERE c.id = s.cust AND s.day = d.day AND d.yr = 2001 AND d.mo BETWEEN 4 AND 6)";
+    let by_join = rows(&mut c, "SELECT DISTINCT s.cust FROM sale s JOIN cal d ON s.day = d.day WHERE d.yr = 2001 AND d.mo BETWEEN 4 AND 6 ORDER BY 1");
+    assert!(!by_join.is_empty());
+    // alone, joined to another table, and counted
+    assert_eq!(rows(&mut c, &format!("SELECT c.id FROM cust c WHERE {exists} ORDER BY 1")), by_join);
+    assert_eq!(rows(&mut c, &format!("SELECT c.id FROM cust c, demo m WHERE m.id = c.demo AND {exists} ORDER BY 1")), by_join);
+    assert_eq!(scalar(&mut c, &format!("SELECT COUNT(*) FROM cust c, demo m WHERE m.id = c.demo AND {exists}")), by_join.len().to_string());
+    assert_eq!(scalar(&mut c, &format!("SELECT COUNT(*) FROM cust c WHERE NOT {exists}")), (200 - by_join.len()).to_string());
+    // a scalar subquery on a column with few values is worked out once per value, and gives what it gives per row
+    assert_eq!(
+        scalar(&mut c, "SELECT COUNT(*) FROM cust c WHERE c.demo > (SELECT AVG(m.id) FROM demo m WHERE m.kind = (SELECT kind FROM demo WHERE id = c.demo))"),
+        scalar(&mut c, "SELECT COUNT(*) FROM cust c, demo m0 WHERE m0.id = c.demo AND c.demo > (SELECT AVG(m.id) FROM demo m WHERE m.kind = m0.kind)")
+    );
+}
+
+#[test]
+fn a_subquery_that_reads_a_variable_uses_its_value() {
+    let mut c = conn();
+    script(&mut c, "CREATE TABLE v (id INT PRIMARY KEY, k INT); INSERT v VALUES (1,1),(2,1),(3,1),(4,1);");
+    assert_eq!(scalar(&mut c, "DECLARE @n INT = 2; SELECT COUNT(*) FROM v WHERE (SELECT COUNT(*) FROM v w WHERE w.k = v.k AND w.id <= @n) = 2"), "4");
+    assert_eq!(scalar(&mut c, "DECLARE @n INT = 3; SELECT COUNT(*) FROM v WHERE (SELECT COUNT(*) FROM v w WHERE w.k = v.k AND w.id <= @n) = 2"), "0");
+}

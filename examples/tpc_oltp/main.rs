@@ -70,6 +70,11 @@ fn main() {
             problems += tally.failed[i];
         }
         println!("New-Orders per minute (tpmC-like): {:.0}; deadlock retries: {}", tally.done[0] as f64 * 60.0 / secs, tally.retries);
+        for (site, n, d) in server.lock_wait_sites().into_iter().take(6) {
+            println!("   lock wait at {}: {} waits, {:.2}s", site, n, d.as_secs_f64());
+        }
+        let (w, d) = server.lock_waits();
+        println!("lock waits: {} ({:.2}s waited in all, {:.2} ms each)", w, d.as_secs_f64(), d.as_secs_f64() * 1000.0 / w.max(1) as f64);
         for e in &tally.errors {
             println!("   ERROR {}", e);
         }
@@ -107,6 +112,14 @@ fn main() {
             problems += tally.failed[i];
         }
         println!("Trade-Results per second (tpsE-like): {:.1}; deadlock retries: {}", tally.done[e::TRADE_RESULT] as f64 / secs, tally.retries);
+        for r in conn.execute("SELECT object_id, name FROM sys.tables").resultsets().first().map(|rs| rs.rows.clone()).unwrap_or_default() {
+            println!("   table {} = {}", r[0], r[1]);
+        }
+        for (site, n, d) in server.lock_wait_sites().into_iter().take(6) {
+            println!("   lock wait at {}: {} waits, {:.2}s", site, n, d.as_secs_f64());
+        }
+        let (w, d) = server.lock_waits();
+        println!("lock waits: {} ({:.2}s waited in all, {:.2} ms each)", w, d.as_secs_f64(), d.as_secs_f64() * 1000.0 / w.max(1) as f64);
         for er in &tally.errors {
             println!("   ERROR {}", er);
         }

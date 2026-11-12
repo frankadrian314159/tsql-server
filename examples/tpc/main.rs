@@ -28,10 +28,29 @@ fn main() {
     if !only_ds {
         println!("== TPC-H (scale factor {}) ==", sf);
         let server = if durable { Server::open(dir.path().join("h")).unwrap() } else { Server::new() };
+        if let Some(mb) = flag("--work-mb") {
+            server.set_work_mem((mb * 1024.0 * 1024.0) as usize, 20_000, None);
+        }
         let mut c = server.connect();
         let t = Instant::now();
         let data = h::load(&mut c, sf);
         println!("loaded in {:.2}s", t.elapsed().as_secs_f64());
+        // --sql "statement" (repeatable) runs ad hoc statements against the loaded data and prints their times and plans
+        let adhoc: Vec<String> = args.iter().enumerate().filter(|(_, a)| *a == "--sql").filter_map(|(i, _)| args.get(i + 1).cloned()).collect();
+        if !adhoc.is_empty() {
+            for sql in adhoc {
+                let (res, dt) = timed(&mut c, &sql);
+                println!("{:.3}s {}", dt, if res.is_ok() { "ok" } else { "ERROR" });
+                if let Ok(rows) = &res { println!("   {} row(s): {:?}", rows.len(), rows.iter().take(6).collect::<Vec<_>>()); } else if let Err(e) = &res { println!("   {}", e); }
+                if let Ok(rows) = &res { for r in rows.iter().take(8) { println!("   row: {}", r.join(" | ")); } }
+                if let Ok(rows) = &res { for r in rows.iter().take(12) { println!("   | {}", r.join(" | ")); } }
+                for l in c.last_plan() {
+                    println!("      plan: {}", l);
+                }
+            }
+            tsql_server::prof::report();
+            return;
+        }
         // with --compare every query also runs on a second server holding the same data but a tiny work-memory budget,
         // which makes it use the streaming and spilling executors; the two answers must agree
         let mut other = if compare {
@@ -95,9 +114,27 @@ fn main() {
     if !only_h {
         println!("== TPC-DS (scale {}) ==", sf);
         let server = if durable { Server::open(dir.path().join("ds")).unwrap() } else { Server::new() };
+        if let Some(mb) = flag("--work-mb") {
+            server.set_work_mem((mb * 1024.0 * 1024.0) as usize, 0, None);
+        }
         let mut c = server.connect();
         let t = Instant::now();
         let data = ds::load(&mut c, sf);
+        let adhoc: Vec<String> = args.iter().enumerate().filter(|(_, a)| *a == "--sql").filter_map(|(i, _)| args.get(i + 1).cloned()).collect();
+        if !adhoc.is_empty() {
+            for sql in adhoc {
+                let (res, dt) = timed(&mut c, &sql);
+                println!("{:.3}s {}", dt, if res.is_ok() { "ok" } else { "ERROR" });
+                if let Ok(rows) = &res { println!("   {} row(s): {:?}", rows.len(), rows.iter().take(6).collect::<Vec<_>>()); } else if let Err(e) = &res { println!("   {}", e); }
+                if let Ok(rows) = &res { for r in rows.iter().take(8) { println!("   row: {}", r.join(" | ")); } }
+                if let Ok(rows) = &res { for r in rows.iter().take(12) { println!("   | {}", r.join(" | ")); } }
+                for l in c.last_plan() {
+                    println!("      plan: {}", l);
+                }
+            }
+            tsql_server::prof::report();
+            return;
+        }
         println!("loaded in {:.2}s", t.elapsed().as_secs_f64());
         // with --compare every query also runs on a second server holding the same data but a tiny work-memory budget,
         // which makes it use the streaming and spilling executors; the two answers must agree

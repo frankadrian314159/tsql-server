@@ -141,6 +141,19 @@ impl Server {
         }
     }
 
+    /// Lock waits by the place in the engine that raised them: (source line, waits, time waited).
+    pub fn lock_wait_sites(&self) -> Vec<(String, u64, std::time::Duration)> {
+        let g = self.shared.state.read().unwrap_or_else(|e| e.into_inner());
+        g.core.lock_wait_sites().into_iter().map(|(s, n, ns)| (s, n, std::time::Duration::from_nanos(ns))).collect()
+    }
+
+    /// (how many times sessions waited for a lock holder, how long they waited in all) since the server started.
+    pub fn lock_waits(&self) -> (u64, std::time::Duration) {
+        let g = self.shared.state.read().unwrap_or_else(|e| e.into_inner());
+        let (n, ns) = g.core.lock_wait_totals();
+        (n, std::time::Duration::from_nanos(ns))
+    }
+
     /// How many times the redo log has been forced to disk for commits (sessions that commit together share a force).
     pub fn log_forces(&self) -> u64 {
         let g = self.shared.state.read().unwrap_or_else(|e| e.into_inner());

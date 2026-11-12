@@ -44,6 +44,11 @@ impl Access {
     }
 }
 
+/// A range scan of an index is only chosen when it covers at most this fraction of the index (tables of fewer rows than
+/// `RANGE_MIN_SLOTS` are not measured: nothing there is costly).
+const RANGE_MAX_FRACTION: f64 = 0.15;
+const RANGE_MIN_SLOTS: usize = 2000;
+
 pub fn split_conjuncts<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
     match e {
         Expr::And(a, b) => {
@@ -343,8 +348,13 @@ impl<'a> Engine<'a> {
                     }
                 }
                 if lo.is_some() || hi.is_some() {
-                    let score = if lo.is_some() && hi.is_some() { 8 } else { 4 };
-                    cand = Some((score, Access::Range { idx: ix, lo, hi, forward: true, name: sp.name.clone() }));
+                    // Reading rows through an index costs several times what reading them in order does, so a range
+                    // that takes in much of the table is better left to a full scan.
+                    let worth = t.data.slot_count() < RANGE_MIN_SLOTS || t.data.range_fraction(ix, lo.as_ref().map(|(v, i)| (v.as_slice(), *i)), hi.as_ref().map(|(v, i)| (v.as_slice(), *i))) <= RANGE_MAX_FRACTION;
+                    if worth {
+                        let score = if lo.is_some() && hi.is_some() { 8 } else { 4 };
+                        cand = Some((score, Access::Range { idx: ix, lo, hi, forward: true, name: sp.name.clone() }));
+                    }
                 }
             }
             if let Some((sc, ac)) = cand {

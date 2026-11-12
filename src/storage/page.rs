@@ -1204,6 +1204,32 @@ impl Pool {
         }
     }
 
+    /// Where the first entry for which `first_true` holds lies, as a fraction (0 to 1) of the tree: the position of its
+    /// child among the children at each level, refined by its position in the leaf. An estimate (the subtrees are taken
+    /// to hold the same number of entries) from one descent.
+    fn rank_fraction(&mut self, root: PageId, first_true: &dyn Fn(&KeyVals, u64) -> bool) -> R<f64> {
+        let mut levels: Vec<(usize, usize)> = vec![];
+        let mut id = root;
+        loop {
+            let f = self.frame(id)?;
+            match &f.node {
+                Node::Inner { keys, children, .. } => {
+                    let c = keys.partition_point(|(k, r)| !first_true(k, *r));
+                    levels.push((c, children.len()));
+                    id = children[c];
+                }
+                Node::Leaf { entries, .. } => {
+                    let p = entries.partition_point(|e| !first_true(&e.key, e.rid));
+                    let mut frac = if entries.is_empty() { 0.0 } else { p as f64 / entries.len() as f64 };
+                    for (c, n) in levels.iter().rev() {
+                        frac = (*c as f64 + frac) / *n as f64;
+                    }
+                    return Ok(frac);
+                }
+            }
+        }
+    }
+
     /// Keys of one leaf chosen by walking down at fraction `frac` of each node, with the last key of the previous leaf.
     fn sample_leaf(&mut self, root: PageId, mut frac: f64) -> R<(Option<KeyVals>, Vec<KeyVals>)> {
         let mut id = root;
@@ -1552,6 +1578,9 @@ pub struct Tree {
     store: Option<Arc<PageStore>>,
     /// The cache of this tree's pages (shared by every handle of the tree).
     pool: Option<Arc<TreePool>>,
+    /// Counts of distinct key prefixes worked out before, as (prefix length, entries then, distinct): the planner asks
+    /// again for every statement, and counting means reading an index.
+    ndv: Mutex<Vec<(usize, u64, usize)>>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -1567,7 +1596,7 @@ impl Tree {
         let pool = Arc::new(RwLock::new(Pool::new(store.sh.clone())));
         let root = store.run_in(&pool, |p| Ok(p.new_tree()));
         store.sh.pools.lock().unwrap_or_else(|e| e.into_inner()).insert(root, pool.clone());
-        Tree { root, entries: AtomicU64::new(0), has_ovf: AtomicBool::new(false), next_id: AtomicU64::new(0), store: Some(store.clone()), pool: Some(pool) }
+        Tree { root, entries: AtomicU64::new(0), has_ovf: AtomicBool::new(false), next_id: AtomicU64::new(0), store: Some(store.clone()), pool: Some(pool), ndv: Mutex::new(vec![]) }
     }
 
     pub fn desc(&self) -> TreeDesc {
@@ -1576,7 +1605,7 @@ impl Tree {
 
     pub fn from_desc(d: TreeDesc, store: Option<Arc<PageStore>>) -> Tree {
         let pool = store.as_ref().map(|s| s.pool_for(d.root));
-        Tree { root: d.root, entries: AtomicU64::new(d.entries), has_ovf: AtomicBool::new(d.has_ovf), next_id: AtomicU64::new(d.next_id), store, pool }
+        Tree { root: d.root, entries: AtomicU64::new(d.entries), has_ovf: AtomicBool::new(d.has_ovf), next_id: AtomicU64::new(d.next_id), store, pool, ndv: Mutex::new(vec![]) }
     }
 
     pub fn store(&self) -> Option<&Arc<PageStore>> {
@@ -1718,6 +1747,26 @@ impl Tree {
             return;
         }
         self.run(|p| p.bt_scan(self.root, first_true, forward, visit));
+    }
+
+    /// The number of distinct key prefixes of length `prefix` that was worked out when the tree held about as many entries
+    /// as it does now (within 5 %), if there is one.
+    pub fn cached_ndv(&self, prefix: usize) -> Option<usize> {
+        let now = self.entries();
+        let m = self.ndv.lock().unwrap_or_else(|e| e.into_inner());
+        m.iter().find(|(p, n, _)| *p == prefix && now.abs_diff(*n) * 20 <= (*n).max(20)).map(|x| x.2)
+    }
+
+    pub fn remember_ndv(&self, prefix: usize, ndv: usize) {
+        let now = self.entries();
+        let mut m = self.ndv.lock().unwrap_or_else(|e| e.into_inner());
+        m.retain(|(p, _, _)| *p != prefix);
+        m.push((prefix, now, ndv));
+    }
+
+    /// See `Pool::rank_fraction`.
+    pub fn rank_fraction(&self, first_true: &dyn Fn(&KeyVals, u64) -> bool) -> f64 {
+        self.run(|p| p.rank_fraction(self.root, first_true))
     }
 
     /// Keys of a leaf at relative position `frac` (0..1) plus the last key of the leaf before it.

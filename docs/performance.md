@@ -224,6 +224,95 @@ above, with 12 threads). "Table per thread" means each session writes a table of
    (the limit is one tree, not the pool); and several sessions that miss the cache in the same tree wait for each
    other's disk reads, because the tree stays locked while a page is read. Both would need latches on single leaves.
 
+## Fourth round: the TPC-H and TPC-DS queries
+
+Profiling TPC-H and TPC-DS at scale factor 0.05 (`cargo run --release --features prof --example tpc h|ds --sf 0.05`;
+`--sql "..."` runs a statement of your own against the loaded data and prints its plan and profile) found these, in the
+order they cost:
+
+| Query | Before | After | Cause |
+| --- | ---: | ---: | --- |
+| TPC-DS Q1 | 14.4 s | 0.40 s | a correlated subquery over a CTE computed the whole CTE again for every outer row |
+| TPC-DS Q69 | 2.6 s | 0.33 s | the planner counted the distinct keys of an index of a few thousand entries by reading it, for every execution of a correlated subquery |
+| TPC-DS Q6 | 2.0 s | 0.45 s | a correlated scalar subquery on a column with a few values ran for every row |
+| TPC-DS Q11 | 3.8 s | 1.1 s | the same CTE cost |
+| TPC-H Q1 | 3.1 s | 1.6 s | an index range scan of 98.6 % of the table, and grouping by sorting every row |
+| TPC-H Q14 | 0.71 s | 0.05 s | an index range scan of a large part of the table |
+| TPC-H Q7, Q8, Q9, Q18 | 1.0-3.3 s | 0.7-2.6 s | hash joins of 75,000-row tables spilled to disk under the 64 MiB work memory |
+| TPC-DS, 24 queries | 25.1 s | 4.6 s | |
+| TPC-H, 22 queries | 17.6 s | 12.1 s | |
+
+1. **A CTE is worked out once per statement.** Every reference to a CTE ran its query again. The rows are now kept in the
+   CTE's entry the first time (unless the query calls `NEWID`, `RAND` or a function of the user, which can differ).
+2. **Distinct key counts are remembered.** The planner asks how many distinct values an index has to estimate how many rows
+   a seek returns; for an index of up to 20,000 entries it counted them by reading every entry, for each leaf of each
+   plan. A tree now remembers the answer for each prefix length and reuses it while its entry count is within 5 %.
+3. **A range scan must be worth it.** The optimizer chose an index range scan whenever a condition bounded the first
+   column, however much of the table it took in, and estimated every range as a third of the table. Reading rows through an
+   index costs several times what reading them in order does (a `COUNT(*)` of 98.6 % of lineitem took 1.4 s, a full scan 0.16
+   s). The fraction of the index inside the range is now estimated from one descent of the tree (`Tree::rank_fraction`:
+   the position of each bound among the children of every node on the way down), used for the estimate of the table's rows,
+   and a range of more than 15 % of a table of 2,000 slots or more is left to a full scan.
+4. **Aggregates are folded as rows arrive.** `GROUP BY` in the streaming executor kept every row of every group (sorted,
+   and written to disk once they did not fit in the work memory) and worked the aggregates out afterwards. `COUNT`,
+   `COUNT_BIG`, `SUM`, `AVG`, `MIN` and `MAX` without `DISTINCT` are now folded into one small state per group
+   (`src/engine/aggacc.rs`), with the same additions in the same order and the same result types as the evaluation over
+   kept rows, and an error (overflow, a string in `SUM`) is kept and raised only if the aggregate is read, so a group that
+   `HAVING` throws away never raises it. Groups come out in the order of their keys, as the sorter gave them. If the groups
+   (a first row each, plus their states) outgrow the work memory the query runs again the old way. Queries with any other
+   aggregate (`STDEV`, `STRING_AGG`, `DISTINCT`) use the old way, with the groups kept in a hash table while they fit.
+5. **Correlated subqueries are reused by the values they depend on.** A correlated subquery's result is kept for each
+   combination of the values of the outer columns its text refers to (`Engine::correlated_rows`; unqualified names and the
+   same name under another qualifier only make the key longer), so one that depends on a column with a few values runs a few
+   times, not once per row. It is not done for a subquery that reads a variable, a sequence, `NEWID`, `RAND` or a function of
+   the user.
+6. **A scan repeated in a SELECT is kept.** The inner side of a correlated subquery reads the tables of its FROM for every
+   outer row. In a `SELECT`, a scan that comes a second time with the same access path (the keys of a seek included) and the
+   same conditions is answered from the rows of the first (`ses.leaf_cache`, per statement, at most 64 scans of 50,000 rows).
+7. **The work memory is 256 MiB** (`WorkMem`, it was 64 MiB), since a hash join gets a share of it per build side and
+   the orders of a 0.05 scale factor database did not fit in a sixth of 64 MiB. `Server::set_work_mem` still sets it.
+
+A mistake caught on the way, kept here because of what it shows: the first version of item 6 keyed a scan by the number of
+keys of its seek, not the keys, so a correlated subquery seeking `date_dim` by a different key for each customer got the first
+answer for all of them (TPC-DS Q69 returned 3 rows where 68 were due, and `--compare` flagged it). The tests
+(`tests/perf_paths.rs`) now run correlated `EXISTS` in joins against a rewrite without a subquery.
+
+Not done: the rest of the time of Q9, Q7, Q21 and Q8 is joins of 60,000 to 300,000 rows (a hash join costs about 3
+microseconds a probe row) and expression evaluation (every column reference of every row looks its name up in the schema);
+compiling expressions to column positions once per query would help every query and is the next step.
+
+## Fifth round: the OLTP benchmarks
+
+`cargo run --release --example tpc_oltp c|e --terminals 4 --secs 10 --warehouses 2` now also prints, from the server's own
+counters, how many times sessions waited for a lock and for how long, and where in the engine each wait was raised
+(`Server::lock_waits`, `Server::lock_wait_sites`). With 4 terminals (in memory, the machine of the sections above):
+
+| | Before | After |
+| --- | ---: | ---: |
+| TPC-E, trade results per second, 1 terminal | 159 | 178 |
+| TPC-E, 4 terminals | 152 | 328 |
+| TPC-E, 4 terminals: waits for a lock, and time spent in them | 2,700 / 6.2 s | 510 / 0.14 s |
+| TPC-E, 4 terminals: Broker-Volume / Trade-Result mean latency | 22 / 6.2 ms | 7.1 / 2.5 ms |
+| TPC-C, New-Orders per minute, 4 terminals | 29,600 | 36,300 |
+
+1. **Table hints leaked out of the statement they were written in.** `ses.hints` was cleared only at nesting level 0, and a
+   procedure call returns before that code runs, so after any procedure ran `WITH (UPDLOCK)` on a table, every later
+   statement of the session that read the table (Broker-Volume, a scan of all pending trades) kept taking an exclusive row
+   lock on every row it read and held them to the end of its transaction: every writer of those rows waited for it. The
+   hints of a statement are now those written in it: a statement inside a procedure or a trigger starts without its caller's,
+   and the caller's come back when it ends. This was nearly all of the TPC-E contention, and some of TPC-C's.
+2. **A SELECT waits for a writer where it is.** A read that met a row another transaction was changing gave up, waited for
+   that transaction to end, and ran the whole statement again from the start (so a scan of 15,000 rows that met a writer
+   in each of its tries restarted again and again). Under READ COMMITTED a plain `SELECT` now waits in place and reads on
+   from the same chunk, as SQL Server does; deadlock detection and `LOCK_TIMEOUT` apply as before. Statements that write,
+   and reads under the stricter levels (which keep locks to the end of the transaction), are still run again.
+
+Where the time goes now: TPC-C is thousands of small statements (about 20 microseconds each, spread over parsing, planning
+and execution; the transactions are 1 to 11 ms), TPC-E's Broker-Volume scans and joins the 15,000 trades that have no
+index on their status (about 4 ms), and what is left of the lock waiting is the hot rows (the district and warehouse rows
+of TPC-C), whose holders keep them to the end of a transaction by design. Not done: resuming a blocked *write* statement
+in place (an `UPDATE` that meets a locked row still runs again after the wait, and must when the row has changed).
+
 ## Where the time goes now
 
 A point lookup by primary key costs about 20 microseconds from `Connection::execute`: parsing 5-10 (statements with

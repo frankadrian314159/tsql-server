@@ -9,6 +9,7 @@
 //! differs.
 use super::hashjoin::{finish_all, push_through, HashJoin, JoinPlan};
 use super::query::{any_coll, cmp_keys, collect_windows, has_agg, keyed, Colls, Env, OutCol, Rowset};
+use super::aggacc::{self, AggAcc};
 use super::spill::{Cmp, Entry, RowsWriter, Sorter, WorkMem};
 use super::*;
 use crate::convert::key_of;
@@ -384,6 +385,35 @@ impl<'a> Engine<'a> {
         } else {
             None
         };
+        // Groups are collected in a hash table while they fit in the work memory (nothing is sorted or written then);
+        // once they do not, everything goes into the external sorter above, which gives the same groups in the same order.
+        let mut hgroups: Option<(std::collections::HashMap<String, Vec<(u64, Row)>>, usize)> = if grouped { Some((std::collections::HashMap::new(), 0)) } else { None };
+        let work_bytes = self.srv.work.bytes;
+        // Aggregates that can be folded one row at a time need no rows kept at all: one small state per group. They are
+        // used when every aggregate of the query can be folded; if the groups do not fit in the work memory the query is
+        // run again the other way (`agg_restart`).
+        let mut agg_calls: Vec<&FuncCall> = vec![];
+        let mut foldable = grouped && !self.ses.no_fold_agg;
+        if foldable {
+            for it in &sel.items {
+                if let SelectItem::Expr { e, .. } = it {
+                    foldable = foldable && aggacc::collect(e, &mut agg_calls);
+                }
+            }
+            if let Some(h) = &sel.having {
+                foldable = foldable && aggacc::collect(h, &mut agg_calls);
+            }
+            for o in order {
+                foldable = foldable && aggacc::collect(&o.e, &mut agg_calls);
+            }
+        }
+        struct GroupAcc {
+            rep: Row,
+            first_seq: u64,
+            accs: Vec<AggAcc>,
+        }
+        let mut agg_groups: Option<(std::collections::HashMap<String, GroupAcc>, usize)> = if foldable { Some((std::collections::HashMap::new(), 0)) } else { None };
+        let mut agg_restart = false;
         let mut wsorter: Option<Sorter> = win_over.as_ref().map(|o| {
             let desc: Vec<bool> = o.order.iter().map(|x| x.desc).collect();
             let cmp: Cmp = Box::new(move |a: &Entry, b: &Entry| {
@@ -400,6 +430,8 @@ impl<'a> Engine<'a> {
             let schema = &schema;
             let where_ = &sel.where_;
             let (sinks, seq, grouper, group_exprs) = (&mut sinks, &mut seq, &mut grouper, &group_exprs);
+            let hgroups_ref = &mut hgroups;
+            let (agg_groups_ref, agg_calls_ref, agg_restart_ref) = (&mut agg_groups, &agg_calls, &mut agg_restart);
             let (wsorter_ref, win_over_ref) = (&mut wsorter, &win_over);
             let (group_colls, order_colls) = (&group_colls, &order_colls);
             // what happens to each row of the source: filter, then group, or project and hand to the sink
@@ -431,6 +463,37 @@ impl<'a> Engine<'a> {
                         kv.push(eng.ev(ge, &env)?);
                     }
                     let gk = if group_colls.is_empty() { key_of(&kv) } else { key_of(&keyed(&kv, group_colls)) };
+                    if let Some((map, bytes)) = agg_groups_ref.as_mut() {
+                        if !map.contains_key(&gk) {
+                            *bytes += super::spill::row_bytes(&row) + gk.len() + 96 * agg_calls_ref.len() + 64;
+                            if *bytes > work_bytes {
+                                *agg_restart_ref = true;
+                                return Ok(false);
+                            }
+                            map.insert(gk.clone(), GroupAcc { rep: row.clone(), first_seq: *seq, accs: agg_calls_ref.iter().map(|_| AggAcc::new()).collect() });
+                        }
+                        if let Some(g) = map.get_mut(&gk) {
+                            for (a, fc) in g.accs.iter_mut().zip(agg_calls_ref.iter()) {
+                                a.update(eng, fc, &env);
+                            }
+                        }
+                        return Ok(true);
+                    }
+                    if let Some((map, bytes)) = hgroups_ref.as_mut() {
+                        *bytes += super::spill::row_bytes(&row) + 24;
+                        map.entry(gk).or_default().push((*seq, row));
+                        if *bytes >= work_bytes {
+                            // too much for memory: hand every row to the sorter, which spills
+                            if let Some((map, _)) = hgroups_ref.take() {
+                                for (k, rows) in map {
+                                    for (sq, r) in rows {
+                                        g.push(Entry { keys: vec![Value::Str(k.clone())], seq: sq, row: r })?;
+                                    }
+                                }
+                            }
+                        }
+                        return Ok(true);
+                    }
                     g.push(Entry { keys: vec![Value::Str(gk)], seq: *seq, row })?;
                     return Ok(true);
                 }
@@ -506,6 +569,13 @@ impl<'a> Engine<'a> {
                 join_note = parts.join(" -> ");
             }
         }
+        if agg_restart {
+            // the groups did not fit in the work memory: run the query again, collecting the rows of each group instead
+            self.ses.no_fold_agg = true;
+            let r = self.try_stream_select(sel, order, offset, fetch, outer, may_stream, to_buf);
+            self.ses.no_fold_agg = false;
+            return r;
+        }
         let mut win_runs = 0usize;
         if let Some(ws) = wsorter.take() {
             win_runs = ws.spilled_runs;
@@ -538,6 +608,30 @@ impl<'a> Engine<'a> {
         }
         let mut group_runs = 0usize;
         let mut groups = 0usize;
+        let mut hashed = false;
+        if let Some((mut map, _)) = agg_groups.take() {
+            // folded aggregates: each group is its first row and the finished aggregates, in the order of the keys
+            grouper = None;
+            hgroups = None;
+            hashed = true;
+            let base_str: Vec<String> = group_exprs.iter().map(|e| format!("{:?}", e)).collect();
+            let mut keys: Vec<String> = map.keys().cloned().collect();
+            keys.sort_unstable();
+            for k in keys {
+                let Some(g) = map.remove(&k) else { continue };
+                groups += 1;
+                let pre: Vec<(usize, std::result::Result<Value, SqlError>)> = g.accs.iter().zip(agg_calls.iter()).map(|(a, fc)| (*fc as *const FuncCall as usize, a.finish(fc))).collect();
+                let ctx = super::query::GroupCtx { rows: vec![g.rep.clone()], pre, excluded: vec![false; base_str.len()], base: base_str.clone() };
+                let env = Env { schema: &schema, row: &g.rep, parent: outer, group: Some(&ctx), win: None };
+                if let Some(h) = &sel.having {
+                    if !matches!(self.ev(h, &env)?, Value::Bit(true)) {
+                        continue;
+                    }
+                }
+                let (prow, keys) = self.project_env(&env, &cols, order, &order_colls)?;
+                sinks.push(prow, keys, g.first_seq)?;
+            }
+        }
         if let Some(g) = grouper.take() {
             group_runs = g.spilled_runs;
             let base_str: Vec<String> = group_exprs.iter().map(|e| format!("{:?}", e)).collect();
@@ -557,7 +651,7 @@ impl<'a> Engine<'a> {
                 let mut process = |rows: Vec<Row>, fs: u64| -> Result<()> {
                     *groups_ref += 1;
                     let rep: Row = rows[0].clone();
-                    let ctx = super::query::GroupCtx { rows, excluded: vec![false; base_str.len()], base: base_str.clone() };
+                    let ctx = super::query::GroupCtx { rows, pre: vec![], excluded: vec![false; base_str.len()], base: base_str.clone() };
                     let env = Env { schema: schema_ref, row: &rep, parent: outer, group: Some(&ctx), win: None };
                     if let Some(h) = &sel.having {
                         if !matches!(eng.ev(h, &env)?, Value::Bit(true)) {
@@ -568,18 +662,36 @@ impl<'a> Engine<'a> {
                     sinks_ref.push(prow, keys, fs)?;
                     Ok(())
                 };
-                let r = g.finish(|e| {
-                    let k = e.keys[0].to_string();
-                    if cur_key.as_deref() != Some(k.as_str()) {
-                        if !cur.is_empty() {
-                            process(std::mem::take(&mut cur), first_seq)?;
+                let r = if let Some((map, _)) = hgroups.take() {
+                    // in the order of the keys, as the sorter would give them
+                    hashed = true;
+                    let mut keys: Vec<String> = map.keys().cloned().collect();
+                    keys.sort_unstable();
+                    let mut map = map;
+                    let mut res = Ok(());
+                    for k in keys {
+                        let rows = map.remove(&k).unwrap_or_default();
+                        let fs = rows.first().map(|r| r.0).unwrap_or(0);
+                        if let Err(e) = process(rows.into_iter().map(|r| r.1).collect(), fs) {
+                            res = Err(e);
+                            break;
                         }
-                        cur_key = Some(k);
-                        first_seq = e.seq;
                     }
-                    cur.push(e.row);
-                    Ok(true)
-                });
+                    res
+                } else {
+                    g.finish(|e| {
+                        let k = e.keys[0].to_string();
+                        if cur_key.as_deref() != Some(k.as_str()) {
+                            if !cur.is_empty() {
+                                process(std::mem::take(&mut cur), first_seq)?;
+                            }
+                            cur_key = Some(k);
+                            first_seq = e.seq;
+                        }
+                        cur.push(e.row);
+                        Ok(true)
+                    })
+                };
                 if let Err(e) = r {
                     pending_error = Some(e);
                 } else if !cur.is_empty() {
@@ -633,7 +745,7 @@ impl<'a> Engine<'a> {
         if may_stream && sel.into.is_none() && top_plain && self.sink.is_some() {
             let (sent, spilled) = self.stream_out(sinks, &cols, off, take)?;
             let sort_note = if order.is_empty() { String::new() } else if use_top_n { ", top-N in memory".to_string() } else { format!(", external sort ({} spilled run(s))", spilled) };
-            let group_note = if grouped { format!(", group by sort ({} group(s), {} spilled run(s))", groups, group_runs) } else if win_over.is_some() { format!(", window by sort ({} spilled run(s))", win_runs) } else { String::new() };
+            let group_note = if grouped { if hashed { format!(", group by hash ({} group(s))", groups) } else { format!(", group by sort ({} group(s), {} spilled run(s))", groups, group_runs) } } else if win_over.is_some() { format!(", window by sort ({} spilled run(s))", win_runs) } else { String::new() };
             let what = match &one {
                 Some(o) => format!("streaming scan {} [{} rows read]: {}", o.a, scanned, o.ap.describe()),
                 None if from_rowset => format!("streaming rowset source [{} rows read]", scanned),
@@ -654,7 +766,7 @@ impl<'a> Engine<'a> {
         } else {
             format!(", external sort ({} spilled run(s))", spilled)
         };
-        let group_note = if grouped { format!(", group by sort ({} group(s), {} spilled run(s))", groups, group_runs) } else if win_over.is_some() { format!(", window by sort ({} spilled run(s))", win_runs) } else { String::new() };
+        let group_note = if grouped { if hashed { format!(", group by hash ({} group(s))", groups) } else { format!(", group by sort ({} group(s), {} spilled run(s))", groups, group_runs) } } else if win_over.is_some() { format!(", window by sort ({} spilled run(s))", win_runs) } else { String::new() };
         let what = match &one {
             Some(o) => format!("streaming scan {} [{} rows read]: {}", o.a, scanned, o.ap.describe()),
             None if from_rowset => format!("streaming rowset source [{} rows read]", scanned),

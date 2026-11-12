@@ -353,6 +353,10 @@ pub fn drive(server: &tsql_server::Server, cfg: std::sync::Arc<Cfg>, terminals: 
                     }
                 }
             }
+            // the profile of the first terminal (spans are kept per thread): `--features prof`
+            if t == 0 {
+                tsql_server::prof::report();
+            }
             tally
         }));
     }

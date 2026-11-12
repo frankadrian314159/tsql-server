@@ -408,7 +408,7 @@ impl<'a> Engine<'a> {
         }
         match self.ses.sub_cache.as_ref().and_then(|c| c.get(&key)) {
             Some(Some(rs)) => return Ok(rs.clone()),
-            Some(None) => return self.exec_query(q, Some(env)),
+            Some(None) => return self.correlated_rows(q, env, key),
             None => {}
         }
         match self.exec_query(q, None) {
@@ -422,10 +422,84 @@ impl<'a> Engine<'a> {
                 if let Some(c) = self.ses.sub_cache.as_mut() {
                     c.insert(key, None);
                 }
-                self.exec_query(q, Some(env))
+                self.correlated_rows(q, env, key)
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Run a correlated subquery for the row in `env`, or reuse what it gave for an earlier row that has the same values in
+    /// every outer column the subquery could read. Which those are is taken from the column references in its text: an
+    /// outer column nothing refers to cannot matter, and one that is only named like a reference of the subquery (an
+    /// unqualified name, or the same name under another qualifier) can only make the key longer. A subquery whose result does not depend on its text and the outer values alone
+    /// (variables, sequences, `NEWID`, `RAND`, functions of the user) is always run.
+    fn correlated_rows(&mut self, q: &Query, env: &Env<'_>, qkey: usize) -> Result<super::query::Rowset> {
+        let names: Option<std::sync::Arc<Vec<(String, Option<String>)>>> = match self.ses.sub_names.get(&qkey) {
+            Some(n) => n.clone(),
+            None => {
+                let text = format!("{:?}", q);
+                let reusable = super::query::text_is_repeatable(&text);
+                let n = if reusable {
+                    // every column reference in the text: (name, qualifier) in lower case
+                    let mut v: Vec<(String, Option<String>)> = vec![];
+                    for part in text.split("Col([").skip(1) {
+                        let Some(end) = part.find("])") else { continue };
+                        let strs: Vec<String> = part[..end].split('"').skip(1).step_by(2).map(|s| s.to_lowercase()).collect();
+                        match strs.as_slice() {
+                            [] => {}
+                            [n] => v.push((n.clone(), None)),
+                            [.., q, n] => v.push((n.clone(), Some(q.clone()))),
+                        }
+                    }
+                    v.sort_unstable();
+                    v.dedup();
+                    Some(std::sync::Arc::new(v))
+                } else {
+                    None
+                };
+                self.ses.sub_names.insert(qkey, n.clone());
+                n
+            }
+        };
+        let Some(names) = names else { return self.exec_query(q, Some(env)) };
+        // the values of the outer columns the subquery names, through every enclosing row
+        let mut vals: Vec<Value> = vec![];
+        let mut cur = Some(env);
+        let mut depth = 0i64;
+        while let Some(e) = cur {
+            for (i, c) in e.schema.cols.iter().enumerate() {
+                let mut buf = [0u8; 64];
+                let n = c.name.len();
+                if n > 64 {
+                    continue;
+                }
+                buf[..n].copy_from_slice(c.name.as_bytes());
+                buf[..n].make_ascii_lowercase();
+                let Ok(lower) = std::str::from_utf8(&buf[..n]) else { continue };
+                let first = names.partition_point(|x| x.0.as_str() < lower);
+                let referred = names[first..].iter().take_while(|x| x.0 == lower).any(|x| match (&x.1, &c.qual) {
+                    (None, _) => true,
+                    (Some(q), Some(cq)) => q.eq_ignore_ascii_case(cq),
+                    (Some(_), None) => false,
+                });
+                if referred {
+                    vals.push(Value::BigInt(depth * 4096 + i as i64));
+                    vals.push(e.row.get(i).cloned().unwrap_or(Value::Null));
+                }
+            }
+            cur = e.parent;
+            depth += 1;
+        }
+        let key = crate::convert::key_of(&vals);
+        if let Some(rs) = self.ses.sub_memo.get(&qkey).and_then(|m| m.get(&key)) {
+            return Ok(rs.clone());
+        }
+        let rs = self.exec_query(q, Some(env))?;
+        let memo = self.ses.sub_memo.entry(qkey).or_default();
+        if memo.len() < 50_000 {
+            memo.insert(key, rs.clone());
+        }
+        Ok(rs)
     }
 
     /// The declared (precision, scale) of a numeric expression, worked out as SQL Server does from the types of columns,

@@ -29,6 +29,7 @@ pub mod bakimport;
 pub mod auditing;
 pub mod bulk;
 pub mod ddltrig;
+pub mod aggacc;
 pub mod ftddl;
 pub mod xmlschema;
 pub mod spatialfn;
@@ -172,6 +173,15 @@ pub struct SessionState {
     pub isolation: Isolation,
     pub stmt_ts: u64,
     pub blocked_on: Vec<TxId>,
+    /// Where the last request for a wait came from (for the statistics of lock waits).
+    pub blocked_at: Option<&'static std::panic::Location<'static>>,
+    /// The table whose lock the session last had to wait for.
+    pub blocked_oid: i32,
+    /// Was NOWAIT in force for the statement that was blocked? (the statement's own flag is put back when it ends,
+    /// before the wait is decided)
+    pub blocked_nowait: bool,
+    /// The kind of statement being run (for the statistics of lock waits).
+    pub stmt_kind: &'static str,
     pub lock_timeout: i64,
     pub login_id: i32,
     pub pushdown: Vec<Vec<(String, Vec<Expr>)>>,
@@ -204,6 +214,17 @@ pub struct SessionState {
     pub sub_cache: Option<HashMap<usize, Option<query::Rowset>>>,
     /// Per statement: what planning a correlated subquery finds out that does not depend on the outer row.
     pub push_plans: HashMap<(usize, usize), std::sync::Arc<optimizer::PushPlan>>,
+    /// Set while a grouped query runs again without folding its aggregates as the rows arrive (see `aggacc`).
+    pub no_fold_agg: bool,
+    /// Per statement: for a correlated subquery, the names it mentions (`None`: its result must not be reused), and the
+    /// rows it gave for each combination of the values of the outer columns with those names (see `Engine::sub_rows`).
+    pub sub_names: HashMap<usize, Option<std::sync::Arc<Vec<(String, Option<String>)>>>>,
+    pub sub_memo: HashMap<usize, HashMap<String, query::Rowset>>,
+    /// Per statement, for a statement that only reads (a SELECT): the rows a table scan with some conditions gave, kept the
+    /// second time the same scan is asked for (a correlated subquery reads the tables of its FROM again for every outer row).
+    pub leaf_seen: std::collections::HashSet<String>,
+    pub leaf_cache: HashMap<String, spill::RowsRef>,
+    pub in_query: bool,
     /// While a statement writes through a view WITH CHECK OPTION: the base table, the filter of the view and the nesting level.
     pub view_check: Option<(String, Expr, i32)>,
     /// Table hints of the statement being run, by table object id (see `Engine::collect_hints`).
@@ -261,6 +282,10 @@ impl SessionState {
             isolation: Isolation::ReadCommitted,
             stmt_ts: 0,
             blocked_on: vec![],
+            blocked_at: None,
+            blocked_oid: 0,
+            blocked_nowait: false,
+            stmt_kind: "",
             lock_timeout: -1,
             login_id: 0,
             pushdown: vec![],
@@ -284,6 +309,12 @@ impl SessionState {
             preeval: None,
             sub_cache: None,
             push_plans: HashMap::new(),
+            no_fold_agg: false,
+            sub_names: HashMap::new(),
+            sub_memo: HashMap::new(),
+            leaf_seen: std::collections::HashSet::new(),
+            leaf_cache: HashMap::new(),
+            in_query: false,
             view_check: None,
             hints: HashMap::new(),
             nowait: false,
@@ -645,6 +676,15 @@ impl<'a> Engine<'a> {
 
     pub fn exec_stmt(&mut self, st: &Stmt) -> Flow<()> {
         crate::span!("exec_stmt");
+        self.ses.stmt_kind = match st {
+            Stmt::Query(_) => "select",
+            Stmt::Insert(_) => "insert",
+            Stmt::Update(_) => "update",
+            Stmt::Delete(_) => "delete",
+            Stmt::Merge(_) => "merge",
+            Stmt::Exec(_) => "exec",
+            _ => "other",
+        };
         let leaf = !matches!(st, Stmt::If { .. } | Stmt::While { .. } | Stmt::Block(_) | Stmt::Try { .. } | Stmt::Exec(_) | Stmt::ExecStr(_));
         if !leaf {
             if self.ses.nest_level == 0 {
@@ -694,16 +734,22 @@ impl<'a> Engine<'a> {
                 self.srv.set_intent(write);
             }
             self.ses.stmt_ts = self.srv.core.clock();
-            if self.ses.nest_level == 0 {
-                self.ses.hints.clear();
-                self.ses.nowait = false;
-            }
+            // The table hints of a statement are those written in it: a statement inside a procedure (or a trigger) starts
+            // without those of the statement that called it, and the caller's come back when it ends. (They used to be cleared
+            // only at the top level, so after one procedure ran `WITH (UPDLOCK)` on a table every later statement of the
+            // session that read the table kept taking exclusive locks on every row it read.)
+            let saved_hints = (std::mem::take(&mut self.ses.hints), std::mem::replace(&mut self.ses.nowait, false));
             self.ses.audit_seen.borrow_mut().clear();
             let saved = self.ses.sub_cache.replace(HashMap::new());
             let saved_plans = std::mem::take(&mut self.ses.push_plans);
+            let saved_memo = (std::mem::take(&mut self.ses.sub_names), std::mem::take(&mut self.ses.sub_memo));
+            let saved_leaf = (std::mem::take(&mut self.ses.leaf_seen), std::mem::take(&mut self.ses.leaf_cache), std::mem::replace(&mut self.ses.in_query, false));
             let mut r = self.exec_inner(st);
             self.ses.sub_cache = saved;
             self.ses.push_plans = saved_plans;
+            (self.ses.sub_names, self.ses.sub_memo) = saved_memo;
+            (self.ses.leaf_seen, self.ses.leaf_cache, self.ses.in_query) = saved_leaf;
+            (self.ses.hints, self.ses.nowait) = saved_hints;
             self.ses.view_check = None;
             if r.is_ok() && ddltrig::is_ddl_stmt(st) {
                 r = self.fire_ddl_triggers(st);
@@ -826,7 +872,9 @@ impl<'a> Engine<'a> {
             Stmt::Query(q) => {
                 // the rows of a plain top-level SELECT may go straight to the client
                 self.ses.stream_ok = self.sink.is_some() && self.ses.capture.is_empty() && q.ctes.is_empty() && q.for_clause.is_none() && matches!(q.body, QueryBody::Select(_));
+                self.ses.in_query = true;
                 let rs = self.exec_query(q, None);
+                self.ses.in_query = false;
                 self.ses.stream_ok = false;
                 let rs = rs?;
                 if !rs.suppress {

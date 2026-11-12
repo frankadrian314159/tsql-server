@@ -364,6 +364,10 @@ pub struct Core {
     group: Mutex<GroupSync>,
     group_cv: Condvar,
     forces: AtomicU64,
+    /// How many times a session had to wait for a lock holder, and for how long in all (nanoseconds).
+    lock_waits: AtomicU64,
+    lock_wait_ns: AtomicU64,
+    lock_wait_sites: Mutex<std::collections::HashMap<String, (u64, u64)>>,
     latches: Latches,
     pub locks: LockTable,
     /// Where audit records are written.
@@ -396,6 +400,9 @@ impl Core {
             group: Mutex::new(GroupSync::default()),
             group_cv: Condvar::new(),
             forces: AtomicU64::new(0),
+            lock_waits: AtomicU64::new(0),
+            lock_wait_ns: AtomicU64::new(0),
+            lock_wait_sites: Mutex::new(std::collections::HashMap::new()),
             latches: Latches::default(),
             locks: LockTable::default(),
             audit: Default::default(),
@@ -653,6 +660,25 @@ impl Core {
             }
             self.group_cv.notify_all();
         }
+    }
+    /// Note one wait for lock holders that took `ns` nanoseconds.
+    pub fn note_lock_wait(&self, site: String, ns: u64) {
+        self.lock_waits.fetch_add(1, Ordering::Relaxed);
+        self.lock_wait_ns.fetch_add(ns, Ordering::Relaxed);
+        let mut m = lock(&self.lock_wait_sites);
+        let e = m.entry(site).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += ns;
+    }
+    /// Lock waits by the place in the code that asked for them: (site, waits, nanoseconds).
+    pub fn lock_wait_sites(&self) -> Vec<(String, u64, u64)> {
+        let mut v: Vec<(String, u64, u64)> = lock(&self.lock_wait_sites).iter().map(|(k, x)| (k.clone(), x.0, x.1)).collect();
+        v.sort_by_key(|x| std::cmp::Reverse(x.2));
+        v
+    }
+    /// (waits, total nanoseconds waited) for locks since the server started.
+    pub fn lock_wait_totals(&self) -> (u64, u64) {
+        (self.lock_waits.load(Ordering::Relaxed), self.lock_wait_ns.load(Ordering::Relaxed))
     }
     /// How many times the log has been forced to disk for commits.
     pub fn log_forces(&self) -> u64 {

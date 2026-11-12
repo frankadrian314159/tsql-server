@@ -103,6 +103,9 @@ impl Rowset {
 
 pub struct GroupCtx {
     pub rows: Vec<Row>,
+    /// Aggregates worked out while the rows arrived (see aggacc.rs), by the address of the call; those not listed are
+    /// evaluated over `rows`.
+    pub pre: Vec<(usize, std::result::Result<Value, SqlError>)>,
     pub excluded: Vec<bool>,
     pub base: Vec<String>, // Debug-rendered base grouping expressions (for GROUPING())
 }
@@ -1057,7 +1060,7 @@ impl<'a> Engine<'a> {
                         }
                     }
                 }
-                units.push(Unit { row: rep, group: Some(GroupCtx { rows: grows, excluded: excluded.clone(), base: base_str.clone() }) });
+                units.push(Unit { row: rep, group: Some(GroupCtx { rows: grows, pre: vec![], excluded: excluded.clone(), base: base_str.clone() }) });
             }
         }
         Ok(units)
@@ -1065,6 +1068,14 @@ impl<'a> Engine<'a> {
 
     // ---------------------------------------------------------- aggregates
     pub fn eval_aggregate(&mut self, fc: &FuncCall, env: &Env<'_>) -> Result<Value> {
+        if let Some(g) = env.group {
+            if !g.pre.is_empty() {
+                let key = fc as *const FuncCall as usize;
+                if let Some((_, v)) = g.pre.iter().find(|(k, _)| *k == key) {
+                    return v.clone();
+                }
+            }
+        }
         let g = match env.group {
             Some(g) => g,
             None => {
@@ -1683,7 +1694,16 @@ impl<'a> Engine<'a> {
                             self.ses.stream_to_buf = query.ctes.is_empty() && matches!(query.body, QueryBody::Select(_));
                             let r = self.exec_query(&query, None);
                             self.ses.stream_to_buf = false;
-                            r?
+                            let rs = r?;
+                            // A CTE does not depend on the row of the query that reads it, so every reference within the
+                            // query that defines it sees the same rows: keep them (a correlated subquery over a CTE
+                            // would otherwise compute the whole CTE once per outer row).
+                            if cte_is_repeatable(&query) {
+                                if let Some(e) = self.ses.cte_stack.get_mut(si).and_then(|m| m.get_mut(&lname)) {
+                                    e.working = Some(rs.clone());
+                                }
+                            }
+                            rs
                         }
                     }
                 };
@@ -2260,4 +2280,16 @@ impl RunningAgg {
             _ => Ok(self.best.clone().unwrap_or(Value::Null)),
         }
     }
+}
+
+/// Does syntax (given as its debug text) give the same answer every time it is evaluated for the same row within a
+/// statement? Not when it reads a variable (an assignment `SELECT @x = ...` changes one from row to row, and the
+/// parameter of an inline function differs from call to call), takes a value from a sequence or identity, or calls a
+/// function that varies (`NEWID`, `RAND`) or one defined by the user (which can have effects).
+pub fn text_is_repeatable(text: &str) -> bool {
+    !["Var(", "SysVar(", "NextValue", "IdentityFn", "\"NEWID\"", "\"NEWSEQUENTIALID\"", "\"RAND\"", "schema: Some("].iter().any(|w| text.contains(w))
+}
+
+fn cte_is_repeatable(q: &Query) -> bool {
+    text_is_repeatable(&format!("{:?}", q))
 }
