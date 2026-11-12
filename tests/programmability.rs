@@ -234,7 +234,8 @@ fn dynamic_sql() {
     exec(&mut c, "CREATE TABLE #tmp (z INT)");
     exec(&mut c, "EXEC('INSERT #tmp VALUES (5)')");
     assert_eq!(rows(&mut c, "SELECT z FROM #tmp"), vec![vec!["5"]]);
-    assert_eq!(err_no(&mut c, "EXEC('SELEC 1')"), 102);
+    // as in SQL Server, a first word that is not a statement is taken for a procedure called without EXEC
+    assert_eq!(err_no(&mut c, "EXEC('SELEC 1')"), 2812);
 }
 
 #[test]
@@ -268,7 +269,7 @@ fn error_message_fidelity() {
     assert_eq!(err(&mut c, "SELECT 1/0").message, "Divide by zero error encountered.");
     assert_eq!(err(&mut c, "SELECT @q").message, "Must declare the scalar variable \"@q\".");
     assert_eq!(err(&mut c, "INSERT t VALUES (1, 'abc')").message, "String or binary data would be truncated in table 'master.dbo.t', column 'b'. Truncated value: 'ab'.");
-    assert_eq!(err(&mut c, "SELEC 1").message, "Incorrect syntax near 'SELEC'.");
+    assert_eq!(err(&mut c, "SELEC 1").message, "Could not find stored procedure 'SELEC'.");
     assert_eq!(err(&mut c, "CREATE TABLE t (x INT)").message, "There is already an object named 't' in the database.");
 }
 

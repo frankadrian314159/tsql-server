@@ -134,6 +134,8 @@ pub struct ModuleScope {
     language: String,
     lock_timeout: i64,
     isolation: Isolation,
+    fmtonly: bool,
+    options: i32,
 }
 
 pub struct Cursor {
@@ -193,6 +195,8 @@ pub struct SessionState {
     pub showplan: bool,
     pub optimizer: bool,
     pub module_owner: Vec<String>,
+    /// The SET options as `@@OPTIONS` reports them (a bit mask).
+    pub options: i32,
     pub nocount: bool,
     pub xact_abort: bool,
     pub rowcount_limit: i64,
@@ -299,6 +303,7 @@ impl SessionState {
             showplan: false,
             optimizer: true,
             module_owner: vec![],
+            options: 5496,
             nocount: false,
             xact_abort: false,
             rowcount_limit: 0,
@@ -1280,6 +1285,42 @@ impl<'a> Engine<'a> {
             match o {
                 SetOpt::Flag(name, val) => {
                     let on = val == "ON";
+                    // the options `@@OPTIONS` reports (SQL Server's bit values)
+                    let bit = |n: &str| -> i32 {
+                        match n {
+                            "DISABLE_DEF_CNST_CHK" => 1,
+                            "IMPLICIT_TRANSACTIONS" => 2,
+                            "CURSOR_CLOSE_ON_COMMIT" => 4,
+                            "ANSI_WARNINGS" => 8,
+                            "ANSI_PADDING" => 16,
+                            "ANSI_NULLS" => 32,
+                            "ARITHABORT" => 64,
+                            "ARITHIGNORE" => 128,
+                            "QUOTED_IDENTIFIER" => 256,
+                            "NOCOUNT" => 512,
+                            "ANSI_NULL_DFLT_ON" => 1024,
+                            "ANSI_NULL_DFLT_OFF" => 2048,
+                            "CONCAT_NULL_YIELDS_NULL" => 4096,
+                            "NUMERIC_ROUNDABORT" => 8192,
+                            "XACT_ABORT" => 16384,
+                            // the options that SET ANSI_DEFAULTS turns on together
+                            "ANSI_DEFAULTS" => 4 | 2 | 8 | 16 | 32 | 256 | 1024,
+                            _ => 0,
+                        }
+                    };
+                    let b = bit(name.as_str());
+                    if b != 0 {
+                        if on {
+                            self.ses.options |= b;
+                            if name == "ANSI_NULL_DFLT_ON" {
+                                self.ses.options &= !2048;
+                            } else if name == "ANSI_NULL_DFLT_OFF" {
+                                self.ses.options &= !1024;
+                            }
+                        } else {
+                            self.ses.options &= !b;
+                        }
+                    }
                     match name.as_str() {
                         "NOCOUNT" => self.ses.nocount = on,
                         "XACT_ABORT" => self.ses.xact_abort = on,
@@ -1893,6 +1934,8 @@ impl<'a> Engine<'a> {
             language: self.ses.language.clone(),
             lock_timeout: self.ses.lock_timeout,
             isolation: self.ses.isolation,
+            fmtonly: self.ses.fmtonly,
+            options: self.ses.options,
         }
     }
 
@@ -1908,6 +1951,8 @@ impl<'a> Engine<'a> {
         self.ses.language = s.language;
         self.ses.lock_timeout = s.lock_timeout;
         self.ses.isolation = s.isolation;
+        self.ses.fmtonly = s.fmtonly;
+        self.ses.options = s.options;
     }
 
     pub fn exec_dynamic(&mut self, sql: &str) -> Flow<()> {

@@ -1886,7 +1886,22 @@ impl Parser {
             if self.accept_op(";") {
                 continue;
             }
-            stmts.push(self.statement()?);
+            let start = self.i;
+            match self.statement() {
+                Ok(s) => stmts.push(s),
+                // the first statement of a batch may call a procedure without EXEC: `sp_help 'tbl'`
+                Err(e) if e.number == 102 && self.i == 0 && stmts.is_empty() && start == 0 && matches!(self.toks[0].tok, Tok::Id(_)) && !self.peek_is_op(1, "=") && !self.peek_is_op(1, "(") => {
+                    self.i = 0;
+                    match self.st_exec_body() {
+                        Ok(s) => {
+                            self.accept_op(";");
+                            stmts.push(s)
+                        }
+                        Err(_) => return Err(e),
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         }
         Ok(stmts)
     }
@@ -2890,6 +2905,11 @@ impl Parser {
 
     fn st_exec(&mut self) -> R<Stmt> {
         self.i += 1;
+        self.st_exec_body()
+    }
+
+    /// What follows `EXEC`: a procedure call, or `(string expression)`.
+    fn st_exec_body(&mut self) -> R<Stmt> {
         if self.is_op("(") {
             self.i += 1;
             let mut parts = vec![self.expr()?];

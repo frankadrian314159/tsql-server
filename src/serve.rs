@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! tsql-serve [DATA_DIR] [--port N] [--bind ADDR] [--sa-password PW] [--pool-pages N]
-//!             [--tls-cert FILE --tls-key FILE | --no-tls] [--force-encryption]
+//!             [--tls-cert FILE --tls-key FILE | --no-tls] [--force-encryption] [--tls13] [--no-mars]
 //! ```
 use tsql_server::tds::{Config, Encryption, Listener, TlsConfig};
 use tsql_server::{Server, StorageOptions};
@@ -10,7 +10,7 @@ use tsql_server::{Server, StorageOptions};
 fn usage() -> ! {
     eprintln!(
         "usage: tsql-serve [DATA_DIR] [--port N] [--bind ADDR] [--sa-password PW] [--pool-pages N]\n\
-                          [--tls-cert FILE --tls-key FILE | --no-tls] [--force-encryption]\n\n\
+                          [--tls-cert FILE --tls-key FILE | --no-tls] [--force-encryption] [--tls13] [--no-mars]\n\n\
          DATA_DIR        directory for the durable database (omitted: in-memory only)\n\
          --port N        TCP port (default 1433)\n\
          --bind ADDR     address to listen on (default 127.0.0.1)\n\
@@ -20,6 +20,8 @@ fn usage() -> ! {
          --tls-cert/--tls-key  PEM certificate (chain) and private key for TLS; without them a self-signed\n\
                          certificate is generated at start-up, as SQL Server does (clients must then trust it)\n\
          --no-tls        do not offer TLS at all\n\
+         --tls13         also offer TLS 1.3 (TLS 1.2 only by default)\n\
+         --no-mars       do not grant MARS (multiple active result sets) to clients that ask for it\n\
          --force-encryption  refuse clients that cannot use TLS and encrypt every session"
     );
     std::process::exit(2)
@@ -32,6 +34,8 @@ fn main() {
     let mut sa = std::env::var("TSQL_SA_PASSWORD").ok();
     let mut opts = StorageOptions::default();
     let (mut cert, mut key, mut no_tls, mut force) = (None::<String>, None::<String>, false, false);
+    let mut tls13 = false;
+    let mut mars = true;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -43,6 +47,8 @@ fn main() {
             "--tls-key" => key = Some(args.next().unwrap_or_else(|| usage())),
             "--no-tls" => no_tls = true,
             "--force-encryption" => force = true,
+            "--tls13" => tls13 = true,
+            "--no-mars" => mars = false,
             "-h" | "--help" => usage(),
             other if !other.starts_with('-') && dir.is_none() => dir = Some(other.to_string()),
             _ => usage(),
@@ -74,6 +80,7 @@ fn main() {
             (None, None) => TlsConfig::self_signed(vec!["localhost".into(), "127.0.0.1".into(), bind.clone()]).map(|t| (t, "TLS, self-signed certificate")),
             _ => usage(),
         };
+        let tls = tls.and_then(|(t, note)| if tls13 { t.tls13(true).map(|t| (t, note)) } else { Ok((t, note)) });
         match tls {
             Ok((t, note)) => {
                 cfg = Config::with_tls(t, if force { Encryption::Required } else { Encryption::Optional });
@@ -88,6 +95,7 @@ fn main() {
         eprintln!("--force-encryption needs TLS");
         std::process::exit(2);
     }
+    cfg.mars = mars;
     let listener = match Listener::bind(server, (bind.as_str(), port), cfg) {
         Ok(l) => l,
         Err(e) => {

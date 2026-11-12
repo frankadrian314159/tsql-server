@@ -168,3 +168,16 @@ async fn insert_bulk_for_a_table_that_is_not_there_is_an_error() {
     assert!(err.to_string().contains("208") || err.to_string().contains("Invalid object name"), "{}", err);
     l.shutdown();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn fmtonly_set_inside_sp_executesql_does_not_outlive_it() {
+    // the Microsoft JDBC driver's bulk copy describes the table this way, with no SET FMTONLY OFF after it
+    let (l, _s) = start();
+    let mut c = sa(&l).await;
+    c.simple_query("CREATE TABLE bulk_fo (id INT)").await.unwrap().into_results().await.unwrap();
+    c.simple_query("INSERT bulk_fo VALUES (1)").await.unwrap().into_results().await.unwrap();
+    let sets = c.simple_query("sp_executesql N'SET FMTONLY ON SELECT * FROM bulk_fo '").await.unwrap().into_results().await.unwrap();
+    assert_eq!(sets[0].len(), 0);
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM bulk_fo").await, "1");
+    l.shutdown();
+}

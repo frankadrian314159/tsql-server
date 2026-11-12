@@ -838,7 +838,7 @@ impl<'a> Engine<'a> {
             "@@CURSOR_ROWS" => Value::Int(-1),
             "@@LOCK_TIMEOUT" => Value::Int(-1),
             "@@TEXTSIZE" => Value::Int(2147483647),
-            "@@OPTIONS" => Value::Int(5496),
+            "@@OPTIONS" => Value::Int(self.ses.options),
             "@@PROCID" => Value::Int(0),
             "@@CONNECTIONS" => Value::Int(1),
             "@@TOTAL_ERRORS" | "@@TOTAL_READ" | "@@TOTAL_WRITE" | "@@IO_BUSY" | "@@CPU_BUSY" | "@@IDLE" | "@@PACK_RECEIVED" | "@@PACK_SENT" | "@@PACKET_ERRORS" | "@@TIMETICKS" => Value::Int(0),

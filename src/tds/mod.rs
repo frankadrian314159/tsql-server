@@ -2,13 +2,17 @@
 //! to a [`Server`] over TCP.
 //!
 //! Supported: pre-login, SQL authentication (Login7), SQL batches, RPC requests (`sp_executesql`,
-//! `sp_prepare`/`sp_execute`/`sp_prepexec`/`sp_unprepare`, and calls to stored procedures, with OUTPUT parameters
-//! and return status), transaction-manager requests (begin/commit/rollback/save), attention (cancel), and
-//! the usual data types, and TLS (see [`TlsConfig`]; the login is always encrypted when the client supports TLS, the
-//! whole session when the client asks for it or the listener requires it). Not supported: integrated/Windows/AAD
-//! authentication, bulk load, server cursors, MARS and the `sql_variant`/`text`/`ntext`/`image` wire types (they are
-//! sent as `nvarchar(max)`, `varchar(max)`, ...).
+//! `sp_prepare`/`sp_execute`/`sp_prepexec`/`sp_unprepare`, the server cursor procedures `sp_cursor*`, and calls to stored
+//! procedures, with OUTPUT parameters and return status), bulk load (`INSERT BULK` and the bulk-load message),
+//! transaction-manager requests (begin/commit/rollback/save), attention (cancel), the usual data types (`sql_variant`,
+//! `hierarchyid`, spatial and the legacy `text`/`ntext`/`image` among them), and TLS 1.2 (1.3 on request; see [`TlsConfig`];
+//! the login is always encrypted when the client supports TLS, the whole session when the client asks for it or the
+//! listener requires it), and MARS (the session multiplex protocol, see `mars.rs`; requests still run one at a time). Not
+//! supported: integrated/Windows/AAD authentication, table-valued parameters, and server cursors that see later changes (a
+//! cursor is a snapshot).
 mod bulk;
+mod cursor;
+mod mars;
 mod rpc;
 mod tls;
 pub mod wire;
@@ -54,9 +58,20 @@ struct Transport {
     pending: Vec<u8>,
     /// Packet id of the next packet of the reply being streamed.
     next_id: u8,
+    /// Present when the session uses MARS: every packet then travels inside an SMP frame.
+    mux: Option<mars::Mux>,
 }
 
 impl Transport {
+    /// Write whole packets to the client (to the current MARS session, when there is one).
+    fn out(&mut self, buf: &[u8]) -> io::Result<()> {
+        if self.mux.is_some() {
+            return self.mars_emit(buf);
+        }
+        self.stream.write_all(buf)?;
+        self.stream.flush()
+    }
+
     /// Carry on inside the TLS connection `conn` (whose handshake is complete).
     fn go_tls(&mut self, conn: rustls::ServerConnection) -> io::Result<()> {
         let sock = self.stream.tcp().try_clone()?;
@@ -105,6 +120,10 @@ impl Transport {
     /// Read the next request. A message is read whole, except a bulk load, which can be far bigger than memory and is
     /// handed over after its first packet to be read as it is decoded.
     fn read_request(&mut self) -> io::Result<Request> {
+        if self.mux.is_some() {
+            let (_, kind, status, data) = self.mars_request()?;
+            return Ok(Request::Message(kind, status, data));
+        }
         let (kind, status, mut data, mut eom) = self.read_packet()?;
         if kind == T_BULK && !eom {
             return Ok(Request::Bulk(data, false));
@@ -140,8 +159,7 @@ impl Transport {
         if buf.is_empty() {
             return Ok(());
         }
-        self.stream.write_all(&buf)?;
-        self.stream.flush()
+        self.out(&buf)
     }
 
     /// Send the rest of a reply (all of it, when `send_part` was not used).
@@ -173,8 +191,7 @@ impl Transport {
             buf.extend_from_slice(c);
             id = id.wrapping_add(1);
         }
-        self.stream.write_all(&buf)?;
-        self.stream.flush()
+        self.out(&buf)
     }
 }
 
@@ -388,6 +405,9 @@ struct Session {
     in_tx: bool,
     /// The target named by `INSERT BULK`, waiting for the data message that follows it.
     bulk: Option<bulk::BulkTarget>,
+    /// The server cursors this connection has open, by handle.
+    cursors: HashMap<i32, cursor::Cursor>,
+    next_cursor: i32,
 }
 
 impl Session {
@@ -475,6 +495,15 @@ impl Session {
         let mut errored = false;
         let mut hint = false;
         for call in calls {
+            if tracing() {
+                let name = match &call.proc {
+                    Proc::Id(i) => format!("system procedure {}", i),
+                    Proc::Name(n) => n.clone(),
+                };
+                let ps: Vec<String> = call.params.iter().map(|p| format!("{}{}={:?}", p.name, if p.out { "(out)" } else { "" }, p.val)).collect();
+                trace(&format!("rpc: {} ({})", name, ps.join(", ")));
+            }
+            let before = out.len();
             let e = match self.one_rpc(&call, &mut out) {
                 Ok(e) => e,
                 Err(msg) => {
@@ -482,6 +511,9 @@ impl Session {
                     true
                 }
             };
+            if tracing() && matches!(&call.proc, Proc::Id(1..=9)) {
+                trace(&format!("rpc reply: {}", out[before..].iter().take(400).map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ")));
+            }
             errored |= e;
             hint |= matches!(&call.proc, Proc::Name(n) if n.to_ascii_lowercase().contains("rollback"));
         }
@@ -498,8 +530,18 @@ impl Session {
                 "sp_execute" => rpc::SP_EXECUTE,
                 "sp_prepexec" => rpc::SP_PREPEXEC,
                 "sp_unprepare" => rpc::SP_UNPREPARE,
+                "sp_cursor" => rpc::SP_CURSOR,
+                "sp_cursoropen" => rpc::SP_CURSOROPEN,
+                "sp_cursorprepare" => rpc::SP_CURSORPREPARE,
+                "sp_cursorexecute" => rpc::SP_CURSOREXECUTE,
+                "sp_cursorprepexec" => rpc::SP_CURSORPREPEXEC,
+                "sp_cursorunprepare" => rpc::SP_CURSORUNPREPARE,
+                "sp_cursorfetch" => rpc::SP_CURSORFETCH,
+                "sp_cursoroption" => rpc::SP_CURSOROPTION,
+                "sp_cursorclose" => rpc::SP_CURSORCLOSE,
                 "sp_reset_connection" => {
                     self.conn.execute("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION");
+                    self.cursors.clear();
                     return Ok(false);
                 }
                 _ => 0,
@@ -517,7 +559,7 @@ impl Session {
                 let decl = rpc::text_param(ps, 1, "@params").unwrap_or(None);
                 let args: Vec<usize> = (2..ps.len()).collect();
                 let plan = rpc::plan_executesql(&stmt, decl.as_deref(), ps, &args)?;
-                Ok(self.run_plan(&plan, ps, out, Some(0)))
+                Ok(self.run_plan(&plan, ps, out, None))
             }
             rpc::SP_PREPARE | rpc::SP_PREPEXEC => {
                 let decl = rpc::text_param(ps, 1, "@params")?;
@@ -529,7 +571,7 @@ impl Session {
                 if id == rpc::SP_PREPEXEC {
                     let args: Vec<usize> = (3..ps.len()).collect();
                     let plan = rpc::plan_executesql(&stmt, decl.as_deref(), ps, &args)?;
-                    errored = self.run_plan(&plan, ps, out, Some(0));
+                    errored = self.run_plan(&plan, ps, out, None);
                 } else {
                     out.push(0x79);
                     out.extend_from_slice(&0i32.to_le_bytes());
@@ -550,7 +592,7 @@ impl Session {
                 let (decl, stmt) = self.prepared.get(&handle).cloned().ok_or_else(|| format!("The prepared statement handle {} is not valid in this context.", handle))?;
                 let args: Vec<usize> = (1..ps.len()).collect();
                 let plan = rpc::plan_executesql(&stmt, decl.as_deref(), ps, &args)?;
-                Ok(self.run_plan(&plan, ps, out, Some(0)))
+                Ok(self.run_plan(&plan, ps, out, None))
             }
             rpc::SP_UNPREPARE => {
                 if let Some(Value::Int(h)) = ps.first().map(|p| &p.val) {
@@ -560,7 +602,8 @@ impl Session {
                 out.extend_from_slice(&0i32.to_le_bytes());
                 Ok(false)
             }
-            other => Err(format!("The remote procedure call (system procedure id {}) is not supported; server cursors are not implemented.", other)),
+            1..=9 => self.cursor_rpc(id, ps, out),
+            other => Err(format!("The remote procedure call (system procedure id {}) is not supported.", other)),
         }
     }
 
@@ -648,8 +691,22 @@ fn encryption_answer(client: u8, tls: bool, mode: Encryption) -> u8 {
     }
 }
 
-fn prelogin_reply(encryption: u8) -> Vec<u8> {
-    // options: VERSION, ENCRYPTION, INSTOPT, MARS (off), terminator
+/// Whether the client's pre-login message asks for MARS (option 4).
+fn prelogin_mars(p: &[u8]) -> bool {
+    let mut i = 0;
+    while i < p.len() && p[i] != 0xFF {
+        let Some(entry) = p.get(i..i + 5) else { return false };
+        if entry[0] == 4 {
+            let off = u16::from_be_bytes([entry[1], entry[2]]) as usize;
+            return p.get(off).copied() == Some(1);
+        }
+        i += 5;
+    }
+    false
+}
+
+fn prelogin_reply(encryption: u8, mars: bool) -> Vec<u8> {
+    // options: VERSION, ENCRYPTION, INSTOPT, MARS, terminator
     let table_len = 4 * 5 + 1;
     let mut table = vec![];
     let mut data = vec![];
@@ -662,7 +719,7 @@ fn prelogin_reply(encryption: u8) -> Vec<u8> {
     add(0, &[16, 0, 0x03, 0xE8, 0, 0]);
     add(1, &[encryption]);
     add(2, &[0]);
-    add(4, &[0]);
+    add(4, &[mars as u8]);
     table.push(0xFF);
     table.extend(data);
     table
@@ -675,6 +732,8 @@ struct Login {
     password: String,
     database: String,
     sspi: bool,
+    /// OptionFlags2 `fODBC` or TypeFlags `fOLEDB`: the driver wants the ANSI defaults.
+    ansi_defaults: bool,
 }
 
 fn parse_login7(p: &[u8]) -> R<Login> {
@@ -682,7 +741,11 @@ fn parse_login7(p: &[u8]) -> R<Login> {
     rd.u32()?;
     let tds_version = rd.u32()?;
     let packet_size = rd.u32()? as usize;
-    rd.take(36 - 12)?;
+    rd.take(24 - 12)?;
+    let _flags1 = rd.u8()?;
+    let flags2 = rd.u8()?;
+    let type_flags = rd.u8()?;
+    rd.take(36 - 27)?;
     // offset table: (offset, length-in-characters) pairs
     fn pair(rd: &mut Rd) -> R<(usize, usize)> {
         Ok((rd.u16()? as usize, rd.u16()? as usize))
@@ -704,7 +767,7 @@ fn parse_login7(p: &[u8]) -> R<Login> {
     };
     // the password is obfuscated: nibbles swapped, then XOR 0xA5
     let pw: Vec<u8> = text(pass)?.into_iter().map(|b| (b ^ 0xA5).rotate_left(4)).collect();
-    Ok(Login { tds_version, packet_size, user: decode_utf16(&text(user)?), password: decode_utf16(&pw), database: decode_utf16(&text(db)?), sspi: sspi.1 > 0 })
+    Ok(Login { tds_version, packet_size, user: decode_utf16(&text(user)?), password: decode_utf16(&pw), database: decode_utf16(&text(db)?), sspi: sspi.1 > 0, ansi_defaults: flags2 & 0x02 != 0 || type_flags & 0x10 != 0 })
 }
 
 fn login_failure(t: &mut Transport, number: i32, state: u8, class: u8, text: &str) -> io::Result<()> {
@@ -742,7 +805,9 @@ fn handshake(server: &Server, mut t: Transport, cfg: &Config) -> io::Result<Opti
     trace(&format!("PRELOGIN, {} bytes, client encryption option {:?}", pre.len(), prelogin_encryption(&pre)));
     let answer = encryption_answer(prelogin_encryption(&pre).unwrap_or(2), cfg.tls.is_some(), cfg.encryption);
     trace(&format!("answering PRELOGIN with encryption {}", answer));
-    t.send(T_REPLY, &prelogin_reply(answer))?;
+    let mars = cfg.mars && prelogin_mars(&pre);
+    trace(&format!("client asks for MARS: {}; answering {}", prelogin_mars(&pre), mars));
+    t.send(T_REPLY, &prelogin_reply(answer, mars))?;
     if answer == 3 {
         refused("the server requires encryption and the client does not offer it");
         return Ok(None); // the client cannot encrypt and the server insists: it will close the connection
@@ -761,6 +826,7 @@ fn handshake(server: &Server, mut t: Transport, cfg: &Config) -> io::Result<Opti
             },
             |bytes| t_ref.borrow_mut().send(T_PRELOGIN, bytes),
         )?;
+        trace(&format!("TLS established: {:?}", conn.protocol_version()));
         t.go_tls(conn)?;
     }
     let (kind, _, payload) = t.read_message()?;
@@ -791,7 +857,11 @@ fn handshake(server: &Server, mut t: Transport, cfg: &Config) -> io::Result<Opti
             return Ok(None);
         }
     };
-    let mut s = Session { t, conn, db: String::new(), prepared: HashMap::new(), next_handle: 0, tx_descriptor: 0, tx_counter: 0, in_tx: false, bulk: None };
+    let mut s = Session { t, conn, db: String::new(), prepared: HashMap::new(), next_handle: 0, tx_descriptor: 0, tx_counter: 0, in_tx: false, bulk: None, cursors: HashMap::new(), next_cursor: 0 };
+    if login.ansi_defaults {
+        // ODBC and OLE DB drivers get SET ANSI_DEFAULTS ON (and no implicit transactions) from the login
+        s.conn.execute("SET ANSI_DEFAULTS ON; SET IMPLICIT_TRANSACTIONS OFF; SET CURSOR_CLOSE_ON_COMMIT OFF");
+    }
     if !login.database.is_empty() {
         let r = s.conn.execute(&format!("USE {}", crate::tools::bracket(&login.database)));
         if r.first_error().is_some() {
@@ -828,6 +898,10 @@ fn handshake(server: &Server, mut t: Transport, cfg: &Config) -> io::Result<Opti
     done(&mut out, 0xFD, 0, 0);
     s.t.send(T_REPLY, &out)?;
     s.t.packet_size = packet;
+    if mars {
+        // from here on every packet is inside an SMP frame
+        s.t.enable_mars();
+    }
     Ok(Some(s))
 }
 
@@ -858,7 +932,7 @@ fn serve_connection(server: Server, stream: TcpStream, cfg: Arc<Config>) {
     let _ = stream.set_nodelay(true);
     // a client that connects and says nothing must not hold a thread forever
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
-    let t = Transport { stream: tls::Wire::Plain(stream), packet_size: DEFAULT_PACKET, spid: 0, pending: vec![], next_id: 0 };
+    let t = Transport { stream: tls::Wire::Plain(stream), packet_size: DEFAULT_PACKET, spid: 0, pending: vec![], next_id: 0, mux: None };
     let mut s = match handshake(&server, t, &cfg) {
         Ok(Some(s)) => s,
         Ok(None) => return,
@@ -872,7 +946,7 @@ fn serve_connection(server: Server, stream: TcpStream, cfg: Arc<Config>) {
     let Ok(probe) = s.t.stream.tcp().try_clone() else { return };
     loop {
         // wait for the next request, noticing a KILL of this session while the client is idle
-        if !wait_readable(&probe, &mut s.conn) {
+        if !s.t.has_ready() && !wait_readable(&probe, &mut s.conn) {
             return;
         }
         let (kind, status, payload) = match s.t.read_request() {
@@ -941,6 +1015,8 @@ fn serve_connection(server: Server, stream: TcpStream, cfg: Arc<Config>) {
 /// Listener settings.
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// Whether a client that asks for MARS (Multiple Active Result Sets) gets it.
+    pub mars: bool,
     /// Largest packet size granted to clients.
     pub max_packet: usize,
     /// The server certificate; without one the listener answers "encryption not supported".
@@ -951,7 +1027,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { max_packet: 32767, tls: None, encryption: Encryption::Optional }
+        Config { max_packet: 32767, tls: None, encryption: Encryption::Optional, mars: true }
     }
 }
 

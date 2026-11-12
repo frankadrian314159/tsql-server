@@ -118,3 +118,19 @@ fn certificates_can_be_loaded_from_pem() {
     std::fs::write(dir.path().join("k.pem"), &key).unwrap();
     TlsConfig::from_pem_files(dir.path().join("c.pem"), dir.path().join("k.pem")).unwrap();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn tls13_can_be_offered_alongside_tls12() {
+    let server = common::server();
+    server.connect().execute("ALTER LOGIN sa WITH PASSWORD = N'Str0ng!pw'");
+    let tls = TlsConfig::self_signed(vec!["localhost".into(), "127.0.0.1".into()]).unwrap().tls13(true).unwrap();
+    let l = Listener::bind(server, "127.0.0.1:0", ListenConfig::with_tls(tls, Encryption::Optional)).unwrap();
+    // tiberius' rustls offers 1.3 and gets it; the session works in full and for the login only
+    let mut c = login(&l, EncryptionLevel::Required, "Str0ng!pw").await.expect("TLS 1.3 login");
+    assert_eq!(two(&mut c).await, 2);
+    let rows = c.simple_query("SELECT REPLICATE(CAST('x' AS varchar(max)), 200000) AS big").await.unwrap().into_first_result().await.unwrap();
+    assert_eq!(rows[0].get::<&str, _>("big").unwrap().len(), 200000);
+    let mut c = login(&l, EncryptionLevel::Off, "Str0ng!pw").await.expect("TLS 1.3 login only");
+    assert_eq!(two(&mut c).await, 2);
+    l.shutdown();
+}

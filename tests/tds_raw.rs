@@ -378,3 +378,298 @@ fn garbage_closes_the_connection_but_not_the_server() {
     assert!(toks.iter().any(|t| matches!(t, Tok::LoginAck)));
     l.shutdown();
 }
+
+fn cursor_params(scroll: i32) -> Vec<(&'static str, bool, Vec<u8>)> {
+    vec![
+        ("", true, null_int()),
+        ("", false, nvarchar("SELECT n FROM (VALUES (10), (20), (30), (40), (50)) AS t(n) ORDER BY n")),
+        ("", true, int(scroll)),
+        ("", true, int(4)),
+        ("", true, null_int()),
+    ]
+}
+
+fn fetch(r: &mut Raw, cursor: i32, kind: i32, row: i32, n: i32) -> Vec<Tok> {
+    r.rpc(Err(7), &[("", false, int(cursor)), ("", false, int(kind)), ("", false, int(row)), ("", false, int(n))])
+}
+
+/// The values fetched: the first column is the value, the last rowstat.
+fn fetched(t: &[Tok]) -> Vec<i32> {
+    t.iter().filter_map(|t| if let Tok::Row(v) = t { if let Value::Int(n) = v[0] { Some(n) } else { None } } else { None }).collect()
+}
+
+fn ret_ints(t: &[Tok]) -> Vec<i32> {
+    t.iter().filter_map(|t| if let Tok::Ret { val: Value::Int(v), .. } = t { Some(*v) } else { None }).collect()
+}
+
+#[test]
+fn server_cursor_scrolls_over_a_snapshot() {
+    let (l, _s) = start();
+    let (mut r, _) = Raw::connect(&l, "sa", "pw");
+    let toks = r.rpc(Err(2), &cursor_params(1)); // asks for a keyset cursor
+    let rets = ret_ints(&toks);
+    assert_eq!(rets.len(), 4, "{:?}", toks);
+    let cursor = rets[0];
+    assert!(cursor != 0);
+    // the cursor in force is static and read-only, and has 5 rows
+    assert_eq!(&rets[1..], &[8, 1, 5], "{:?}", toks);
+    assert_eq!(last_done(&toks), (0, 0xFE));
+    let t = fetch(&mut r, cursor, 2, 0, 2); // NEXT 2
+    assert!(t.iter().any(|t| matches!(t, Tok::Meta(n) if n[0] == "n" && n[1] == "rowstat")), "{:?}", t);
+    assert_eq!(fetched(&t), vec![10, 20]);
+    assert_eq!(fetched(&fetch(&mut r, cursor, 2, 0, 2)), vec![30, 40]);
+    assert_eq!(fetched(&fetch(&mut r, cursor, 2, 0, 2)), vec![50]);
+    assert_eq!(fetched(&fetch(&mut r, cursor, 2, 0, 2)), Vec::<i32>::new()); // past the end
+    assert_eq!(fetched(&fetch(&mut r, cursor, 8, 0, 2)), vec![40, 50]); // LAST
+    assert_eq!(fetched(&fetch(&mut r, cursor, 4, 0, 2)), vec![20, 30]); // PREV
+    assert_eq!(fetched(&fetch(&mut r, cursor, 1, 0, 1)), vec![10]); // FIRST
+    assert_eq!(fetched(&fetch(&mut r, cursor, 4, 0, 1)), Vec::<i32>::new()); // before the first
+    assert_eq!(fetched(&fetch(&mut r, cursor, 0x10, 3, 1)), vec![30]); // ABSOLUTE 3
+    assert_eq!(fetched(&fetch(&mut r, cursor, 0x10, -1, 1)), vec![50]); // ABSOLUTE -1
+    assert_eq!(fetched(&fetch(&mut r, cursor, 0x20, -2, 1)), vec![30]); // RELATIVE -2
+    let t = r.rpc(Err(9), &[("", false, int(cursor))]); // sp_cursorclose
+    assert_eq!(last_done(&t), (0, 0xFE));
+    let t = fetch(&mut r, cursor, 2, 0, 1);
+    assert!(t.iter().any(|t| matches!(t, Tok::Error { number: 16916, .. })), "{:?}", t);
+    // a positioned update is refused
+    let t = r.rpc(Err(1), &[("", false, int(cursor)), ("", false, int(33))]);
+    assert!(t.iter().any(|t| matches!(t, Tok::Error { .. })));
+    l.shutdown();
+}
+
+#[test]
+fn forward_only_cursor_refuses_to_scroll_back_and_prepared_cursors_work() {
+    let (l, _s) = start();
+    let (mut r, _) = Raw::connect(&l, "sa", "pw");
+    let toks = r.rpc(Err(2), &cursor_params(4)); // forward only
+    let rets = ret_ints(&toks);
+    let cursor = rets[0];
+    assert_eq!(rets[1], 4);
+    assert_eq!(fetched(&fetch(&mut r, cursor, 2, 0, 3)), vec![10, 20, 30]);
+    let t = fetch(&mut r, cursor, 4, 0, 1);
+    assert!(t.iter().any(|t| matches!(t, Tok::Error { number: 16911, .. })), "{:?}", t);
+    // sp_cursorprepexec: the handle and the cursor come back, with a parameter
+    let toks = r.rpc(
+        Err(5),
+        &[
+            ("", true, null_int()),
+            ("", true, null_int()),
+            ("", false, nvarchar("@lo int")),
+            ("", false, nvarchar("SELECT n FROM (VALUES (10), (20), (30)) AS t(n) WHERE n > @lo ORDER BY n")),
+            ("", true, int(8)),
+            ("", true, int(1)),
+            ("", true, null_int()),
+            ("@lo", false, int(10)),
+        ],
+    );
+    let rets = ret_ints(&toks);
+    assert_eq!(rets.len(), 5, "{:?}", toks);
+    assert_eq!(rets[4], 2, "two rows are above 10");
+    let cur = rets[1];
+    assert_eq!(fetched(&fetch(&mut r, cur, 1, 0, 10)), vec![20, 30]);
+    l.shutdown();
+}
+
+#[test]
+fn sp_executesql_returns_the_status_of_the_batch_and_ansi_defaults_show_in_options() {
+    let (l, _s) = start();
+    let (mut r, _) = Raw::connect(&l, "sa", "pw");
+    let toks = r.rpc(Err(10), &[("", false, nvarchar("RETURN 7"))]);
+    assert!(toks.iter().any(|t| matches!(t, Tok::Status(7))), "{:?}", toks);
+    let t = r.batch("SET ANSI_DEFAULTS ON; SELECT @@OPTIONS");
+    assert!(t.iter().any(|t| matches!(t, Tok::Row(v) if matches!(v[0], Value::Int(n) if n & 2 != 0 && n & 4 != 0 && n & 32 != 0))), "{:?}", t);
+    let t = r.batch("SET ANSI_DEFAULTS OFF; SELECT @@OPTIONS");
+    assert!(t.iter().any(|t| matches!(t, Tok::Row(v) if matches!(v[0], Value::Int(n) if n & 2 == 0 && n & 32 == 0))), "{:?}", t);
+    l.shutdown();
+}
+
+// ------------------------------------------------------------------------------------------------ MARS
+/// A frame of the Session Multiplex Protocol: flags, session, sequence number, window, payload.
+struct Smp(u8, u16, u32, u32, Vec<u8>);
+
+impl Raw {
+    /// Log in asking for MARS in the pre-login message; what follows is framed as SMP.
+    fn connect_mars(l: &Listener) -> Raw {
+        let mut s = TcpStream::connect(l.local_addr()).unwrap();
+        s.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+        // options: VERSION, ENCRYPTION (off), MARS (on)
+        let mut pre = vec![0, 0, 16, 0, 6, 1, 0, 22, 0, 1, 4, 0, 23, 0, 1, 0xFF];
+        pre.extend_from_slice(&[9, 0, 0, 0, 0, 0, 0, 1]);
+        s.write_all(&packet(18, &pre)).unwrap();
+        let mut r = Raw { s };
+        let (kind, reply) = r.read_message();
+        assert_eq!(kind, 4);
+        // the reply carries the MARS option, granted
+        let mut i = 0;
+        let mut granted = false;
+        while reply[i] != 0xFF {
+            if reply[i] == 4 {
+                let off = u16::from_be_bytes([reply[i + 1], reply[i + 2]]) as usize;
+                granted = reply[off] == 1;
+            }
+            i += 5;
+        }
+        assert!(granted, "MARS must be granted");
+        r.s.write_all(&packet(16, &login7("sa", "pw"))).unwrap(); // the login itself is plain
+        let toks = r.tokens();
+        assert!(toks.iter().any(|t| matches!(t, Tok::LoginAck)));
+        r
+    }
+
+    fn smp_send(&mut self, flags: u8, sid: u16, seq: u32, wnd: u32, payload: &[u8]) {
+        let mut f = vec![0x53, flags];
+        f.extend_from_slice(&sid.to_le_bytes());
+        f.extend_from_slice(&((16 + payload.len()) as u32).to_le_bytes());
+        f.extend_from_slice(&seq.to_le_bytes());
+        f.extend_from_slice(&wnd.to_le_bytes());
+        f.extend_from_slice(payload);
+        self.s.write_all(&f).unwrap();
+    }
+
+    fn smp_read(&mut self) -> Smp {
+        let mut h = [0u8; 16];
+        self.s.read_exact(&mut h).unwrap();
+        assert_eq!(h[0], 0x53);
+        let len = u32::from_le_bytes([h[4], h[5], h[6], h[7]]) as usize;
+        let mut p = vec![0u8; len - 16];
+        self.s.read_exact(&mut p).unwrap();
+        Smp(h[1], u16::from_le_bytes([h[2], h[3]]), u32::from_le_bytes([h[8], h[9], h[10], h[11]]), u32::from_le_bytes([h[12], h[13], h[14], h[15]]), p)
+    }
+
+    /// A SQL batch on session `sid`, as its n-th DATA frame.
+    fn smp_batch(&mut self, sid: u16, n: u32, sql: &str) {
+        let mut p = headers();
+        p.extend(utf16(sql));
+        self.smp_send(0x08, sid, n, 4 + n, &packet(1, &p));
+    }
+}
+
+/// The tokens of a reply made of the payloads of TDS packets joined in `data`.
+fn reply_tokens(data: Vec<u8>) -> Vec<Tok> {
+    let mut rd = Rd::new(&data);
+    let mut out = vec![];
+    let mut cols: Vec<Ti> = vec![];
+    while rd.left() > 0 {
+        match rd.u8().unwrap() {
+            0xFD | 0xFE | 0xFF => {
+                let status = rd.u16().unwrap();
+                rd.u16().unwrap();
+                let count = rd.u64().unwrap();
+                out.push(Tok::Done { status, count, kind: 0xFD });
+            }
+            0x81 => {
+                let n = rd.u16().unwrap();
+                cols.clear();
+                let mut names = vec![];
+                for _ in 0..n {
+                    rd.u32().unwrap();
+                    rd.u16().unwrap();
+                    cols.push(read_typeinfo(&mut rd).unwrap());
+                    names.push(rd.bvarchar().unwrap());
+                }
+                out.push(Tok::Meta(names));
+            }
+            0xD1 => {
+                let row = cols.iter().map(|ti| read_value(&mut rd, ti).unwrap()).collect();
+                out.push(Tok::Row(row));
+            }
+            0xE3 => {
+                let len = rd.u16().unwrap() as usize;
+                rd.take(len).unwrap();
+            }
+            other => panic!("unexpected token 0x{:02X}", other),
+        }
+    }
+    out
+}
+
+/// Add the frame `f` of session `sid` to the message being assembled; the tokens when it is complete.
+fn take_frame(r: &mut Raw, f: Smp, inbytes: &mut Vec<u8>, data: &mut Vec<u8>) -> Option<Vec<Tok>> {
+    r.smp_send(0x02, f.1, 0, f.2 + 4, &[]);
+    inbytes.extend(f.4);
+    while inbytes.len() >= 8 {
+        let len = u16::from_be_bytes([inbytes[2], inbytes[3]]) as usize;
+        if inbytes.len() < len {
+            break;
+        }
+        let pkt: Vec<u8> = inbytes.drain(..len).collect();
+        data.extend_from_slice(&pkt[8..]);
+        if pkt[1] & 1 != 0 {
+            return Some(reply_tokens(std::mem::take(data)));
+        }
+    }
+    None
+}
+
+/// Frames until the message of `sid` is complete; frames of other sessions are collected in `others`.
+fn read_reply(r: &mut Raw, sid: u16, others: &mut Vec<Smp>) -> Vec<Tok> {
+    let (mut data, mut inbytes) = (vec![], vec![]);
+    loop {
+        let f = r.smp_read();
+        if f.0 & 0x08 == 0 {
+            continue; // an ACK
+        }
+        if f.1 != sid {
+            others.push(f);
+            continue;
+        }
+        if let Some(t) = take_frame(r, f, &mut inbytes, &mut data) {
+            return t;
+        }
+    }
+}
+
+#[test]
+fn mars_sessions_share_a_connection() {
+    let (l, _s) = start();
+    let mut r = Raw::connect_mars(&l);
+    // open two logical sessions: each SYN is acknowledged
+    for sid in [1u16, 2] {
+        r.smp_send(0x01, sid, 0, 4, &[]);
+        let f = r.smp_read();
+        assert_eq!((f.0, f.1), (0x02, sid), "a SYN is acknowledged");
+    }
+    let mut others = vec![];
+    r.smp_batch(1, 1, "CREATE TABLE mars_t (n INT); INSERT mars_t VALUES (1), (2), (3)");
+    read_reply(&mut r, 1, &mut others);
+    r.smp_batch(1, 2, "SELECT COUNT(*) FROM mars_t");
+    let t = read_reply(&mut r, 1, &mut others);
+    assert!(t.iter().any(|t| matches!(t, Tok::Row(v) if matches!(v[0], Value::Int(3)))), "{:?}", t);
+    // the second session sees the same connection state: a temporary table of the first
+    r.smp_batch(1, 3, "CREATE TABLE #mine (a INT); INSERT #mine VALUES (7)");
+    read_reply(&mut r, 1, &mut others);
+    r.smp_batch(2, 1, "SELECT a FROM #mine");
+    let t = read_reply(&mut r, 2, &mut others);
+    assert!(t.iter().any(|t| matches!(t, Tok::Row(v) if matches!(v[0], Value::Int(7)))), "{:?}", t);
+    // a big result on session 1 that the client does not acknowledge must not hold up session 2
+    r.smp_batch(1, 4, "SELECT REPLICATE(CAST('x' AS varchar(max)), 100000)");
+    r.smp_batch(2, 2, "SELECT 42");
+    let t = read_reply(&mut r, 2, &mut others);
+    assert!(t.iter().any(|t| matches!(t, Tok::Row(v) if matches!(v[0], Value::Int(42)))), "{:?}", t);
+    let early = others.iter().filter(|f| f.1 == 1).count();
+    assert!(early <= 4, "only the window of frames of session 1 can have arrived: {}", early);
+    // now read session 1's result (the frames already read are in `others`)
+    let mut frames: std::collections::VecDeque<Smp> = others.drain(..).filter(|f| f.1 == 1).collect();
+    let (mut data, mut inbytes) = (vec![], vec![]);
+    let t = loop {
+        let f = match frames.pop_front() {
+            Some(f) => f,
+            None => {
+                let f = r.smp_read();
+                if f.0 & 0x08 == 0 || f.1 != 1 {
+                    continue;
+                }
+                f
+            }
+        };
+        if let Some(t) = take_frame(&mut r, f, &mut inbytes, &mut data) {
+            break t;
+        }
+    };
+    assert!(t.iter().any(|t| matches!(t, Tok::Row(v) if matches!(&v[0], Value::Str(s) if s.len() == 100000))), "the whole value arrives");
+    // closing a session is acknowledged with FIN
+    r.smp_send(0x04, 2, 3, 8, &[]);
+    let f = r.smp_read();
+    assert_eq!((f.0, f.1), (0x04, 2));
+    l.shutdown();
+}

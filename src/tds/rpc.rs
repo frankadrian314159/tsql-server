@@ -31,6 +31,15 @@ pub const SP_PREPARE: u16 = 11;
 pub const SP_EXECUTE: u16 = 12;
 pub const SP_PREPEXEC: u16 = 13;
 pub const SP_UNPREPARE: u16 = 15;
+pub const SP_CURSOR: u16 = 1;
+pub const SP_CURSOROPEN: u16 = 2;
+pub const SP_CURSORPREPARE: u16 = 3;
+pub const SP_CURSOREXECUTE: u16 = 4;
+pub const SP_CURSORPREPEXEC: u16 = 5;
+pub const SP_CURSORUNPREPARE: u16 = 6;
+pub const SP_CURSORFETCH: u16 = 7;
+pub const SP_CURSOROPTION: u16 = 8;
+pub const SP_CURSORCLOSE: u16 = 9;
 
 pub fn parse(payload: &[u8]) -> R<Vec<Rpc>> {
     let mut rd = Rd::new(payload);
@@ -52,7 +61,7 @@ pub fn parse(payload: &[u8]) -> R<Vec<Rpc>> {
             // an untyped NULL (type 0x1F) has no value bytes; give it a type that converts to anything
             let (ti, val) = if rd.b[rd.p] == 0x1F {
                 rd.u8()?;
-                (Ti { w: Wire::Int(4), fixed: false }, Value::Null)
+                (Ti { w: Wire::Int(4), fixed: false, cp: 1252 }, Value::Null)
             } else {
                 let ti = read_typeinfo(&mut rd)?;
                 let val = read_value(&mut rd, &ti)?;
@@ -156,7 +165,7 @@ pub fn plan_named(name: &str, params: &[Param]) -> R<Plan> {
 /// `sp_executesql @stmt, @params, ...` with `args` as the user parameters.
 pub fn plan_executesql(stmt: &str, decl: Option<&str>, params: &[Param], args: &[usize]) -> R<Plan> {
     let lead = vec![literal(&Value::str(stmt)), decl.map(|d| literal(&Value::str(d))).unwrap_or_else(|| "NULL".into())];
-    plan("sp_executesql", &lead, params, args, false)
+    plan("sp_executesql", &lead, params, args, true)
 }
 
 pub fn text_param(params: &[Param], i: usize, what: &str) -> R<Option<String>> {

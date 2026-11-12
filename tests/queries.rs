@@ -217,7 +217,7 @@ fn errors_for_bad_queries() {
     assert_eq!(err_no(&mut c, "SELECT nope FROM emp"), 207);
     assert_eq!(err_no(&mut c, "SELECT * FROM nothere"), 208);
     assert_eq!(err_no(&mut c, "SELECT id FROM emp e JOIN dept d ON 1=1"), 209);
-    assert_eq!(err_no(&mut c, "SELEC 1"), 102);
+    assert_eq!(err_no(&mut c, "SELEC 1"), 2812);
     assert_eq!(err_no(&mut c, "SELECT FROM"), 102);
     assert_eq!(err_no(&mut c, "SELECT 1 FROM emp WHERE"), 102);
     assert_eq!(err_no(&mut c, "SELECT @undeclared"), 137);

@@ -126,6 +126,107 @@ pub fn from_cp1252(b: &[u8]) -> String {
         .collect()
 }
 
+/// The ANSI code page of a collation: its 5 bytes are the LCID (20 bits), flags (12 bits) and the SQL sort order id. A SQL
+/// collation (sort id not 0) names the code page by its sort id, a Windows collation by its language.
+pub fn codepage_of(coll: &[u8]) -> u16 {
+    if coll.len() < 5 {
+        return 1252;
+    }
+    let lcid = u32::from_le_bytes([coll[0], coll[1], coll[2], 0]) & 0xFFFFF;
+    let sort = coll[4];
+    if sort != 0 {
+        return match sort {
+            30..=34 => 437,
+            40..=45 | 49 | 55..=61 => 850,
+            104..=108 | 112..=114 => 1253,
+            111 => 1254,
+            120 => 950,
+            124 => 936,
+            192..=197 => 932,
+            198..=204 | 210..=213 => 936,
+            209 => 1250,
+            214..=221 => 949,
+            222..=224 => 950,
+            225..=229 => 874,
+            _ => 1252,
+        };
+    }
+    // the language decides, with a few whole-LCID exceptions
+    match lcid & 0xFFFF {
+        0x0411 => 932,
+        0x0804 | 0x1004 => 936,
+        0x0412 => 949,
+        0x0404 | 0x0C04 | 0x1404 => 950,
+        0x041E => 874,
+        l => match l & 0x3FF {
+            0x05 | 0x0E | 0x15 | 0x18 | 0x1A | 0x1B | 0x24 => 1250,
+            0x02 | 0x19 | 0x22 | 0x23 | 0x2F | 0x44 | 0x3F | 0x40 => 1251,
+            0x08 => 1253,
+            0x1F | 0x2C => 1254,
+            0x0D => 1255,
+            0x01 | 0x20 | 0x29 | 0x8C => 1256,
+            0x25 | 0x26 | 0x27 => 1257,
+            0x2A => 1258,
+            _ => 1252,
+        },
+    }
+}
+
+/// Bytes in the code page `cp` as text. 1252 is the common case and does not go through the general decoder.
+pub fn decode_cp(cp: u16, b: &[u8]) -> String {
+    if cp == 1252 || b.is_ascii() {
+        return from_cp1252(b);
+    }
+    match encoding_for(cp) {
+        Some(e) => e.decode_without_bom_handling(b).0.into_owned(),
+        None => from_cp1252(b),
+    }
+}
+
+/// Text as bytes in the code page `cp`; characters it lacks become a question mark.
+pub fn encode_cp(cp: u16, s: &str) -> Vec<u8> {
+    if cp == 1252 || s.is_ascii() {
+        return to_cp1252(s);
+    }
+    match encoding_for(cp) {
+        // encoding_rs writes what it cannot map as an HTML numeric reference: one character at a time, so it can be replaced
+        Some(e) => s
+            .chars()
+            .flat_map(|c| {
+                let mut buf = [0u8; 4];
+                let (bytes, _, bad) = e.encode(c.encode_utf8(&mut buf));
+                if bad {
+                    vec![b'?']
+                } else {
+                    bytes.into_owned()
+                }
+            })
+            .collect(),
+        None => to_cp1252(s),
+    }
+}
+
+fn encoding_for(cp: u16) -> Option<&'static encoding_rs::Encoding> {
+    Some(match cp {
+        866 => encoding_rs::IBM866,
+        874 => encoding_rs::WINDOWS_874,
+        932 => encoding_rs::SHIFT_JIS,
+        936 => encoding_rs::GBK,
+        949 => encoding_rs::EUC_KR,
+        950 => encoding_rs::BIG5,
+        1250 => encoding_rs::WINDOWS_1250,
+        1251 => encoding_rs::WINDOWS_1251,
+        1253 => encoding_rs::WINDOWS_1253,
+        1254 => encoding_rs::WINDOWS_1254,
+        1255 => encoding_rs::WINDOWS_1255,
+        1256 => encoding_rs::WINDOWS_1256,
+        1257 => encoding_rs::WINDOWS_1257,
+        1258 => encoding_rs::WINDOWS_1258,
+        // 437 and 850 (the older SQL collations) are not in encoding_rs: they read as 1252
+        _ => return None,
+    })
+}
+
 // ----------------------------------------------------------------------------- types
 /// A column or parameter type as it appears in TYPE_INFO.
 #[derive(Clone, Debug, PartialEq)]
@@ -168,6 +269,8 @@ pub enum Wire {
 pub struct Ti {
     pub w: Wire,
     pub fixed: bool,
+    /// The code page of `char`, `varchar` and `text` values, from the collation in the TYPE_INFO (1252 when there is none).
+    pub cp: u16,
 }
 
 impl Wire {
@@ -368,8 +471,8 @@ pub fn write_table_name(out: &mut Vec<u8>, w: &Wire) {
 
 pub fn read_typeinfo(rd: &mut Rd) -> R<Ti> {
     let tok = rd.u8()?;
-    let fixed = |w| Ok(Ti { w, fixed: true });
-    let var = |w| Ok(Ti { w, fixed: false });
+    let fixed = |w| Ok(Ti { w, fixed: true, cp: 1252 });
+    let var = |w| Ok(Ti { w, fixed: false, cp: 1252 });
     match tok {
         0x30 => fixed(Wire::Int(1)),
         0x32 => fixed(Wire::Bit),
@@ -409,13 +512,14 @@ pub fn read_typeinfo(rd: &mut Rd) -> R<Ti> {
         0x2B => var(Wire::Dto(rd.u8()?.min(7))),
         0xA7 | 0xAF | 0xE7 | 0xEF => {
             let n = rd.u16()?;
-            rd.take(5)?;
-            var(match tok {
+            let cp = codepage_of(rd.take(5)?);
+            let w = match tok {
                 0xA7 => Wire::VarChar(n),
                 0xAF => Wire::Char(n),
                 0xE7 => Wire::NVarChar(n),
                 _ => Wire::NChar(n),
-            })
+            };
+            Ok(Ti { w, fixed: false, cp })
         }
         0xA5 | 0xAD => {
             let n = rd.u16()?;
@@ -451,9 +555,9 @@ pub fn read_typeinfo(rd: &mut Rd) -> R<Ti> {
         }
         0x23 | 0x63 => {
             rd.u32()?;
-            rd.take(5)?;
+            let cp = codepage_of(rd.take(5)?);
             // a table name follows in COLMETADATA, which the caller of a column list skips (`skip_table_name`)
-            var(if tok == 0x23 { Wire::Text } else { Wire::NText })
+            Ok(Ti { w: if tok == 0x23 { Wire::Text } else { Wire::NText }, fixed: false, cp })
         }
         0x22 => {
             rd.u32()?;
@@ -772,7 +876,7 @@ pub fn read_value(rd: &mut Rd, ti: &Ti) -> R<Value> {
             let n = rd.u32()? as usize;
             let d = rd.take(n)?;
             return Ok(match w {
-                Wire::Text => Value::Str(from_cp1252(d)),
+                Wire::Text => Value::Str(decode_cp(ti.cp, d)),
                 Wire::NText => Value::Str(decode_utf16(d)),
                 _ => Value::Bin(d.to_vec()),
             });
@@ -805,7 +909,7 @@ pub fn read_value(rd: &mut Rd, ti: &Ti) -> R<Value> {
                 return Ok(match read_plp(rd)? {
                     None => Value::Null,
                     Some(d) => match w {
-                        Wire::VarChar(_) => Value::Str(from_cp1252(&d)),
+                        Wire::VarChar(_) => Value::Str(decode_cp(ti.cp, &d)),
                         Wire::VarBinary(_) => Value::Bin(d),
                         _ => Value::Str(decode_utf16(&d)),
                     },
@@ -845,7 +949,7 @@ pub fn read_value(rd: &mut Rd, ti: &Ti) -> R<Value> {
         }
         Wire::Float(4) => Value::Float(f32::from_le_bytes(b.get(..4).ok_or_else(short)?.try_into().unwrap()) as f64),
         Wire::Float(_) => Value::Float(f64::from_le_bytes(b.get(..8).ok_or_else(short)?.try_into().unwrap())),
-        Wire::Char(_) | Wire::VarChar(_) => Value::Str(from_cp1252(b)),
+        Wire::Char(_) | Wire::VarChar(_) => Value::Str(decode_cp(ti.cp, b)),
         Wire::NChar(_) | Wire::NVarChar(_) => Value::Str(decode_utf16(b)),
         Wire::Binary(_) | Wire::VarBinary(_) => Value::Bin(b.to_vec()),
         Wire::Xml => Value::Str(decode_utf16(b)),
@@ -888,7 +992,7 @@ pub fn read_value(rd: &mut Rd, ti: &Ti) -> R<Value> {
 /// A `sql_variant` value: its total length, its base type, the base type's properties, then the value's bytes.
 fn write_variant(out: &mut Vec<u8>, v: &Value) {
     let mut body = vec![];
-    let mut put_str = |body: &mut Vec<u8>, bytes: &[u8], base: u8| {
+    let put_str = |body: &mut Vec<u8>, bytes: &[u8], base: u8| {
         body.push(base);
         body.push(7);
         body.extend_from_slice(&COLLATION);
@@ -997,7 +1101,7 @@ fn read_variant(rd: &mut Rd) -> R<Value> {
             Value::Dec(Dec::new(if rest[0] == 0 { -m } else { m }, s))
         }
         0xE7 | 0xEF => Value::Str(decode_utf16(rest)),
-        0xA7 | 0xAF => Value::Str(from_cp1252(rest)),
+        0xA7 | 0xAF => Value::Str(decode_cp(codepage_of(p), rest)),
         0xA5 | 0xAD => Value::Bin(rest.to_vec()),
         0x28 => Value::Date(date_from(rest.get(..3).ok_or_else(short)?)?),
         0x29 => {
@@ -1046,7 +1150,7 @@ mod tests {
         let mut out = vec![];
         write_value(&mut out, &w, &v);
         let mut rd = Rd::new(&out);
-        let got = read_value(&mut rd, &Ti { w, fixed: false }).unwrap();
+        let got = read_value(&mut rd, &Ti { w, fixed: false, cp: 1252 }).unwrap();
         assert_eq!(rd.left(), 0);
         got
     }
@@ -1090,10 +1194,48 @@ mod tests {
         }
     }
 
+    fn typeinfo_roundtrip(w: Wire) -> Wire {
+        let mut out = vec![];
+        write_typeinfo(&mut out, &w);
+        let mut rd = Rd::new(&out);
+        let ti = read_typeinfo(&mut rd).unwrap();
+        assert_eq!(rd.left(), 0, "{:?}", w);
+        ti.w
+    }
+
+    #[test]
+    fn sql_variant_carries_the_base_type() {
+        for v in [Value::Int(7), Value::BigInt(1 << 40), Value::Bit(true), Value::Float(1.5), Value::str("caf\u{e9} \u{2603}"), Value::Bin(vec![1, 2, 3]), Value::Null] {
+            assert_eq!(format!("{:?}", roundtrip(Wire::Variant, v.clone())), format!("{:?}", v));
+        }
+        assert_eq!(typeinfo_roundtrip(Wire::Variant), Wire::Variant);
+    }
+
+    #[test]
+    fn legacy_lobs_and_udts_round_trip() {
+        let s = Value::str("long text \u{e9}");
+        assert_eq!(format!("{:?}", roundtrip(Wire::Text, s.clone())), format!("{:?}", s));
+        assert_eq!(format!("{:?}", roundtrip(Wire::NText, Value::str("\u{2603}"))), format!("{:?}", Value::str("\u{2603}")));
+        assert_eq!(format!("{:?}", roundtrip(Wire::Image, Value::Bin(vec![9, 8, 7]))), format!("{:?}", Value::Bin(vec![9, 8, 7])));
+        assert!(matches!(roundtrip(Wire::Text, Value::Null), Value::Null));
+        assert!(matches!(roundtrip(Wire::Image, Value::Null), Value::Null));
+        for w in [Wire::Text, Wire::NText, Wire::Image, Wire::Udt(0), Wire::Udt(1), Wire::Udt(2)] {
+            assert_eq!(typeinfo_roundtrip(w.clone()), w);
+        }
+    }
+
     #[test]
     fn code_page() {
         assert_eq!(to_cp1252("a€é☃"), vec![b'a', 0x80, 0xE9, b'?']);
         assert_eq!(from_cp1252(&[0x80, 0xE9]), "€é");
+        // collations name other code pages
+        assert_eq!(codepage_of(&[0x09, 0x04, 0xD0, 0x00, 0x34]), 1252);
+        assert_eq!(codepage_of(&[0x19, 0x04, 0xD0, 0x00, 0x00]), 1251); // Cyrillic_General
+        assert_eq!(codepage_of(&[0x11, 0x04, 0x00, 0x00, 0x00]), 932); // Japanese
+        assert_eq!(decode_cp(1251, &[0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2]), "Привет");
+        assert_eq!(encode_cp(1251, "Привет"), vec![0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2]);
+        assert_eq!(decode_cp(932, &[0x93, 0xFA]), "日");
+        assert_eq!(encode_cp(1251, "a☃"), vec![b'a', b'?']);
     }
 
     #[test]

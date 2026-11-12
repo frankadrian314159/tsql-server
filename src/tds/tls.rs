@@ -30,6 +30,7 @@ pub struct TlsConfig {
     pub(crate) cfg: Arc<ServerConfig>,
     /// PEM of the server certificate, for clients that want to trust it explicitly.
     pub certificate_pem: String,
+    key_pem: Vec<u8>,
 }
 
 fn bad(e: impl std::fmt::Display) -> io::Error {
@@ -43,19 +44,33 @@ impl TlsConfig {
         if chain.is_empty() {
             return Err(bad("no certificate found in the PEM data"));
         }
+        TlsConfig::build(cert_pem, key_pem, false)
+    }
+
+    fn build(cert_pem: &[u8], key_pem: &[u8], tls13: bool) -> io::Result<TlsConfig> {
+        let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem).collect::<Result<_, _>>().map_err(bad)?;
+        if chain.is_empty() {
+            return Err(bad("no certificate found in the PEM data"));
+        }
         let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(bad)?;
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        // TLS 1.2 only, as SQL Server before 2022 and the TDS 7.x clients (the Microsoft JDBC driver among them) expect: the
-        // handshake is wrapped in TDS packets and TLS 1.3 changes what follows it
+        // TLS 1.2 by default, as SQL Server before 2022 and the TDS 7.x clients (the Microsoft JDBC driver among them) expect;
+        // TLS 1.3 (what SQL Server 2022 and TDS 8 clients use) is opt-in. The handshake is wrapped in TDS packets either way
+        let versions: &[&'static rustls::SupportedProtocolVersion] = if tls13 { &[&rustls::version::TLS13, &rustls::version::TLS12] } else { &[&rustls::version::TLS12] };
         let mut cfg = ServerConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS12])
+            .with_protocol_versions(versions)
             .map_err(bad)?
             .with_no_client_auth()
             .with_single_cert(chain, key)
             .map_err(bad)?;
         // anything the server sends after the handshake must not need TDS framing, so no session tickets
         cfg.send_tls13_tickets = 0;
-        Ok(TlsConfig { cfg: Arc::new(cfg), certificate_pem: String::from_utf8_lossy(cert_pem).into_owned() })
+        Ok(TlsConfig { cfg: Arc::new(cfg), certificate_pem: String::from_utf8_lossy(cert_pem).into_owned(), key_pem: key_pem.to_vec() })
+    }
+
+    /// The same certificate, also offering TLS 1.3 (`enabled`) or only TLS 1.2.
+    pub fn tls13(&self, enabled: bool) -> io::Result<TlsConfig> {
+        TlsConfig::build(self.certificate_pem.as_bytes(), &self.key_pem, enabled)
     }
 
     /// A certificate and key read from PEM files.
