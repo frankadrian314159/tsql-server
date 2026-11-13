@@ -8,6 +8,7 @@ RESTORE DATABASE shop FROM DISK = 'C:\backups\shop.bak' WITH REPLACE, NORECOVERY
 RESTORE LOG shop FROM DISK = 'C:\backups\shop_1.trn' WITH STOPAT = '2026-11-09 14:30:00', RECOVERY;
 
 RESTORE VERIFYONLY FROM DISK = '...';     -- checks every checksum
+BACKUP DATABASE shop TO DISK = 'shop_mssql.bak' WITH SQL_SERVER_FORMAT;   -- a backup in the form of a SQL Server .bak
 RESTORE HEADERONLY FROM DISK = '...';     -- name, type, database, times, recovery model
 
 ALTER DATABASE shop SET RECOVERY FULL | SIMPLE;   -- BULK_LOGGED is treated as FULL
@@ -75,7 +76,7 @@ backup compression and no tail-log backup (`WITH NORECOVERY` on `BACKUP LOG`).
 
 ## Native SQL Server backups (`.bak`): work in progress
 
-Reading the `.bak` files of a real SQL Server is being built in phases; reading only, no writer is planned. This server's own
+Reading the `.bak` files of a real SQL Server was built in phases (below); writing one is the last section of this chapter. This server's own
 format (above) stays the default for `BACKUP` and for `RESTORE` of files that start with `TSQLBAK1`; a SQL Server backup
 is recognised by its first bytes, so `RESTORE` can tell the formats apart. The work is checked against a real backup, a
 SQL Server 2025 `AdventureWorks2025.bak` (50 MB, compressed), which is not part of the repository: put it in `resources/`
@@ -143,6 +144,63 @@ and full-text search, which this server now has in a reduced form). `WITH EXECUT
 accepted by the parser and not applied (there is no replication, and the procedure runs as its caller).
 
 Everything that is not created is listed in warnings (the first 30, then a count) with the reason.
+
+## Writing a SQL Server backup
+
+```sql
+BACKUP DATABASE shop TO DISK = 'C:\backups\shop_mssql.bak' WITH SQL_SERVER_FORMAT, NAME = 'nightly';
+RESTORE DATABASE shop2 FROM DISK = 'C:\backups\shop_mssql.bak';
+```
+
+`WITH SQL_SERVER_FORMAT` writes the database as a SQL Server `.bak` instead of this server's own format (which stays the
+default). `RESTORE DATABASE`, `RESTORE VERIFYONLY`, `RESTORE HEADERONLY` and `tsql-bakinfo` read the file back. It is a
+full backup only: it is refused with `BACKUP LOG` and `DIFFERENTIAL`, it never changes the log chain or the base of
+differential backups (it behaves as `COPY_ONLY`), and it takes the same snapshot as a native backup, so other sessions keep
+working while it runs.
+
+**What the file is.** An uncompressed Microsoft Tape Format file (what SQL Server writes when a backup is not compressed):
+`TAPE`, `SSET` (name, description, user, date, software version 17), `VOLB`, `MSCI`, an `MSDA` block whose `MQDA` stream is the
+data file, and `MSLS`, laid out as in the SQL Server 2025 backup used to build the reader (the stream starts two bytes before
+a page boundary so that the pages are aligned; `tsql-bakinfo` reports the container as well formed). The data file is a
+sequence of 8 KiB pages in the form `src/sqlbak.rs` reads: the system base tables (`sysschobjs`, `syscolpars`, `sysrscols`,
+`sysrowsets`, `sysallocunits`, `sysidxstats`, `sysiscols`, `sysobjvalues`, `syssingleobjrefs`, `sysclsobjs`, `sysftinds`) as
+records on data pages, the rows of each table as records laid out as `sysrscols` says (clustered key columns first, fixed
+columns, bit columns sharing bytes, variable columns with their end offsets, null bitmap), large values on text pages (a
+pointer in the row to up to 600 fragments of 8,040 bytes, or to internal nodes over them; `text`, `ntext` and `image` through
+a root record), binary XML, a boot page with the database name, a file header, and PFS pages. The writer is
+`src/sqlbak_write.rs` (pages), `src/mtfwrite.rs` (container), `src/engine/bakexport.rs` (the catalog and the rows of the
+snapshot), and `from_xml` in `src/binxml.rs`.
+
+**What comes back.** Everything the reader brings over (see above): schemas, tables with their columns (types, nullability,
+identity with its current value, computed columns and their expressions, collations of the default kind), all rows, primary
+keys, unique constraints, clustered and nonclustered indexes with `INCLUDE` and descending keys, foreign keys (`ON DELETE
+CASCADE`), defaults, check constraints, XML, spatial and full-text indexes and catalogs, views, procedures, functions and
+triggers (the database triggers included). `tests/bakwrite.rs` checks it two ways:
+
+* a database with every kind of column (all the integer, decimal, money, float, string, binary, date and time types,
+  `uniqueidentifier`, `xml`, `text`, `ntext`, `image`, `sql_variant`, `hierarchyid`, `(max)` values of 100 KB, a computed
+  column, an identity column, a clustered key, nonclustered indexes, a foreign key, a unique constraint, defaults, a check, a
+  view, a procedure, a function and a trigger) is backed up, restored under another name, and compared; the restored database
+  is backed up and restored again and compared once more;
+* the sample `AdventureWorks2025.bak` (`cargo test --release --test bakwrite -- --ignored`, about a minute) is restored,
+  backed up in this form (80 MB, uncompressed), restored again, and the two databases are compared: for every one of the 73
+  tables the columns (type, length, precision, scale, nullability, identity, computed), the indexes and their columns, the
+  defaults, the checks, the foreign keys and their columns, the identity value, and the **count and a checksum of every row**;
+  and the text of every view, procedure, function and trigger, the schemas, the full-text catalogs and indexes, the XML
+  indexes. All are identical (122 items compared).
+
+**What does not (and the honest limit).** This was verified only by reading the files back with this server. **It has not
+been tried on a real SQL Server, which probably would not restore the file**: the pages of nonclustered indexes and the B-tree
+levels above the leaves of clustered indexes are not written (this server rebuilds indexes from the rows), the allocation
+maps are minimal (no IAM pages, an all-zero GAM and SGAM), pages carry no checksum, the log is not written, the
+configuration stream `MQCI` is a simplified one, and statistics are absent. What the reader cannot read is not written
+either: sequences, synonyms, user-defined types (a column of an alias type is written with its base type), users, roles and
+permissions, XML schema collections (typed `xml` columns come back untyped), row-level security, the filter of a filtered
+index, the tessellation settings of a spatial index, and the referential actions other than `ON DELETE CASCADE`. A check
+constraint or default written without the outer parentheses that SQL Server keeps comes back with them. `sql_variant` values
+of types `decimal`, `time`, `datetime2` and `datetimeoffset` are written as NULL (the reader cannot read them either; a message
+on stderr counts them). A database of more than about 4 GB (one allocation interval) is refused. The pages are written to a
+temporary file next to the backup first, so the disk needs the size of the data file twice while it runs.
 
 ### What a recent backup looks like
 

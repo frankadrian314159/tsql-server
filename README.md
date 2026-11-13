@@ -41,7 +41,7 @@ cargo run --release --bin tsql -- -D ./data           # durable shell on ./data 
 cargo run --release --bin tsql -- -D ./data --pool-pages 4096   # cache 4096 pages = 32 MiB
 cargo run --release --bin tsql                         # in-memory shell (nothing is written)
 cargo run --release --bin tsql-serve -- ./data --sa-password "Str0ng!pw"   # TDS server on 127.0.0.1:1433
-cargo run --release --bin tsql-bakinfo -- some.bak               # describe a native SQL Server backup (RESTORE DATABASE x FROM DISK = 'file.bak' imports it)
+cargo run --release --bin tsql-bakinfo -- some.bak               # describe a native SQL Server backup (RESTORE DATABASE x FROM DISK = 'file.bak' imports it; BACKUP DATABASE x TO DISK = 'file.bak' WITH SQL_SERVER_FORMAT writes one)
 cargo run --release --features gui --bin tsql-gui      # desktop app (add a data directory to keep your data)
 cargo run --bin tsql -- -D ./data -Q "SELECT @@VERSION"
 cargo run --bin tsql -- -D ./data -U ann -P secret     # log in as a SQL login
@@ -91,7 +91,7 @@ exactly as described in [docs/concurrency.md](docs/concurrency.md).
 | `persist` | Write-ahead log, checkpoints, crash recovery, data-directory locking |
 | `inspect`, `tools` | Catalog introspection (`table_info`, `objects`, …) and helpers for front ends: result grids, CSV import/export, SQL literals, table scripts |
 | `xmlpath.rs`, `xsd.rs`, `fulltext.rs`, `spatial.rs`, `hierarchyid.rs` | The XQuery subset behind the xml methods (`.value`, `.exist`, `.query`, `.nodes`, `.modify`, `OPENXML`), XML Schema validation, full-text matching, the geometry and geography types, and hierarchyid |
-| `mtf.rs`, `mssqlbak.rs`, `xpress.rs`, `sqlbak.rs`, `binxml.rs`, `engine/bakimport.rs`, `bakinfo.rs` | Native SQL Server `.bak` files (restore of tables, rows, large values, XML, computed columns, keys, indexes, defaults, checks, views, procedures, functions and triggers; see [docs/backup.md](docs/backup.md)): the Microsoft Tape Format reader, the compressed `MSSQLBAK` chunks and their Xpress Huffman decoder, pages and system tables, binary XML, the import into this server, and the `tsql-bakinfo` inspector |
+| `mtf.rs`, `mssqlbak.rs`, `xpress.rs`, `sqlbak.rs`, `binxml.rs`, `engine/bakimport.rs`, `bakinfo.rs` | Native SQL Server `.bak` files (restore of tables, rows, large values, XML, computed columns, keys, indexes, defaults, checks, views, procedures, functions and triggers; see [docs/backup.md](docs/backup.md)): the Microsoft Tape Format reader, the compressed `MSSQLBAK` chunks and their Xpress Huffman decoder, pages and system tables, binary XML, the import into this server, and the `tsql-bakinfo` inspector; `BACKUP DATABASE ... WITH SQL_SERVER_FORMAT` writes one (`mtfwrite.rs`, `sqlbak_write.rs`, `engine/bakexport.rs`) |
 | `tds/`, `serve.rs` | The TDS 7.4 listener (`tds::Listener`) and the `tsql-serve` program: packets, login, batches, RPC, transaction-manager requests, token streams, data type encoding |
 | `main.rs`, `gui/` | The `tsql` shell, and the optional `tsql-gui` desktop app (cargo feature `gui`) |
 | `security` | Logins, users, roles, permission resolution |

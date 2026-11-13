@@ -25,6 +25,7 @@ pub mod setops;
 pub mod spill;
 pub mod admin;
 pub mod backup;
+pub mod bakexport;
 pub mod bakimport;
 pub mod auditing;
 pub mod bulk;

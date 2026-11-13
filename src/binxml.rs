@@ -1,4 +1,5 @@
-//! SQL Server's binary XML (the stored form of the `xml` type), turned back into text.
+//! SQL Server's binary XML (the stored form of the `xml` type), turned back into text ([`to_xml`]) and made from text
+//! ([`from_xml`], untyped XML only).
 //!
 //! A value starts with `DF FF`, a version byte (1 for untyped XML, 2 for XML bound to a schema collection) and a code page
 //! (`B0 04` is 1200, UTF-16). What follows is a stream of tokens, which this decoder reads as they were observed in real
@@ -269,5 +270,252 @@ fn typed_value(b: &[u8], i: &mut usize) -> Res<String> {
             Ok(format!("{}{}", date.format("%Y-%m-%d"), tz))
         }
         _ => Err("a value of a type that is not known".into()),
+    }
+}
+
+// ----------------------------------------------------------------------------------------------------------- writing
+
+fn put_mb32(out: &mut Vec<u8>, mut v: usize) {
+    loop {
+        let b = (v & 0x7F) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(b);
+            return;
+        }
+        out.push(b | 0x80);
+    }
+}
+
+/// The names, qualified names and tokens of the binary form being built.
+struct Enc {
+    out: Vec<u8>,
+    names: std::collections::HashMap<String, usize>,
+    qnames: std::collections::HashMap<(usize, usize), usize>,
+}
+
+impl Enc {
+    fn name(&mut self, s: &str) -> usize {
+        if s.is_empty() {
+            return 0;
+        }
+        if let Some(&n) = self.names.get(s) {
+            return n;
+        }
+        let n = self.names.len() + 1;
+        self.names.insert(s.to_string(), n);
+        self.out.push(0xF0);
+        put_mb32(&mut self.out, s.encode_utf16().count());
+        self.out.extend(s.encode_utf16().flat_map(|u| u.to_le_bytes()));
+        n
+    }
+
+    /// A qualified name from its prefix and local part; the namespace is not recorded.
+    fn qname(&mut self, prefix: &str, local: &str) -> usize {
+        let (p, l) = (self.name(prefix), self.name(local));
+        if let Some(&q) = self.qnames.get(&(p, l)) {
+            return q;
+        }
+        let q = self.qnames.len() + 1;
+        self.qnames.insert((p, l), q);
+        self.out.push(0xEF);
+        put_mb32(&mut self.out, 0);
+        put_mb32(&mut self.out, p);
+        put_mb32(&mut self.out, l);
+        q
+    }
+
+    fn text(&mut self, token: u8, s: &str) {
+        self.out.push(token);
+        put_mb32(&mut self.out, s.encode_utf16().count());
+        self.out.extend(s.encode_utf16().flat_map(|u| u.to_le_bytes()));
+    }
+}
+
+struct Parser<'a> {
+    s: &'a str,
+    i: usize,
+}
+
+impl<'a> Parser<'a> {
+    fn rest(&self) -> &'a str {
+        &self.s[self.i..]
+    }
+
+    fn eat(&mut self, p: &str) -> bool {
+        if self.rest().starts_with(p) {
+            self.i += p.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn until(&mut self, end: &str) -> Res<&'a str> {
+        let at = self.rest().find(end).ok_or_else(|| format!("the XML has no '{}' where one is expected", end))?;
+        let t = &self.s[self.i..self.i + at];
+        self.i += at + end.len();
+        Ok(t)
+    }
+
+    fn name(&mut self) -> Res<&'a str> {
+        let n = self.rest().find(|c: char| c.is_whitespace() || matches!(c, '=' | '>' | '/' | '<')).unwrap_or(self.rest().len());
+        if n == 0 {
+            return Err("a name is missing in the XML".into());
+        }
+        let r = &self.s[self.i..self.i + n];
+        self.i += n;
+        Ok(r)
+    }
+
+    fn ws(&mut self) {
+        let n = self.rest().len() - self.rest().trim_start().len();
+        self.i += n;
+    }
+}
+
+/// Entities and character references in text.
+fn unescape(s: &str) -> Res<String> {
+    if !s.contains('&') {
+        return Ok(s.to_string());
+    }
+    let mut o = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find('&') {
+        o.push_str(&rest[..at]);
+        let end = rest[at..].find(';').ok_or("an entity in the XML is not closed")?;
+        let ent = &rest[at + 1..at + end];
+        match ent {
+            "amp" => o.push('&'),
+            "lt" => o.push('<'),
+            "gt" => o.push('>'),
+            "quot" => o.push('"'),
+            "apos" => o.push('\''),
+            _ => {
+                let code = if let Some(h) = ent.strip_prefix("#x").or_else(|| ent.strip_prefix("#X")) { u32::from_str_radix(h, 16).ok() } else { ent.strip_prefix('#').and_then(|d| d.parse().ok()) };
+                o.push(code.and_then(char::from_u32).ok_or_else(|| format!("the entity &{}; is not known", ent))?);
+            }
+        }
+        rest = &rest[at + end + 1..];
+    }
+    o.push_str(rest);
+    Ok(o)
+}
+
+fn split_qname(n: &str) -> (&str, &str) {
+    n.split_once(':').unwrap_or(("", n))
+}
+
+fn element(p: &mut Parser, e: &mut Enc) -> Res<()> {
+    // after '<'
+    let tag = p.name()?;
+    let (pre, local) = split_qname(tag);
+    let q = e.qname(pre, local);
+    e.out.push(0xF8);
+    put_mb32(&mut e.out, q);
+    loop {
+        p.ws();
+        if p.eat("/>") {
+            e.out.push(0xF7);
+            return Ok(());
+        }
+        if p.eat(">") {
+            break;
+        }
+        let an = p.name()?;
+        p.ws();
+        if !p.eat("=") {
+            return Err(format!("the attribute '{}' has no value", an));
+        }
+        p.ws();
+        let quote = if p.eat("\"") { "\"" } else if p.eat("'") { "'" } else { return Err("an attribute value is not quoted".into()) };
+        let val = unescape(p.until(quote)?)?;
+        let (apre, alocal) = split_qname(an);
+        // a namespace declaration is `xmlns` (the prefix) with the declared prefix as the local name
+        let q = if an == "xmlns" { e.qname("xmlns", "") } else if apre == "xmlns" { e.qname("xmlns", alocal) } else { e.qname(apre, alocal) };
+        e.out.push(0xF6);
+        put_mb32(&mut e.out, q);
+        e.text(0x11, &val);
+    }
+    e.out.push(0xF5);
+    content(p, e, Some(tag))?;
+    e.out.push(0xF7);
+    Ok(())
+}
+
+/// Children up to the end tag of `parent` (or the end of the text, at the top level).
+fn content(p: &mut Parser, e: &mut Enc, parent: Option<&str>) -> Res<()> {
+    loop {
+        if p.rest().is_empty() {
+            return match parent {
+                Some(t) => Err(format!("the element '{}' is not closed", t)),
+                None => Ok(()),
+            };
+        }
+        if p.eat("</") {
+            let t = p.until(">")?.trim();
+            return match parent {
+                Some(open) if open == t => Ok(()),
+                _ => Err(format!("the end tag '{}' does not match", t)),
+            };
+        }
+        if p.eat("<!--") {
+            let c = p.until("-->")?;
+            e.text(0xF3, c);
+        } else if p.eat("<![CDATA[") {
+            let t = p.until("]]>")?;
+            e.text(0x11, t);
+        } else if p.eat("<?") {
+            let body = p.until("?>")?;
+            let (name, text) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
+            if !name.eq_ignore_ascii_case("xml") || parent.is_some() {
+                let n = e.name(name);
+                e.out.push(0xF4);
+                put_mb32(&mut e.out, n);
+                put_mb32(&mut e.out, text.trim_start().encode_utf16().count());
+                e.out.extend(text.trim_start().encode_utf16().flat_map(|u| u.to_le_bytes()));
+            }
+        } else if p.eat("<!") {
+            p.until(">")?; // a DOCTYPE
+        } else if p.eat("<") {
+            element(p, e)?;
+        } else {
+            let end = p.rest().find('<').unwrap_or(p.rest().len());
+            let t = unescape(&p.rest()[..end])?;
+            p.i += end;
+            e.text(0x11, &t);
+        }
+    }
+}
+
+/// The binary form of an untyped XML document or fragment: the inverse of [`to_xml`].
+pub fn from_xml(text: &str) -> Res<Vec<u8>> {
+    let mut e = Enc { out: vec![0xDF, 0xFF, 1, 0xB0, 0x04], names: Default::default(), qnames: Default::default() };
+    let mut p = Parser { s: text, i: 0 };
+    content(&mut p, &mut e, None)?;
+    Ok(e.out)
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+
+    #[test]
+    fn xml_survives_the_binary_form() {
+        for x in [
+            "<a/>",
+            "<a></a>",
+            "<root xmlns=\"urn:x\" xmlns:p=\"urn:p\"><p:item id=\"1\" name=\"a &amp; b\">text &lt;here&gt;</p:item><!--note--><?pi data?><empty/></root>",
+            "<a>one<b>two</b>three</a>",
+            "plain text",
+            "<a x=\"&quot;q&quot;\">caf\u{e9} \u{2603}</a>",
+            "<a>line\r\nbreak</a>",
+        ] {
+            let bin = from_xml(x).unwrap();
+            let back = to_xml(&bin).unwrap();
+            // the decoder writes a carriage return as a character reference
+            assert_eq!(back, x.replace('\r', "&#xD;"), "{}", x);
+        }
+        assert!(from_xml("<a><b></a>").is_err());
     }
 }

@@ -638,12 +638,13 @@ impl<'a> Engine<'a> {
                     let mut rows = vec![];
                     for o in db.objects.values() {
                         if let Object::Table(t) = o {
-                            for c in &t.checks {
-                                rows.push(vec![sv(&c.name), Value::Int(t.object_id), Value::Bit(!c.enabled)]);
+                            for (k, c) in t.checks.iter().enumerate() {
+                                let col = c.col.as_ref().and_then(|n| t.columns.iter().position(|x| x.name.eq_ignore_ascii_case(n))).map(|i| i as i32 + 1).unwrap_or(0);
+                                rows.push(vec![sv(&c.name), Value::Int(t.object_id), Value::Bit(!c.enabled), Value::Int(t.object_id * 1000 + 700 + k as i32), sv(&c.text), Value::Int(col), sv("C"), sv("CHECK_CONSTRAINT")]);
                             }
                         }
                     }
-                    Some(rs(&[("name", nv()), ("parent_object_id", DataType::Int), ("is_disabled", DataType::Bit)], rows))
+                    Some(rs(&[("name", nv()), ("parent_object_id", DataType::Int), ("is_disabled", DataType::Bit), ("object_id", DataType::Int), ("definition", nv()), ("parent_column_id", DataType::Int), ("type", DataType::Char(2)), ("type_desc", nv())], rows))
                 }
                 "key_constraints" => {
                     let mut rows = vec![];

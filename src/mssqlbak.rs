@@ -115,11 +115,21 @@ pub struct Expanded<R: Read + Seek> {
     pub layout: Layout,
     pos: u64,
     cache: Option<(usize, Vec<u8>)>,
+    /// An uncompressed backup (a plain Microsoft Tape Format file): the stream is the file itself.
+    plain: bool,
 }
 
 impl<R: Read + Seek> Expanded<R> {
     pub fn open(mut r: R) -> io::Result<Result<Expanded<R>, String>> {
-        Ok(layout(&mut r)?.map(|layout| Expanded { r, layout, pos: 0, cache: None }))
+        // an uncompressed backup starts with the TAPE block of Microsoft Tape Format
+        let len = r.seek(SeekFrom::End(0))?;
+        r.seek(SeekFrom::Start(0))?;
+        let mut head = [0u8; 4];
+        if len >= 4 && r.read_exact(&mut head).is_ok() && crate::mtf::is_mtf(&head) {
+            let layout = Layout { header_words: vec![], chunks: vec![], total: len, comp_total: len, end: len };
+            return Ok(Ok(Expanded { r, layout, pos: 0, cache: None, plain: true }));
+        }
+        Ok(layout(&mut r)?.map(|layout| Expanded { r, layout, pos: 0, cache: None, plain: false }))
     }
 
     fn chunk_of(&self, pos: u64) -> Option<usize> {
@@ -143,6 +153,12 @@ impl<R: Read + Seek> Expanded<R> {
 
 impl<R: Read + Seek> Read for Expanded<R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.plain {
+            self.r.seek(SeekFrom::Start(self.pos))?;
+            let n = self.r.read(out)?;
+            self.pos += n as u64;
+            return Ok(n);
+        }
         let Some(i) = self.chunk_of(self.pos) else { return Ok(0) };
         let start = (self.pos - self.layout.chunks[i].virt) as usize;
         let data = self.chunk(i)?;

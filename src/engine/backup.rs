@@ -157,7 +157,7 @@ fn verify(path: &str) -> Result<(BackupHeader, u64, u64, u64)> {
 }
 
 /// Ends the snapshot a backup reads from.
-struct Snapshot(std::sync::Arc<crate::coord::Core>, crate::storage::TxId);
+pub(super) struct Snapshot(pub(super) std::sync::Arc<crate::coord::Core>, pub(super) crate::storage::TxId);
 
 impl Drop for Snapshot {
     fn drop(&mut self) {
@@ -256,7 +256,7 @@ impl<'a> Engine<'a> {
     fn check_backup_options(&mut self, opts: &[(String, Option<Expr>)], what: &str) -> Result<()> {
         const IGNORED: &[&str] = &[
             "INIT", "NOINIT", "FORMAT", "NOFORMAT", "SKIP", "NOSKIP", "CHECKSUM", "NO_CHECKSUM", "STATS", "COMPRESSION", "NO_COMPRESSION", "STOP_ON_ERROR", "CONTINUE_AFTER_ERROR", "MEDIANAME",
-            "MEDIADESCRIPTION", "EXPIREDATE", "RETAINDAYS", "BLOCKSIZE", "BUFFERCOUNT", "MAXTRANSFERSIZE", "UNLOAD", "NOUNLOAD", "REWIND", "NOREWIND", "FILE", "MOVE", "NAME", "DESCRIPTION", "COPY_ONLY",
+            "MEDIADESCRIPTION", "SQL_SERVER_FORMAT", "EXPIREDATE", "RETAINDAYS", "BLOCKSIZE", "BUFFERCOUNT", "MAXTRANSFERSIZE", "UNLOAD", "NOUNLOAD", "REWIND", "NOREWIND", "FILE", "MOVE", "NAME", "DESCRIPTION", "COPY_ONLY",
             "REPLACE", "RECOVERY", "NORECOVERY", "STOPAT", "DIFFERENTIAL",
         ];
         for (n, _) in opts {
@@ -322,7 +322,17 @@ impl<'a> Engine<'a> {
         let description = self.opt_text(&b.opts, "DESCRIPTION")?;
         let started = std::time::Instant::now();
         let tmp = format!("{}.tmp", path);
-        let result = if b.log { self.backup_log(&dbkey, &tmp, name, description) } else { self.backup_full(&dbkey, &tmp, copy_only, diff, name, description) };
+        let sqlserver = b.opts.iter().any(|(n, _)| n == "SQL_SERVER_FORMAT");
+        if sqlserver && (b.log || diff) {
+            return Err(SqlError::with(155, 15, 1, "The option SQL_SERVER_FORMAT is valid for a full BACKUP DATABASE only."));
+        }
+        let result = if b.log {
+            self.backup_log(&dbkey, &tmp, name, description)
+        } else if sqlserver {
+            self.backup_sqlserver(&dbkey, &tmp, name, description)
+        } else {
+            self.backup_full(&dbkey, &tmp, copy_only, diff, name, description)
+        };
         let (records, tables) = match result {
             Ok(x) => x,
             Err(e) => {

@@ -864,7 +864,7 @@ enum Kind {
     Unknown,
 }
 
-fn fixed_size(c: &ColMeta) -> usize {
+pub fn fixed_size(c: &ColMeta) -> usize {
     match c.xtype {
         48 => 1,
         52 => 2,
