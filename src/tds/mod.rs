@@ -2,14 +2,14 @@
 //! to a [`Server`] over TCP.
 //!
 //! Supported: pre-login, SQL authentication (Login7), SQL batches, RPC requests (`sp_executesql`,
-//! `sp_prepare`/`sp_execute`/`sp_prepexec`/`sp_unprepare`, the server cursor procedures `sp_cursor*`, and calls to stored
+//! `sp_prepare`/`sp_execute`/`sp_prepexec`/`sp_unprepare`, the server cursor procedures `sp_cursor*` (keyset and updatable cursors
+//! included), table-valued parameters, and calls to stored
 //! procedures, with OUTPUT parameters and return status), bulk load (`INSERT BULK` and the bulk-load message),
 //! transaction-manager requests (begin/commit/rollback/save), attention (cancel), the usual data types (`sql_variant`,
 //! `hierarchyid`, spatial and the legacy `text`/`ntext`/`image` among them), and TLS 1.2 (1.3 on request; see [`TlsConfig`];
 //! the login is always encrypted when the client supports TLS, the whole session when the client asks for it or the
 //! listener requires it), and MARS (the session multiplex protocol, see `mars.rs`; requests still run one at a time). Not
-//! supported: group-based Windows logins (see `auth.rs` for the Azure AD and Kerberos logins that are), table-valued parameters, and server cursors that see later changes (a
-//! cursor is a snapshot).
+//! supported: group-based Windows logins (see `auth.rs` for the Azure AD and Kerberos logins that are), DYNAMIC server cursors (served as keyset cursors, which do not see rows others insert).
 pub mod auth;
 mod bulk;
 mod cursor;
@@ -258,11 +258,17 @@ fn envchange(out: &mut Vec<u8>, kind: u8, new: &[u8], old: &[u8], binary: bool) 
 }
 
 fn colmetadata(out: &mut Vec<u8>, names: &[String], wires: &[Wire]) {
+    colmetadata_flags(out, names, wires, &[]);
+}
+
+/// As [`colmetadata`], with the flags of each column (the default is "nullable, update status unknown"): bit 0 nullable,
+/// bits 2-3 whether the column can be updated (0 no, 1 yes, 2 unknown).
+fn colmetadata_flags(out: &mut Vec<u8>, names: &[String], wires: &[Wire], flags: &[u16]) {
     out.push(0x81);
     out.extend_from_slice(&(names.len() as u16).to_le_bytes());
-    for (n, w) in names.iter().zip(wires) {
+    for (i, (n, w)) in names.iter().zip(wires).enumerate() {
         out.extend_from_slice(&0u32.to_le_bytes()); // user type
-        out.extend_from_slice(&0x0009u16.to_le_bytes()); // nullable, update status unknown
+        out.extend_from_slice(&flags.get(i).copied().unwrap_or(0x0009).to_le_bytes());
         write_typeinfo(out, w);
         write_table_name(out, w);
         put_bvar(out, n);

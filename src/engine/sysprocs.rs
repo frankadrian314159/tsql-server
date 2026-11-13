@@ -34,6 +34,9 @@ impl<'a> Engine<'a> {
                 let mut decl: Option<String> = None;
                 let mut positional: Vec<&SysArg> = vec![];
                 let mut named: Vec<&SysArg> = vec![];
+                // the table arguments (table-valued parameters), by the position of the argument
+                let sys_tables = self.ses.sys_tables.clone();
+                let arg_table = |a: &SysArg| -> Option<Table> { args.iter().position(|x| std::ptr::eq(x, a)).and_then(|i| sys_tables.get(i).cloned().flatten()) };
                 for a in args {
                     match a.0.as_deref() {
                         Some("@stmt") => stmt = Some(convert::to_str(&a.1)),
@@ -69,6 +72,17 @@ impl<'a> Engine<'a> {
                 let mut out_map: Vec<(String, String)> = vec![];
                 let rest: Vec<&SysArg> = positional.iter().skip(pi).copied().collect();
                 for (i, p) in params.iter().enumerate() {
+                    if let Some(defs) = self.table_type_defs(&p.ty) {
+                        // a table-valued parameter: the rows of the table variable that was passed
+                        let arg = named.iter().find(|a| a.0.as_deref().map(|n| n.eq_ignore_ascii_case(&p.name)).unwrap_or(false)).copied().or_else(|| rest.get(i).copied());
+                        let mut t = self.build_table(&self.ses.db.clone(), "dbo", &p.name, &defs, true)?;
+                        if let Some(src) = arg.and_then(|a| arg_table(a)) {
+                            let rows: Vec<Row> = src.data.iter(crate::storage::ReadView::dirty()).into_iter().map(|(_, r)| r).collect();
+                            t.load_rows(rows);
+                        }
+                        frame.tables.insert(p.name.clone(), t);
+                        continue;
+                    }
                     let dt = self.resolve_type(&p.ty)?;
                     let arg = named.iter().find(|a| a.0.as_deref().map(|n| n.eq_ignore_ascii_case(&p.name)).unwrap_or(false)).copied().or_else(|| rest.get(i).copied());
                     let val = match arg {

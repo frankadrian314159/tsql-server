@@ -35,6 +35,7 @@ on its own threads (one per client) and returns a handle with `local_addr()`, `w
 | Bulk load | `INSERT BULK` and the bulk-load message (`bcp`, `SqlBulkCopy`, the JDBC `SQLServerBulkCopy`, tiberius `bulk_insert`); see [Bulk load](#bulk-load) |
 | Server cursors | `sp_cursoropen`, `sp_cursorprepare`, `sp_cursorexecute`, `sp_cursorprepexec`, `sp_cursorfetch`, `sp_cursoroption`, `sp_cursorclose`, `sp_cursorunprepare`; see [Server cursors](#server-cursors) |
 | Azure AD, Kerberos | opt-in: access-token logins (`--aad-tenant`, `--aad-jwks`) and Kerberos logins (`--kerberos`, a build with `kerberos-windows`, `kerberos-linux` or `kerberos-macos`); see [authentication.md](authentication.md) |
+| Table-valued parameters | `TVP` parameters of procedures and `sp_executesql`; see [Table-valued parameters](#table-valued-parameters) |
 | MARS | a client that asks for Multiple Active Result Sets (`MultipleActiveResultSets=True`) gets it; see [MARS](#mars) |
 | Metadata queries | `SET FMTONLY ON` (describes a result without running it), `sp_tablecollations_100`, a procedure call without `EXEC` at the start of a batch |
 | Types | bit, tinyint … bigint, decimal/numeric, money, smallmoney, float, real, char/varchar/text, nchar/nvarchar/ntext, binary/varbinary/image, timestamp, date, time, datetime, smalldatetime, datetime2, datetimeoffset, uniqueidentifier, xml, `sql_variant` (sent with its base type), `hierarchyid`, `geometry` and `geography` (as CLR user-defined types: the client gets the type name and the serialized bytes), and the legacy `text`, `ntext` and `image` (as the old text-pointer types); `(max)` types use partially length-prefixed values |
@@ -98,17 +99,45 @@ that roll back) and the Microsoft JDBC `SQLServerBulkCopy`.
 
 ## Server cursors
 
-The OLE DB, ODBC and JDBC drivers open server cursors (`sp_cursoropen` and friends) for scrollable result sets. A cursor is a
-**snapshot**: opening it runs the statement and keeps its rows, and `sp_cursorfetch` pages through them (`FIRST`, `NEXT`,
-`PREV`, `LAST`, `ABSOLUTE`, `RELATIVE`, `REFRESH`, `INFO`, with any number of rows). So a keyset or dynamic cursor is
-converted to a static one and an updatable cursor to `READ_ONLY`, which the protocol allows (the call returns the type and
-concurrency in force, the client sees them and the JDBC driver reports `TYPE_SCROLL_INSENSITIVE` or `CONCUR_READ_ONLY`).
-Forward-only and fast-forward cursors refuse backward fetches; `AUTO_FETCH` and `AUTO_CLOSE` are honoured; positioned
-updates and deletes (`sp_cursor`) are refused with error 16929. A fetched row ends with a hidden `rowstat` column, which
-the Microsoft JDBC driver skips (the position of that column was settled by testing against this driver; it has not been
-compared with a real SQL Server). Checked with the Microsoft JDBC driver (insensitive, sensitive and updatable result
-sets, `absolute`, `relative`, `last`, `previous`, forward-only with a fetch size, prepared statements with parameters);
-not checked with the OLE DB and ODBC drivers of Windows, which speak only TDS 7.1 and cannot connect.
+The OLE DB, ODBC and JDBC drivers open server cursors (`sp_cursoropen` and friends) for scrollable result sets, and for result
+sets that can be changed. `sp_cursorfetch` pages through the rows (`FIRST`, `NEXT`, `PREV`, `LAST`, `ABSOLUTE`, `RELATIVE`,
+`REFRESH`, `INFO`, with any number of rows). A fetched row ends with a hidden `rowstat` column (1: fetched, 2: deleted), which the
+Microsoft JDBC driver skips (its position was settled by testing against this driver; it has not been compared with a real SQL
+Server). There are two kinds of cursor:
+
+* **Keyset cursors** (asked for as KEYSET or DYNAMIC, or as FORWARD_ONLY with updatable concurrency) over a statement that is
+  a plain read of one table (`SELECT columns | * FROM table [WHERE ...] [ORDER BY ...]`, no join, grouping, `DISTINCT` or
+  expression columns) that returns the table's primary key (or a unique constraint of NOT NULL columns). The cursor keeps
+  the key of each row: the membership is fixed when it opens, and **every fetch reads the rows of the block again by key**, so
+  it shows what other sessions (and the cursor itself) changed; a row deleted since comes back with `rowstat` 2. Rows other
+  sessions inserted are not in it, so a DYNAMIC cursor is served as a keyset one and the call says so. Such a cursor can
+  be **updatable**: `sp_cursor` updates (operation 33), deletes (34), inserts (4) and refreshes (1) the row at a position. The
+  update and delete check optimistically that the row is as the cursor last fetched it (error 16934 otherwise, 16933 for a row
+  that is gone); an inserted row joins the cursor (its key is its given key columns, or the identity value it received). The
+  result columns are flagged updatable and the browse information (`TABNAME`, `COLINFO`) is sent, which the JDBC driver needs.
+* **Snapshot cursors**: anything else (STATIC, FAST_FORWARD, a read-only request that is not asked as keyset, a statement that
+  is not a plain read of one table with its key). Opening it runs the statement and keeps the rows; it is read-only, and the call
+  returns the type (static, or forward-only) and concurrency (`READ_ONLY`) in force, which the protocol allows.
+
+Forward-only and fast-forward cursors refuse backward fetches; `AUTO_FETCH` and `AUTO_CLOSE` are honoured. Rows are read
+again in the cursor's own session and transaction, so a keyset cursor inside a transaction sees that transaction's changes.
+Checked with the Microsoft JDBC driver: insensitive, sensitive and updatable result sets (`updateRow`, `deleteRow`,
+`insertRow`, `refreshRow`, `rowDeleted`, a change made by another connection, forward-only updatable, a grouped query staying
+read-only), `absolute`, `relative`, `last`, `previous`, prepared statements with parameters (`scripts/jdbc/`), and by
+hand-written requests (`tests/tds_raw.rs`). Not checked with the OLE DB and ODBC drivers of Windows, which speak only TDS 7.1
+and cannot connect.
+
+## Table-valued parameters
+
+A parameter of type `TVP` (the `Structured` type of ADO.NET, `setStructured` of JDBC) is read with its type name and rows and
+passed to the stored procedure or to `sp_executesql` (`@p dbo.MyType READONLY`) as a table variable of that type, filled with the
+rows. The table type must exist (`CREATE TYPE dbo.MyType AS TABLE (...)`). The rows are inserted by a statement the server
+builds, 500 to a statement; an empty or NULL table passes an empty table. A column flagged as default in the TVP metadata
+is not treated specially (the client sends every column). `sp_executesql` accepts table-type parameters in its parameter list
+in the engine too (`EXEC sp_executesql N'...', N'@p dbo.T READONLY', @p = @tablevar`), and an unnamed argument after a named
+one (as the JDBC driver sends them) is bound by position. Checked with `System.Data.SqlClient` (a 1,200-row table with NULLs, a
+stored procedure, a text command, an empty table) and the Microsoft JDBC driver (a call and an `EXEC`), and by hand-written
+requests.
 
 ## MARS
 
@@ -131,8 +160,8 @@ commands in a row) and by hand-written frames (`tests/tds_raw.rs`).
 ## Not supported
 
 * Group-based logins and NTLM-only domains; see [authentication.md](authentication.md) for what Azure AD and Kerberos do cover.
-* Query notifications and table-valued parameters (the engine has no table types).
-* Keyset and dynamic cursors that see later changes, and updatable server cursors.
+* Query notifications.
+* DYNAMIC cursors that see rows inserted by others (they are served as keyset cursors), and updatable cursors over joins, views, or statements that do not return a key.
 * `ANSI_NULLS OFF`, `QUOTED_IDENTIFIER OFF` and the like: the SET options are recorded (`@@OPTIONS`) but the engine always
   behaves as with them ON.
 * `varchar` result columns are sent in code page 1252 (a value the code page lacks makes the column `nvarchar`).

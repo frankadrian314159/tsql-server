@@ -198,6 +198,8 @@ pub struct SessionState {
     pub module_owner: Vec<String>,
     /// The SET options as `@@OPTIONS` reports them (a bit mask).
     pub options: i32,
+    /// The table arguments (table variables passed by name) of the system procedure call being run, by argument position.
+    pub sys_tables: Vec<Option<Table>>,
     pub nocount: bool,
     pub xact_abort: bool,
     pub rowcount_limit: i64,
@@ -305,6 +307,7 @@ impl SessionState {
             optimizer: true,
             module_owner: vec![],
             options: 5496,
+            sys_tables: vec![],
             nocount: false,
             xact_abort: false,
             rowcount_limit: 0,
@@ -1228,7 +1231,7 @@ impl<'a> Engine<'a> {
         DataType::from_name(&tr.parts[0], &tr.args, true)
     }
 
-    fn table_type_defs(&self, tr: &TypeRef) -> Option<Vec<TableDef>> {
+    pub(super) fn table_type_defs(&self, tr: &TypeRef) -> Option<Vec<TableDef>> {
         let db = self.srv.databases.get(&self.ses.db.to_lowercase())?;
         let (schema, name) = match tr.parts.len() {
             1 => ("dbo".to_string(), tr.parts[0].clone()),
@@ -1881,10 +1884,14 @@ impl<'a> Engine<'a> {
             self.leave_module(scope);
             self.ses.module_owner.pop();
             rc = r?;
-        } else if let Some(v) = self.exec_sysproc(&lname, &bound.iter().map(|b| (b.name.clone(), b.val.clone(), b.out_var.clone())).collect::<Vec<_>>())? {
-            rc = v;
         } else {
-            return Err(SqlError::new(2812, format!("Could not find stored procedure '{}'.", plain.join("."))).into());
+            self.ses.sys_tables = bound.iter().map(|b| b.table.clone()).collect();
+            let r = self.exec_sysproc(&lname, &bound.iter().map(|b| (b.name.clone(), b.val.clone(), b.out_var.clone())).collect::<Vec<_>>());
+            self.ses.sys_tables.clear();
+            match r? {
+                Some(v) => rc = v,
+                None => return Err(SqlError::new(2812, format!("Could not find stored procedure '{}'.", plain.join("."))).into()),
+            }
         }
         if let Some(rv) = &ex.retvar {
             self.set_var(rv, rc)?;

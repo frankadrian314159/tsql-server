@@ -11,6 +11,71 @@ pub struct Param {
     pub out: bool,
     pub ti: Ti,
     pub val: Value,
+    /// A table-valued parameter: the table type and its rows.
+    pub tvp: Option<Tvp>,
+}
+
+/// A table-valued parameter as the client sent it (TVP_TYPE_INFO and its rows).
+pub struct Tvp {
+    pub schema: String,
+    pub name: String,
+    pub rows: Vec<Vec<Value>>,
+}
+
+/// TVPTYPE, the type byte of a table-valued parameter.
+const TVPTYPE: u8 = 0xF3;
+
+/// The table-valued parameter at the reader (its type byte included).
+fn parse_tvp(rd: &mut Rd) -> R<Tvp> {
+    rd.u8()?;
+    let _database = rd.bvarchar()?;
+    let schema = rd.bvarchar()?;
+    let name = rd.bvarchar()?;
+    // the columns: a count (0xFFFF for none), and for each a user type, flags, TYPE_INFO and name
+    let n = rd.u16()?;
+    let mut cols: Vec<Ti> = vec![];
+    if n != 0xFFFF {
+        for _ in 0..n {
+            rd.u32()?;
+            rd.u16()?;
+            cols.push(read_typeinfo(rd)?);
+            rd.bvarchar()?;
+        }
+    }
+    // optional ordering and uniqueness (0x10) and column ordering (0x11) tokens, then the end of the metadata
+    loop {
+        match rd.b.get(rd.p) {
+            Some(0x10) => {
+                rd.u8()?;
+                let k = rd.u16()? as usize;
+                rd.take(3 * k)?;
+            }
+            Some(0x11) => {
+                rd.u8()?;
+                let k = rd.u16()? as usize;
+                rd.take(2 * k)?;
+            }
+            _ => break,
+        }
+    }
+    if rd.left() > 0 {
+        rd.u8()?; // TVP_END_TOKEN
+    }
+    let mut rows = vec![];
+    while rd.left() > 0 {
+        match rd.u8()? {
+            0x01 => {
+                let mut row = Vec::with_capacity(cols.len());
+                for ti in &cols {
+                    row.push(read_value(rd, ti)?);
+                }
+                rows.push(row);
+            }
+            0x00 => break,
+            other => return Err(format!("unexpected token {:#x} in a table-valued parameter", other)),
+        }
+    }
+    Ok(Tvp { schema, name, rows })
 }
 
 pub enum Proc {
@@ -59,6 +124,11 @@ pub fn parse(payload: &[u8]) -> R<Vec<Rpc>> {
             let name = rd.bvarchar()?;
             let status = rd.u8()?;
             // an untyped NULL (type 0x1F) has no value bytes; give it a type that converts to anything
+            if rd.b[rd.p] == TVPTYPE {
+                let tvp = parse_tvp(&mut rd)?;
+                params.push(Param { name, out: false, ti: Ti { w: Wire::Int(4), fixed: false, cp: 1252 }, val: Value::Null, tvp: Some(tvp) });
+                continue;
+            }
             let (ti, val) = if rd.b[rd.p] == 0x1F {
                 rd.u8()?;
                 (Ti { w: Wire::Int(4), fixed: false, cp: 1252 }, Value::Null)
@@ -67,7 +137,7 @@ pub fn parse(payload: &[u8]) -> R<Vec<Rpc>> {
                 let val = read_value(&mut rd, &ti)?;
                 (ti, val)
             };
-            params.push(Param { name, out: status & 1 != 0, ti, val });
+            params.push(Param { name, out: status & 1 != 0, ti, val, tvp: None });
         }
         calls.push(Rpc { proc, params });
     }
@@ -122,13 +192,29 @@ fn safe_proc_name(n: &str) -> R<&str> {
 /// Build the batch for calling `target` (a procedure name, or `sp_executesql` with the text and declarations
 /// already in `lead`) with the parameters `args`, given as indexes into `params`.
 pub fn plan(target: &str, lead: &[String], params: &[Param], args: &[usize], capture_status: bool) -> R<Plan> {
+    plan_with_names(target, lead, params, args, capture_status, &[])
+}
+
+/// As [`plan`]; `pnames` are the names the unnamed arguments take, by position (the parameter names of the declaration of
+/// `sp_executesql`, since a call may not put an unnamed argument after a named one).
+pub fn plan_with_names(target: &str, lead: &[String], params: &[Param], args: &[usize], capture_status: bool, pnames: &[String]) -> R<Plan> {
     let mut sql = String::from("DECLARE @__rc int = 0;\n");
     let mut outs = vec![];
     let mut call: Vec<String> = lead.to_vec();
-    for &i in args {
+    for (k, &i) in args.iter().enumerate() {
         let p = &params[i];
-        let named = p.name.trim_start_matches('@');
-        let expr = if p.out {
+        let named = if p.name.is_empty() { pnames.get(k).map(|n| n.trim_start_matches('@')).unwrap_or("") } else { p.name.trim_start_matches('@') };
+        let expr = if let Some(t) = &p.tvp {
+            // a table-valued parameter: a table variable of the type, filled with the rows, passed by name
+            let var = format!("@__tv{}", i);
+            let q = |n: &str| format!("[{}]", n.replace(']', "]]"));
+            sql.push_str(&format!("DECLARE {} {}.{};\n", var, q(if t.schema.is_empty() { "dbo" } else { &t.schema }), q(&t.name)));
+            for chunk in t.rows.chunks(500) {
+                let rows: Vec<String> = chunk.iter().map(|r| format!("({})", r.iter().map(literal).collect::<Vec<_>>().join(", "))).collect();
+                sql.push_str(&format!("INSERT {} VALUES {};\n", var, rows.join(", ")));
+            }
+            var
+        } else if p.out {
             let var = format!("@__o{}", i);
             sql.push_str(&format!("DECLARE {} {} = {};\n", var, p.ti.w.sql_name(), literal(&p.val)));
             outs.push(i);
@@ -165,7 +251,11 @@ pub fn plan_named(name: &str, params: &[Param]) -> R<Plan> {
 /// `sp_executesql @stmt, @params, ...` with `args` as the user parameters.
 pub fn plan_executesql(stmt: &str, decl: Option<&str>, params: &[Param], args: &[usize]) -> R<Plan> {
     let lead = vec![literal(&Value::str(stmt)), decl.map(|d| literal(&Value::str(d))).unwrap_or_else(|| "NULL".into())];
-    plan("sp_executesql", &lead, params, args, true)
+    // the names of the declared parameters: an unnamed argument after a named one (the Microsoft JDBC driver names a
+    // table-valued parameter and not the others) must be named to be a valid call
+    let pnames: Vec<String> = decl.and_then(|d| crate::parser::parse_param_decls(d).ok()).map(|v| v.into_iter().map(|p| p.name).collect()).unwrap_or_default();
+    let mixed = args.iter().any(|&i| !params[i].name.is_empty()) && args.iter().any(|&i| params[i].name.is_empty());
+    plan_with_names("sp_executesql", &lead, params, args, true, if mixed { &pnames } else { &[] })
 }
 
 pub fn text_param(params: &[Param], i: usize, what: &str) -> R<Option<String>> {

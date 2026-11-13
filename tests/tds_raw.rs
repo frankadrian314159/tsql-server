@@ -133,6 +133,11 @@ impl Raw {
                     rd.take(len).unwrap();
                     out.push(Tok::LoginAck);
                 }
+                // TABNAME and COLINFO: the browse information of a cursor
+                0xA4 | 0xA5 => {
+                    let len = rd.u16().unwrap() as usize;
+                    rd.take(len).unwrap();
+                }
                 0x79 => out.push(Tok::Status(rd.u32().unwrap() as i32)),
                 0xAC => {
                     rd.u16().unwrap();
@@ -671,5 +676,150 @@ fn mars_sessions_share_a_connection() {
     r.smp_send(0x04, 2, 3, 8, &[]);
     let f = r.smp_read();
     assert_eq!((f.0, f.1), (0x04, 2));
+    l.shutdown();
+}
+
+// ------------------------------------------------------------------------------------------------ table-valued parameters
+fn bvar(s: &str) -> Vec<u8> {
+    let mut v = vec![s.encode_utf16().count() as u8];
+    v.extend(utf16(s));
+    v
+}
+
+/// A table-valued parameter: its type, columns and rows, as TVP_TYPE_INFO and the rows that follow.
+fn tvp(schema: &str, name: &str, cols: &[Wire], rows: &[Vec<Value>]) -> Vec<u8> {
+    let mut v = vec![0xF3];
+    v.extend(bvar(""));
+    v.extend(bvar(schema));
+    v.extend(bvar(name));
+    v.extend_from_slice(&(cols.len() as u16).to_le_bytes());
+    for w in cols {
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes());
+        write_typeinfo(&mut v, w);
+        v.extend(bvar(""));
+    }
+    v.push(0x00); // the end of the metadata
+    for r in rows {
+        v.push(0x01);
+        for (w, x) in cols.iter().zip(r) {
+            write_value(&mut v, w, x);
+        }
+    }
+    v.push(0x00);
+    v
+}
+
+#[test]
+fn table_valued_parameters_reach_procedures_and_sp_executesql() {
+    let (l, _s) = start();
+    let (mut r, _) = Raw::connect(&l, "sa", "pw");
+    r.batch("CREATE TYPE dbo.IdList AS TABLE (id INT NOT NULL PRIMARY KEY, name NVARCHAR(20) NULL)");
+    r.batch("CREATE PROCEDURE dbo.p_sum @t dbo.IdList READONLY, @k INT AS SELECT SUM(id) + @k AS s, COUNT(*) AS n, MAX(name) AS m FROM @t");
+    let cols = [Wire::Int(4), Wire::NVarChar(20)];
+    let rows = vec![vec![Value::Int(1), Value::str("a")], vec![Value::Int(2), Value::Null], vec![Value::Int(3), Value::str("caf\u{e9}")]];
+    // sp_executesql with the table in its parameter list
+    let t = r.rpc(
+        Err(10),
+        &[("", false, nvarchar("SELECT SUM(id) AS s, COUNT(*) AS n FROM @t")), ("", false, nvarchar("@t dbo.IdList READONLY")), ("@t", false, tvp("dbo", "IdList", &cols, &rows))],
+    );
+    let row = t.iter().find_map(|t| if let Tok::Row(v) = t { Some(v.clone()) } else { None }).unwrap_or_else(|| panic!("{:?}", t));
+    assert!(matches!(row[0], Value::Int(6)) || matches!(row[0], Value::BigInt(6)), "{:?}", row);
+    assert!(matches!(row[1], Value::Int(3)), "{:?}", row);
+    // a stored procedure by name, with the table and another parameter
+    let t = r.rpc(Ok("dbo.p_sum"), &[("@t", false, tvp("dbo", "IdList", &cols, &rows)), ("@k", false, int(100))]);
+    let row = t.iter().find_map(|t| if let Tok::Row(v) = t { Some(v.clone()) } else { None }).unwrap_or_else(|| panic!("{:?}", t));
+    assert!(matches!(row[0], Value::Int(106)) || matches!(row[0], Value::BigInt(106)), "{:?}", row);
+    assert!(matches!(&row[2], Value::Str(s) if s == "caf\u{e9}"), "{:?}", row);
+    // no rows at all, and a type that is not there
+    let t = r.rpc(Ok("dbo.p_sum"), &[("@t", false, tvp("dbo", "IdList", &cols, &[])), ("@k", false, int(5))]);
+    assert!(t.iter().any(|t| matches!(t, Tok::Row(v) if matches!(v[1], Value::Int(0)))), "{:?}", t);
+    let t = r.rpc(Err(10), &[("", false, nvarchar("SELECT 1")), ("", false, nvarchar("@t dbo.Nothing READONLY")), ("@t", false, tvp("dbo", "Nothing", &cols, &rows))]);
+    assert!(t.iter().any(|t| matches!(t, Tok::Error { .. })), "{:?}", t);
+    l.shutdown();
+}
+
+// ------------------------------------------------------------------------------------------------ keyset and updatable cursors
+/// The rows of a fetch of a cursor over `ct (id, name)`: (id, name, rowstat).
+fn ct_rows(t: &[Tok]) -> Vec<(i32, String, i32)> {
+    t.iter()
+        .filter_map(|t| match t {
+            Tok::Row(v) => match (&v[0], &v[1], &v[2]) {
+                (Value::Int(i), Value::Str(n), Value::Int(s)) => Some((*i, n.clone(), *s)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+fn open_ct(r: &mut Raw, scroll: i32, cc: i32) -> Vec<i32> {
+    let toks = r.rpc(Err(2), &[("", true, null_int()), ("", false, nvarchar("SELECT id, name FROM ct ORDER BY id")), ("", true, int(scroll)), ("", true, int(cc)), ("", true, null_int())]);
+    assert!(!toks.iter().any(|t| matches!(t, Tok::Error { .. })), "{:?}", toks);
+    ret_ints(&toks)
+}
+
+fn change(r: &mut Raw, cursor: i32, op: i32, row: i32, table: &str, values: &[(&str, Vec<u8>)]) -> Vec<Tok> {
+    let mut ps: Vec<(&str, bool, Vec<u8>)> = vec![("", false, int(cursor)), ("", false, int(op)), ("", false, int(row)), ("", false, nvarchar(table))];
+    for (n, v) in values {
+        ps.push((n, false, v.clone()));
+    }
+    r.rpc(Err(1), &ps)
+}
+
+#[test]
+fn keyset_cursors_see_changes_and_updatable_ones_make_them() {
+    let (l, server) = start();
+    let mut other = server.connect();
+    other.execute("CREATE TABLE ct (id INT IDENTITY(1, 1) PRIMARY KEY, name NVARCHAR(20))");
+    other.execute("INSERT ct (name) VALUES (N'a'), (N'b'), (N'c'), (N'd')");
+    let (mut r, _) = Raw::connect(&l, "sa", "pw");
+    // a keyset cursor, updatable: the type and concurrency come back as asked
+    let rets = open_ct(&mut r, 1, 4);
+    assert_eq!(rets, vec![rets[0], 1, 4, 4], "cursor, keyset, optimistic, 4 rows");
+    let cursor = rets[0];
+    let t = fetch(&mut r, cursor, 1, 0, 4);
+    assert_eq!(ct_rows(&t), vec![(1, "a".into(), 1), (2, "b".into(), 1), (3, "c".into(), 1), (4, "d".into(), 1)]);
+    // browse information: the table and the columns (key, hidden rowstat)
+    // another session changes a row: a fetch shows the new value
+    other.execute("UPDATE ct SET name = N'B2' WHERE id = 2");
+    assert_eq!(ct_rows(&fetch(&mut r, cursor, 1, 0, 4))[1], (2, "B2".into(), 1));
+    // an update through the cursor (the fourth parameter names the table; the values are named by column)
+    let t = change(&mut r, cursor, 33, 1, "ct", &[("@name", nvarchar("changed"))]);
+    assert!(t.iter().any(|t| matches!(t, Tok::Status(0))), "{:?}", t);
+    assert_eq!(other.query("SELECT name FROM ct WHERE id = 1").unwrap()[0][0].to_string(), "changed");
+    assert_eq!(ct_rows(&fetch(&mut r, cursor, 0x80, 0, 0))[0].1, "changed");
+    // the optimistic check: a row that someone else changed since it was fetched is not overwritten
+    other.execute("UPDATE ct SET name = N'sneaky' WHERE id = 3");
+    let t = change(&mut r, cursor, 33, 3, "ct", &[("@name", nvarchar("mine"))]);
+    assert!(t.iter().any(|t| matches!(t, Tok::Error { number: 16934, .. })), "{:?}", t);
+    assert_eq!(other.query("SELECT name FROM ct WHERE id = 3").unwrap()[0][0].to_string(), "sneaky");
+    // after a fetch the cursor knows the new value and the update goes through
+    fetch(&mut r, cursor, 1, 0, 4);
+    assert!(change(&mut r, cursor, 33, 3, "ct", &[("@name", nvarchar("mine"))]).iter().any(|t| matches!(t, Tok::Status(0))));
+    // a delete through the cursor, and a row deleted elsewhere, are flagged (rowstat 2)
+    assert!(change(&mut r, cursor, 34, 2, "ct", &[]).iter().any(|t| matches!(t, Tok::Status(0))));
+    other.execute("DELETE FROM ct WHERE id = 4");
+    let rows = ct_rows(&fetch(&mut r, cursor, 1, 0, 4));
+    assert_eq!((rows[1].0, rows[1].2), (2, 2), "{:?}", rows);
+    assert_eq!((rows[3].0, rows[3].2), (4, 2), "{:?}", rows);
+    assert_eq!(rows[0].2, 1);
+    assert_eq!(other.query("SELECT COUNT(*) FROM ct").unwrap()[0][0].to_string(), "2");
+    // an insert through the cursor: the identity value is found and the row joins the cursor
+    assert!(change(&mut r, cursor, 4, 1, "ct", &[("@name", nvarchar("new"))]).iter().any(|t| matches!(t, Tok::Status(0))));
+    let rows = ct_rows(&fetch(&mut r, cursor, 8, 0, 1)); // LAST
+    assert_eq!((rows[0].1.as_str(), rows[0].2), ("new", 1), "{:?}", rows);
+    // a forward-only cursor that asks to be updatable is a keyset one too
+    let rets = open_ct(&mut r, 4, 4);
+    assert_eq!(&rets[1..3], &[4, 4]);
+    // a static cursor, a read-only one and one that is not a plain read of a table stay read-only and refuse changes
+    let rets = open_ct(&mut r, 8, 4);
+    assert_eq!(&rets[1..3], &[8, 1]);
+    let t = change(&mut r, rets[0], 33, 1, "ct", &[("@name", nvarchar("x"))]);
+    assert!(t.iter().any(|t| matches!(t, Tok::Error { number: 16929, .. })), "{:?}", t);
+    let rets = open_ct(&mut r, 1, 1);
+    assert_eq!(&rets[1..3], &[1, 1], "a read-only keyset cursor");
+    let toks = r.rpc(Err(2), &[("", true, null_int()), ("", false, nvarchar("SELECT name, COUNT(*) FROM ct GROUP BY name")), ("", true, int(1)), ("", true, int(4)), ("", true, null_int())]);
+    assert_eq!(&ret_ints(&toks)[1..3], &[8, 1], "{:?}", toks);
     l.shutdown();
 }
