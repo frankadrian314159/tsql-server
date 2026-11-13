@@ -62,6 +62,12 @@ impl AggAcc {
 
     /// Take one row of the group into account.
     pub fn update(&mut self, eng: &mut Engine<'_>, fc: &FuncCall, env: &Env<'_>) {
+        self.update_pre(eng, fc, env, None)
+    }
+
+    /// As [`AggAcc::update`], with the value of the argument already evaluated (by a worker of a parallel query): `None` for
+    /// an aggregate with no argument (`COUNT(*)`), else the value or the error the evaluation gave.
+    pub fn update_pre(&mut self, eng: &mut Engine<'_>, fc: &FuncCall, env: &Env<'_>, pre: Option<std::result::Result<Value, SqlError>>) {
         if self.err.is_some() {
             return;
         }
@@ -69,7 +75,7 @@ impl AggAcc {
             self.count += 1;
             return;
         }
-        let v = match eng.ev(&fc.args[0], env) {
+        let v = match pre.unwrap_or_else(|| eng.ev(&fc.args[0], env)) {
             Ok(v) => v,
             Err(e) => {
                 self.err = Some(e);

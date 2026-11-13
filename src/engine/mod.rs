@@ -27,6 +27,7 @@ pub mod admin;
 pub mod backup;
 pub mod bakexport;
 pub mod bakimport;
+pub mod par;
 pub mod auditing;
 pub mod bulk;
 pub mod ddltrig;
@@ -381,7 +382,9 @@ pub const SHARED_READS: bool = true;
 /// to exclusive mode (releasing the shared guard first, so the catalog can change at that point; nothing borrowed
 /// from it can be alive, because `cat_mut` needs `&mut self`).
 pub struct SrvGuard<'a> {
-    lock: &'a RwLock<ServerState>,
+    lock: Option<&'a RwLock<ServerState>>,
+    /// A guard that only borrows the catalog some other guard holds (a worker of a parallel query, see `par.rs`).
+    shared: Option<&'a ServerState>,
     write: bool,
     r: OnceCell<RwLockReadGuard<'a, ServerState>>,
     w: OnceCell<RwLockWriteGuard<'a, ServerState>>,
@@ -391,7 +394,11 @@ impl<'a> SrvGuard<'a> {
     /// A guard that takes the catalog shared when first used. Each statement then chooses its mode with
     /// [`SrvGuard::set_intent`]; code that changes the catalog calls [`SrvGuard::cat_mut`].
     pub fn new(lock: &'a RwLock<ServerState>) -> SrvGuard<'a> {
-        SrvGuard { lock, write: false, r: OnceCell::new(), w: OnceCell::new() }
+        SrvGuard { lock: Some(lock), shared: None, write: false, r: OnceCell::new(), w: OnceCell::new() }
+    }
+    /// A guard over a catalog that another guard holds, read only: it never takes or gives up the lock.
+    pub fn shared(state: &'a ServerState) -> SrvGuard<'a> {
+        SrvGuard { lock: None, shared: Some(state), write: false, r: OnceCell::new(), w: OnceCell::new() }
     }
     /// Choose the mode for the next acquisition; a guard held in another mode is released.
     pub fn set_intent(&mut self, write: bool) {
@@ -426,9 +433,10 @@ impl<'a> SrvGuard<'a> {
                 eprintln!("catalog upgrade:
 {}", std::backtrace::Backtrace::force_capture());
             }
+            let lock = self.lock.expect("a worker of a parallel query cannot change the catalog");
             self.r.take();
             self.write = true;
-            let g = self.lock.write().unwrap_or_else(|e| e.into_inner());
+            let g = lock.write().unwrap_or_else(|e| e.into_inner());
             let _ = self.w.set(g);
         }
         let s = &mut **self.w.get_mut().unwrap();
@@ -440,13 +448,17 @@ impl<'a> SrvGuard<'a> {
 impl<'a> Deref for SrvGuard<'a> {
     type Target = ServerState;
     fn deref(&self) -> &ServerState {
+        if let Some(s) = self.shared {
+            return s;
+        }
+        let lock = self.lock.expect("a guard has a lock or a catalog");
         if let Some(w) = self.w.get() {
             return w;
         }
         if self.write {
-            self.w.get_or_init(|| self.lock.write().unwrap_or_else(|e| e.into_inner()))
+            self.w.get_or_init(|| lock.write().unwrap_or_else(|e| e.into_inner()))
         } else {
-            self.r.get_or_init(|| self.lock.read().unwrap_or_else(|e| e.into_inner()))
+            self.r.get_or_init(|| lock.read().unwrap_or_else(|e| e.into_inner()))
         }
     }
 }

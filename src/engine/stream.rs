@@ -407,6 +407,12 @@ impl<'a> Engine<'a> {
                 foldable = foldable && aggacc::collect(&o.e, &mut agg_calls);
             }
         }
+        /// What a worker evaluated for a row that passed the WHERE (see `par_dop`).
+        struct Prep {
+            gk: Option<String>,
+            args: Vec<Option<std::result::Result<Value, SqlError>>>,
+            proj: Option<(Row, Vec<Value>)>,
+        }
         struct GroupAcc {
             rep: Row,
             first_seq: u64,
@@ -425,6 +431,34 @@ impl<'a> Engine<'a> {
         let mut seq: u64 = 0;
         let mut scanned = 0usize;
         let mut join_note = String::new();
+        // A big single-table scan whose per-row work is plain expression evaluation (the WHERE, the group key, the arguments of
+        // the aggregates, the select list) shares that evaluation out to workers (see par.rs); the rows are then taken into
+        // the sinks or the groups here, one at a time and in the order they were read, so the result is what a serial run gives.
+        let par_dop: usize = 'par: {
+            let Some(o) = &one else { break 'par 1 };
+            if outer.is_some() || win_over.is_some() || rowsrc.is_some() || join.is_some() || sel.into.is_some() {
+                break 'par 1;
+            }
+            if o.t.data.slot_count() < super::par::min_slots() || o.schema.cols.iter().any(|c| c.denied.is_some()) || cols.iter().any(|c| c.mask.is_some()) {
+                break 'par 1;
+            }
+            if grouped != agg_groups.is_some() {
+                break 'par 1;
+            }
+            // a limit without a sort ends the scan early: reading ahead a batch would only waste work
+            if cap.is_some() && order.is_empty() {
+                break 'par 1;
+            }
+            let safe = sel.where_.as_ref().is_none_or(super::par::par_safe)
+                && group_exprs.iter().all(|e| super::par::par_safe(e))
+                && agg_calls.iter().all(|fc| fc.star || fc.args.iter().all(super::par::par_safe))
+                && (grouped || cols.iter().all(|c| c.src_idx.is_some() || c.expr.is_some_and(super::par::par_safe)))
+                && order.iter().all(|o| super::par::par_safe(&o.e));
+            if !safe {
+                break 'par 1;
+            }
+            self.dop()
+        };
         {
             let cols = &cols;
             let schema = &schema;
@@ -435,11 +469,13 @@ impl<'a> Engine<'a> {
             let (wsorter_ref, win_over_ref) = (&mut wsorter, &win_over);
             let (group_colls, order_colls) = (&group_colls, &order_colls);
             // what happens to each row of the source: filter, then group, or project and hand to the sink
-            let mut handle = |eng: &mut Engine<'_>, row: Row| -> Result<bool> {
+            let mut handle = |eng: &mut Engine<'_>, row: Row, mut pre: Option<Prep>| -> Result<bool> {
                 let env = Env::new(schema, &row, outer);
-                if let Some(w) = where_ {
-                    if !matches!(eng.ev(w, &env)?, Value::Bit(true)) {
-                        return Ok(true);
+                if pre.is_none() {
+                    if let Some(w) = where_ {
+                        if !matches!(eng.ev(w, &env)?, Value::Bit(true)) {
+                            return Ok(true);
+                        }
                     }
                 }
                 *seq += 1;
@@ -458,11 +494,16 @@ impl<'a> Engine<'a> {
                 }
                 if let Some(g) = grouper.as_mut() {
                     // grouping: sort the filtered rows by group key; groups are processed afterwards
-                    let mut kv = Vec::with_capacity(group_exprs.len());
-                    for ge in group_exprs.iter() {
-                        kv.push(eng.ev(ge, &env)?);
-                    }
-                    let gk = if group_colls.is_empty() { key_of(&kv) } else { key_of(&keyed(&kv, group_colls)) };
+                    let gk = match pre.as_mut().and_then(|p| p.gk.take()) {
+                        Some(gk) => gk,
+                        None => {
+                            let mut kv = Vec::with_capacity(group_exprs.len());
+                            for ge in group_exprs.iter() {
+                                kv.push(eng.ev(ge, &env)?);
+                            }
+                            if group_colls.is_empty() { key_of(&kv) } else { key_of(&keyed(&kv, group_colls)) }
+                        }
+                    };
                     if let Some((map, bytes)) = agg_groups_ref.as_mut() {
                         if !map.contains_key(&gk) {
                             *bytes += super::spill::row_bytes(&row) + gk.len() + 96 * agg_calls_ref.len() + 64;
@@ -473,8 +514,11 @@ impl<'a> Engine<'a> {
                             map.insert(gk.clone(), GroupAcc { rep: row.clone(), first_seq: *seq, accs: agg_calls_ref.iter().map(|_| AggAcc::new()).collect() });
                         }
                         if let Some(g) = map.get_mut(&gk) {
-                            for (a, fc) in g.accs.iter_mut().zip(agg_calls_ref.iter()) {
-                                a.update(eng, fc, &env);
+                            for (i, (a, fc)) in g.accs.iter_mut().zip(agg_calls_ref.iter()).enumerate() {
+                                match pre.as_mut() {
+                                    Some(p) => a.update_pre(eng, fc, &env, p.args.get_mut(i).and_then(|x| x.take())),
+                                    None => a.update(eng, fc, &env),
+                                }
                             }
                         }
                         return Ok(true);
@@ -497,28 +541,84 @@ impl<'a> Engine<'a> {
                     g.push(Entry { keys: vec![Value::Str(gk)], seq: *seq, row })?;
                     return Ok(true);
                 }
-                let (prow, keys) = eng.project_env(&env, cols, order, order_colls)?;
+                let (prow, keys) = match pre.as_mut().and_then(|p| p.proj.take()) {
+                    Some(p) => p,
+                    None => eng.project_env(&env, cols, order, order_colls)?,
+                };
                 sinks.push(prow, keys, *seq)
             };
             if let Some(rs) = rowsrc.take() {
                 let mut it = rs.rows.stream();
                 while let Some(row) = it.next_row()? {
                     scanned += 1;
-                    if !handle(self, row)? {
+                    if !handle(self, row, None)? {
                         break;
                     }
                 }
             } else if let Some(o) = &one {
                 let scanned = &mut scanned;
-                self.scan_each(&o.loc, &o.t, &o.ap, Some((&o.schema, &o.pushed)), &mut |eng, chunk| {
-                    for (_, row) in chunk {
-                        *scanned += 1;
-                        if !handle(eng, row)? {
+                if par_dop > 1 {
+                    // collect batches of rows, evaluate them on the workers, take the results in the order of the rows
+                    let batch = par_dop * 2048;
+                    let mut buf: Vec<Row> = Vec::new();
+                    let (where_, group_exprs, group_colls, agg_calls, cols, order, order_colls, schema, fold) = (&sel.where_, &group_exprs, &group_colls, &agg_calls, &cols, order, &order_colls, &o.schema, grouped);
+                    let prepare = |w: &mut Engine<'_>, row: Row| -> Result<Option<(Row, Prep)>> {
+                        let env = Env::new(schema, &row, None);
+                        if let Some(wh) = where_ {
+                            if !matches!(w.ev(wh, &env)?, Value::Bit(true)) {
+                                return Ok(None);
+                            }
+                        }
+                        let mut prep = Prep { gk: None, args: vec![], proj: None };
+                        if fold {
+                            let mut kv = Vec::with_capacity(group_exprs.len());
+                            for ge in group_exprs.iter() {
+                                kv.push(w.ev(ge, &env)?);
+                            }
+                            prep.gk = Some(if group_colls.is_empty() { key_of(&kv) } else { key_of(&keyed(&kv, group_colls)) });
+                            prep.args = agg_calls.iter().map(|fc| if fc.star { None } else { Some(w.ev(&fc.args[0], &env)) }).collect();
+                        } else {
+                            prep.proj = Some(w.project_env(&env, cols, order, order_colls)?);
+                        }
+                        Ok(Some((row, prep)))
+                    };
+                    let mut run = |eng: &mut Engine<'_>, rows: Vec<Row>, handle: &mut dyn FnMut(&mut Engine<'_>, Row, Option<Prep>) -> Result<bool>| -> Result<bool> {
+                        let parts = eng.par_map(rows, par_dop, &|w, part: Vec<Row>| part.into_iter().map(|row| prepare(w, row)).collect::<Vec<_>>());
+                        for part in parts {
+                            for r in part {
+                                if let Some((row, prep)) = r? {
+                                    if !handle(eng, row, Some(prep))? {
+                                        return Ok(false);
+                                    }
+                                }
+                            }
+                        }
+                        Ok(true)
+                    };
+                    let mut stopped = false;
+                    self.scan_each(&o.loc, &o.t, &o.ap, Some((&o.schema, &o.pushed)), &mut |eng, chunk| {
+                        *scanned += chunk.len();
+                        buf.extend(chunk.into_iter().map(|(_, row)| row));
+                        if buf.len() >= batch && !run(eng, std::mem::take(&mut buf), &mut handle)? {
+                            stopped = true;
                             return Ok(false);
                         }
+                        Ok(true)
+                    })?;
+                    if !stopped && !buf.is_empty() {
+                        run(self, std::mem::take(&mut buf), &mut handle)?;
                     }
-                    Ok(true)
-                })?;
+                } else {
+                    self.scan_each(&o.loc, &o.t, &o.ap, Some((&o.schema, &o.pushed)), &mut |eng, chunk| {
+                        for (_, row) in chunk {
+                            *scanned += 1;
+                            if !handle(eng, row, None)? {
+                                return Ok(false);
+                            }
+                        }
+                        Ok(true)
+                    })?;
+                }
             } else if let Some(plan) = join.take() {
                 let JoinPlan { leaves, order: exec_order, stages, perm, .. } = plan;
                 let budget = (self.srv.work.bytes / stages.len().max(1)).max(1);
@@ -541,7 +641,7 @@ impl<'a> Engine<'a> {
                 // then the first table is read and every row goes through the stages
                 let mut sink = |eng: &mut Engine<'_>, joined: Row| -> Result<bool> {
                     let row: Row = perm.iter().map(|&i| joined[i].clone()).collect();
-                    handle(eng, row)
+                    handle(eng, row, None)
                 };
                 let probe = &leaves[exec_order[0]];
                 let mut stopped = false;

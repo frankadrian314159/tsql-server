@@ -153,7 +153,7 @@ window functions, JSON (`JSON_VALUE JSON_QUERY JSON_MODIFY OPENJSON ISJSON`), `H
 
 Things that are **not** implemented, so you are not surprised:
 
-* **TDS: group-based Windows logins, parallel execution under MARS (its requests run one at a time), DYNAMIC server cursors (served as keyset cursors)** — see [docs/tds.md](docs/tds.md). TLS is
+* **TDS: group-based Windows logins, DYNAMIC server cursors (served as keyset cursors)** — see [docs/tds.md](docs/tds.md). TLS is
   supported (a self-signed certificate is generated unless you give one; `--force-encryption` makes it mandatory).
 * **Memory use** — stored data (heaps, indexes, version chains, large values) live in a paged file and are cached by a
   bounded buffer pool, so a database may be much larger than RAM. What must still fit in memory is the working set of

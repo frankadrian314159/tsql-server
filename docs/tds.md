@@ -146,13 +146,17 @@ After the login every packet travels inside a frame of the Session Multiplex Pro
 sessions (SYN), each carrying its own requests and replies, with a sequence number and a window per session. The sessions
 share the connection's one engine state, as in SQL Server: the transaction, temporary tables, SET options.
 
-**How it differs from SQL Server:** the engine runs one statement at a time, so requests are executed one after another in
-the order they arrive, never in parallel, and the reply to each is queued for its session and sent as the client's window
-allows, interleaved with the replies of the other sessions. A result is therefore held in memory while the client reads
-another session (a reader over millions of rows that the client does not drain costs that much memory), and a statement
-does not start until the one before it has finished running, though the client need not have read its result. The usual use
+**How it differs from SQL Server:** requests that **only read** (a batch of `SELECT`s, or `sp_executesql` / `sp_execute` of one,
+with no OUTPUT parameter, no `@@` variable, sequence, `INTO` or locking hint, and no open transaction) run in parallel, each
+on a worker thread over a fork of the connection's session (same login, database, temporary tables and settings), so a long
+query on one logical session does not hold up a short one on another (`src/tds/mars_par.rs`). Any other request (DML, DDL,
+`EXEC`, `SET`, transaction control, cursors, bulk load) waits for the running ones to finish, then runs on the session itself,
+so it is complete before the next starts; while a transaction is open every request runs serially. Replies of one logical
+session stay in order; those of different sessions are interleaved as they finish, within the client's windows. A reply is
+held in memory until the client's window lets it go, so a reader over millions of rows that the client does not drain costs
+that much memory. The usual use
 (read one result while issuing other commands, nested readers, several commands in flight) works and does not deadlock.
-This is a change to the transport only: `src/tds/mars.rs` sits between the socket and the packet code, and a connection that
+This is mostly a change to the transport: `src/tds/mars.rs` sits between the socket and the packet code, and a connection that
 does not use MARS is unchanged. Checked with `System.Data.SqlClient` (`MultipleActiveResultSets=True`: a 6,000-row reader
 kept open while a scalar command, DDL, DML and a second reader run; a transaction shared by the sessions; hundreds of
 commands in a row) and by hand-written frames (`tests/tds_raw.rs`).

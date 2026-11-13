@@ -61,8 +61,28 @@ writer holding row 1 does not block a reader of row 3; a table scan, which must 
 
 ## Differences from SQL Server
 
-There is no lock escalation and no page locks. Statements of one session never run in parallel with each other (no
-parallel query plans); statements of different sessions do (see Latching).
+There is no lock escalation and no page locks. A statement of one session can share the evaluation of its expressions among
+worker threads (see Intra-query parallelism); statements of different sessions, and the read-only requests of a MARS
+connection, run in parallel (see Latching and [tds.md](tds.md#mars)).
+
+## Intra-query parallelism
+
+A scan of a large table can share the *evaluation of expressions* among worker threads: the `WHERE` condition of a table
+scan, and, for grouped aggregates and sorted queries, the grouping keys, aggregate arguments and projected expressions.
+The scan itself stays on the session's thread (visibility, locks and waits are unchanged); rows are handed to workers in
+batches while the session thread waits, so the catalog guard is never released under a worker and DDL cannot deadlock with
+one. Results are committed in row order, so rows, their order, errors (the first failing row) and even float sums are those
+of a serial run.
+
+* **What is shared out:** columns, literals, variables, arithmetic and boolean operators, and a list of pure scalar functions.
+  Subqueries, user-defined functions, `@@` variables, sequences and random functions keep the query on one thread.
+* **Degree:** `OPTION (MAXDOP 1)` forces one thread; otherwise `sp_configure 'max degree of parallelism'` (0 = the number
+  of processors, at most 8), capped by the processors. A scan is shared only when the table has at least 20,000 row slots.
+  For tests, `TSQL_PARALLEL_FORCE_DOP` and `TSQL_PARALLEL_MIN_SLOTS` override these.
+* **TOP without ORDER BY** is not shared out (it would read a batch beyond what it needs).
+* **Measured** (release, 400,000 rows, 12 processors; `cargo test --release --test parallel_query -- --ignored --nocapture`):
+  filter 1.7x, group by 2.2x, sorted top-N 2.3x. Only expression-heavy queries gain; a plain scan is bound by the thread
+  that reads the table.
 
 ### Key-range locks
 

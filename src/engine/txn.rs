@@ -481,6 +481,10 @@ impl<'a> Engine<'a> {
             // stream the heap in chunks, keeping only rows that pass the filter
             let view = self.read_view_iso(&db, iso);
             let mut after = None;
+            // a big scan with conditions that only read the row: the rows read are collected into batches whose conditions are
+            // evaluated by several threads (see par.rs); the rows that pass go to `f` in the order they were read
+            let (batch, dop) = if h.write_lock { (0, 1) } else { self.par_batch(t, flt) };
+            let mut pending: Vec<(RowId, Row)> = Vec::new();
             loop {
                 let mut chunk = t.data.scan_chunk(&view, after, 512, !h.readpast);
                 if let Some(w) = chunk.blocked_by {
@@ -508,6 +512,22 @@ impl<'a> Engine<'a> {
                         self.lock_row(oid, *rid, Mode::S)?;
                     }
                     self.changed_since_read(t, chunk.rows.iter().map(|(r, _)| *r))?;
+                }
+                if batch > 0 {
+                    pending.extend(chunk.rows);
+                    let finished = chunk.done || chunk.last.is_none();
+                    if pending.len() >= batch || finished {
+                        let (sc, es) = flt.expect("a parallel scan has conditions");
+                        let rows = self.par_filter(sc, std::mem::take(&mut pending), es, dop)?;
+                        if !rows.is_empty() && !f(self, rows)? {
+                            return Ok(());
+                        }
+                    }
+                    if finished {
+                        break;
+                    }
+                    after = chunk.last;
+                    continue;
                 }
                 let rows = match flt {
                     Some((sc, es)) => self.filter_pushed(sc, chunk.rows, es)?,

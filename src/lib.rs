@@ -299,6 +299,16 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// A second connection for the same login that can run statements that only read while this one is busy (what the
+    /// requests of a MARS connection that are read-only do in parallel). `None` while a transaction is open: the statements of
+    /// a transaction run one at a time.
+    pub fn fork_reader(&self) -> Option<Connection> {
+        if self.session.trancount > 0 {
+            return None;
+        }
+        Some(Connection { server: self.server.clone(), session: self.session.fork() })
+    }
+
     /// Execute a single batch (no `GO` handling).
     pub fn execute(&mut self, sql: &str) -> BatchResult {
         crate::span!("execute");

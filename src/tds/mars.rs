@@ -6,12 +6,12 @@
 //! replies. The sessions share the connection's engine state (the transaction, temporary tables, SET options), as in SQL
 //! Server.
 //!
-//! The engine runs one statement at a time, so requests are executed one after another in the order they arrive, and the
+//! A session runs one statement at a time, so requests that change anything are executed one after another in the order they
+//! arrive (requests that only read run on workers, see `mars_par.rs`), and the
 //! reply to each is queued for its session and sent as the client's window for that session allows, interleaved with the
 //! replies of other sessions. A reply is therefore held in memory while the client is busy with another session, and a
 //! statement does not start until the one before it has finished running (it need not have been read). That keeps the
-//! common use of MARS (read a result while issuing other commands on the same connection) from deadlocking, without
-//! running statements in parallel.
+//! common use of MARS (read a result while issuing other commands on the same connection) from deadlocking.
 use super::*;
 use std::collections::VecDeque;
 
@@ -113,6 +113,34 @@ impl Transport {
         self.stream.flush()
     }
 
+    /// A request that is complete and waiting, if there is one.
+    pub(super) fn mars_pop_ready(&mut self) -> Option<(u16, u8, u8, Vec<u8>)> {
+        let m = self.mux.as_mut()?;
+        let r = m.ready.pop_front()?;
+        m.cur = r.0;
+        Some(r)
+    }
+
+    /// Make `sid` the session whose request is being served (replies go to it).
+    pub(super) fn set_current_session(&mut self, sid: u16) {
+        if let Some(m) = self.mux.as_mut() {
+            m.cur = sid;
+        }
+    }
+
+    /// The logical session whose request is being served.
+    pub(super) fn current_session(&self) -> u16 {
+        self.mux.as_ref().map(|m| m.cur).unwrap_or(0)
+    }
+
+    /// Send the reply to a request of session `sid`.
+    pub(super) fn mars_reply(&mut self, sid: u16, reply: &[u8]) -> io::Result<()> {
+        if let Some(m) = self.mux.as_mut() {
+            m.cur = sid;
+        }
+        self.send(T_REPLY, reply)
+    }
+
     /// The next request of any session; blocks, reading frames, until one is complete.
     pub(super) fn mars_request(&mut self) -> io::Result<(u16, u8, u8, Vec<u8>)> {
         loop {
@@ -125,7 +153,7 @@ impl Transport {
     }
 
     /// Read one SMP frame and act on it.
-    fn mars_read_frame(&mut self) -> io::Result<()> {
+    pub(super) fn mars_read_frame(&mut self) -> io::Result<()> {
         let mut h = [0u8; HEADER];
         self.stream.read_exact(&mut h)?;
         if h[0] != SMID {

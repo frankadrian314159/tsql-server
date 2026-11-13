@@ -1311,7 +1311,11 @@ impl Parser {
                         if !cur.is_empty() {
                             cur.push(' ');
                         }
-                        cur.push_str(&t.up);
+                        match t.tok {
+                            // (`MAXDOP 4`: the number is part of the hint)
+                            Tok::Int(n) => cur.push_str(&n.to_string()),
+                            _ => cur.push_str(&t.up),
+                        }
                     }
                     _ => {}
                 }

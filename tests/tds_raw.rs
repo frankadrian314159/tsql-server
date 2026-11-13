@@ -823,3 +823,66 @@ fn keyset_cursors_see_changes_and_updatable_ones_make_them() {
     assert_eq!(&ret_ints(&toks)[1..3], &[8, 1], "{:?}", toks);
     l.shutdown();
 }
+
+#[test]
+fn mars_requests_that_only_read_run_at_the_same_time() {
+    let (l, _s) = start();
+    let mut r = Raw::connect_mars(&l);
+    for sid in [1u16, 2, 3] {
+        r.smp_send(0x01, sid, 0, 4, &[]);
+        assert_eq!(r.smp_read().0, 0x02);
+    }
+    let mut others = vec![];
+    r.smp_batch(1, 1, "CREATE TABLE ptab (n INT); WITH c AS (SELECT 1 AS i UNION ALL SELECT i + 1 FROM c WHERE i < 40000) INSERT ptab SELECT i FROM c OPTION (MAXRECURSION 0)");
+    read_reply(&mut r, 1, &mut others);
+    r.smp_batch(1, 2, "CREATE TABLE #tmp (a INT); INSERT #tmp VALUES (7)");
+    read_reply(&mut r, 1, &mut others);
+    // a long read on session 1, and short ones on 2 and 3 sent after it: the short ones are answered first
+    r.smp_batch(1, 3, "SELECT COUNT(*) FROM ptab WHERE LEN(REPLICATE('abcdefghij', n % 400)) > 3000 AND CHARINDEX('j', REPLICATE('abcdefghij', n % 50)) > 0");
+    r.smp_batch(2, 1, "SELECT 42");
+    r.smp_batch(3, 1, "SELECT a FROM #tmp"); // a temporary table of the connection is visible to a worker
+    let mut state: std::collections::HashMap<u16, (Vec<u8>, Vec<u8>)> = Default::default();
+    let mut finished: Vec<(u16, Vec<Tok>)> = vec![];
+    while finished.len() < 3 {
+        let f = r.smp_read();
+        if f.0 & 0x08 == 0 {
+            continue;
+        }
+        let sid = f.1;
+        let e = state.entry(sid).or_default();
+        if let Some(t) = take_frame(&mut r, f, &mut e.0, &mut e.1) {
+            finished.push((sid, t));
+        }
+    }
+    let order: Vec<u16> = finished.iter().map(|f| f.0).collect();
+    assert_eq!(order.last(), Some(&1), "the long read finishes last: {:?}", order);
+    for (sid, t) in &finished {
+        match sid {
+            2 => assert!(t.iter().any(|t| matches!(t, Tok::Row(v) if matches!(v[0], Value::Int(42)))), "{:?}", t),
+            3 => assert!(t.iter().any(|t| matches!(t, Tok::Row(v) if matches!(v[0], Value::Int(7)))), "{:?}", t),
+            _ => assert!(t.iter().any(|t| matches!(t, Tok::Row(_))), "{:?}", t),
+        }
+    }
+    // a write waits for the reads that are running, and the reads that follow it see it
+    r.smp_batch(1, 4, "SELECT COUNT(*) FROM ptab WHERE LEN(REPLICATE('abcdefghij', n % 400)) > 3000");
+    r.smp_batch(2, 2, "INSERT ptab VALUES (-1)");
+    r.smp_batch(3, 2, "SELECT COUNT(*) FROM ptab WHERE n = -1");
+    let mut state: std::collections::HashMap<u16, (Vec<u8>, Vec<u8>)> = Default::default();
+    let mut finished: Vec<(u16, Vec<Tok>)> = vec![];
+    while finished.len() < 3 {
+        let f = r.smp_read();
+        if f.0 & 0x08 == 0 {
+            continue;
+        }
+        let sid = f.1;
+        let e = state.entry(sid).or_default();
+        if let Some(t) = take_frame(&mut r, f, &mut e.0, &mut e.1) {
+            finished.push((sid, t));
+        }
+    }
+    let order: Vec<u16> = finished.iter().map(|f| f.0).collect();
+    assert_eq!(order, vec![1, 2, 3], "the write waited for the read before it, and the read after it saw the write: {:?}", order);
+    let seen = finished[2].1.iter().find_map(|t| if let Tok::Row(v) = t { Some(v[0].clone()) } else { None });
+    assert!(matches!(seen, Some(Value::Int(1))), "{:?}", finished[2].1);
+    l.shutdown();
+}

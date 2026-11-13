@@ -8,7 +8,7 @@
 //! transaction-manager requests (begin/commit/rollback/save), attention (cancel), the usual data types (`sql_variant`,
 //! `hierarchyid`, spatial and the legacy `text`/`ntext`/`image` among them), and TLS 1.2 (1.3 on request; see [`TlsConfig`];
 //! the login is always encrypted when the client supports TLS, the whole session when the client asks for it or the
-//! listener requires it), and MARS (the session multiplex protocol, see `mars.rs`; requests still run one at a time). Not
+//! listener requires it), and MARS (the session multiplex protocol, see `mars.rs`; requests that only read run in parallel, see `mars_par.rs`). Not
 //! supported: group-based Windows logins (see `auth.rs` for the Azure AD and Kerberos logins that are), DYNAMIC server cursors (served as keyset cursors, which do not see rows others insert).
 pub mod auth;
 mod bulk;
@@ -16,6 +16,7 @@ mod cursor;
 #[cfg(all(unix, any(feature = "kerberos-linux", feature = "kerberos-macos")))]
 mod gssapi;
 mod mars;
+mod mars_par;
 #[cfg(all(windows, feature = "kerberos-windows"))]
 mod sspi;
 mod rpc;
@@ -331,7 +332,7 @@ impl Live {
     }
 
     /// Handle one item of engine output; returns false when the client can no longer be written to.
-    fn on(&mut self, item: Streamed, out: &mut Vec<u8>, t: &mut Transport) -> bool {
+    fn on(&mut self, item: Streamed, out: &mut Vec<u8>, t: Option<&mut Transport>) -> bool {
         let more = match self.reply {
             Reply::Batch => 0xFD,
             Reply::Proc => 0xFF,
@@ -384,10 +385,13 @@ impl Live {
                     write_value(out, w, row.get(c).unwrap_or(&Value::Null));
                 }
                 if out.len() >= FLUSH_AT {
-                    if t.send_part(T_REPLY, out).is_err() {
-                        return false;
+                    // (a reply that is built without a transport is kept whole, and sent when it is finished)
+                    if let Some(t) = t {
+                        if t.send_part(T_REPLY, out).is_err() {
+                            return false;
+                        }
+                        out.clear();
                     }
-                    out.clear();
                 }
             }
             Streamed::End(n) => {
@@ -400,6 +404,30 @@ impl Live {
 }
 
 // ----------------------------------------------------------------------------- the session
+/// Run the batch of an RPC on `conn` and write its tokens (and, with a transport, send them as they fill); returns whether it
+/// failed.
+fn run_plan_on(conn: &mut Connection, mut t: Option<&mut Transport>, plan: &rpc::Plan, params: &[rpc::Param], out: &mut Vec<u8>, status_override: Option<i32>) -> bool {
+    // the trailer is the last result set whose first column is the marker; `Live` keeps it apart
+    if tracing() {
+        trace(&format!("rpc batch: {:?}", plan.sql));
+    }
+    let mut live = Live::new(Reply::Proc);
+    conn.execute_streaming(&plan.sql, &mut |item| live.on(item, out, t.as_deref_mut()));
+    let errored = live.errored;
+    if !errored {
+        if let Some(tr) = &live.trailer {
+            let status = status_override.unwrap_or_else(|| if plan.status { as_i32(&tr[0]) } else { 0 });
+            out.push(0x79);
+            out.extend_from_slice(&status.to_le_bytes());
+            for (k, &pi) in plan.outs.iter().enumerate() {
+                let p = &params[pi];
+                return_value(out, pi as u16, &p.name, &p.ti.w, tr.get(k + 1).unwrap_or(&Value::Null));
+            }
+        }
+    }
+    errored
+}
+
 /// How a request's reply ends: batches finish with DONE, RPCs with DONEPROC (statements inside with DONEINPROC).
 #[derive(Clone, Copy, PartialEq)]
 enum Reply {
@@ -469,7 +497,7 @@ impl Session {
         {
             // rows of a big result go to the client while the statement is still running
             let Session { t, conn, .. } = self;
-            conn.execute_streaming(&sql, &mut |item| live.on(item, &mut out, t));
+            conn.execute_streaming(&sql, &mut |item| live.on(item, &mut out, Some(&mut *t)));
         }
         let errored = live.errored;
         self.changes(errored, sql.to_ascii_lowercase().contains("rollback"), &mut out);
@@ -478,28 +506,8 @@ impl Session {
 
     /// Run the batch for one RPC and write its tokens; returns whether it failed.
     fn run_plan(&mut self, plan: &rpc::Plan, params: &[rpc::Param], out: &mut Vec<u8>, status_override: Option<i32>) -> bool {
-        // the trailer is the last result set whose first column is the marker; `Live` keeps it apart
-        if tracing() {
-            trace(&format!("rpc batch: {:?}", plan.sql));
-        }
-        let mut live = Live::new(Reply::Proc);
-        {
-            let Session { t, conn, .. } = self;
-            conn.execute_streaming(&plan.sql, &mut |item| live.on(item, out, t));
-        }
-        let errored = live.errored;
-        if !errored {
-            if let Some(t) = &live.trailer {
-                let status = status_override.unwrap_or_else(|| if plan.status { as_i32(&t[0]) } else { 0 });
-                out.push(0x79);
-                out.extend_from_slice(&status.to_le_bytes());
-                for (k, &pi) in plan.outs.iter().enumerate() {
-                    let p = &params[pi];
-                    return_value(out, pi as u16, &p.name, &p.ti.w, t.get(k + 1).unwrap_or(&Value::Null));
-                }
-            }
-        }
-        errored
+        let Session { t, conn, .. } = self;
+        run_plan_on(conn, Some(t), plan, params, out, status_override)
     }
 
     fn rpc(&mut self, payload: &[u8]) -> R<Vec<u8>> {
@@ -1155,34 +1163,59 @@ fn serve_connection(server: Server, stream: TcpStream, cfg: Arc<Config>) {
     };
     let _ = s.t.stream.tcp().set_read_timeout(None);
     let Ok(probe) = s.t.stream.tcp().try_clone() else { return };
+    let mut pool = mars_par::Pool::new();
     loop {
-        // wait for the next request, noticing a KILL of this session while the client is idle
-        if !s.t.has_ready() && !wait_readable(&probe, &mut s.conn) {
-            return;
-        }
-        let (kind, status, payload) = match s.t.read_request() {
-            Ok(Request::Message(k, st, p)) => (k, st, p),
-            Ok(Request::Bulk(first, eom)) => {
-                trace(&format!("bulk load, first packet {} bytes", first.len()));
-                let out = s.bulk_load(first, eom).unwrap_or_else(|msg| {
-                    eprintln!("tsql-serve: a bulk load could not be processed: {}", msg);
-                    let mut out = vec![];
-                    error_token(&mut out, &SqlError::new(4832, format!("Bulk load: {}", msg)));
-                    done(&mut out, 0xFD, DONE_ERROR, 0);
-                    out
-                });
-                if let Err(e) = s.t.send(T_REPLY, &out) {
-                    trace(&format!("sending the reply failed: {} ({:?})", e, e.kind()));
+        // the next request: with MARS from any of the logical sessions, while the replies of requests that run on workers are
+        // delivered as they finish; without MARS, the next message
+        let mut request_session = 0u16;
+        let (kind, status, payload) = if s.t.mux.is_some() {
+            match pool.next_request(&mut s, &probe) {
+                Some((sid, k, st, p)) => {
+                    request_session = sid;
+                    (k, st, p)
+                }
+                None => return,
+            }
+        } else {
+            // wait for the next request, noticing a KILL of this session while the client is idle
+            if !wait_readable(&probe, &mut s.conn) {
+                return;
+            }
+            match s.t.read_request() {
+                Ok(Request::Message(k, st, p)) => (k, st, p),
+                Ok(Request::Bulk(first, eom)) => {
+                    trace(&format!("bulk load, first packet {} bytes", first.len()));
+                    let out = s.bulk_load(first, eom).unwrap_or_else(|msg| {
+                        eprintln!("tsql-serve: a bulk load could not be processed: {}", msg);
+                        let mut out = vec![];
+                        error_token(&mut out, &SqlError::new(4832, format!("Bulk load: {}", msg)));
+                        done(&mut out, 0xFD, DONE_ERROR, 0);
+                        out
+                    });
+                    if let Err(e) = s.t.send(T_REPLY, &out) {
+                        trace(&format!("sending the reply failed: {} ({:?})", e, e.kind()));
+                        return;
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    trace(&format!("the client's connection ended: {} ({:?})", e, e.kind()));
                     return;
                 }
-                continue;
-            }
-            Err(e) => {
-                trace(&format!("the client's connection ended: {} ({:?})", e, e.kind()));
-                return;
             }
         };
         trace(&format!("request: packet type {}, {} bytes, status {:#x}", kind, payload.len(), status));
+        if s.t.mux.is_some() {
+            // a request that only reads runs on a worker, beside the others; any other waits for them to finish first
+            if pool.try_run(&s, kind, status, &payload) {
+                continue;
+            }
+            if pool.drain(&mut s).is_err() {
+                return;
+            }
+            // (the replies of the workers went to their own sessions: the reply to this request goes to its own)
+            s.t.set_current_session(request_session);
+        }
         if status & 0x08 != 0 {
             // RESETCONNECTION: end any open transaction
             s.conn.execute("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION");

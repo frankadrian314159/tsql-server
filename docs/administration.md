@@ -21,8 +21,8 @@ locks until its next statement, because nothing is listening on its behalf. `WAI
 
 `EXEC sp_configure` lists options, `EXEC sp_configure 'name'` shows one (a unique prefix is enough), `EXEC sp_configure 'name', value`
 sets it and `RECONFIGURE` makes it the running value (`config_value` vs `run_value`, also `sys.configurations`). Advanced options
-are hidden until `'show advanced options'` is 1. The options are recorded and reported; they do not change engine behaviour
-(there is no parallelism or memory governor to configure; memory use is set with `Server::set_work_mem`).
+are hidden until `'show advanced options'` is 1. The options are recorded and reported; most do not change engine behaviour. `max degree of parallelism` does (see
+[Intra-query parallelism](concurrency.md#intra-query-parallelism)); there is no memory governor (memory use is set with `Server::set_work_mem`).
 
 ## Table hints and query hints
 
