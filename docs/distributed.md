@@ -156,6 +156,59 @@ as in the Raft dissertation); `Cluster::remove_replica(shard, addr)` takes one o
 and its state file follow (`replicas.rs`). A removed replica that keeps running cannot depose the group: a vote is refused
 while a leader has been heard from recently, and from a node that is not a voter.
 
+## Operating a cluster
+
+**Starting.** Shards and the control node may be started together. `tsql-cluster --listen` waits up to `--wait-shards` seconds
+(default 30) for every shard to answer, then serves; a shard that restarted with prepared transactions refuses statements until the
+control node has settled them (see Transactions), which the control node does by itself. A durable shard (`--data DIR`) recovers
+from its write-ahead log; one that stopped gracefully has a checkpoint and starts at once.
+
+**Stopping.** `tsql-shard` stops gracefully on SIGTERM (what `systemctl stop` and a Compute Engine shutdown send) and on Ctrl-C:
+it *drains* (`NodeControl::drain`). It refuses new work (error 50240, "shutting down") except from sessions that already have a
+transaction open, which may go on and commit; it waits up to `--drain-secs` (default 15) for them; it rolls back what is still open
+after that; it forces the log and writes a checkpoint; then it closes its listener and, for a replica, stops its Raft loop (the
+others elect a new leader; there is no hand-over of leadership). A *prepared* two-phase-commit transaction is never rolled back by
+a stop: it is durable, the shard keeps it in doubt after the restart, and its coordinator settles it. `tsql-cluster` stops on the
+same signals: it stops serving, which closes the client sessions (their open transactions are rolled back on the shards), and writes
+its state file; transactions decided but not yet confirmed everywhere stay in that file and are finished at the next start. The
+shard prints what the drain did (`open`, `finished`, `rolled back`, `prepared left`, `checkpoint`). The systemd units in
+`deploy/gcp/` set `KillSignal=SIGTERM` and a stop timeout longer than the drain.
+
+**Metrics.** Every shard samples its machine once a second (`tsql_shared_ces::metrics`): processor use of the machine and of the
+process, memory used (percent of the machine) and the process's resident memory, the process's disk reads and writes per second,
+and the bytes received and sent per second on all network interfaces; plus the engine's counters: sessions, statements in flight and
+run, lock waits and the time waited, log forces, whether it is draining. The control node reads them with the action `metrics`
+(`Cluster::metrics`, also in `Cluster::telemetry`) and samples itself. `--metrics-listen HOST:PORT` on `tsql-shard` serves its own
+numbers, and on `tsql-cluster` serves those of the control node and every shard with `tsql_shard_up` and `tsql_slots`, at `/metrics`
+in the Prometheus text format (Google Cloud's Ops Agent and Managed Service for Prometheus read it) and `/health`. Where the bottleneck
+is: the busiest resource of a shard against its limit (the `Bottleneck` advice below); lock waits and log forces say whether the
+time goes to contention or to commits rather than to the machine.
+
+**Autoscaling** (`autoscale.rs`, `tsql-cluster --autoscale`). The thresholds are those of a `ScalePolicy`:
+
+| setting | default | meaning |
+|---|---|---|
+| `cpu_high_pct` | 75 | add a shard when the machines' processors average above this |
+| `cpu_low_pct` | 20 | a shard may be removed when they average below this |
+| `mem_high_pct` | 85 | add a shard when memory in use averages above this (percent of the machine) |
+| `disk_high_bps` | 150 MB/s | add a shard when the processes' disk reads and writes average above this |
+| `net_high_bps` | 500 MB/s | add a shard when the machines' network receive and send average above this |
+| `sustain` | 6 readings | the change must be advised by each of this many readings in a row (a burst adds nothing) |
+| `cooldown_secs` | 300 | wait this long after a change (moving data loads the machines) |
+| `min_shards`, `max_shards` | 1, 64 | the bounds |
+| `max_rows_per_shard`, `min_rows_per_shard` | 50 M, 1 M | the row thresholds (a grow or shrink on data volume) |
+| `max_slot_imbalance` | 1.1 | rebalance when a shard owns more than this times the average slots |
+
+The averages are over the shards; one shard above a limit is reported as a `Bottleneck` (with its resource, value and limit) and
+does not by itself add a machine, since another shard does not help a hot key. A shard is removed only when the rows or the
+processors say so *and* what remains would stay under 90% of every limit with the load of the one removed. A shard that does not
+answer stops all changes. The cluster cannot make machines, so a `Provisioner` does: `--scale-up-cmd` starts a shard node and prints
+its `host:port` last, `--scale-down-cmd` deletes the node at `$TSQL_SHARD_ADDR` after its data has been moved off (see
+`deploy/gcp/scale-up.sh` and `scale-down.sh`, which use `gcloud`; the delete reaches the shard as SIGTERM, a graceful stop). The flags
+are `--cpu-high --cpu-low --mem-high --disk-high-mb --net-high-mb --sustain --scale-interval --cooldown --min-shards --max-shards`.
+Limits: shards are added at the end and only the last one can be removed; the shards it adds are single nodes (a replica group is
+made by hand, see Replication); the numbers are starting points, to be set from a run of the benchmark on the machine type in use.
+
 ## Benchmarks on a cluster
 
 The drivers of the single-node examples run against a cluster too, through a cluster session (`util::Sql` is implemented for

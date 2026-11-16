@@ -64,6 +64,12 @@ pub struct LoadReq {
     pub rows: Vec<Vec<Value>>,
 }
 
+/// The resource and engine metrics of a node (reply: `metrics::NodeMetrics`).
+pub const ACTION_METRICS: &str = "metrics";
+
+/// The error number of "this node is shutting down": it is draining and takes no new work.
+pub const SHUTTING_DOWN: i32 = 50240;
+
 /// The error number of a membership change that could not be made (the message says why).
 pub const MEMBERSHIP: i32 = 50230;
 

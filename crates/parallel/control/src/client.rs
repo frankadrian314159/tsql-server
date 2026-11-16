@@ -8,7 +8,8 @@ use tsql_server::{ResultSet, SqlError};
 use tsql_shared_ces::arrowconv;
 use tsql_shared_ces::wire::{sql_error_of, Fragment, PrepareReq, RunReply, SettleReq, ShardStatus, Work, ACTION_CLOSE_SESSION, ACTION_KILL, ACTION_MEMBERS, ACTION_PREPARE, ACTION_PREPARED, ACTION_RUN, ACTION_SETTLE, ACTION_STATUS, ACTION_WAITS, IN_DOUBT, NOT_LEADER};
 use tsql_shared_ces::wire::MemberReq;
-use tsql_shared_ces::wire::{ShuffleReq, ACTION_SHUFFLE};
+use tsql_shared_ces::wire::{ShuffleReq, ACTION_METRICS, ACTION_SHUFFLE};
+use tsql_shared_ces::metrics::NodeMetrics;
 
 /// What became of a transaction that a shard holds prepared (decided by the coordinator, see `txn.rs`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -228,6 +229,12 @@ impl ShardClient {
         if let Ok(body) = postcard::to_allocvec(&session) {
             let _ = self.action(ACTION_CLOSE_SESSION, body).await;
         }
+    }
+
+    /// The shard's resource use (CPU, memory, disk, network) and engine counters.
+    pub async fn metrics(&self) -> Result<NodeMetrics, SqlError> {
+        let reply = self.action(ACTION_METRICS, vec![]).await?;
+        postcard::from_bytes(&reply).map_err(|e| SqlError::new(50000, format!("bad reply from shard {}: {}", self.id, e)))
     }
 
     pub async fn status(&self) -> Result<ShardStatus, SqlError> {

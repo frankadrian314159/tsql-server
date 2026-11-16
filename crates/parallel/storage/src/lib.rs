@@ -22,7 +22,9 @@ use tsql_server::{Connection, Event, ResultSet, Server};
 use tsql_shared_ces::arrowconv;
 use tsql_shared_ces::wire::{self, status_for, Fragment, PrepareReq, RunReply, SettleReq, WireError, WireEvent, Work, ACTION_CLOSE_SESSION, ACTION_PREPARE, ACTION_KILL, ACTION_MEMBERS, ACTION_PREPARED, ACTION_RAFT, ACTION_RUN, ACTION_SETTLE, ACTION_STATUS, ACTION_WAITS, IN_DOUBT, MEMBERSHIP, NOT_LEADER};
 use tsql_shared_ces::wire::MemberReq;
-use tsql_shared_ces::wire::{LoadReq, ShuffleReq, ACTION_LOAD, ACTION_SHUFFLE};
+use tsql_shared_ces::wire::{LoadReq, ShuffleReq, ACTION_LOAD, ACTION_METRICS, ACTION_SHUFFLE, SHUTTING_DOWN};
+use tsql_shared_ces::metrics::{NodeMetrics, Sampler};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tsql_shared_ces::route::{key_hash, slot_of};
 
 pub mod replica;
@@ -38,18 +40,150 @@ pub struct ShardNode {
     server: Arc<Server>,
     /// set when this node is one replica of a replicated shard
     replica: Option<Arc<Replica>>,
-    sessions: Mutex<HashMap<u64, Arc<Mutex<Connection>>>>,
+    sessions: Arc<Mutex<HashMap<u64, Arc<Mutex<Connection>>>>>,
     /// the session that holds each prepared transaction that is still open (by transaction id)
-    prepared_by: Mutex<HashMap<u64, u64>>,
+    prepared_by: Arc<Mutex<HashMap<u64, u64>>>,
     /// the engine's session id of each session (readable while the session's statement runs, which holds its connection)
     spids: Mutex<HashMap<u64, i32>>,
     /// connections to the other shards (made on first use), for the shuffle
     peers: shuffle::Peers,
+    /// resource use of the machine, sampled in the background
+    sampler: Sampler,
+    started: std::time::Instant,
+    /// statements being run, and run since the start
+    in_flight: Arc<AtomicU64>,
+    statements: Arc<AtomicU64>,
+    /// set while the node drains for a shutdown: statements of sessions with no open transaction are refused
+    draining: Arc<AtomicBool>,
+}
+
+/// The sampling interval of the resource metrics.
+const SAMPLE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A statement being run (counted in `in_flight` until it ends).
+struct InFlight(Arc<AtomicU64>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// What a drain did.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DrainReport {
+    /// transactions open when the drain began, and how many of them finished by themselves
+    pub open_at_start: usize,
+    pub finished: usize,
+    /// transactions rolled back at the end of the grace period
+    pub rolled_back: usize,
+    /// prepared (two-phase commit) transactions left as they are: the log keeps them and their coordinator settles them
+    pub prepared_left: usize,
+    /// a checkpoint was written (the next start needs no recovery)
+    pub checkpointed: bool,
+    pub waited_ms: u64,
+}
+
+/// The parts of a node a process needs to stop it gracefully, kept after the node is handed to the server.
+#[derive(Clone)]
+pub struct NodeControl {
+    server: Arc<Server>,
+    sessions: Arc<Mutex<HashMap<u64, Arc<Mutex<Connection>>>>>,
+    prepared_by: Arc<Mutex<HashMap<u64, u64>>>,
+    draining: Arc<AtomicBool>,
+    in_flight: Arc<AtomicU64>,
+    statements: Arc<AtomicU64>,
+    sampler: Sampler,
+    started: std::time::Instant,
+}
+
+/// Whether the session's connection has a transaction open (None: the connection is busy running a statement).
+fn open_transaction(conn: &Arc<Mutex<Connection>>) -> Option<bool> {
+    let mut c = conn.try_lock().ok()?;
+    let r = c.execute("SELECT @@TRANCOUNT");
+    Some(r.resultsets().first().and_then(|rs| rs.rows.first()).and_then(|r| r.first()).map(|v| v.to_string() != "0").unwrap_or(false))
+}
+
+impl NodeControl {
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
+    }
+
+    /// The node's resource use and engine counters.
+    pub fn metrics(&self) -> NodeMetrics {
+        let (waits, waited) = self.server.lock_waits();
+        NodeMetrics {
+            sample: self.sampler.sample(),
+            sessions: self.sessions.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            in_flight: self.in_flight.load(Ordering::SeqCst),
+            statements: self.statements.load(Ordering::SeqCst),
+            lock_waits: waits,
+            lock_wait_secs: waited.as_secs_f64(),
+            log_forces: self.server.log_forces(),
+            draining: self.draining.load(Ordering::SeqCst),
+            uptime_secs: self.started.elapsed().as_secs(),
+        }
+    }
+
+    fn open_sessions(&self) -> Vec<(u64, Arc<Mutex<Connection>>)> {
+        self.sessions.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(k, v)| (*k, v.clone())).collect()
+    }
+
+    /// Stop taking new work, let the open transactions finish (for at most `grace`), roll back what is still open, force the log
+    /// and write a checkpoint. A prepared transaction is left alone: it is durable, and its coordinator settles it after the
+    /// restart. The node still answers requests of sessions that have a transaction open, so that it can be committed.
+    pub async fn drain(&self, grace: std::time::Duration) -> DrainReport {
+        let t0 = std::time::Instant::now();
+        self.draining.store(true, Ordering::SeqCst);
+        let prepared_sessions = |this: &NodeControl| -> std::collections::HashSet<u64> { this.prepared_by.lock().unwrap_or_else(|e| e.into_inner()).values().copied().collect() };
+        let count_open = |this: &NodeControl| -> usize {
+            let prepared = prepared_sessions(this);
+            this.open_sessions().iter().filter(|(id, c)| !prepared.contains(id) && open_transaction(c).unwrap_or(true)).count()
+        };
+        let mut report = DrainReport { open_at_start: count_open(self), ..Default::default() };
+        loop {
+            let open = count_open(self);
+            if (open == 0 && self.in_flight.load(Ordering::SeqCst) == 0) || t0.elapsed() >= grace {
+                report.finished = report.open_at_start.saturating_sub(open);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // what is still open is rolled back (a client that does not come back to finish loses its transaction)
+        let prepared = prepared_sessions(self);
+        for (id, conn) in self.open_sessions() {
+            if prepared.contains(&id) {
+                continue;
+            }
+            if let Ok(mut c) = conn.try_lock() {
+                if open_transaction_locked(&mut c) {
+                    let _ = c.execute("ROLLBACK TRANSACTION");
+                    report.rolled_back += 1;
+                }
+            }
+        }
+        report.prepared_left = self.server.in_doubt().len() + prepared.len();
+        let server = self.server.clone();
+        report.checkpointed = tokio::task::spawn_blocking(move || {
+            let _ = server.flush_log();
+            server.checkpoint();
+            true
+        })
+        .await
+        .unwrap_or(false);
+        report.waited_ms = t0.elapsed().as_millis() as u64;
+        report
+    }
+}
+
+fn open_transaction_locked(c: &mut Connection) -> bool {
+    let r = c.execute("SELECT @@TRANCOUNT");
+    r.resultsets().first().and_then(|rs| rs.rows.first()).and_then(|r| r.first()).map(|v| v.to_string() != "0").unwrap_or(false)
 }
 
 impl ShardNode {
     pub fn new(shard_id: u32, server: Server) -> ShardNode {
-        ShardNode { shard_id, server: Arc::new(server), replica: None, sessions: Mutex::new(HashMap::new()), prepared_by: Mutex::new(HashMap::new()), spids: Mutex::new(HashMap::new()), peers: Default::default() }
+        ShardNode::build(shard_id, Arc::new(server), None)
     }
 
     /// A node that is one replica of a replicated shard: `server` must be a persistent engine; the replica keeps its Raft log
@@ -57,7 +191,57 @@ impl ShardNode {
     pub fn replicated(shard_id: u32, server: Server, cfg: ReplicaConfig) -> std::io::Result<ShardNode> {
         let server = Arc::new(server);
         let replica = Replica::start(cfg, server.clone())?;
-        Ok(ShardNode { shard_id, server, replica: Some(replica), sessions: Mutex::new(HashMap::new()), prepared_by: Mutex::new(HashMap::new()), spids: Mutex::new(HashMap::new()), peers: Default::default() })
+        Ok(ShardNode::build(shard_id, server, Some(replica)))
+    }
+
+    fn build(shard_id: u32, server: Arc<Server>, replica: Option<Arc<Replica>>) -> ShardNode {
+        ShardNode {
+            shard_id,
+            server,
+            replica,
+            sessions: Default::default(),
+            prepared_by: Default::default(),
+            spids: Mutex::new(HashMap::new()),
+            peers: Default::default(),
+            sampler: Sampler::start(SAMPLE_EVERY),
+            started: std::time::Instant::now(),
+            in_flight: Arc::new(AtomicU64::new(0)),
+            statements: Arc::new(AtomicU64::new(0)),
+            draining: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// The handle with which a process drains and stops the node (take it before the node is given to `spawn`).
+    pub fn control(&self) -> NodeControl {
+        NodeControl {
+            server: self.server.clone(),
+            sessions: self.sessions.clone(),
+            prepared_by: self.prepared_by.clone(),
+            draining: self.draining.clone(),
+            in_flight: self.in_flight.clone(),
+            statements: self.statements.clone(),
+            sampler: self.sampler.clone(),
+            started: self.started,
+        }
+    }
+
+    /// The node's resource use and engine counters.
+    pub fn metrics(&self) -> NodeMetrics {
+        self.control().metrics()
+    }
+
+    /// Let a statement of this session run: not while the node drains, except for a session that has a transaction open (which
+    /// must be able to finish it). The statement counts as in flight until the guard is dropped.
+    fn admit(&self, session: u64) -> Result<InFlight, Status> {
+        if self.draining.load(Ordering::SeqCst) {
+            let conn = self.sessions.lock().unwrap_or_else(|e| e.into_inner()).get(&session).cloned();
+            if !conn.map(|c| open_transaction(&c).unwrap_or(true)).unwrap_or(false) {
+                return Err(status_for(&WireError { number: SHUTTING_DOWN, severity: 16, state: 1, message: format!("Shard {} is shutting down and takes no new work.", self.shard_id) }));
+            }
+        }
+        self.statements.fetch_add(1, Ordering::SeqCst);
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        Ok(InFlight(self.in_flight.clone()))
     }
 
     pub fn replica(&self) -> Option<&Arc<Replica>> {
@@ -221,6 +405,7 @@ impl FlightService for ShardNode {
     async fn do_get(&self, request: Request<Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
         self.check_serving()?;
         let frag: Fragment = postcard::from_bytes(&request.into_inner().ticket).map_err(|e| Status::invalid_argument(format!("bad ticket: {}", e)))?;
+        let _busy = self.admit(frag.session)?;
         let conn = self.session(frag.session);
         let rs = tokio::task::spawn_blocking(move || {
             let mut c = conn.lock().unwrap_or_else(|e| e.into_inner());
@@ -243,6 +428,7 @@ impl FlightService for ShardNode {
             ACTION_RUN => {
                 self.check_serving()?;
                 let frag: Fragment = postcard::from_bytes(&action.body).map_err(|e| Status::invalid_argument(format!("bad request: {}", e)))?;
+                let _busy = self.admit(frag.session)?;
                 let conn = self.session(frag.session);
                 let reply = tokio::task::spawn_blocking(move || {
                     let mut c = conn.lock().unwrap_or_else(|e| e.into_inner());
@@ -252,15 +438,18 @@ impl FlightService for ShardNode {
                 .map_err(|e| Status::internal(format!("the statement panicked: {}", e)))?;
                 postcard::to_allocvec(&reply).map_err(|e| Status::internal(e.to_string()))?
             }
+            ACTION_METRICS => postcard::to_allocvec(&self.metrics()).map_err(|e| Status::internal(e.to_string()))?,
             ACTION_LOAD => {
                 self.check_serving()?;
                 let req: LoadReq = postcard::from_bytes(&action.body).map_err(|e| Status::invalid_argument(format!("bad request: {}", e)))?;
+                let _busy = self.admit(req.session)?;
                 self.load_rows(req.session, req.table, req.rows).await?;
                 vec![]
             }
             ACTION_SHUFFLE => {
                 self.check_serving()?;
                 let req: ShuffleReq = postcard::from_bytes(&action.body).map_err(|e| Status::invalid_argument(format!("bad request: {}", e)))?;
+                let _busy = self.admit(req.session)?;
                 let sent = self.shuffle(req).await?;
                 postcard::to_allocvec(&sent).map_err(|e| Status::internal(e.to_string()))?
             }
@@ -417,7 +606,7 @@ impl FlightService for ShardNode {
         Err(Status::unimplemented("do_exchange"))
     }
     async fn list_actions(&self, _r: Request<Empty>) -> Result<Response<Self::ListActionsStream>, Status> {
-        let acts = [ACTION_RUN, ACTION_CLOSE_SESSION, ACTION_STATUS, ACTION_PREPARE, ACTION_SETTLE, ACTION_PREPARED, ACTION_WAITS, ACTION_KILL, ACTION_MEMBERS, ACTION_SHUFFLE, ACTION_LOAD].iter().map(|n| Ok(ActionType { r#type: n.to_string(), description: String::new() })).collect::<Vec<_>>();
+        let acts = [ACTION_RUN, ACTION_CLOSE_SESSION, ACTION_STATUS, ACTION_PREPARE, ACTION_SETTLE, ACTION_PREPARED, ACTION_WAITS, ACTION_KILL, ACTION_MEMBERS, ACTION_SHUFFLE, ACTION_LOAD, ACTION_METRICS].iter().map(|n| Ok(ActionType { r#type: n.to_string(), description: String::new() })).collect::<Vec<_>>();
         Ok(Response::new(stream::iter(acts).boxed()))
     }
 }
@@ -428,11 +617,25 @@ pub struct RunningShard {
     /// the node's engine (for tests and tools that look at a shard directly)
     pub server: Arc<Server>,
     pub replica: Option<Arc<Replica>>,
+    control: NodeControl,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     join: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RunningShard {
+    /// The handle for draining the node.
+    pub fn control(&self) -> &NodeControl {
+        &self.control
+    }
+
+    /// Stop gracefully: refuse new work, give open transactions `grace` to finish, roll back the rest, force the log and
+    /// checkpoint, then stop the listener (and the replica's Raft loop: the other replicas elect a new leader).
+    pub async fn graceful_shutdown(self, grace: std::time::Duration) -> DrainReport {
+        let report = self.control.drain(grace).await;
+        self.shutdown().await;
+        report
+    }
+
     /// Stop the listener and wait for it (open connections are dropped, as when a node dies).
     pub async fn shutdown(mut self) {
         if let Some(r) = &self.replica {
@@ -461,6 +664,7 @@ pub async fn spawn_on(node: ShardNode, listener: tokio::net::TcpListener) -> std
     let incoming = tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
     let server = node.server().clone();
     let replica = node.replica().cloned();
+    let control = node.control();
     let svc = node.into_service();
     let join = tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
@@ -470,5 +674,5 @@ pub async fn spawn_on(node: ShardNode, listener: tokio::net::TcpListener) -> std
             })
             .await;
     });
-    Ok(RunningShard { addr: local, server, replica, stop: Some(stop), join: Some(join) })
+    Ok(RunningShard { addr: local, server, replica, control, stop: Some(stop), join: Some(join) })
 }

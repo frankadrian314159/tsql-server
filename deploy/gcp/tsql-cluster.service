@@ -1,0 +1,17 @@
+[Unit]
+Description=tsql-server control node
+# the shards may come up at the same time: the control node waits for them (--wait-shards)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=tsql
+EnvironmentFile=/etc/tsql/cluster.env
+ExecStart=/usr/local/bin/tsql-cluster --config /etc/tsql/cluster.json --state /var/lib/tsql/cluster.state --listen 1433 --bind 0.0.0.0 --wait-shards 120 --metrics-listen 0.0.0.0:9100
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

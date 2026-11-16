@@ -12,6 +12,7 @@ use crate::astutil::*;
 use crate::client::ShardClient;
 use crate::{Cluster, ClusterSession, Dist, DistTable};
 use futures::future::join_all;
+pub use tsql_shared_ces::metrics::NodeMetrics;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -210,8 +211,8 @@ impl Cluster {
                     }
                 }
                 out.push(match status {
-                    Ok(st) => ShardTelemetry { id: i, reachable: true, slots: slots.get(i).copied().unwrap_or(0), sessions: st.sessions, lock_waits: st.lock_waits, log_forces: st.log_forces, rows },
-                    Err(_) => ShardTelemetry { id: i, reachable: false, slots: slots.get(i).copied().unwrap_or(0), sessions: 0, lock_waits: 0, log_forces: 0, rows: 0 },
+                    Ok(st) => ShardTelemetry { id: i, reachable: true, slots: slots.get(i).copied().unwrap_or(0), sessions: st.sessions, lock_waits: st.lock_waits, log_forces: st.log_forces, rows, metrics: sh.metrics().await.ok() },
+                    Err(_) => ShardTelemetry { id: i, reachable: false, slots: slots.get(i).copied().unwrap_or(0), sessions: 0, lock_waits: 0, log_forces: 0, rows: 0, metrics: None },
                 });
             }
             out
@@ -424,11 +425,41 @@ pub struct ShardTelemetry {
     pub log_forces: u64,
     /// rows it holds of the sharded tables
     pub rows: u64,
+    /// its resource use and engine counters (None: it did not answer, or is too old to know the action)
+    pub metrics: Option<NodeMetrics>,
 }
 
-/// When to grow or shrink.
+/// A resource that can be the limit of a node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resource {
+    Cpu,
+    Memory,
+    DiskIo,
+    Network,
+}
+
+/// When to grow or shrink. The thresholds on resources are the autoscaling thresholds: the shards' averages over the whole
+/// window the autoscaler watches (`sustain` readings) decide, never one reading.
 #[derive(Clone, Debug)]
 pub struct ScalePolicy {
+    /// add a shard when the machines' processors are busier than this on average (percent)
+    pub cpu_high_pct: f64,
+    /// a shard may be removed when they are less busy than this (percent)
+    pub cpu_low_pct: f64,
+    /// add a shard when memory in use on the machines exceeds this (percent of the machine's memory)
+    pub mem_high_pct: f64,
+    /// add a shard when the processes read and write more than this per second on average (bytes; the default is about
+    /// two thirds of what a 1 TB balanced persistent disk gives)
+    pub disk_high_bps: f64,
+    /// add a shard when the machines send and receive more than this per second on average (bytes)
+    pub net_high_bps: f64,
+    /// how many readings in a row must cross a threshold before the autoscaler acts
+    pub sustain: usize,
+    /// the least and the most shards the cluster may have
+    pub min_shards: usize,
+    pub max_shards: usize,
+    /// seconds to wait after a change before the next one (moving data loads the machines, which must not read as demand)
+    pub cooldown_secs: u64,
     /// add a shard when the shards hold more rows than this on average
     pub max_rows_per_shard: u64,
     /// remove one when they hold fewer than this on average (and there is more than one)
@@ -439,7 +470,20 @@ pub struct ScalePolicy {
 
 impl Default for ScalePolicy {
     fn default() -> Self {
-        ScalePolicy { max_rows_per_shard: 50_000_000, min_rows_per_shard: 1_000_000, max_slot_imbalance: 1.1 }
+        ScalePolicy {
+            cpu_high_pct: 75.0,
+            cpu_low_pct: 20.0,
+            mem_high_pct: 85.0,
+            disk_high_bps: 150e6,
+            net_high_bps: 500e6,
+            sustain: 6,
+            min_shards: 1,
+            max_shards: 64,
+            cooldown_secs: 300,
+            max_rows_per_shard: 50_000_000,
+            min_rows_per_shard: 1_000_000,
+            max_slot_imbalance: 1.1,
+        }
     }
 }
 
@@ -450,6 +494,8 @@ pub enum ScaleAdvice {
     Rebalance { reason: String },
     /// the shard does not answer: replace it (or restore it from its replica)
     Unreachable { shard: usize },
+    /// a shard is above the limit of a resource (where the bottleneck is; adding shards helps when the average is above too)
+    Bottleneck { shard: usize, resource: Resource, value: f64, limit: f64 },
 }
 
 /// The advice the telemetry and the policy give. Shrinking is advised only when everything is reachable and balanced
@@ -461,16 +507,47 @@ pub fn advise(t: &[ShardTelemetry], p: &ScalePolicy) -> Vec<ScaleAdvice> {
     }
     let n = t.len() as u64;
     let total: u64 = t.iter().map(|s| s.rows).sum();
-    let avg = total / n;
+    // resource use: the average over the shards decides whether to grow or shrink, and a single shard over a limit is a bottleneck
+    let ms: Vec<(usize, &NodeMetrics)> = t.iter().filter_map(|s| s.metrics.as_ref().map(|m| (s.id, m))).collect();
+    let avg = |f: &dyn Fn(&NodeMetrics) -> f64| if ms.is_empty() { 0.0 } else { ms.iter().map(|(_, m)| f(m)).sum::<f64>() / ms.len() as f64 };
+    let limits: [(Resource, f64, Box<dyn Fn(&NodeMetrics) -> f64>); 4] = [
+        (Resource::Cpu, p.cpu_high_pct, Box::new(|m| m.sample.cpu_machine_pct)),
+        (Resource::Memory, p.mem_high_pct, Box::new(|m| m.sample.mem_used_pct())),
+        (Resource::DiskIo, p.disk_high_bps, Box::new(|m| m.sample.disk_bps())),
+        (Resource::Network, p.net_high_bps, Box::new(|m| m.sample.net_bps())),
+    ];
+    let mut hot: Vec<String> = vec![];
+    for (res, limit, f) in &limits {
+        for (id, m) in &ms {
+            if f(m) > *limit {
+                out.push(ScaleAdvice::Bottleneck { shard: *id, resource: *res, value: f(m), limit: *limit });
+            }
+        }
+        if !ms.is_empty() && avg(f.as_ref()) > *limit {
+            hot.push(format!("{:?} averages {:.1} over the shards (limit {:.1})", res, avg(f.as_ref()), limit));
+        }
+    }
+    let avg_rows = total / n;
     let slots_avg = t.iter().map(|s| s.slots).sum::<usize>() as f64 / t.len() as f64;
     let slots_max = t.iter().map(|s| s.slots).max().unwrap_or(0) as f64;
     if slots_avg > 0.0 && slots_max / slots_avg > p.max_slot_imbalance {
         out.push(ScaleAdvice::Rebalance { reason: format!("the busiest shard owns {:.0} slots, {:.2} times the average", slots_max, slots_max / slots_avg) });
     }
-    if avg > p.max_rows_per_shard {
-        out.push(ScaleAdvice::AddShard { reason: format!("{} rows per shard on average (more than {})", avg, p.max_rows_per_shard) });
-    } else if n > 1 && avg < p.min_rows_per_shard && out.is_empty() {
-        out.push(ScaleAdvice::RemoveShard { reason: format!("{} rows per shard on average (fewer than {})", avg, p.min_rows_per_shard) });
+    let growing = avg_rows > p.max_rows_per_shard || !hot.is_empty();
+    if t.len() >= p.max_shards {
+        // (the most shards: the bottlenecks above are all there is to say)
+    } else if avg_rows > p.max_rows_per_shard {
+        out.push(ScaleAdvice::AddShard { reason: format!("{} rows per shard on average (more than {})", avg_rows, p.max_rows_per_shard) });
+    } else if !hot.is_empty() {
+        out.push(ScaleAdvice::AddShard { reason: hot.join("; ") });
+    }
+    // shrinking: few rows, or idle processors, and what remains must stay under every limit with the load of the one removed
+    let nf = t.len() as f64;
+    let projected_ok = ms.is_empty() || limits.iter().all(|(_, limit, f)| avg(f.as_ref()) * nf / (nf - 1.0).max(1.0) < limit * 0.9) && avg_rows * n / (n - 1).max(1) <= p.max_rows_per_shard;
+    let idle = !ms.is_empty() && avg(&|m| m.sample.cpu_machine_pct) < p.cpu_low_pct;
+    if !growing && t.len() > p.min_shards.max(1) && !out.iter().any(|a| !matches!(a, ScaleAdvice::Bottleneck { .. })) && projected_ok && (avg_rows < p.min_rows_per_shard || idle) {
+        let why = if avg_rows < p.min_rows_per_shard { format!("{} rows per shard on average (fewer than {})", avg_rows, p.min_rows_per_shard) } else { format!("the processors average {:.1}% (less than {}%)", avg(&|m| m.sample.cpu_machine_pct), p.cpu_low_pct) };
+        out.push(ScaleAdvice::RemoveShard { reason: why });
     }
     out
 }
@@ -480,12 +557,20 @@ mod tests {
     use super::*;
 
     fn t(id: usize, slots: usize, rows: u64, up: bool) -> ShardTelemetry {
-        ShardTelemetry { id, reachable: up, slots, sessions: 0, lock_waits: 0, log_forces: 0, rows }
+        ShardTelemetry { id, reachable: up, slots, sessions: 0, lock_waits: 0, log_forces: 0, rows, metrics: None }
+    }
+
+    fn busy(id: usize, cpu: f64, mem_used_pct: f64) -> ShardTelemetry {
+        let mut m = NodeMetrics::default();
+        m.sample.cpu_machine_pct = cpu;
+        m.sample.mem_total_bytes = 1000;
+        m.sample.mem_available_bytes = (1000.0 * (100.0 - mem_used_pct) / 100.0) as u64;
+        ShardTelemetry { metrics: Some(m), ..t(id, 512, 100, true) }
     }
 
     #[test]
     fn advice_follows_the_policy() {
-        let p = ScalePolicy { max_rows_per_shard: 1000, min_rows_per_shard: 100, max_slot_imbalance: 1.1 };
+        let p = ScalePolicy { max_rows_per_shard: 1000, min_rows_per_shard: 100, max_slot_imbalance: 1.1, ..Default::default() };
         assert!(advise(&[t(0, 512, 500, true), t(1, 512, 500, true)], &p).is_empty());
         assert!(matches!(advise(&[t(0, 512, 5000, true), t(1, 512, 3000, true)], &p)[..], [ScaleAdvice::AddShard { .. }]));
         assert!(matches!(advise(&[t(0, 512, 10, true), t(1, 512, 20, true)], &p)[..], [ScaleAdvice::RemoveShard { .. }]));
@@ -493,5 +578,27 @@ mod tests {
         assert_eq!(advise(&[t(0, 512, 500, true), t(1, 512, 0, false)], &p), vec![ScaleAdvice::Unreachable { shard: 1 }]);
         // one shard is never removed
         assert!(advise(&[t(0, 1024, 1, true)], &p).is_empty());
+    }
+
+    #[test]
+    fn advice_follows_the_resource_thresholds() {
+        let p = ScalePolicy { max_rows_per_shard: u64::MAX, min_rows_per_shard: 0, ..Default::default() };
+        let adds = |a: &[ScaleAdvice]| a.iter().any(|x| matches!(x, ScaleAdvice::AddShard { .. }));
+        let removes = |a: &[ScaleAdvice]| a.iter().any(|x| matches!(x, ScaleAdvice::RemoveShard { .. }));
+        // busy processors on average: add; one hot shard among cool ones is a bottleneck, not a reason to grow
+        let a = advise(&[busy(0, 90.0, 40.0), busy(1, 80.0, 40.0)], &p);
+        assert!(adds(&a) && a.iter().any(|x| matches!(x, ScaleAdvice::Bottleneck { resource: Resource::Cpu, .. })), "{:?}", a);
+        let a = advise(&[busy(0, 90.0, 40.0), busy(1, 30.0, 40.0), busy(2, 30.0, 40.0)], &p);
+        assert!(!adds(&a) && a.iter().any(|x| matches!(x, ScaleAdvice::Bottleneck { shard: 0, resource: Resource::Cpu, .. })), "{:?}", a);
+        // memory
+        assert!(adds(&advise(&[busy(0, 10.0, 95.0), busy(1, 10.0, 90.0)], &p)));
+        // idle: remove one, unless what remains would be above the limits with the load of the one removed
+        assert!(removes(&advise(&[busy(0, 10.0, 20.0), busy(1, 10.0, 20.0), busy(2, 10.0, 20.0)], &p)));
+        assert!(!removes(&advise(&[busy(0, 18.0, 70.0), busy(1, 18.0, 70.0)], &p)), "memory would be 140%");
+        // the least and the most shards
+        let p1 = ScalePolicy { min_shards: 2, ..p.clone() };
+        assert!(!removes(&advise(&[busy(0, 10.0, 20.0), busy(1, 10.0, 20.0)], &p1)));
+        let p2 = ScalePolicy { max_shards: 2, ..p.clone() };
+        assert!(!adds(&advise(&[busy(0, 90.0, 40.0), busy(1, 90.0, 40.0)], &p2)));
     }
 }

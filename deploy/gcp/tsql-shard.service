@@ -1,0 +1,20 @@
+[Unit]
+Description=tsql-server shard node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=tsql
+# a durable shard: write-ahead log and checkpoints in /var/lib/tsql/shard; metrics for the Ops Agent / Prometheus
+ExecStart=/usr/local/bin/tsql-shard --id ${SHARD_ID} --listen 0.0.0.0:50051 --data /var/lib/tsql/shard --drain-secs 20 --metrics-listen 0.0.0.0:9101
+EnvironmentFile=/etc/tsql/shard.env
+# SIGTERM (what systemctl stop and a GCE shutdown send) drains the node: no new work, open transactions finish, the log is
+# forced and a checkpoint written. Give it longer than --drain-secs plus the checkpoint.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

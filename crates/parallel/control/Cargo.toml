@@ -18,7 +18,7 @@ tsql-server = { path = "../../.." }
 tsql-shared-ces = { path = "../shared-ces" }
 arrow-flight = "60"
 tonic = "0.14"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time", "signal"] }
 futures = "0.3"
 postcard = { version = "1", features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
@@ -29,6 +29,7 @@ tsql-storage = { path = "../storage" }
 # the TPC-H example reuses the generator and queries of the single-node example
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 rand = "0.8"
+tempfile = "3"
 # a TDS client, to check the control node as an ordinary SQL Server to its clients
 tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono", "rustls"] }
 tokio-util = { version = "0.7", features = ["compat"] }

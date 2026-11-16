@@ -439,7 +439,8 @@ fn telemetry_sees_the_shards_and_advice_follows() {
     // the rows of the sharded tables: 300 customers + 3000 orders (the regions table is replicated, not counted)
     assert_eq!(t.iter().map(|s| s.rows).sum::<u64>(), 3300);
     assert_eq!(t.iter().map(|s| s.slots).sum::<usize>(), 1024);
-    let policy = tsql_control::rebalance::ScalePolicy { max_rows_per_shard: 500, min_rows_per_shard: 10, max_slot_imbalance: 1.1 };
+    // (the thresholds on resources are out of the way: this test is about rows; the machine's own use is whatever it is)
+    let policy = tsql_control::rebalance::ScalePolicy { max_rows_per_shard: 500, min_rows_per_shard: 10, max_slot_imbalance: 1.1, cpu_high_pct: f64::MAX, cpu_low_pct: -1.0, mem_high_pct: f64::MAX, disk_high_bps: f64::MAX, net_high_bps: f64::MAX, ..Default::default() };
     assert!(matches!(tsql_control::rebalance::advise(&t, &policy)[..], [tsql_control::rebalance::ScaleAdvice::AddShard { .. }]));
     let shard = p.h.shards.pop().unwrap();
     p.h._rt.block_on(shard.shutdown());

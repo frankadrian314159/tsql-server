@@ -22,6 +22,7 @@
 //! `UPDATE`) leaves the shards that succeeded changed: atomic cross-shard transactions need the two-phase commit of a later
 //! phase.
 pub mod astutil;
+pub mod autoscale;
 pub mod client;
 pub mod deadlock;
 pub mod decorrelate;
@@ -30,6 +31,7 @@ pub mod front;
 pub mod joins;
 pub mod merge;
 pub mod nested;
+pub mod ops;
 pub mod plan;
 pub mod rebalance;
 pub mod split;
