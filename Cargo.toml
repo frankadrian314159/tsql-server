@@ -5,6 +5,12 @@ edition = "2021"
 description = "A clone of Microsoft SQL Server with a T-SQL engine, durable storage and a TDS listener"
 license = "MIT"
 
+[workspace]
+# The distributed (cluster) edition lives in crates/parallel; the single-node server above is the root package and is
+# unchanged by it (`cargo build` / `cargo test` at the root build only the root package; add `--workspace` for all).
+members = ["crates/parallel/raft", "crates/parallel/shared-ces", "crates/parallel/storage", "crates/parallel/control"]
+resolver = "2"
+
 [lib]
 name = "tsql_server"
 path = "src/lib.rs"

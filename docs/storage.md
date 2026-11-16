@@ -1,5 +1,9 @@
 # Storage and durability
 
+## Replication hook
+
+A server can be made one replica of a group (`Server::set_replicator`, used by the distributed edition, see [distributed.md](distributed.md)): each commit hands its redo record to a `Replicator` under the commit lock (so records enter the group's log in commit-timestamp order), and finishes (stamps its versions, releases its locks) only when the group has committed it; the record is written to this node's own log after that. `Server::apply_replicated` applies a record another replica committed, as log replay would, and ignores a record whose timestamp is not past the data's. Without a replicator nothing changes.
+
 ## Layout of a data directory
 
 ```

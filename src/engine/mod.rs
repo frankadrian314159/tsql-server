@@ -165,6 +165,8 @@ pub struct TriggerCtx {
 
 pub struct SessionState {
     pub spid: i32,
+    /// The record of the transaction that is committing, proposed to the replicator and not yet confirmed.
+    pub pending_repl: Option<crate::persist::PendingRepl>,
     /// This session's entry in the session table (none for a session that is not registered).
     pub info: Option<crate::coord::SessionHandle>,
     pub stat_buf: std::sync::Arc<crate::coord::StatBuf>,
@@ -281,6 +283,7 @@ impl SessionState {
     pub fn new(spid: i32) -> SessionState {
         SessionState {
             spid,
+            pending_repl: None,
             info: None,
             stat_buf: Default::default(),
             login: "sa".into(),

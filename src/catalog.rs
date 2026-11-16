@@ -758,6 +758,8 @@ pub struct ServerState {
     pub epoch: u64,
     /// What DML statements derive from the foreign keys of the catalog (see `engine/dml.rs`).
     pub fk_cache: std::sync::Mutex<FkCache>,
+    /// Set when this server is a replica of a group: every commit is proposed to it (see `persist::Replicator`).
+    pub replicator: std::sync::Mutex<Option<Arc<dyn crate::persist::Replicator>>>,
 }
 
 /// Foreign-key facts about one table, valid for one catalog epoch.
@@ -785,6 +787,7 @@ impl ServerState {
             work: crate::engine::spill::WorkMem::default(),
             epoch: 0,
             fk_cache: std::sync::Mutex::new(FkCache::default()),
+            replicator: std::sync::Mutex::new(None),
         };
         for (i, n) in ["master", "tempdb", "model", "msdb"].iter().enumerate() {
             s.databases.insert(n.to_string(), Database::new(n, i as i32 + 1));

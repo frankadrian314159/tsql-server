@@ -139,6 +139,10 @@ one (as the JDBC driver sends them) is bound by position. Checked with `System.D
 stored procedure, a text command, an empty table) and the Microsoft JDBC driver (a call and an `EXEC`), and by hand-written
 requests.
 
+## Interceptors (the control node of a cluster)
+
+`Server::set_interceptor` installs a factory of per-connection `Interceptor`s: for each batch a connection is asked to run, the interceptor either runs it and reports to the sink, or declines and the engine runs it as usual (`Server::connect_internal` makes a connection that is never intercepted). The listener is unaware: the control node of the distributed edition serves its own engine over TDS and an interceptor sends the batches that touch distributed tables to the cluster (see [distributed.md](distributed.md)). Without an interceptor nothing changes.
+
 ## MARS
 
 A client that asks for MARS in its pre-login message gets it (`tsql-serve --no-mars`, or `Config::mars = false`, turns it off).

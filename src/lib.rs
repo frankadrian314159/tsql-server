@@ -53,7 +53,21 @@ pub use types::{DataType, Value};
 struct Shared {
     state: RwLock<ServerState>,
     crashed: std::sync::atomic::AtomicBool,
+    /// makes the interceptor of each new connection (see [`Interceptor`])
+    interceptor: std::sync::Mutex<Option<std::sync::Arc<InterceptorFactory>>>,
 }
+
+/// A hook that can take over the batches of a connection. An interceptor sees the text of every batch the connection is
+/// asked to run; it either runs the batch itself and reports what happened to `sink` (returning true), or declines (returning
+/// false) and the engine runs the batch as usual. The distributed edition uses it to serve clients (over TDS) from a control
+/// node whose own engine only holds the schema: the interceptor sends the batches that touch distributed tables to the
+/// cluster. A server without an interceptor behaves as it always has.
+pub trait Interceptor: Send {
+    fn handle(&mut self, sql: &str, sink: &mut dyn FnMut(Streamed) -> bool) -> bool;
+}
+
+/// Makes the interceptor of a new connection.
+pub type InterceptorFactory = dyn Fn() -> Box<dyn Interceptor> + Send + Sync;
 
 impl Drop for Shared {
     fn drop(&mut self) {
@@ -88,7 +102,7 @@ impl Default for Server {
 impl Server {
     /// A server whose data lives only in memory (nothing is written to disk).
     pub fn new() -> Server {
-        Server { shared: Arc::new(Shared { state: RwLock::new(ServerState::new()), crashed: Default::default() }) }
+        Server { shared: Arc::new(Shared { state: RwLock::new(ServerState::new()), crashed: Default::default(), interceptor: Default::default() }) }
     }
 
     /// Open (or create) a server whose data lives in `dir`. Committed work survives crashes:
@@ -103,7 +117,36 @@ impl Server {
         let (p, mut state) = persist::Persist::open(dir.as_ref(), opts)?;
         state.persist = std::sync::Mutex::new(Some(p));
         state.core.audit.set_active(state.security.audits.iter().any(|a| a.enabled));
-        Ok(Server { shared: Arc::new(Shared { state: RwLock::new(state), crashed: Default::default() }) })
+        Ok(Server { shared: Arc::new(Shared { state: RwLock::new(state), crashed: Default::default(), interceptor: Default::default() }) })
+    }
+
+    /// Make this server one replica of a group: every transaction that commits proposes its redo record to `r` first (see
+    /// [`persist::Replicator`]). `None` makes it an ordinary server again. A replica needs a persistent server
+    /// ([`Server::open`]).
+    pub fn set_replicator(&self, r: Option<Arc<dyn persist::Replicator>>) {
+        let g = self.shared.state.read().unwrap_or_else(|e| e.into_inner());
+        *g.replicator.lock().unwrap_or_else(|e| e.into_inner()) = r;
+    }
+
+    /// The commit timestamp the data is current to.
+    pub fn applied_ts(&self) -> u64 {
+        self.shared.state.read().unwrap_or_else(|e| e.into_inner()).core.clock()
+    }
+
+    /// Apply a record that another replica committed (a follower applying the group's log): it is written to this
+    /// server's log and its changes are made, as when the log is replayed after a crash. Returns false when the record
+    /// is already applied (its timestamp is not past the data's), so applying a log twice is harmless.
+    pub fn apply_replicated(&self, rec: &persist::WalRecord) -> Result<bool, SqlError> {
+        let mut g = self.shared.state.write().unwrap_or_else(|e| e.into_inner());
+        if rec.ts <= g.core.clock() {
+            return Ok(false);
+        }
+        if let Some(p) = g.persist().as_mut() {
+            p.append(rec.ts, rec.next_object_id, rec.next_rowversion, rec.ops.clone(), false)?;
+        }
+        persist::apply_record(&mut g, rec);
+        g.epoch += 1;
+        Ok(true)
     }
 
     /// Drop the server as if the process had been killed: no final checkpoint is written, so the
@@ -170,7 +213,23 @@ impl Server {
 
     /// Open a trusted session as the built-in `sa` (sysadmin) login.
     pub fn connect(&self) -> Connection {
+        let mut c = self.session_for("sa");
+        c.interceptor = self.new_interceptor();
+        c
+    }
+
+    /// Like [`Server::connect`] but the connection is never intercepted (for the interceptor's own use of the engine).
+    pub fn connect_internal(&self) -> Connection {
         self.session_for("sa")
+    }
+
+    /// Install (or remove) the factory of the interceptors of the connections made from now on (see [`Interceptor`]).
+    pub fn set_interceptor(&self, f: Option<std::sync::Arc<InterceptorFactory>>) {
+        *self.shared.interceptor.lock().unwrap_or_else(|e| e.into_inner()) = f;
+    }
+
+    fn new_interceptor(&self) -> Option<Box<dyn Interceptor>> {
+        self.shared.interceptor.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|f| f())
     }
 
     /// Authenticate with a login name and password.
@@ -194,6 +253,7 @@ impl Server {
             }
         }
         conn.run_logon_triggers()?;
+        conn.interceptor = self.new_interceptor();
         Ok(conn)
     }
 
@@ -225,6 +285,7 @@ impl Server {
             }
         }
         conn.run_logon_triggers()?;
+        conn.interceptor = self.new_interceptor();
         Ok(conn)
     }
 
@@ -288,7 +349,7 @@ impl Server {
             command: String::new(),
         }));
         drop(g);
-        Connection { server: self.clone(), session }
+        Connection { server: self.clone(), session, interceptor: None }
     }
 }
 
@@ -296,6 +357,7 @@ impl Server {
 pub struct Connection {
     server: Server,
     session: SessionState,
+    interceptor: Option<Box<dyn Interceptor>>,
 }
 
 impl Connection {
@@ -303,15 +365,39 @@ impl Connection {
     /// requests of a MARS connection that are read-only do in parallel). `None` while a transaction is open: the statements of
     /// a transaction run one at a time.
     pub fn fork_reader(&self) -> Option<Connection> {
-        if self.session.trancount > 0 {
+        if self.session.trancount > 0 || self.interceptor.is_some() {
             return None;
         }
-        Some(Connection { server: self.server.clone(), session: self.session.fork() })
+        Some(Connection { server: self.server.clone(), session: self.session.fork(), interceptor: None })
     }
 
     /// Execute a single batch (no `GO` handling).
     pub fn execute(&mut self, sql: &str) -> BatchResult {
         crate::span!("execute");
+        if let Some(i) = self.interceptor.as_mut() {
+            let mut events = vec![];
+            let mut rows: Option<ResultSet> = None;
+            let handled = i.handle(sql, &mut |item| {
+                match item {
+                    Streamed::Event(e) => events.push(e),
+                    Streamed::Header { columns, types, .. } => rows = Some(ResultSet { columns, types, rows: vec![] }),
+                    Streamed::Row(r) => {
+                        if let Some(rs) = rows.as_mut() {
+                            rs.rows.push(r);
+                        }
+                    }
+                    Streamed::End(_) => {
+                        if let Some(rs) = rows.take() {
+                            events.push(Event::Rows(rs));
+                        }
+                    }
+                }
+                true
+            });
+            if handled {
+                return BatchResult { events };
+            }
+        }
         let shared = &self.server.shared;
         let guard = SrvGuard::new(&shared.state);
         let mut eng = Engine::new(guard, &mut self.session);
@@ -335,6 +421,11 @@ impl Connection {
     /// consumer has gone away; the statement is then abandoned. Small results and every other kind of result set
     /// arrive whole, as `Event::Rows`.
     pub fn execute_streaming(&mut self, sql: &str, sink: &mut dyn FnMut(Streamed) -> bool) {
+        if let Some(i) = self.interceptor.as_mut() {
+            if i.handle(sql, sink) {
+                return;
+            }
+        }
         let shared = &self.server.shared;
         let guard = SrvGuard::new(&shared.state);
         let mut eng = Engine::with_sink(guard, &mut self.session, sink);

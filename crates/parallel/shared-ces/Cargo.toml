@@ -1,0 +1,15 @@
+[package]
+name = "tsql-shared-ces"
+version = "0.1.0"
+edition = "2021"
+description = "Types shared by the control, execute and storage nodes of the distributed tsql-server"
+license = "MIT"
+
+[dependencies]
+tsql-server = { path = "../../.." }
+arrow-array = "60"
+arrow-schema = "60"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", features = ["alloc"] }
+tonic = "0.14"

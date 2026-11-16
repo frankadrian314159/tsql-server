@@ -66,6 +66,24 @@ pub struct WalRecord {
     pub ops: Vec<LogOp>,
 }
 
+/// Receives the redo record of every transaction that commits, in commit order, before the commit completes: how a
+/// server is made one replica of a group (see [`crate::Server::set_replicator`]). A server without a replicator is
+/// unaffected.
+pub trait Replicator: Send + Sync {
+    /// Called with the commit lock held, in commit-timestamp order, so it must only queue the record (to the replicated
+    /// log) and return quickly. The ticket identifies it for [`Replicator::wait`].
+    fn propose(&self, rec: &WalRecord) -> Result<u64, String>;
+    /// Called after the commit lock is released: wait until the record is committed by the group. An error makes the
+    /// transaction roll back.
+    fn wait(&self, ticket: u64) -> Result<(), String>;
+}
+
+/// A committing transaction's record that has been proposed to the replicator and is waited for.
+pub struct PendingRepl {
+    pub ticket: u64,
+    pub rec: WalRecord,
+}
+
 #[derive(Serialize, Deserialize)]
 struct Checkpoint {
     lsn: u64,

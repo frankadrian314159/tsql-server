@@ -1,0 +1,34 @@
+[package]
+name = "tsql-control"
+version = "0.1.0"
+edition = "2021"
+description = "The control node of the distributed tsql-server: routing, planning and merging over shard nodes"
+license = "MIT"
+
+[lib]
+name = "tsql_control"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tsql-cluster"
+path = "src/main.rs"
+
+[dependencies]
+tsql-server = { path = "../../.." }
+tsql-shared-ces = { path = "../shared-ces" }
+arrow-flight = "60"
+tonic = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
+futures = "0.3"
+postcard = { version = "1", features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tsql-storage = { path = "../storage" }
+# the TPC-H example reuses the generator and queries of the single-node example
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+rand = "0.8"
+# a TDS client, to check the control node as an ordinary SQL Server to its clients
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono", "rustls"] }
+tokio-util = { version = "0.7", features = ["compat"] }

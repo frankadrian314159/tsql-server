@@ -153,9 +153,32 @@ impl<'a> Engine<'a> {
             return Ok(None);
         }
         let (oid, rv) = (self.srv.core.object_id(), self.srv.core.rowversion());
+        let repl = self.srv.replicator.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(r) = repl {
+            // a replica: the record goes to the group's log first and is written to this node's own log once the group
+            // has committed it (see `replicate_wait`), so a record that the group never commits never reaches the log
+            let rec = crate::persist::WalRecord { lsn: 0, ts, wall: chrono::Utc::now().timestamp_micros(), next_object_id: oid, next_rowversion: rv, ops };
+            let ticket = r.propose(&rec).map_err(|e| SqlError::with(3314, 21, 1, format!("The commit could not be replicated: {}", e)))?;
+            self.ses.pending_repl = Some(crate::persist::PendingRepl { ticket, rec });
+            return Ok(None);
+        }
         let mut g = self.srv.persist();
         let lsn = g.as_mut().unwrap().append_buffered(ts, oid, rv, ops)?;
         Ok(Some(lsn))
+    }
+
+    /// Wait until the group has committed the record that `write_redo` proposed (nothing to do for a server that is not a
+    /// replica), then write it to this node's own log (not forced: the group's log is the durable copy).
+    pub fn replicate_wait(&mut self) -> Result<()> {
+        let Some(p) = self.ses.pending_repl.take() else { return Ok(()) };
+        let repl = self.srv.replicator.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(r) = repl {
+            r.wait(p.ticket).map_err(|e| SqlError::with(3314, 21, 1, format!("The commit could not be replicated: {}", e)))?;
+        }
+        if let Some(pp) = self.srv.persist().as_mut() {
+            pp.append_buffered(p.rec.ts, p.rec.next_object_id, p.rec.next_rowversion, p.rec.ops)?;
+        }
+        Ok(())
     }
 
     /// Wait until the log is on disk up to `lsn` (group commit: one session forces the log for all that wait).

@@ -1,0 +1,25 @@
+[package]
+name = "tsql-storage"
+version = "0.1.0"
+edition = "2021"
+description = "A shard node of the distributed tsql-server: a full engine behind an Arrow Flight service"
+license = "MIT"
+
+[lib]
+name = "tsql_storage"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tsql-shard"
+path = "src/main.rs"
+
+[dependencies]
+tsql-server = { path = "../../.." }
+tsql-shared-ces = { path = "../shared-ces" }
+tsql-raft = { path = "../raft" }
+serde = { version = "1", features = ["derive"] }
+arrow-flight = "60"
+tonic = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "signal", "time"] }
+futures = "0.3"
+postcard = { version = "1", features = ["alloc"] }

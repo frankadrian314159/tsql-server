@@ -124,6 +124,12 @@ impl<'a> Engine<'a> {
             }
         }
         drop(commit);
+        if let Err(e) = self.replicate_wait() {
+            core.finish_commit_ts(ts);
+            self.ses.tx = Some(Tx { undo, ..tx });
+            self.rollback_tx();
+            return Err(e);
+        }
         if let Some(l) = lsn {
             if let Err(e) = self.sync_log(l) {
                 core.finish_commit_ts(ts);
