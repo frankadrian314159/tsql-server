@@ -118,6 +118,7 @@ pub struct Cluster {
     broadcast_limit: AtomicU64,
     /// the longest list an `IN (SELECT ...)` is turned into (longer results become replicated temporary tables)
     in_list_limit: AtomicU64,
+    in_join_min: AtomicU64,
     /// how long a statement of a transaction waits for a lock on a shard (ms); a deadlock between shards is broken by it
     lock_timeout_ms: AtomicU64,
     /// the views (by table id) as their `CREATE VIEW` statements: a query that reads one is rewritten around its definition
@@ -183,6 +184,7 @@ impl Cluster {
             next_session: AtomicU64::new(fresh_session_base()),
             broadcast_limit: AtomicU64::new(100_000),
             in_list_limit: AtomicU64::new(20_000),
+            in_join_min: AtomicU64::new(100),
             lock_timeout_ms: AtomicU64::new(5000),
             views: Mutex::new(HashMap::new()),
             fks: Mutex::new(vec![]),
@@ -293,6 +295,11 @@ impl Cluster {
     /// The longest list an `IN (SELECT ...)` is turned into; a longer result is made a replicated temporary table.
     pub fn set_in_list_limit(&self, rows: u64) {
         self.in_list_limit.store(rows, Ordering::Relaxed);
+    }
+
+    /// The shortest literal `IN` list that is joined as a replicated table instead (default 100); 0 or less than 2 is 2.
+    pub fn set_in_join_min(&self, values: u64) {
+        self.in_join_min.store(values.max(2), Ordering::Relaxed);
     }
 
     pub fn set_broadcast_limit(&self, rows: u64) {

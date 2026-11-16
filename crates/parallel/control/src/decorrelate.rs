@@ -457,10 +457,11 @@ fn exists(sq: &Query, negated: bool, outer: &[String], conj: &[Expr], me: usize)
     if negated {
         rest.push(Expr::IsNull(Box::new(inner_key.clone()), true));
     }
-    // (the grouped scalar case restricts its keys to those of the surviving outer rows, see `reduction`; here that was tried and made
-    // TPC-H Q22 slower: the restricted list is a long literal IN list, which the engine tests against every row of the scan. The
-    // `conj` and `me` arguments stay for when the engine tests long lists with a hash.)
-    let _ = (conj, me);
+    // only the keys of the outer rows that can survive the outer query's own conditions on that table are of any use; the list that
+    // makes is long, and is joined as a replicated table (see `in_list_to_join` in nested.rs) or tested with a hash by the engine
+    if let Some(r) = reduction(&parts, conj, me) {
+        rest.push(r);
+    }
     // (distinct: the list is a set, and a long one is made a replicated table, so it must not repeat itself)
     let list = simple_query(Select {
         distinct: true,

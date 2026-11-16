@@ -126,7 +126,14 @@ tables sharded on the item), and its table shows how each query ran (`split`, `s
     query are recognised (an unqualified column is placed by the tables' schemas); a rewrite that does not bind is undone and the
     statement runs as it was. The grouped table is *restricted to the keys the outer query can meet*: the conditions of the outer
     `WHERE` that mention the outer table of the key alone become `inner_key IN (SELECT DISTINCT outer_key FROM that_table WHERE ...)`
-    inside it (TPC-H Q17 wants the average quantity of about twenty parts, not of all of them; this took it from 4 times slower than
+    inside it (`NOT EXISTS` gets the same restriction: TPC-H Q22 only looks at the orders of customers in its country codes). A literal
+    `IN` list of at least `set_in_join_min` values (100 by default) at the top level of a `WHERE`, against a plain column, is made a
+    replicated temporary table of its distinct values and *joined*: `x IN (...)` an inner join, `x NOT IN (...)` a left join that keeps
+    the unmatched rows (a NULL probe dropped, as NOT IN does; a list holding a NULL, strings a case-insensitive collation could call equal,
+    a bare `SELECT *` and a multi-table `FROM` for NOT IN are left as they are), so the shards probe a table where they would
+    compare every row with every item (measured: 8,000 values 4.7 s as a list, 0.1 s as a join; NOT IN 23 s against 0.18 s). Each engine
+    also tests a long list of integer literals through a hash set (one lookup per row), which covers lists the cluster does not rewrite.
+    (TPC-H Q17 wants the average quantity of about twenty parts, not of all of them; this took it from 4 times slower than
     one node to faster than it);
   * *set operations* (`split.rs`): `UNION`, `INTERSECT` and `EXCEPT` (also nested, with `ALL`, `TOP` in a branch, `ORDER BY`
     over the result) run each branch as a query of its own, over the shards, and combine the answers on the control node;

@@ -22,6 +22,17 @@ fn tv(b: Option<bool>) -> Value {
 /// Functions whose string result has the collation of their (first string) argument.
 const COLLATION_PASSING: &[&str] = &["UPPER", "LOWER", "LTRIM", "RTRIM", "TRIM", "SUBSTRING", "LEFT", "RIGHT", "REPLACE", "REVERSE", "CONCAT", "ISNULL", "COALESCE", "STUFF", "REPLICATE", "NULLIF"];
 
+/// Lists of at least this many items are tested through a hash set when they are literal integers.
+const IN_SET_MIN: usize = 16;
+
+/// The integer literals of a long `IN` list, for `Engine::int_set`.
+pub struct IntSet {
+    len: usize,
+    first: i64,
+    last: i64,
+    set: std::collections::HashSet<i64>,
+}
+
 impl<'a> Engine<'a> {
     /// The collation of an expression as SQL Server derives it: an explicit `COLLATE` wins; otherwise the collation of a
     /// column it is built from; literals and variables take whatever they are compared with. `None` means the
@@ -195,6 +206,19 @@ impl<'a> Engine<'a> {
                 let l = self.ev(a, env)?;
                 if l.is_null() {
                     return Ok(Value::Null);
+                }
+                // a long list of integer literals, tested against an integer: one hash lookup instead of a comparison with each
+                if items.len() >= IN_SET_MIN {
+                    if let Value::Int(_) | Value::BigInt(_) = l {
+                        if let Some(set) = self.int_set(items) {
+                            let k = match l {
+                                Value::Int(i) => i as i64,
+                                Value::BigInt(i) => i,
+                                _ => 0,
+                            };
+                            return Ok(Value::Bit(set.set.contains(&k) != *neg));
+                        }
+                    }
                 }
                 let mut saw_null = false;
                 for it in items {
@@ -401,6 +425,46 @@ impl<'a> Engine<'a> {
     /// an uncorrelated one is as likely as not to be a full scan). Whether it is correlated is found by running it
     /// once without the enclosing row: if that works, no outer column was evaluated; if it fails because a column is
     /// unknown, it is correlated and runs per row as before.
+    /// The integers of a list that is nothing but integer literals (no NULL), as a hash set kept for the statement; None when the list
+    /// is anything else, or when no statement scope is open (a set built for one row would cost more than it saves). The set is found
+    /// by the address of the list, and checked against it (length, first and last item) before it is used.
+    fn int_set(&mut self, items: &[Expr]) -> Option<std::sync::Arc<IntSet>> {
+        let key = items.as_ptr() as usize;
+        let int_of = |e: &Expr| match e {
+            Expr::Lit(Value::Int(i)) => Some(*i as i64),
+            Expr::Lit(Value::BigInt(i)) => Some(*i),
+            _ => None,
+        };
+        let cache = self.ses.in_sets.as_mut()?;
+        if let Some(entry) = cache.get(&key) {
+            match entry {
+                Some(s) if s.len == items.len() && Some(s.first) == items.first().and_then(int_of) && Some(s.last) == items.last().and_then(int_of) => return Some(s.clone()),
+                None if items.len() >= IN_SET_MIN => {
+                    // (a list that was not eligible: it is still that list unless the address was reused, which the first item tells)
+                    if items.first().and_then(int_of).is_none() {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut set = std::collections::HashSet::with_capacity(items.len());
+        for it in items {
+            match int_of(it) {
+                Some(v) => {
+                    set.insert(v);
+                }
+                None => {
+                    cache.insert(key, None);
+                    return None;
+                }
+            }
+        }
+        let s = std::sync::Arc::new(IntSet { len: items.len(), first: int_of(&items[0])?, last: int_of(&items[items.len() - 1])?, set });
+        cache.insert(key, Some(s.clone()));
+        Some(s)
+    }
+
     fn sub_rows(&mut self, q: &Query, env: &Env<'_>) -> Result<super::query::Rowset> {
         let key = q as *const Query as usize;
         if self.ses.sub_cache.is_none() {

@@ -239,21 +239,21 @@ impl ClusterSession {
             }
         }
         if !has_nested_query(q) {
-            return self.run_query_flat(q).await;
+            return self.run_flat(q).await;
         }
         // (a correlated subquery is first rewritten as a join; if the rewrite does not bind, the statement is run as it was)
         for decorrelate in [true, false] {
             let mut temps: Vec<String> = vec![];
             let mut rewrote = false;
             let out = match self.resolve_query(q, &mut temps, decorrelate, &mut rewrote).await {
-                Ok(Some(flat)) => match self.run_query_flat(&flat).await {
+                Ok(Some(flat)) => match self.run_flat(&flat).await {
                     // the rewritten query had to be gathered, and the control node's engine does not have the temporary tables
                     // the pieces were put in (they are on the shards): gather the statement as it was
-                    Err(e) if e.number == 208 && e.message.contains("#dpn_") => self.run_query_flat(q).await,
+                    Err(e) if e.number == 208 && e.message.contains("#dpn_") => self.run_flat(q).await,
                     r => r,
                 },
                 // not rewritable: the whole statement is gathered
-                Ok(None) => self.run_query_flat(q).await,
+                Ok(None) => self.run_flat(q).await,
                 Err(e) => Err(e),
             };
             self.drop_temps(temps).await;
@@ -263,6 +263,111 @@ impl ClusterSession {
             return out;
         }
         unreachable!()
+    }
+
+    /// Run a query without nested parts. A long list of literals in its condition (`x IN (1, 2, ...)`) is first made a replicated
+    /// temporary table and joined in: the shards then probe a table (a hash join, or an index) where they would otherwise compare each
+    /// row with every item of the list.
+    async fn run_flat(&mut self, q: &Query) -> Result<ResultSet, SqlError> {
+        let mut temps = vec![];
+        let rewritten = match self.in_list_to_join(q, &mut temps).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.drop_temps(temps).await;
+                return Err(e);
+            }
+        };
+        let out = match &rewritten {
+            Some(r) => match self.run_query_flat(r).await {
+                // (the rewritten query had to be gathered and the control node's engine does not have the temporary table)
+                Err(e) if e.number == 208 && e.message.contains("#dpn_") => self.run_query_flat(q).await,
+                r => r,
+            },
+            None => self.run_query_flat(q).await,
+        };
+        self.drop_temps(temps).await;
+        out
+    }
+
+    /// `WHERE x IN (v1, v2, ...)` with at least `in_join_min` literals, at the top level of the condition, becomes a join with a
+    /// replicated table of the distinct values; `x NOT IN (...)` becomes a left join that keeps the rows with no match. None when the
+    /// query has no such condition or the list cannot be treated so (a NULL or an expression in it, strings that are equal under a
+    /// case-insensitive collation, a probe that is not a plain column).
+    async fn in_list_to_join(&mut self, q: &Query, temps: &mut Vec<String>) -> Result<Option<Query>, SqlError> {
+        let min = self.cluster.in_join_min.load(Ordering::Relaxed) as usize;
+        let QueryBody::Select(sel) = &q.body else { return Ok(None) };
+        let Some(w) = &sel.where_ else { return Ok(None) };
+        // (a bare `*` would show the joined table's column; an INTO or a variable assignment is left alone)
+        if sel.into.is_some() || sel.items.iter().any(|i| matches!(i, SelectItem::Star(None) | SelectItem::Assign { .. })) {
+            return Ok(None);
+        }
+        fn conj(e: &Expr, out: &mut Vec<Expr>) {
+            match e {
+                Expr::And(a, b) => {
+                    conj(a, out);
+                    conj(b, out);
+                }
+                Expr::Paren(a) => conj(a, out),
+                other => out.push(other.clone()),
+            }
+        }
+        let mut all = vec![];
+        conj(w, &mut all);
+        let Some(at) = all.iter().position(|c| matches!(c, Expr::InList(a, items, _) if items.len() >= min && matches!(&**a, Expr::Col(_)) && items.iter().all(|i| matches!(i, Expr::Lit(Value::Int(_) | Value::BigInt(_) | Value::Str(_)))))) else { return Ok(None) };
+        let Expr::InList(probe, items, neg) = all[at].clone() else { return Ok(None) };
+        let values: Vec<Value> = items.iter().filter_map(|i| if let Expr::Lit(v) = i { Some(v.clone()) } else { None }).collect();
+        if neg && sel.from.len() != 1 {
+            return Ok(None);
+        }
+        let strings = values.iter().any(|v| matches!(v, Value::Str(_)));
+        if strings && !values.iter().all(|v| matches!(v, Value::Str(_))) {
+            return Ok(None);
+        }
+        // the distinct values; for strings, a pair that a collation might call equal is left to the shards
+        let mut seen = std::collections::HashSet::new();
+        let mut folded = std::collections::HashSet::new();
+        let mut rows = vec![];
+        for v in &values {
+            let key = v.to_string();
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            if strings && !folded.insert(key.trim_end().to_lowercase()) {
+                return Ok(None);
+            }
+            rows.push(vec![v.clone()]);
+        }
+        let ty = if strings {
+            tsql_server::DataType::VarChar(8000)
+        } else if values.iter().any(|v| matches!(v, Value::BigInt(_))) {
+            tsql_server::DataType::BigInt
+        } else {
+            tsql_server::DataType::Int
+        };
+        let rs = ResultSet { columns: vec!["k".into()], types: vec![ty], rows };
+        let Some(temp) = self.materialize(rs, Some(vec!["k".into()]), temps).await? else { return Ok(None) };
+        let alias = format!("{}_j", temp.trim_start_matches('#'));
+        let key = Expr::Col(vec![alias.clone(), "k".into()]);
+        let table = TableRef::Table { name: vec![temp], alias: Some(alias), hints: vec![] };
+        let mut out = q.clone();
+        let QueryBody::Select(s) = &mut out.body else { return Ok(None) };
+        let mut rest: Vec<Expr> = all.iter().enumerate().filter(|(i, _)| *i != at).map(|(_, c)| c.clone()).collect();
+        let eq = Expr::Binary(BinOp::Eq, probe.clone(), Box::new(key.clone()));
+        if neg {
+            // an anti join: the rows of the first table that find no partner; a NULL probe is unknown for NOT IN, so it is dropped
+            let Some(last) = s.from.pop() else { return Ok(None) };
+            s.from.push(TableRef::Join { kind: JoinKind::Left, left: Box::new(last), right: Box::new(table), on: Some(eq) });
+            rest.push(Expr::IsNull(Box::new(key), false));
+            rest.push(Expr::IsNull(probe, true));
+        } else {
+            s.from.push(table);
+            rest.push(eq);
+        }
+        let mut it = rest.into_iter();
+        let first = it.next().unwrap();
+        s.where_ = Some(it.fold(first, |a, b| Expr::And(Box::new(a), Box::new(b))));
+        self.plan.push(format!("list of {} values joined as a replicated table", items.len()));
+        Ok(Some(out))
     }
 
     /// The query with its independent nested parts replaced by their results, or None when some part cannot be.

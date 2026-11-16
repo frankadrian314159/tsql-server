@@ -224,6 +224,9 @@ pub struct SessionState {
     /// Results of subqueries that do not depend on the enclosing row, for the statement being run (see `Engine::sub_rows`).
     /// `None` where caching is not safe: outside a statement, and while an IF or WHILE condition is evaluated.
     pub sub_cache: Option<HashMap<usize, Option<query::Rowset>>>,
+    /// The literal integers of the long `IN` lists of the statement being run, as hash sets (by the address of the list; see
+    /// `Engine::int_set`). Scoped like `sub_cache`: None where no statement is being run.
+    pub in_sets: Option<HashMap<usize, Option<std::sync::Arc<expr::IntSet>>>>,
     /// Per statement: what planning a correlated subquery finds out that does not depend on the outer row.
     pub push_plans: HashMap<(usize, usize), std::sync::Arc<optimizer::PushPlan>>,
     /// Set while a grouped query runs again without folding its aggregates as the rows arrive (see `aggacc`).
@@ -326,6 +329,7 @@ impl SessionState {
             stream_to_buf: false,
             preeval: None,
             sub_cache: None,
+            in_sets: None,
             push_plans: HashMap::new(),
             no_fold_agg: false,
             sub_names: HashMap::new(),
@@ -728,8 +732,10 @@ impl<'a> Engine<'a> {
             }
             // a condition may change from one iteration to the next: no cached subquery results
             let saved = self.ses.sub_cache.take();
+            let saved_sets = self.ses.in_sets.take();
             let r = self.exec_inner(st);
             self.ses.sub_cache = saved;
+            self.ses.in_sets = saved_sets;
             return match r {
                 Err(Interrupt::Error(e)) => self.handle_error(e),
                 other => other,
@@ -780,11 +786,13 @@ impl<'a> Engine<'a> {
             let saved_hints = (std::mem::take(&mut self.ses.hints), std::mem::replace(&mut self.ses.nowait, false));
             self.ses.audit_seen.borrow_mut().clear();
             let saved = self.ses.sub_cache.replace(HashMap::new());
+            let saved_sets = self.ses.in_sets.replace(HashMap::new());
             let saved_plans = std::mem::take(&mut self.ses.push_plans);
             let saved_memo = (std::mem::take(&mut self.ses.sub_names), std::mem::take(&mut self.ses.sub_memo));
             let saved_leaf = (std::mem::take(&mut self.ses.leaf_seen), std::mem::take(&mut self.ses.leaf_cache), std::mem::replace(&mut self.ses.in_query, false));
             let mut r = self.exec_inner(st);
             self.ses.sub_cache = saved;
+            self.ses.in_sets = saved_sets;
             self.ses.push_plans = saved_plans;
             (self.ses.sub_names, self.ses.sub_memo) = saved_memo;
             (self.ses.leaf_seen, self.ses.leaf_cache, self.ses.in_query) = saved_leaf;

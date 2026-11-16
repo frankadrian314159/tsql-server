@@ -1463,3 +1463,24 @@ fn not_exists_is_restricted_to_the_keys_of_the_outer_rows_that_survive() {
         assert!(plan.iter().any(|l| l.contains("rewritten as a join")) && !plan.iter().any(|l| l.starts_with("gather")), "{}\n{:?}", sql, plan);
     }
 }
+
+#[test]
+fn a_long_list_of_literals_is_joined_as_a_replicated_table() {
+    let mut p = Pair::new(3);
+    p.load();
+    p.h.cluster.set_in_join_min(10);
+    let list = (0..60).map(|i| (i * 3).to_string()).collect::<Vec<_>>().join(", ");
+    let dup = format!("{}, 3, 6, 9", list);
+    // IN: a join with the distinct values (a repeated value must not repeat the row)
+    p.check_plan(&format!("SELECT id, amount FROM orders WHERE id IN ({}) AND qty > 1 ORDER BY id", dup), true, "joined as a replicated table");
+    p.check_plan(&format!("SELECT COUNT(*), SUM(amount) FROM orders WHERE id IN ({})", dup), true, "joined as a replicated table");
+    // NOT IN: an anti join; a NULL probe is unknown and is dropped, a NULL in the list means nothing qualifies, so that one is not rewritten
+    p.check_plan(&format!("SELECT COUNT(*) FROM orders WHERE id NOT IN ({})", dup), true, "joined as a replicated table");
+    p.check(&format!("SELECT COUNT(*) FROM orders WHERE id NOT IN ({}, NULL)", dup), true);
+    // strings, and a list under the threshold
+    let names = (0..30).map(|i| format!("'n{}'", i)).collect::<Vec<_>>().join(", ");
+    p.check(&format!("SELECT COUNT(*) FROM customers WHERE name IN ({})", names), true);
+    p.check("SELECT COUNT(*) FROM orders WHERE id IN (1, 2, 3)", true);
+    // a star select is left as it is (the joined table's column must not show)
+    p.check(&format!("SELECT * FROM orders WHERE id IN ({}) ORDER BY id", dup), true);
+}

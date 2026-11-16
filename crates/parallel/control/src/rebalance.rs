@@ -106,6 +106,7 @@ impl Cluster {
             next_session: AtomicU64::new(crate::fresh_session_base()),
             broadcast_limit: AtomicU64::new(100_000),
             in_list_limit: AtomicU64::new(20_000),
+            in_join_min: AtomicU64::new(100),
             lock_timeout_ms: AtomicU64::new(5000),
             views: Mutex::new(views.into_iter().collect()),
             fks: Mutex::new(fks),
