@@ -18,7 +18,7 @@ A few small, general hooks were added to the single-node engine for it (they do 
 | `tsql-shared-ces` | What the nodes share: configuration, wire messages, `ResultSet` to Arrow conversion, the key hash and slot function. |
 
 A separate compute tier (`execute`, `shared-ce`, `shared-es` in the original plan) was not needed: shards do their own
-computing, joins repartition through the control node, and no compute node was introduced.
+computing, joins shuffle rows from shard to shard, and no compute node was introduced.
 
 ## Running a cluster
 
@@ -39,7 +39,9 @@ tsql-cluster --config cluster.json --state cluster.state --plan < script.sql    
 started on an existing file picks the cluster up where it was and ignores `--config`. From Rust: `Cluster::connect(&config)` or
 `Cluster::open(state_file, &config)`, then `cluster.session()` and `session.execute(sql)`; `session.last_plan()` says how each
 statement ran. `cargo run --release -p tsql-control --example tpch_cluster` runs TPC-H on a cluster and compares every
-answer with a single node.
+answer with a single node; `--example tpcds_cluster` does the same for the 24 TPC-DS-style queries (dimensions replicated, fact
+tables sharded on the item), and its table shows how each query ran (`split`, `set`, `correlated`, `join`, `scatter-gather`,
+`gather`): none gathers.
 
 ## How a statement runs
 
@@ -70,7 +72,10 @@ answer with a single node.
     sharded tables are joined on their shard keys. **Broadcast**: a small table (at most 100,000 rows, `set_broadcast_limit`)
     is copied to every shard as a session temporary table, with the conditions on it applied while copying; replicated tables
     need no copy. **Repartition** (shuffle): a table is re-spread over the shards by its join column with the hash the other
-    table's shard key uses. The planner picks which tables stay put so as to move the fewest rows. An outer join is planned
+    table's shard key uses. The planner picks which tables stay put so as to move the fewest rows. A copy (broadcast or
+    repartition) is made by the **shuffle**: the control node asks every shard to run the scan and send each row to the shard
+    that needs it (action `shuffle`; the shards send the rows to each other with the action `load`, 5,000 rows to a message), so
+    the rows never pass through the control node. An outer join is planned
     only when its preserved side is partitioned over the shards; full joins and joins on expressions are gathered;
   * *subqueries, CTEs, derived tables and views* (`nested.rs`): the parts that do not depend on the outer query are evaluated
     first, each by the cluster itself, and the outer query is rewritten around their results: a scalar subquery becomes its
@@ -78,9 +83,25 @@ answer with a single node.
     or table variable becomes a small *replicated* temporary table on every shard (up to the broadcast limit) that the rest of
     the query joins like any replicated table. The rewritten query then goes through the planning above. A correlated subquery
     (it does not bind alone), a recursive CTE, `ANY`/`ALL`, and a result too big to list or broadcast are not rewritten;
-  * *gather*: everything else (those, windows, `DISTINCT` aggregates, `ROLLUP`, set operations, ...): the tables are copied
-    into the control node's mirror (kept until a change bumps their version) and the query runs there. This is the
-    correctness baseline, always exact, running at single-node speed after a one-time copy.
+  * *correlated subqueries* (`decorrelate.rs`): the common shapes are rewritten as joins first, so that their parts do not
+    depend on the outer rows. A scalar aggregate subquery in a comparison of the `WHERE`
+    (`x > (SELECT AVG(y) FROM t WHERE t.k = o.k)`, also under arithmetic) becomes a join with a grouped derived table (a row
+    with no match gets NULL, which fails the comparison, as the join dropping it does; `COUNT` is left alone, it gives 0 for no
+    rows). `EXISTS (... WHERE t.k = o.k ..)` becomes `o.k IN (SELECT t.k ..)`, and `NOT EXISTS` the same with `NOT IN`, written
+    so that a NULL key counts as no match. Only equalities between a column of the subquery and a qualified column of the outer
+    query are recognised; a rewrite that does not bind is undone and the statement runs as it was;
+  * *set operations* (`split.rs`): `UNION`, `INTERSECT` and `EXCEPT` (also nested, with `ALL`, `TOP` in a branch, `ORDER BY`
+    over the result) run each branch as a query of its own, over the shards, and combine the answers on the control node;
+  * *windows, `ROLLUP`/`CUBE`/`GROUPING SETS` and `DISTINCT` aggregates* (`plan_split`, `split.rs`): an *inner* query returns
+    the finest grain (the group expressions of all grouping sets, plus the distinct argument, with partial aggregates; or the
+    columns a windowed row query reads) and is run over the shards like any query; the control node's engine then runs the
+    *outer* query over its answer: the grouping sets re-aggregate the partials, a `COUNT(DISTINCT x)` counts the `x` column,
+    and windows (also over aggregates, `SUM(SUM(x)) OVER (..)`) see the aggregated rows. Only one distinct expression per
+    query is supported (more gather);
+  * *gather*: everything else (a correlated subquery that is not an equality, `STDEV` and the like, more than one distinct
+    expression, recursive CTEs, ...): the tables are copied into the control node's mirror (kept until a change
+    bumps their version) and the query runs there. This is the correctness baseline, always exact, running at single-node
+    speed after a one-time copy.
 * **Transactions.** `BEGIN TRANSACTION` begins on a shard when a statement first uses it, on that shard's session for this
   control session, so locks and uncommitted changes are held there and the session reads its own writes. `COMMIT`: one shard,
   committed there; several shards, **two-phase commit** (see `txn.rs`): every participant makes its part durable (a `Prepare`
@@ -173,7 +194,8 @@ suite passes unchanged in all its modes.
 ## Checked against one node
 
 `crates/parallel/control/tests/cluster.rs` runs every statement on a real cluster (control node and Flight shards over TCP) and
-on one engine: scans, `TOP`, `DISTINCT`, hidden sort keys, every aggregate with `GROUP BY` and `HAVING`; co-located, broadcast,
+on one engine: scans, `TOP`, `DISTINCT`, hidden sort keys, every aggregate with `GROUP BY` and `HAVING`; windows, grouping
+sets, distinct aggregates, set operations and correlated subqueries run over the shards and not gathered; co-located, broadcast,
 repartition, left and right joins and the shapes that must gather; DML and the caches following it; transactions (commit across
 shards, rollback, read-your-own-writes, isolation, a dead participant, a deadlock broken by the timeout); `twophase.rs`
 crashes shards between their vote and the commit and stops the control node before and after it decides; adding and removing a
@@ -203,7 +225,9 @@ generated rows.
   subqueries in DML, and schema changes inside a transaction. Views cannot be written through.
 * **Foreign keys and identity values are the control node's**: the checks are not atomic across sessions (see Foreign keys),
   and a control node that loses its state file loses the identity counters and the foreign keys with it.
-* **Gather moves whole tables** (queries with correlated subqueries, windows and the like run at single-node speed on the
-  control node), a CTE, view or derived table bigger than the broadcast limit makes the whole query gather, results are
-  collected on a shard before they are sent, and the control node merges in memory.
+* **Gather moves whole tables** (queries with a correlated subquery that is not an equality, `STDEV`, recursive CTEs and the
+  like run at single-node speed on the control node), a CTE, view or derived table bigger than the broadcast limit makes the
+  whole query gather, results are collected on a shard before they are sent, and the control node merges in memory. The outer
+  query of a split runs on the control node: a window over a very large aggregated result, or the rollup of a very fine grain,
+  is as big as that result. A join of three tables that need different shuffles is still gathered.
 * Elasticity moves slots one pair of shards at a time under a pause, and only the last shard can be removed.

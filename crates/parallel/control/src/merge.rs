@@ -106,3 +106,20 @@ pub fn run_final(
     let _ = conn.execute(&format!("DROP TABLE IF EXISTS {}", TMP));
     result
 }
+
+/// Make the temporary table `name` in the control node's engine with these columns (types widened to hold the rows) and fill it.
+pub fn load_table(conn: &mut Connection, name: &str, columns: &[String], types: &[DataType], rows: Vec<Vec<Value>>) -> Result<(), SqlError> {
+    let types = widen(types, &rows);
+    let defs: Vec<String> = columns.iter().zip(&types).map(|(n, t)| format!("[{}] {} NULL", n.replace(']', "]]"), t)).collect();
+    let _ = conn.execute(&format!("DROP TABLE IF EXISTS {}", name));
+    check(&conn.execute(&format!("CREATE TABLE {} ({})", name, defs.join(", "))))?;
+    let mut it = rows.into_iter();
+    loop {
+        let chunk: Vec<Vec<Expr>> = it.by_ref().take(CHUNK).map(|r| r.into_iter().map(Expr::Lit).collect()).collect();
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        let ins = Stmt::Insert(Box::new(Insert { ctes: vec![], target: Target::Table(vec![name.to_string()]), cols: None, output: None, src: InsertSrc::Values(chunk), top: None }));
+        check(&conn.execute_stmts(&[ins]))?;
+    }
+}

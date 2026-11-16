@@ -22,8 +22,11 @@ use tsql_server::{Connection, Event, ResultSet, Server};
 use tsql_shared_ces::arrowconv;
 use tsql_shared_ces::wire::{self, status_for, Fragment, PrepareReq, RunReply, SettleReq, WireError, WireEvent, Work, ACTION_CLOSE_SESSION, ACTION_PREPARE, ACTION_KILL, ACTION_MEMBERS, ACTION_PREPARED, ACTION_RAFT, ACTION_RUN, ACTION_SETTLE, ACTION_STATUS, ACTION_WAITS, IN_DOUBT, MEMBERSHIP, NOT_LEADER};
 use tsql_shared_ces::wire::MemberReq;
+use tsql_shared_ces::wire::{LoadReq, ShuffleReq, ACTION_LOAD, ACTION_SHUFFLE};
+use tsql_shared_ces::route::{key_hash, slot_of};
 
 pub mod replica;
+mod shuffle;
 mod transport;
 pub use replica::{Replica, ReplicaConfig};
 
@@ -40,11 +43,13 @@ pub struct ShardNode {
     prepared_by: Mutex<HashMap<u64, u64>>,
     /// the engine's session id of each session (readable while the session's statement runs, which holds its connection)
     spids: Mutex<HashMap<u64, i32>>,
+    /// connections to the other shards (made on first use), for the shuffle
+    peers: shuffle::Peers,
 }
 
 impl ShardNode {
     pub fn new(shard_id: u32, server: Server) -> ShardNode {
-        ShardNode { shard_id, server: Arc::new(server), replica: None, sessions: Mutex::new(HashMap::new()), prepared_by: Mutex::new(HashMap::new()), spids: Mutex::new(HashMap::new()) }
+        ShardNode { shard_id, server: Arc::new(server), replica: None, sessions: Mutex::new(HashMap::new()), prepared_by: Mutex::new(HashMap::new()), spids: Mutex::new(HashMap::new()), peers: Default::default() }
     }
 
     /// A node that is one replica of a replicated shard: `server` must be a persistent engine; the replica keeps its Raft log
@@ -52,7 +57,7 @@ impl ShardNode {
     pub fn replicated(shard_id: u32, server: Server, cfg: ReplicaConfig) -> std::io::Result<ShardNode> {
         let server = Arc::new(server);
         let replica = Replica::start(cfg, server.clone())?;
-        Ok(ShardNode { shard_id, server, replica: Some(replica), sessions: Mutex::new(HashMap::new()), prepared_by: Mutex::new(HashMap::new()), spids: Mutex::new(HashMap::new()) })
+        Ok(ShardNode { shard_id, server, replica: Some(replica), sessions: Mutex::new(HashMap::new()), prepared_by: Mutex::new(HashMap::new()), spids: Mutex::new(HashMap::new()), peers: Default::default() })
     }
 
     pub fn replica(&self) -> Option<&Arc<Replica>> {
@@ -84,6 +89,70 @@ impl ShardNode {
 
     pub fn server(&self) -> &Arc<Server> {
         &self.server
+    }
+
+    /// Insert rows into a table of the session (what a shuffle sends to this shard).
+    async fn load_rows(&self, session: u64, table: String, rows: Vec<Vec<tsql_server::Value>>) -> Result<(), Status> {
+        let conn = self.session(session);
+        tokio::task::spawn_blocking(move || -> Result<(), WireError> {
+            let mut c = conn.lock().unwrap_or_else(|e| e.into_inner());
+            for chunk in rows.chunks(1000) {
+                let values: Vec<Vec<tsql_server::ast::Expr>> = chunk.iter().map(|r| r.iter().cloned().map(tsql_server::ast::Expr::Lit).collect()).collect();
+                let ins = tsql_server::ast::Stmt::Insert(Box::new(tsql_server::ast::Insert { ctes: vec![], target: tsql_server::ast::Target::Table(vec![table.clone()]), cols: None, output: None, src: tsql_server::ast::InsertSrc::Values(values), top: None }));
+                let res = c.execute_stmts(&[ins]);
+                if let Some(e) = res.first_error() {
+                    return Err(WireError::from_sql(e));
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| Status::internal(format!("the load panicked: {}", e)))?
+        .map_err(|e| status_for(&e))
+    }
+
+    /// Run the scan and send every row to the shard that owns it (or to all of them), straight to that shard.
+    async fn shuffle(&self, req: ShuffleReq) -> Result<u64, Status> {
+        let conn = self.session(req.session);
+        let scan = Work::Stmts(vec![req.scan.clone()]);
+        let rs = tokio::task::spawn_blocking(move || {
+            let mut c = conn.lock().unwrap_or_else(|e| e.into_inner());
+            first_result_set(&mut c, &scan)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("the scan panicked: {}", e)))?
+        .map_err(|e| status_for(&e))?;
+        let n = req.peers.len();
+        let mut parts: Vec<Vec<Vec<tsql_server::Value>>> = vec![vec![]; n];
+        let total = rs.rows.len() as u64;
+        for row in rs.rows {
+            match req.key {
+                None => {
+                    for p in parts.iter_mut() {
+                        p.push(row.clone());
+                    }
+                }
+                Some((col, class)) => {
+                    let h = key_hash(&row[col], class).unwrap_or(0);
+                    let dest = *req.slots.get(slot_of(h)).ok_or_else(|| Status::invalid_argument("bad slot map"))? as usize;
+                    parts.get_mut(dest).ok_or_else(|| Status::invalid_argument("bad slot map"))?.push(row);
+                }
+            }
+        }
+        let sends = parts.into_iter().enumerate().filter(|(_, p)| !p.is_empty()).map(|(i, p)| {
+            let (table, session, me, addr) = (req.table.clone(), req.session, req.me, req.peers[i].clone());
+            async move {
+                if i == me {
+                    self.load_rows(session, table, p).await
+                } else {
+                    self.peers.send_load(&addr, LoadReq { session, table, rows: p }).await
+                }
+            }
+        });
+        for r in futures::future::join_all(sends).await {
+            r?;
+        }
+        Ok(total)
     }
 
     fn session(&self, id: u64) -> Arc<Mutex<Connection>> {
@@ -182,6 +251,18 @@ impl FlightService for ShardNode {
                 .await
                 .map_err(|e| Status::internal(format!("the statement panicked: {}", e)))?;
                 postcard::to_allocvec(&reply).map_err(|e| Status::internal(e.to_string()))?
+            }
+            ACTION_LOAD => {
+                self.check_serving()?;
+                let req: LoadReq = postcard::from_bytes(&action.body).map_err(|e| Status::invalid_argument(format!("bad request: {}", e)))?;
+                self.load_rows(req.session, req.table, req.rows).await?;
+                vec![]
+            }
+            ACTION_SHUFFLE => {
+                self.check_serving()?;
+                let req: ShuffleReq = postcard::from_bytes(&action.body).map_err(|e| Status::invalid_argument(format!("bad request: {}", e)))?;
+                let sent = self.shuffle(req).await?;
+                postcard::to_allocvec(&sent).map_err(|e| Status::internal(e.to_string()))?
             }
             ACTION_PREPARE => {
                 self.check_leader()?;
@@ -336,7 +417,7 @@ impl FlightService for ShardNode {
         Err(Status::unimplemented("do_exchange"))
     }
     async fn list_actions(&self, _r: Request<Empty>) -> Result<Response<Self::ListActionsStream>, Status> {
-        let acts = [ACTION_RUN, ACTION_CLOSE_SESSION, ACTION_STATUS, ACTION_PREPARE, ACTION_SETTLE, ACTION_PREPARED, ACTION_WAITS, ACTION_KILL, ACTION_MEMBERS].iter().map(|n| Ok(ActionType { r#type: n.to_string(), description: String::new() })).collect::<Vec<_>>();
+        let acts = [ACTION_RUN, ACTION_CLOSE_SESSION, ACTION_STATUS, ACTION_PREPARE, ACTION_SETTLE, ACTION_PREPARED, ACTION_WAITS, ACTION_KILL, ACTION_MEMBERS, ACTION_SHUFFLE, ACTION_LOAD].iter().map(|n| Ok(ActionType { r#type: n.to_string(), description: String::new() })).collect::<Vec<_>>();
         Ok(Response::new(stream::iter(acts).boxed()))
     }
 }

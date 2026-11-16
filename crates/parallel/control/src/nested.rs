@@ -162,19 +162,27 @@ impl ClusterSession {
         if !has_nested_query(q) {
             return self.run_query_flat(q).await;
         }
-        let mut temps: Vec<String> = vec![];
-        let out = match self.resolve_query(q, &mut temps).await {
-            Ok(Some(flat)) => self.run_query_flat(&flat).await,
-            // not rewritable: the whole statement is gathered
-            Ok(None) => self.run_query_flat(q).await,
-            Err(e) => Err(e),
-        };
-        self.drop_temps(temps).await;
-        out
+        // (a correlated subquery is first rewritten as a join; if the rewrite does not bind, the statement is run as it was)
+        for decorrelate in [true, false] {
+            let mut temps: Vec<String> = vec![];
+            let mut rewrote = false;
+            let out = match self.resolve_query(q, &mut temps, decorrelate, &mut rewrote).await {
+                Ok(Some(flat)) => self.run_query_flat(&flat).await,
+                // not rewritable: the whole statement is gathered
+                Ok(None) => self.run_query_flat(q).await,
+                Err(e) => Err(e),
+            };
+            self.drop_temps(temps).await;
+            if rewrote && matches!(&out, Err(e) if is_correlation_error(e) || e.number == 209) {
+                continue;
+            }
+            return out;
+        }
+        unreachable!()
     }
 
     /// The query with its independent nested parts replaced by their results, or None when some part cannot be.
-    async fn resolve_query(&mut self, q: &Query, temps: &mut Vec<String>) -> Result<Option<Query>, SqlError> {
+    async fn resolve_query(&mut self, q: &Query, temps: &mut Vec<String>, decorrelate: bool, rewrote: &mut bool) -> Result<Option<Query>, SqlError> {
         let mut v = serde_json::to_value(q).map_err(json_err)?;
         let ctes: Vec<J> = match v.get_mut("ctes") {
             Some(J::Array(a)) => std::mem::take(a),
@@ -207,6 +215,17 @@ impl ClusterSession {
         }
         if let Some(c) = v.get_mut("ctes") {
             *c = J::Array(vec![]);
+        }
+        if decorrelate {
+            if let Ok(mut typed) = serde_json::from_value::<Query>(v.clone()) {
+                let mut counter = self.temp_counter;
+                if crate::decorrelate::decorrelate(&mut typed, &mut counter) {
+                    self.temp_counter = counter;
+                    self.plan.push("correlated subquery rewritten as a join".into());
+                    *rewrote = true;
+                    v = serde_json::to_value(&typed).map_err(json_err)?;
+                }
+            }
         }
         if !self.resolve_value(&mut v, temps).await? {
             return Ok(None);

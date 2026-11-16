@@ -24,6 +24,7 @@
 pub mod astutil;
 pub mod client;
 pub mod deadlock;
+pub mod decorrelate;
 pub mod fk;
 pub mod front;
 pub mod joins;
@@ -31,6 +32,7 @@ pub mod merge;
 pub mod nested;
 pub mod plan;
 pub mod rebalance;
+pub mod split;
 pub mod replicas;
 pub mod txn;
 
@@ -258,6 +260,11 @@ impl Cluster {
     /// The shard that owns the key with this hash (through the slot map).
     pub fn shard_of_hash(&self, h: u64) -> usize {
         self.slots.read().unwrap_or_else(|e| e.into_inner())[slot_of(h)] as usize
+    }
+
+    /// The shard that owns each hash slot.
+    pub fn slot_map(&self) -> Vec<u32> {
+        self.slots.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// How many slots each shard owns.
@@ -1328,6 +1335,9 @@ impl ClusterSession {
             self.plan.push("direct: replicated tables, on shard 0".into());
             return self.direct(0, q).await;
         }
+        if let Some(rs) = self.run_setop(q).await? {
+            return Ok(rs);
+        }
         if tables.len() == 1 && !has_nested_query(q) {
             let t = &tables[0];
             let shards = prune_shards(query_where(q), t, &self.cluster);
@@ -1343,6 +1353,9 @@ impl ClusterSession {
             if let Some(rs) = self.try_join(q, &tables).await? {
                 return Ok(rs);
             }
+        }
+        if let Some(rs) = self.run_split(q).await? {
+            return Ok(rs);
         }
         self.gather(q, &tables).await
     }
@@ -1442,7 +1455,6 @@ impl ClusterSession {
             group: None,
             having: None,
         });
-        let source = self.fan_query(&shards, |_| Work::Stmts(vec![Stmt::Query(Box::new(scan.clone()))])).await?;
         // the temporary table has the columns of the table
         let create = Stmt::Query(Box::new(simple_query(Select {
             distinct: false,
@@ -1455,42 +1467,20 @@ impl ClusterSession {
             having: None,
         })));
         self.fan_run(&shards, |_| Work::Stmts(vec![create.clone()])).await?;
-        let mut per_shard: Vec<Vec<Vec<Value>>> = vec![vec![]; n];
-        for rs in source {
-            for row in rs.rows {
-                match p.repartition {
-                    None => {
-                        for s in per_shard.iter_mut() {
-                            s.push(row.clone());
-                        }
-                    }
-                    Some((col, class)) => {
-                        let h = key_hash(&row[col], class).unwrap_or(0);
-                        per_shard[self.cluster.shard_of_hash(h)].push(row);
-                    }
-                }
-            }
+        // every shard scans its rows and sends each to the shard that needs it, straight there: the rows do not pass through
+        // the control node (the transaction has begun on every shard: the create above did that)
+        let slots = self.cluster.slot_map();
+        let peers: Vec<String> = self.cluster.shard_list().iter().map(|s| s.addr.clone()).collect();
+        let clients: Vec<ShardClient> = shards.iter().map(|&i| self.cluster.shard(i)).collect();
+        let futs: Vec<_> = clients
+            .iter()
+            .zip(&shards)
+            .map(|(c, &me)| c.shuffle(tsql_shared_ces::wire::ShuffleReq { session: self.id, scan: Stmt::Query(Box::new(scan.clone())), key: p.repartition, table: p.temp.clone(), slots: slots.clone(), peers: peers.clone(), me }))
+            .collect();
+        for r in join_all(futs).await {
+            r?;
         }
-        // (a broadcast sends the same rows to every shard, a thousand rows to a statement)
-        let mut offset = 0;
-        loop {
-            let stmts: Vec<Option<Stmt>> = (0..n)
-                .map(|i| {
-                    let rows = &per_shard[i];
-                    if offset >= rows.len() {
-                        return None;
-                    }
-                    let chunk: Vec<Vec<Expr>> = rows[offset..(offset + 1000).min(rows.len())].iter().map(|r| r.iter().cloned().map(Expr::Lit).collect()).collect();
-                    Some(Stmt::Insert(Box::new(Insert { ctes: vec![], target: Target::Table(vec![p.temp.clone()]), cols: None, output: None, src: InsertSrc::Values(chunk), top: None })))
-                })
-                .collect();
-            let active: Vec<usize> = (0..n).filter(|i| stmts[*i].is_some()).collect();
-            if active.is_empty() {
-                break;
-            }
-            self.fan_run(&active, |i| Work::Stmts(vec![stmts[i].clone().unwrap()])).await?;
-            offset += 1000;
-        }
+        let _ = n;
         Ok(())
     }
 

@@ -51,10 +51,13 @@ enum AggKind {
     Min,
     Max,
     Avg,
+    /// `COUNT(DISTINCT x)` and the like, over the `x` column that the partial rows are grouped by too (split plans only)
+    Distinct,
 }
 
 struct AggInfo {
     key: String,
+    name: String,
     kind: AggKind,
     /// the partial column (the SUM of an AVG)
     col: usize,
@@ -65,6 +68,8 @@ struct AggInfo {
 pub struct AggPlan {
     pub shard_query: Query,
     group_keys: Vec<String>,
+    /// the `GROUP BY` as written (plain expressions, `ROLLUP`, `CUBE`, `GROUPING SETS`)
+    group_items: Vec<GroupItem>,
     aggs: Vec<AggInfo>,
     items: Vec<(Expr, Option<String>)>,
     having: Option<Expr>,
@@ -159,7 +164,7 @@ fn plan_scatter_with(q: &Query, multi: bool) -> Option<Shape> {
         });
     }
     if has_agg || sel.group.is_some() {
-        plan_agg(q, sel).map(Shape::Agg)
+        plan_agg(q, sel, false).map(Shape::Agg)
     } else if sel.having.is_some() {
         None
     } else {
@@ -238,14 +243,23 @@ impl RowPlan {
     }
 }
 
-fn plan_agg(q: &Query, sel: &Select) -> Option<AggPlan> {
+fn plan_agg(q: &Query, sel: &Select, split: bool) -> Option<AggPlan> {
     let mut group_exprs: Vec<Expr> = vec![];
+    let mut group_items: Vec<GroupItem> = vec![];
     if let Some(g) = &sel.group {
         for gi in g {
-            let GroupItem::Expr(e) = gi else { return None };
-            if !group_exprs.iter().any(|x| expr_key(x) == expr_key(e)) {
-                group_exprs.push(e.clone());
+            let exprs: Vec<&Expr> = match gi {
+                GroupItem::Expr(e) => vec![e],
+                GroupItem::Rollup(v) | GroupItem::Cube(v) if split => v.iter().collect(),
+                GroupItem::Sets(vv) if split => vv.iter().flatten().collect(),
+                _ => return None,
+            };
+            for e in exprs {
+                if !group_exprs.iter().any(|x| expr_key(x) == expr_key(e)) {
+                    group_exprs.push(e.clone());
+                }
             }
+            group_items.push(gi.clone());
         }
     }
     let mut items: Vec<(Expr, Option<String>)> = vec![];
@@ -258,11 +272,29 @@ fn plan_agg(q: &Query, sel: &Select) -> Option<AggPlan> {
     // the aggregate calls of the select list, HAVING and ORDER BY, each once
     let mut calls: Vec<FuncCall> = vec![];
     let mut unsupported = false;
+    let mut distinct_arg: Option<Expr> = None;
     let mut collect = |e: &Expr| {
         walk_expr(e, &mut |x| {
             if let Expr::Func(fc) = x {
                 if AGGREGATES.contains(&fc.name.as_str()) {
-                    let ok = matches!(fc.name.as_str(), "COUNT" | "COUNT_BIG" | "SUM" | "AVG" | "MIN" | "MAX") && !fc.distinct && fc.over.is_none() && fc.within.is_none();
+                    if fc.over.is_some() {
+                        // a window function over the aggregated rows (the aggregates inside it are visited on their own)
+                        if !split {
+                            unsupported = true;
+                        }
+                        return;
+                    }
+                    let mut ok = matches!(fc.name.as_str(), "COUNT" | "COUNT_BIG" | "SUM" | "AVG" | "MIN" | "MAX") && fc.within.is_none();
+                    if fc.distinct {
+                        // one distinct expression for all of them: the partial rows are grouped by it as well
+                        ok = ok && split && fc.args.len() == 1 && !fc.star;
+                        if ok {
+                            match &distinct_arg {
+                                None => distinct_arg = Some(fc.args[0].clone()),
+                                Some(d) => ok = expr_key(d) == expr_key(&fc.args[0]),
+                            }
+                        }
+                    }
                     if !ok {
                         unsupported = true;
                     } else if !calls.iter().any(|c| expr_key(&Expr::Func(Box::new(c.clone()))) == expr_key(x)) {
@@ -289,8 +321,16 @@ fn plan_agg(q: &Query, sel: &Select) -> Option<AggPlan> {
     for (i, g) in group_exprs.iter().enumerate() {
         shard_items.push(SelectItem::Expr { e: g.clone(), alias: Some(format!("g{}", i)) });
     }
+    let dcol = shard_items.len();
+    if let Some(d) = &distinct_arg {
+        shard_items.push(SelectItem::Expr { e: d.clone(), alias: Some("gd".into()) });
+    }
     let mut aggs = vec![];
     for c in &calls {
+        if c.distinct {
+            aggs.push(AggInfo { key: expr_key(&Expr::Func(Box::new(c.clone()))), name: c.name.clone(), kind: AggKind::Distinct, col: dcol, count_col: None });
+            continue;
+        }
         let col = shard_items.len();
         let kind = match c.name.as_str() {
             "COUNT" => AggKind::Count,
@@ -308,16 +348,31 @@ fn plan_agg(q: &Query, sel: &Select) -> Option<AggPlan> {
             n.name = "COUNT".into();
             shard_items.push(SelectItem::Expr { e: Expr::Func(Box::new(s)), alias: Some(format!("p{}", col)) });
             shard_items.push(SelectItem::Expr { e: Expr::Func(Box::new(n)), alias: Some(format!("p{}", col + 1)) });
-            aggs.push(AggInfo { key, kind, col, count_col: Some(col + 1) });
+            aggs.push(AggInfo { key, name: c.name.clone(), kind, col, count_col: Some(col + 1) });
         } else {
             shard_items.push(SelectItem::Expr { e: Expr::Func(Box::new(c.clone())), alias: Some(format!("p{}", col)) });
-            aggs.push(AggInfo { key, kind, col, count_col: None });
+            aggs.push(AggInfo { key, name: c.name.clone(), kind, col, count_col: None });
         }
     }
-    let shard = Select { distinct: false, top: None, items: shard_items, into: None, from: sel.from.clone(), where_: sel.where_.clone(), group: sel.group.clone(), having: None };
+    // (a split plan groups by every expression that any grouping set uses, and by the distinct expression: the finest grain)
+    let shard_group = if split {
+        let mut g: Vec<GroupItem> = group_exprs.iter().cloned().map(GroupItem::Expr).collect();
+        if let Some(d) = &distinct_arg {
+            g.push(GroupItem::Expr(d.clone()));
+        }
+        if g.is_empty() {
+            None
+        } else {
+            Some(g)
+        }
+    } else {
+        sel.group.clone()
+    };
+    let shard = Select { distinct: false, top: None, items: shard_items, into: None, from: sel.from.clone(), where_: sel.where_.clone(), group: shard_group, having: None };
     let plan = AggPlan {
         shard_query: simple_query(shard),
         group_keys: group_exprs.iter().map(expr_key).collect(),
+        group_items,
         aggs,
         items,
         having: sel.having.clone(),
@@ -345,6 +400,7 @@ impl AggPlan {
             AggKind::Count | AggKind::CountBig | AggKind::Sum => func("SUM", vec![c(info.col)]),
             AggKind::Min => func("MIN", vec![c(info.col)]),
             AggKind::Max => func("MAX", vec![c(info.col)]),
+            AggKind::Distinct => Expr::Func(Box::new(FuncCall { name: info.name.clone(), schema: None, parts: vec![], args: vec![c(info.col)], distinct: true, star: false, over: None, within: None })),
             AggKind::Avg => {
                 let div = Expr::Binary(BinOp::Div, Box::new(func("SUM", vec![c(info.col)])), Box::new(func("SUM", vec![c(info.count_col.unwrap_or(info.col))])));
                 match types.get(info.col) {
@@ -414,8 +470,235 @@ impl AggPlan {
         if failed {
             return None;
         }
-        let group = if self.group_keys.is_empty() { None } else { Some((0..self.group_keys.len()).map(|i| GroupItem::Expr(col(&cname(i)))).collect()) };
+        let pos = |e: &Expr| self.group_keys.iter().position(|g| *g == expr_key(e)).map(|i| col(&cname(i)));
+        let mut group: Vec<GroupItem> = vec![];
+        let mut seen: Vec<String> = vec![];
+        for gi in &self.group_items {
+            match gi {
+                GroupItem::Expr(e) => {
+                    let k = expr_key(e);
+                    if !seen.contains(&k) {
+                        seen.push(k);
+                        group.push(GroupItem::Expr(pos(e)?));
+                    }
+                }
+                GroupItem::Rollup(v) => group.push(GroupItem::Rollup(v.iter().map(|e| pos(e)).collect::<Option<Vec<_>>>()?)),
+                GroupItem::Cube(v) => group.push(GroupItem::Cube(v.iter().map(|e| pos(e)).collect::<Option<Vec<_>>>()?)),
+                GroupItem::Sets(vv) => group.push(GroupItem::Sets(vv.iter().map(|v| v.iter().map(|e| pos(e)).collect::<Option<Vec<_>>>()).collect::<Option<Vec<_>>>()?)),
+            }
+        }
+        let group = if group.is_empty() { None } else { Some(group) };
         let sel = Select { distinct: self.distinct, top: self.top.clone(), items, into: None, from: table_item(tmp), where_: None, group, having };
+        let mut q = simple_query(sel);
+        q.order = order;
+        Some(q)
+    }
+}
+
+// ------------------------------------------------------------------ split plans
+
+/// A query the shards cannot answer in one pass but that is a query over the answer of one they can: windows, `ROLLUP` /
+/// `CUBE` / `GROUPING SETS` and `DISTINCT` aggregates. The *inner* query is a plain grouping (or row) query that the cluster
+/// runs as it runs any query (scattered, joined over the shards); the control node's engine then runs the *outer* query over
+/// its answer, so windows, grouping sets and distinct aggregates behave exactly as in the single-node server.
+pub struct SplitPlan {
+    pub inner: Query,
+    kind: SplitKind,
+}
+
+enum SplitKind {
+    Agg(AggPlan),
+    Rows(RowSplit),
+}
+
+struct RowSplit {
+    /// the column references of the query, as written (the inner query returns them)
+    atoms: Vec<String>,
+    items: Vec<(Expr, Option<String>)>,
+    order: Vec<OrderItem>,
+    top: Option<Top>,
+    distinct: bool,
+}
+
+fn has_session(e: &Expr) -> bool {
+    let mut found = false;
+    walk_expr(e, &mut |x| {
+        if matches!(x, Expr::Var(_) | Expr::SysVar(_) | Expr::NextValue(_)) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Plan a flat query as a split. None: not one (the scatter planner handles it, or it is gathered).
+pub fn plan_split(q: &Query) -> Option<SplitPlan> {
+    let sel = only_select(q)?;
+    let mut all: Vec<&Expr> = vec![];
+    for it in &sel.items {
+        match it {
+            SelectItem::Expr { e, .. } => all.push(e),
+            _ => return None,
+        }
+    }
+    if let Some(w) = &sel.where_ {
+        if has_window_or_session(w) {
+            return None;
+        }
+        all.push(w);
+    }
+    if let Some(h) = &sel.having {
+        all.push(h);
+    }
+    for o in &q.order {
+        all.push(&o.e);
+    }
+    let mut grouping_sets = false;
+    if let Some(g) = &sel.group {
+        for gi in g {
+            match gi {
+                GroupItem::Expr(e) => all.push(e),
+                GroupItem::Rollup(v) | GroupItem::Cube(v) => {
+                    grouping_sets = true;
+                    all.extend(v.iter());
+                }
+                GroupItem::Sets(vv) => {
+                    grouping_sets = true;
+                    all.extend(vv.iter().flatten());
+                }
+            }
+        }
+    }
+    if let Some(t) = &sel.top {
+        if !matches!(t.e, Expr::Lit(_)) {
+            return None;
+        }
+    }
+    if all.iter().any(|e| has_session(e) || has_subquery(e)) {
+        return None;
+    }
+    let (mut windows, mut distinct_agg, mut has_agg) = (false, false, false);
+    let mut within = false;
+    for e in &all {
+        walk_expr(e, &mut |x| {
+            if let Expr::Func(fc) = x {
+                if fc.over.is_some() {
+                    windows = true;
+                } else if AGGREGATES.contains(&fc.name.as_str()) {
+                    has_agg = true;
+                    distinct_agg |= fc.distinct;
+                }
+                within |= fc.within.is_some();
+            }
+        });
+    }
+    if within || !(windows || grouping_sets || distinct_agg) {
+        return None;
+    }
+    if has_agg || sel.group.is_some() {
+        let plan = plan_agg(q, sel, true)?;
+        return Some(SplitPlan { inner: plan.shard_query.clone(), kind: SplitKind::Agg(plan) });
+    }
+    // windows over plain rows: the inner query returns the columns the query reads
+    let mut items: Vec<(Expr, Option<String>)> = vec![];
+    for it in &sel.items {
+        if let SelectItem::Expr { e, alias } = it {
+            items.push((e.clone(), alias.clone()));
+        }
+    }
+    let aliases: Vec<String> = items.iter().filter_map(|(_, a)| a.clone()).map(|a| a.to_lowercase()).collect();
+    let mut atoms: Vec<Expr> = vec![];
+    let mut note = |e: &Expr, skip_aliases: bool| {
+        walk_expr(e, &mut |x| {
+            if let Expr::Col(p) = x {
+                if skip_aliases && p.len() == 1 && aliases.contains(&p[0].to_lowercase()) {
+                    return;
+                }
+                if !atoms.iter().any(|a| expr_key(a) == expr_key(x)) {
+                    atoms.push(x.clone());
+                }
+            }
+        });
+    };
+    for (e, _) in &items {
+        note(e, false);
+    }
+    for o in &q.order {
+        note(&o.e, true);
+    }
+    if atoms.is_empty() {
+        return None;
+    }
+    let inner_items = atoms.iter().enumerate().map(|(i, a)| SelectItem::Expr { e: a.clone(), alias: Some(format!("a{}", i)) }).collect();
+    let inner = Select { distinct: false, top: None, items: inner_items, into: None, from: sel.from.clone(), where_: sel.where_.clone(), group: None, having: None };
+    let plan = RowSplit { atoms: atoms.iter().map(expr_key).collect(), items, order: q.order.clone(), top: sel.top.clone(), distinct: sel.distinct };
+    let sp = SplitPlan { inner: simple_query(inner), kind: SplitKind::Rows(plan) };
+    sp.final_query("t", &vec![DataType::Float; atoms.len()])?;
+    Some(sp)
+}
+
+impl SplitPlan {
+    pub fn final_query(&self, tmp: &str, types: &[DataType]) -> Option<Query> {
+        match &self.kind {
+            SplitKind::Agg(p) => p.final_query(tmp, types),
+            SplitKind::Rows(p) => p.final_query(tmp),
+        }
+    }
+}
+
+impl RowSplit {
+    fn final_query(&self, tmp: &str) -> Option<Query> {
+        let aliases: Vec<String> = self.items.iter().filter_map(|(e, a)| a.clone().or_else(|| if let Expr::Col(p) = e { p.last().cloned() } else { None })).map(|s| s.to_lowercase()).collect();
+        let mut failed = false;
+        let rewrite = |e: &Expr| -> Expr {
+            map_expr(e, &mut |x| {
+                if let Expr::Col(_) = x {
+                    let k = expr_key(x);
+                    return self.atoms.iter().position(|a| *a == k).map(|i| col(&cname(i)));
+                }
+                None
+            })
+        };
+        let items: Vec<SelectItem> = self
+            .items
+            .iter()
+            .map(|(e, alias)| {
+                let alias = alias.clone().or_else(|| if let Expr::Col(p) = e { p.last().cloned() } else { None });
+                SelectItem::Expr { e: rewrite(e), alias }
+            })
+            .collect();
+        // an ORDER BY term that names an output column stays as it is
+        let order: Vec<OrderItem> = self
+            .order
+            .iter()
+            .map(|o| {
+                let is_alias = matches!(&o.e, Expr::Col(p) if p.len() == 1 && aliases.contains(&p[0].to_lowercase()) && !self.atoms.contains(&expr_key(&o.e)));
+                OrderItem { e: if matches!(o.e, Expr::Lit(_)) || is_alias { o.e.clone() } else { rewrite(&o.e) }, desc: o.desc }
+            })
+            .collect();
+        let mut check = |e: &Expr| {
+            walk_expr(e, &mut |x| match x {
+                Expr::Col(p) => {
+                    let n = p.last().map(|s| s.to_lowercase()).unwrap_or_default();
+                    if !(p.len() == 1 && (n.starts_with(COL) || aliases.contains(&n))) {
+                        failed = true;
+                    }
+                }
+                Expr::Star(_) => failed = true,
+                _ => {}
+            });
+        };
+        for it in &items {
+            if let SelectItem::Expr { e, .. } = it {
+                check(e);
+            }
+        }
+        for o in &order {
+            check(&o.e);
+        }
+        if failed {
+            return None;
+        }
+        let sel = Select { distinct: self.distinct, top: self.top.clone(), items, into: None, from: table_item(tmp), where_: None, group: None, having: None };
         let mut q = simple_query(sel);
         q.order = order;
         Some(q)

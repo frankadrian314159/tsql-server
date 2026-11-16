@@ -208,8 +208,10 @@ fn what_cannot_be_scattered_is_gathered_and_still_exact() {
     // a subquery that does not depend on the outer query is evaluated first and the outer query runs over the shards
     let plan = p.check("SELECT c.name FROM customers c WHERE c.id IN (SELECT customer_id FROM orders WHERE amount > 990)", false);
     assert!(!plan.iter().any(|l| l.starts_with("gather")), "{:?}", plan);
-    // a correlated one is gathered
+    // a correlated one by equality is rewritten as a join, one that is not is gathered
     let plan = p.check("SELECT c.name FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.amount > 990)", false);
+    assert!(!plan.iter().any(|l| l.starts_with("gather")), "{:?}", plan);
+    let plan = p.check("SELECT c.name FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.amount > c.credit)", false);
     assert!(plan.iter().any(|l| l.starts_with("gather")), "{:?}", plan);
 }
 
@@ -692,10 +694,10 @@ fn subqueries_ctes_and_derived_tables_are_evaluated_around_the_shards() {
         assert!(plan.iter().any(|l| l.contains(expect)), "{}\nexpected {:?} in the plan, got {:?}", sql, expect, plan);
         assert!(!plan.iter().any(|l| l.starts_with("gather")), "{}\nthe tables should not be gathered: {:?}", sql, plan);
     }
-    // what cannot be evaluated alone is gathered, and still exact: a correlated subquery, ANY / ALL
+    // what cannot be evaluated alone is gathered, and still exact: a correlated subquery that is not an equality, ANY / ALL
     for sql in [
-        "SELECT c.id FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.amount > 990) ORDER BY c.id",
-        "SELECT c.id FROM customers c WHERE c.credit > (SELECT AVG(o.amount) FROM orders o WHERE o.customer_id = c.id) ORDER BY c.id",
+        "SELECT c.id FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.amount > c.credit) ORDER BY c.id",
+        "SELECT c.id FROM customers c WHERE c.credit > (SELECT AVG(o.amount) FROM orders o WHERE o.customer_id < c.id) ORDER BY c.id",
         "SELECT id FROM customers WHERE credit > ANY (SELECT amount FROM orders WHERE amount < 10) ORDER BY id",
     ] {
         let plan = p.check(sql, true);
@@ -1035,4 +1037,124 @@ fn foreign_keys_survive_a_restart_of_the_control_node() {
     assert!(cl.execute("INSERT c VALUES (1, 2)").first_error().is_none());
     assert_eq!(cl.execute("DELETE FROM p WHERE id = 2").first_error().map(|e| e.number), Some(547));
     let _ = std::fs::remove_file(&path);
+}
+
+fn no_gather(plan: &[String], sql: &str) {
+    assert!(!plan.iter().any(|l| l.starts_with("gather")), "{}\nthe tables should not be gathered: {:?}", sql, plan);
+}
+
+#[test]
+fn windows_grouping_sets_and_distinct_aggregates_run_over_the_shards() {
+    let mut p = Pair::new(3);
+    p.load();
+    for (sql, ordered) in [
+        // windows over rows, over aggregates, with ranking and running totals
+        ("SELECT id, ROW_NUMBER() OVER (ORDER BY amount DESC, id) AS rn FROM orders WHERE id <= 30", false),
+        ("SELECT id, status, RANK() OVER (PARTITION BY status ORDER BY amount DESC, id) AS rk, SUM(qty) OVER (PARTITION BY status) AS q FROM orders WHERE id <= 60 ORDER BY id", true),
+        ("SELECT status, SUM(amount) AS s, SUM(SUM(amount)) OVER () AS total, SUM(amount) * 100.0 / SUM(SUM(amount)) OVER () AS pct FROM orders GROUP BY status ORDER BY status", true),
+        ("SELECT customer_id, status, COUNT(*) AS n, RANK() OVER (PARTITION BY status ORDER BY COUNT(*) DESC, customer_id) AS r FROM orders GROUP BY customer_id, status ORDER BY status, r, customer_id", true),
+        ("SELECT TOP 10 id, SUM(amount) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running FROM orders ORDER BY id", true),
+        ("SELECT DISTINCT status, MAX(qty) OVER (PARTITION BY status) AS m FROM orders", false),
+        // grouping sets
+        ("SELECT status, COUNT(*) AS n, SUM(amount) AS s, AVG(qty) AS a FROM orders GROUP BY ROLLUP(status)", false),
+        ("SELECT status, qty, COUNT(*) AS n, GROUPING(status) AS gs, GROUPING(qty) AS gq FROM orders WHERE qty < 4 GROUP BY ROLLUP(status, qty)", false),
+        ("SELECT status, qty, MIN(amount) AS lo, MAX(amount) AS hi FROM orders WHERE qty < 4 GROUP BY CUBE(status, qty)", false),
+        ("SELECT status, qty, COUNT(*) AS n FROM orders WHERE qty < 4 GROUP BY GROUPING SETS ((status), (qty), ())", false),
+        ("SELECT c.region, o.status, SUM(o.amount) AS s FROM orders o JOIN customers c ON c.id = o.customer_id GROUP BY ROLLUP(c.region, o.status) ORDER BY c.region, o.status", true),
+        ("SELECT status, SUM(amount) AS s FROM orders GROUP BY ROLLUP(status) HAVING SUM(amount) > 0 ORDER BY s DESC", true),
+        // distinct aggregates
+        ("SELECT COUNT(DISTINCT customer_id) FROM orders", false),
+        ("SELECT status, COUNT(DISTINCT customer_id) AS c, COUNT(*) AS n, SUM(amount) AS s FROM orders GROUP BY status ORDER BY status", true),
+        ("SELECT status, SUM(DISTINCT qty) AS sq, AVG(DISTINCT qty) AS aq, MAX(amount) AS hi FROM orders GROUP BY status ORDER BY status", true),
+        ("SELECT COUNT(DISTINCT customer_id), COUNT(DISTINCT customer_id) + 1 AS plus FROM orders WHERE id < 0", false),
+        ("SELECT c.region, COUNT(DISTINCT o.customer_id) AS buyers FROM orders o JOIN customers c ON c.id = o.customer_id GROUP BY c.region ORDER BY c.region", true),
+    ] {
+        let plan = p.check(sql, ordered);
+        no_gather(&plan, sql);
+        assert!(plan.iter().any(|l| l.starts_with("split")), "{}\nexpected a split plan, got {:?}", sql, plan);
+    }
+}
+
+#[test]
+fn set_operations_run_each_branch_over_the_shards() {
+    let mut p = Pair::new(3);
+    p.load();
+    for (sql, ordered) in [
+        ("SELECT id FROM orders WHERE id < 5 UNION ALL SELECT id FROM customers WHERE id < 5", false),
+        ("SELECT status FROM orders UNION SELECT region FROM customers", false),
+        ("SELECT customer_id FROM orders WHERE qty > 5 INTERSECT SELECT id FROM customers WHERE id < 50", false),
+        ("SELECT id FROM customers EXCEPT SELECT customer_id FROM orders WHERE qty > 8", false),
+        ("SELECT customer_id AS k FROM orders WHERE qty = 1 UNION SELECT customer_id FROM orders WHERE qty = 2 EXCEPT SELECT id FROM customers WHERE id < 20 ORDER BY k", true),
+        ("(SELECT TOP 3 id FROM orders ORDER BY id) UNION ALL (SELECT TOP 3 id FROM orders ORDER BY id DESC) ORDER BY id", true),
+        ("SELECT COUNT(*) FROM (SELECT customer_id FROM orders WHERE qty < 3 INTERSECT SELECT customer_id FROM orders WHERE qty > 7) x", false),
+        ("SELECT status AS s, COUNT(*) AS n FROM orders GROUP BY status UNION ALL SELECT region, COUNT(*) FROM customers GROUP BY region ORDER BY s", true),
+    ] {
+        let plan = p.check(sql, ordered);
+        no_gather(&plan, sql);
+    }
+    // the branches do not have to match in names, only in their number
+    let a = p.cl.execute("SELECT id FROM orders UNION SELECT id, id FROM customers");
+    assert_eq!(a.first_error().map(|e| e.number), p.oracle.execute("SELECT id FROM orders UNION SELECT id, id FROM customers").first_error().map(|e| e.number));
+}
+
+#[test]
+fn correlated_subqueries_become_joins() {
+    let mut p = Pair::new(3);
+    p.load();
+    for (sql, ordered) in [
+        ("SELECT c.id FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.amount > 990) ORDER BY c.id", true),
+        ("SELECT c.id FROM customers c WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.qty > 8) ORDER BY c.id", true),
+        ("SELECT c.id FROM customers c WHERE c.credit > (SELECT AVG(o.amount) FROM orders o WHERE o.customer_id = c.id) ORDER BY c.id", true),
+        ("SELECT c.id FROM customers c WHERE c.credit * 2 < 1.5 * (SELECT SUM(o.amount) FROM orders o WHERE o.customer_id = c.id) ORDER BY c.id", true),
+        ("SELECT o.id FROM orders o WHERE o.amount > (SELECT AVG(x.amount) FROM orders x WHERE x.status = o.status AND x.qty > 2) AND o.id < 200 ORDER BY o.id", true),
+        ("SELECT o.id FROM orders o WHERE o.amount = (SELECT MAX(x.amount) FROM orders x WHERE x.customer_id = o.customer_id) ORDER BY o.id", true),
+        // a key that is NULL finds nothing: NOT EXISTS holds for it, and the scalar subquery gives NULL
+        ("SELECT o.id FROM orders o WHERE NOT EXISTS (SELECT 1 FROM customers c WHERE c.id = o.customer_id) ORDER BY o.id", true),
+    ] {
+        let plan = p.check(sql, ordered);
+        no_gather(&plan, sql);
+        assert!(plan.iter().any(|l| l.contains("rewritten as a join")), "{}\nexpected a rewrite, got {:?}", sql, plan);
+    }
+    // a NULL key on the outer side
+    p.both("CREATE TABLE kk (id INT PRIMARY KEY, k INT NULL)");
+    p.both("INSERT INTO kk VALUES (1, 1), (2, NULL), (3, 3), (4, 99)");
+    p.both("CREATE TABLE vv (id INT PRIMARY KEY, k INT NULL, n INT)");
+    p.both("INSERT INTO vv VALUES (1, 1, 10), (2, NULL, 20), (3, 3, 30), (4, 3, 40)");
+    for sql in [
+        "SELECT id FROM kk WHERE NOT EXISTS (SELECT 1 FROM vv WHERE vv.k = kk.k) ORDER BY id",
+        "SELECT id FROM kk WHERE EXISTS (SELECT 1 FROM vv WHERE vv.k = kk.k) ORDER BY id",
+        "SELECT id FROM kk WHERE 5 < (SELECT SUM(n) FROM vv WHERE vv.k = kk.k) ORDER BY id",
+    ] {
+        p.check(sql, true);
+    }
+    // a subquery that reads a name the rewrite cannot place falls back to the original (and gives its error or answer)
+    let sql = "SELECT id FROM kk WHERE 5 < (SELECT SUM(n) FROM vv WHERE vv.k = kk.k AND nosuch = 1)";
+    let a = p.cl.execute(sql);
+    let b = p.oracle.execute(sql);
+    assert_eq!(a.first_error().map(|e| e.number), b.first_error().map(|e| e.number));
+}
+
+#[test]
+fn a_shuffle_sends_rows_from_shard_to_shard() {
+    let mut p = Pair::new(3);
+    p.load();
+    p.load_items();
+    // too big to broadcast: the table that is not keyed on the join column is shuffled
+    p.h.cluster.set_broadcast_limit(10);
+    for sql in [
+        "SELECT c.region, SUM(o.amount) AS total, COUNT(*) AS n FROM orders o JOIN customers c ON c.id = o.customer_id GROUP BY c.region ORDER BY c.region",
+        "SELECT COUNT(*), SUM(o.qty) FROM orders o JOIN customers c ON c.id = o.customer_id WHERE c.region = 'north'",
+        "SELECT o.id, c.name FROM orders o LEFT JOIN customers c ON c.id = o.customer_id WHERE o.id <= 25 ORDER BY o.id",
+    ] {
+        let plan = p.check(sql, sql.contains("ORDER BY"));
+        no_gather(&plan, sql);
+        assert!(plan.iter().any(|l| l.contains("repartition")), "{}\n{:?}", sql, plan);
+    }
+    // inside a transaction, the rows the transaction changed are the ones that move
+    let sql = "BEGIN TRANSACTION; UPDATE customers SET region = 'moved' WHERE id <= 10; SELECT c.region, COUNT(*) FROM orders o JOIN customers c ON c.id = o.customer_id GROUP BY c.region ORDER BY c.region; ROLLBACK";
+    let a = p.cl.execute(sql);
+    let b = p.oracle.execute(sql);
+    assert!(a.first_error().is_none(), "{:?}", a.first_error());
+    assert_eq!(rows_of(&a), rows_of(&b));
+    p.h.cluster.set_broadcast_limit(100_000);
 }

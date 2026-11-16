@@ -8,6 +8,7 @@ use tsql_server::{ResultSet, SqlError};
 use tsql_shared_ces::arrowconv;
 use tsql_shared_ces::wire::{sql_error_of, Fragment, PrepareReq, RunReply, SettleReq, ShardStatus, Work, ACTION_CLOSE_SESSION, ACTION_KILL, ACTION_MEMBERS, ACTION_PREPARE, ACTION_PREPARED, ACTION_RUN, ACTION_SETTLE, ACTION_STATUS, ACTION_WAITS, IN_DOUBT, NOT_LEADER};
 use tsql_shared_ces::wire::MemberReq;
+use tsql_shared_ces::wire::{ShuffleReq, ACTION_SHUFFLE};
 
 /// What became of a transaction that a shard holds prepared (decided by the coordinator, see `txn.rs`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -194,6 +195,13 @@ impl ShardClient {
             }
         })
         .await
+    }
+
+    /// Have this shard run a scan and send its rows to the shards that own them (see `ShuffleReq`). Returns the rows sent.
+    pub async fn shuffle(&self, req: ShuffleReq) -> Result<u64, SqlError> {
+        let body = postcard::to_allocvec(&req).map_err(|e| SqlError::new(50000, e.to_string()))?;
+        let reply = self.action(ACTION_SHUFFLE, body).await?;
+        postcard::from_bytes(&reply).map_err(|e| SqlError::new(50000, format!("bad reply from shard {}: {}", self.id, e)))
     }
 
     /// The members of a replicated shard, after making the change `req` asks for (none: just list them): (node id, address,

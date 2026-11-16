@@ -34,6 +34,14 @@ pub fn map_expr(e: &Expr, f: &mut dyn FnMut(&Expr) -> Option<Expr>) -> Expr {
         Expr::Func(fc) => {
             let mut c = (**fc).clone();
             c.args = fc.args.iter().map(|x| m(x, f)).collect();
+            // (the partition and the order of a window, and the order of WITHIN GROUP, are expressions too)
+            if let Some(o) = &mut c.over {
+                o.partition = o.partition.iter().map(|x| m(x, f)).collect();
+                o.order = o.order.iter().map(|oi| OrderItem { e: m(&oi.e, f), desc: oi.desc }).collect();
+            }
+            if let Some(w) = &mut c.within {
+                *w = w.iter().map(|oi| OrderItem { e: m(&oi.e, f), desc: oi.desc }).collect();
+            }
             Expr::Func(Box::new(c))
         }
         Expr::Collate(a, s) => Expr::Collate(bx(m(a, f)), s.clone()),

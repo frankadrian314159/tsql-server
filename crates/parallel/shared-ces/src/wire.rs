@@ -4,8 +4,9 @@
 //! action whose body is one of these types encoded with postcard (the engine's own serialization, so a statement
 //! tree needs no printer: the control node sends the rewritten syntax tree and the shard runs it).
 use serde::{Deserialize, Serialize};
+use crate::route::KeyClass;
 use tsql_server::ast::Stmt;
-use tsql_server::SqlError;
+use tsql_server::{SqlError, Value};
 
 /// Flight action names.
 pub const ACTION_RUN: &str = "run";
@@ -31,6 +32,37 @@ pub const ACTION_KILL: &str = "kill";
 /// Membership of a replicated shard (`MemberReq`, reply: the members, `Vec<(u64, String, bool)>`: id, address, voter). With
 /// nothing to add or remove it only lists them. Served by the leader.
 pub const ACTION_MEMBERS: &str = "members";
+
+/// The shuffle (exchange) between shards. `shuffle` (`ShuffleReq`, reply: the number of rows sent, a `u64`): the shard runs a
+/// scan on its session and sends each row to the shard that owns it by the hash of a column (or every row to every shard),
+/// straight to that shard with the action `load` (`LoadReq`), which inserts the rows into a table of its session. The rows
+/// never pass through the control node.
+pub const ACTION_SHUFFLE: &str = "shuffle";
+pub const ACTION_LOAD: &str = "load";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ShuffleReq {
+    pub session: u64,
+    /// run on this shard's session; its first result set is what is sent
+    pub scan: Stmt,
+    /// the column (of the scan's result) and key class that decide the destination; None: every row goes to every shard
+    pub key: Option<(usize, KeyClass)>,
+    /// the table each shard inserts what it receives into (it exists on all of them)
+    pub table: String,
+    /// the shard that owns each hash slot
+    pub slots: Vec<u32>,
+    /// the address (or the comma-separated addresses of the replicas) of each shard, by index
+    pub peers: Vec<String>,
+    /// this shard's index
+    pub me: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LoadReq {
+    pub session: u64,
+    pub table: String,
+    pub rows: Vec<Vec<Value>>,
+}
 
 /// The error number of a membership change that could not be made (the message says why).
 pub const MEMBERSHIP: i32 = 50230;
