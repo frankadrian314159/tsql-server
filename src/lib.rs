@@ -149,6 +149,121 @@ impl Server {
         Ok(true)
     }
 
+    /// A record that a session of this server proposed (its changes are made by the session itself, not applied from the
+    /// log) has been committed by the replica group: record what it does to the set of prepared transactions, which the
+    /// session leaves to the log. `live`: the transaction is still open on a session here.
+    pub fn note_prepared(&self, rec: &persist::WalRecord, live: bool) {
+        let g = self.shared.state.read().unwrap_or_else(|e| e.into_inner());
+        let mut p = g.prepared.lock().unwrap_or_else(|e| e.into_inner());
+        for op in &rec.ops {
+            match op {
+                persist::LogOp::Prepare { gid, ops } => {
+                    p.entry(*gid).or_insert_with(|| persist::PreparedTxn { ops: ops.clone(), live });
+                }
+                persist::LogOp::Resolve { gid } => {
+                    p.remove(gid);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The whole committed state of the server, as bytes: what a replica group keeps as a snapshot of its state machine so
+    /// that its log can be cut, and sends to a replica that has fallen behind the start of the log (see
+    /// [`Server::install_state`]). Statements keep running while it is taken (it only reads what is committed, like a
+    /// query), so it may include the changes of commits that are in progress: the record is stamped `ts`, the commit
+    /// timestamp of the last log entry it is meant to contain, so that a replica that installs it applies the entries after
+    /// that one again, which is harmless (a record sets rows and objects to the values it has). It cannot be taken while
+    /// the caller holds up a commit that is waiting for the caller (use another thread).
+    pub fn export_state_at(&self, ts: u64) -> Result<Vec<u8>, SqlError> {
+        let g = self.shared.state.read().unwrap_or_else(|e| e.into_inner());
+        let mut rec = g.export_record();
+        rec.ts = ts;
+        postcard::to_allocvec(&rec).map_err(|e| SqlError::with(9002, 17, 1, format!("snapshot serialisation failed: {}", e)))
+    }
+
+    /// [`Server::export_state_at`] the current clock.
+    pub fn export_state(&self) -> Result<Vec<u8>, SqlError> {
+        self.export_state_at(self.applied_ts())
+    }
+
+    /// Replace the whole state of this server by one exported with [`Server::export_state`] (a replica that is being given
+    /// a snapshot). It is written to this server's log first, so that a restart finds it.
+    pub fn install_state(&self, data: &[u8]) -> Result<(), SqlError> {
+        let rec: persist::WalRecord = postcard::from_bytes(data).map_err(|e| SqlError::with(9002, 17, 1, format!("bad snapshot: {}", e)))?;
+        let mut g = self.shared.state.write().unwrap_or_else(|e| e.into_inner());
+        let full = g.install_record(&rec);
+        if let Some(p) = g.persist().as_mut() {
+            p.append(full.ts, full.next_object_id, full.next_rowversion, full.ops.clone(), true)?;
+        }
+        persist::apply_record(&mut g, &full);
+        g.epoch += 1;
+        Ok(())
+    }
+
+    /// Write every commit so far to the log file and force it to disk. A commit that a replica group has made durable in its
+    /// own log is written to the engine's log without being forced (the group's log is the durable copy); the group forces
+    /// the engine's log before it drops the entries (see [`Server::export_state`]).
+    pub fn flush_log(&self) -> Result<(), SqlError> {
+        let g = self.shared.state.read().unwrap_or_else(|e| e.into_inner());
+        let batch = match g.persist().as_mut() {
+            Some(p) => p.take_batch(),
+            None => return Ok(()),
+        };
+        batch.force().map(|_| ()).map_err(|e| SqlError::with(3314, 21, 1, format!("I/O error: {}", e)))
+    }
+
+    /// Who waits for whom for a lock right now, as sessions: (waiting session, the session it waits for), for the sessions
+    /// whose transactions are known. The control node of the distributed edition joins the graphs of its shards to find the
+    /// deadlocks that run through several of them.
+    pub fn wait_graph(&self) -> Vec<(i32, i32)> {
+        self.shared.state.read().unwrap_or_else(|e| e.into_inner()).core.wait_graph()
+    }
+
+    /// Ask session `spid` to stop (as `KILL` does): its statement ends with error 596 and its transaction is rolled back.
+    pub fn kill_session(&self, spid: i32) {
+        self.shared.state.read().unwrap_or_else(|e| e.into_inner()).core.kill_session(spid);
+    }
+
+    /// The prepared transactions (two-phase commit, see [`Connection::prepare_transaction`]) that are *in doubt*: they voted,
+    /// and the process that held them open is gone (the server restarted, or their session ended), so only their log record
+    /// remains. Each must be settled with [`Server::resolve_prepared`]; until then the data they would change is not safe to
+    /// use, which is why a coordinator settles them before it lets statements run.
+    pub fn in_doubt(&self) -> Vec<u64> {
+        let g = self.shared.state.read().unwrap_or_else(|e| e.into_inner());
+        let p = g.prepared.lock().unwrap_or_else(|e| e.into_inner());
+        p.iter().filter(|(_, t)| !t.live).map(|(k, _)| *k).collect()
+    }
+
+    /// Whether `gid` is prepared on this server, and whether its transaction is still open on a session (`Some(true)`).
+    pub fn prepared_state(&self, gid: u64) -> Option<bool> {
+        let g = self.shared.state.read().unwrap_or_else(|e| e.into_inner());
+        let p = g.prepared.lock().unwrap_or_else(|e| e.into_inner());
+        p.get(&gid).map(|t| t.live)
+    }
+
+    /// Settle an in-doubt prepared transaction: commit it (its changes are made, from its `Prepare` record) or abort it
+    /// (nothing is made). The settlement is durable (and replicated, on a replica) before it returns. Returns false when
+    /// `gid` is not prepared here (it was settled already, so this is safe to repeat). A transaction that is still open on a
+    /// session is settled by that session (`COMMIT` / `ROLLBACK`), and this returns error 50211.
+    pub fn resolve_prepared(&self, gid: u64, commit: bool) -> Result<bool, SqlError> {
+        // the record is made durable under a shared lock (a replica's apply thread needs the exclusive one while we wait)
+        let settled = {
+            let g = self.shared.state.read().unwrap_or_else(|e| e.into_inner());
+            g.log_settlement(gid, commit, false)?
+        };
+        let Some((ts, rec)) = settled else { return Ok(false) };
+        let mut g = self.shared.state.write().unwrap_or_else(|e| e.into_inner());
+        if commit {
+            persist::apply_record(&mut g, &rec);
+            g.epoch += 1;
+        } else {
+            g.prepared.get_mut().unwrap_or_else(|e| e.into_inner()).remove(&gid);
+        }
+        g.core.finish_commit_ts(ts);
+        Ok(true)
+    }
+
     /// Drop the server as if the process had been killed: no final checkpoint is written, so the
     /// next [`Server::open`] has to recover from the log. Intended for tests.
     #[doc(hidden)]
@@ -506,6 +621,18 @@ impl Connection {
     /// Has another session asked this one to stop (`KILL`)? Listeners check this while a client is idle.
     pub fn is_killed(&self) -> bool {
         self.server.shared.state.read().unwrap_or_else(|e| e.into_inner()).core.is_killed(self.session.spid)
+    }
+
+    /// Two-phase commit, phase one: make this session's open transaction durable under `gid` (a log record, replicated on a
+    /// replica) without committing it; it stays open with its locks. After this the server can finish the commit even if it
+    /// restarts or fails over first: `COMMIT TRANSACTION` commits it, `ROLLBACK TRANSACTION` aborts it, and if the session
+    /// ends or the process dies it is in doubt ([`Server::in_doubt`]) until [`Server::resolve_prepared`]. Returns false when
+    /// the transaction changed nothing (there is nothing to wait for).
+    pub fn prepare_transaction(&mut self, gid: u64) -> Result<bool, SqlError> {
+        let shared = &self.server.shared;
+        let guard = SrvGuard::new(&shared.state);
+        let mut eng = Engine::new(guard, &mut self.session);
+        eng.prepare_tx(gid)
     }
 
     /// Roll back whatever a killed session had open and forget the kill request.

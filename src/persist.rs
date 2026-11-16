@@ -53,6 +53,23 @@ pub enum LogOp {
     DbAuditSpecs { db: String, specs: Vec<crate::audit::AuditSpec> },
     Security(Security),
     DbSecurity { db: String, sec: crate::security::DbSecurity, owners: BTreeMap<String, String> },
+    /// A transaction of a distributed commit has voted yes (two-phase commit, see `Connection::prepare_transaction`): `ops`
+    /// are the changes its commit will log. They are made durable now, while the transaction is still open, so that a node
+    /// that restarts can finish the commit when told to. Replay keeps them aside; nothing is changed.
+    Prepare { gid: u64, ops: Vec<LogOp> },
+    /// The prepared transaction `gid` is settled: its commit record carries the changes (and this operation), or it was rolled
+    /// back (a record of this operation alone).
+    Resolve { gid: u64 },
+}
+
+/// A prepared transaction (see [`LogOp::Prepare`]).
+#[derive(Clone, Debug)]
+pub struct PreparedTxn {
+    /// the changes its commit makes
+    pub ops: Vec<LogOp>,
+    /// the transaction is still open on a session of this server, holding its locks (false: the server restarted, or the
+    /// session went away; the changes are only in this record and the transaction is *in doubt* until it is settled)
+    pub live: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -400,6 +417,10 @@ impl Persist {
 
     /// Write a checkpoint of all committed state and truncate the log.
     pub fn checkpoint(&mut self, srv: &ServerState) -> Result<(), crate::error::SqlError> {
+        // prepared transactions live only in the log: it is kept (not folded into a checkpoint) until they are settled
+        if !srv.prepared.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            return Ok(());
+        }
         // every changed page goes to the page file first; the checkpoint then names the page table
         let image = srv.store.prepare_checkpoint()?;
         let cp = Checkpoint { lsn: self.lsn, clock: srv.core.clock(), next_object_id: srv.core.object_id(), next_rowversion: srv.core.rowversion(), databases: srv.databases.clone(), security: srv.security.clone(), store: image };
@@ -575,6 +596,109 @@ pub fn apply_record(srv: &mut ServerState, rec: &WalRecord) {
                     d.schema_owner = owners.clone();
                 }
             }
+            LogOp::Prepare { gid, ops } => {
+                srv.prepared.get_mut().unwrap_or_else(|e| e.into_inner()).insert(*gid, PreparedTxn { ops: ops.clone(), live: false });
+            }
+            LogOp::Resolve { gid } => {
+                srv.prepared.get_mut().unwrap_or_else(|e| e.into_inner()).remove(gid);
+            }
         }
+    }
+}
+
+impl ServerState {
+    /// The whole committed state of the server as one record (a snapshot for a replica group): every database with its
+    /// tables' rows, the security settings and the prepared transactions. Applying the record to a server replaces its state
+    /// with this one (see [`ServerState::install_record`]). Takes what is committed now: the caller holds the server still
+    /// (the exclusive lock), so no statement is half way.
+    pub fn export_record(&self) -> WalRecord {
+        let mut ops = vec![LogOp::Security(self.security.clone())];
+        for (key, d) in &self.databases {
+            ops.push(LogOp::PutDatabase { key: key.clone(), db: d.clone() });
+            for (k, o) in &d.objects {
+                if let Object::Table(t) = o {
+                    ops.push(LogOp::TableReset { db: key.clone(), key: k.clone() });
+                    for (rowid, row) in t.data.iter(crate::storage::ReadView::committed(0)) {
+                        ops.push(LogOp::Put { db: key.clone(), key: k.clone(), rowid, row: Some(row) });
+                    }
+                    if t.identity_col().is_some() {
+                        ops.push(LogOp::SetIdentity { db: key.clone(), key: k.clone(), next: t.identity_next.get() });
+                    }
+                }
+            }
+        }
+        for (gid, p) in self.prepared.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            ops.push(LogOp::Prepare { gid: *gid, ops: p.ops.clone() });
+        }
+        WalRecord { lsn: 0, ts: self.core.clock(), wall: chrono::Utc::now().timestamp_micros(), next_object_id: self.core.object_id(), next_rowversion: self.core.rowversion(), ops }
+    }
+
+    /// The operations that turn the current state into the one `rec` (from [`ServerState::export_record`]) describes: what
+    /// the snapshot does not have is dropped first, then the snapshot is loaded.
+    pub fn install_record(&self, rec: &WalRecord) -> WalRecord {
+        let mut ops: Vec<LogOp> = vec![];
+        let kept: std::collections::BTreeSet<&String> = rec.ops.iter().filter_map(|o| if let LogOp::PutDatabase { key, .. } = o { Some(key) } else { None }).collect();
+        for k in self.databases.keys() {
+            if !kept.contains(k) {
+                ops.push(LogOp::DropDatabase { key: k.clone() });
+            }
+        }
+        let snap_prepared: std::collections::BTreeSet<u64> = rec.ops.iter().filter_map(|o| if let LogOp::Prepare { gid, .. } = o { Some(*gid) } else { None }).collect();
+        for gid in self.prepared.lock().unwrap_or_else(|e| e.into_inner()).keys() {
+            if !snap_prepared.contains(gid) {
+                ops.push(LogOp::Resolve { gid: *gid });
+            }
+        }
+        ops.extend(rec.ops.iter().cloned());
+        WalRecord { ops, ..rec.clone() }
+    }
+
+    /// Make the record that settles the prepared transaction `gid` durable (through the replicator when this server is a
+    /// replica): its changes and a `Resolve` when `commit`, a `Resolve` alone otherwise. Returns the record and its commit
+    /// timestamp, or `None` when `gid` is not prepared here. The caller applies it (a commit: `apply_record` under the
+    /// exclusive lock; an abort: nothing but removing the entry) and then calls `core.finish_commit_ts(ts)`. `allow_live`:
+    /// settle a transaction that is still open on a session (the caller is that session).
+    pub fn log_settlement(&self, gid: u64, commit: bool, allow_live: bool) -> Result<Option<(u64, WalRecord)>, crate::error::SqlError> {
+        let mut ops = match self.prepared.lock().unwrap_or_else(|e| e.into_inner()).get(&gid) {
+            None => return Ok(None),
+            Some(p) if p.live && !allow_live => return Err(crate::error::SqlError::new(50211, format!("Transaction {} is still open on a session of this server.", gid))),
+            Some(p) => {
+                if commit {
+                    p.ops.clone()
+                } else {
+                    vec![]
+                }
+            }
+        };
+        ops.push(LogOp::Resolve { gid });
+        let core = self.core.clone();
+        let commit_guard = core.commit_lock();
+        let ts = core.alloc_commit_ts();
+        let rec = WalRecord { lsn: 0, ts, wall: chrono::Utc::now().timestamp_micros(), next_object_id: core.object_id(), next_rowversion: core.rowversion(), ops };
+        let fail = |e: crate::error::SqlError| {
+            core.finish_commit_ts(ts);
+            e
+        };
+        let repl = self.replicator.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(r) = repl {
+            let ticket = r.propose(&rec).map_err(|e| fail(crate::error::SqlError::with(3314, 21, 1, format!("The commit could not be replicated: {}", e))))?;
+            drop(commit_guard);
+            r.wait(ticket).map_err(|e| fail(crate::error::SqlError::with(3314, 21, 1, format!("The commit could not be replicated: {}", e))))?;
+            if let Some(p) = self.persist().as_mut() {
+                p.append_buffered(rec.ts, rec.next_object_id, rec.next_rowversion, rec.ops.clone()).map_err(&fail)?;
+            }
+        } else if self.persist().is_some() {
+            let lsn = self.persist().as_mut().unwrap().append_buffered(rec.ts, rec.next_object_id, rec.next_rowversion, rec.ops.clone()).map_err(&fail)?;
+            drop(commit_guard);
+            self.core
+                .sync_log(lsn, || match self.persist().as_mut() {
+                    Some(p) => p.take_batch().force(),
+                    None => Err("no log".to_string()),
+                })
+                .map_err(|e| fail(crate::error::SqlError::with(3314, 21, 1, format!("I/O error: {}", e))))?;
+        } else {
+            drop(commit_guard);
+        }
+        Ok(Some((ts, rec)))
     }
 }

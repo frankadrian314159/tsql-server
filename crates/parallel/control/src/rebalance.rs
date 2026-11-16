@@ -50,9 +50,12 @@ impl Cluster {
             Err(e) => return Err(SqlError::new(50000, format!("{}: {}", path.display(), e))),
         };
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().map_err(|e| SqlError::new(50000, e.to_string()))?;
+        let pending = Arc::new(Mutex::new(pending));
+        let preparing = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let verdict = crate::make_verdict(&pending, &preparing);
         let shards = {
             let _g = rt.enter();
-            addrs.iter().enumerate().map(|(i, a)| ShardClient::new(i as u32, a)).collect::<Result<Vec<_>, _>>()?
+            addrs.iter().enumerate().map(|(i, a)| ShardClient::new(i as u32, a).map(|c| c.with_verdict(verdict.clone()))).collect::<Result<Vec<_>, _>>()?
         };
         let n = shards.len();
         let slots = slots.unwrap_or_else(|| (0..SLOTS).map(|i| (i % n) as u32).collect());
@@ -85,11 +88,20 @@ impl Cluster {
             next_session: AtomicU64::new(crate::fresh_session_base()),
             broadcast_limit: AtomicU64::new(100_000),
             lock_timeout_ms: AtomicU64::new(5000),
-            pending: Mutex::new(pending),
+            pending,
+            preparing,
+            next_gid: AtomicU64::new(crate::fresh_session_base()),
+            fault: Mutex::new(None),
+            deadlock_check_ms: AtomicU64::new(200),
+            victims: Mutex::new(Default::default()),
+            deadlocks: AtomicU64::new(0),
         });
+        cluster.start_deadlock_monitor();
         cluster.save_state();
-        // transactions that were decided to commit when the control node stopped are finished
+        // transactions that were decided to commit when the control node stopped are finished, and the ones that were not
+        // decided are rolled back (a shard that prepared one holds it until it is told)
         cluster.resolve_pending();
+        cluster.settle_prepared();
         Ok(cluster)
     }
 
@@ -124,7 +136,7 @@ impl Cluster {
         let mut s = self.session();
         let id = self.rt.block_on(async {
             let id = s.cluster.shard_count();
-            let client = ShardClient::new(id as u32, addr)?;
+            let client = ShardClient::new(id as u32, addr)?.with_verdict(s.cluster.verdict_fn());
             client.status().await?;
             s.cluster.shards.write().unwrap_or_else(|e| e.into_inner()).push(client);
             let r = async {

@@ -23,11 +23,13 @@
 //! phase.
 pub mod astutil;
 pub mod client;
+pub mod deadlock;
 pub mod front;
 pub mod joins;
 pub mod merge;
 pub mod plan;
 pub mod rebalance;
+pub mod replicas;
 pub mod txn;
 
 use astutil::*;
@@ -94,20 +96,52 @@ pub struct Cluster {
     broadcast_limit: AtomicU64,
     /// how long a statement of a transaction waits for a lock on a shard (ms); a deadlock between shards is broken by it
     lock_timeout_ms: AtomicU64,
-    /// transactions whose commit was decided but not yet confirmed by every shard: (control session, shards still to finish)
-    pending: Mutex<Vec<(u64, Vec<usize>)>>,
+    /// transactions whose commit was decided but not yet confirmed by every shard: (transaction id, shards still to finish)
+    pending: Arc<Mutex<Vec<(u64, Vec<usize>)>>>,
+    /// transactions of this control node that are being prepared right now (not yet decided)
+    preparing: Arc<Mutex<std::collections::HashSet<u64>>>,
+    /// the next distributed transaction id (unique over restarts, like session ids)
+    next_gid: AtomicU64,
+    /// for tests: called at named points of two-phase commit; returning true stops the commit there, as a crash would
+    fault: Mutex<Option<FaultHook>>,
+    /// how often the control node looks for deadlocks across shards (ms; 0: not at all), see `deadlock.rs`
+    deadlock_check_ms: AtomicU64,
+    /// sessions chosen as deadlock victims whose statement has not yet come back with the error
+    victims: Mutex<std::collections::HashSet<u64>>,
+    deadlocks: AtomicU64,
+}
+
+pub type FaultHook = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// How a shard that finds a prepared transaction is told to settle it: committed when its commit was decided (it is in
+/// `pending`), left alone while it is being prepared, aborted otherwise (presumed abort: the decision is recorded before any
+/// commit is sent, so a transaction without one never committed anywhere).
+fn make_verdict(pending: &Arc<Mutex<Vec<(u64, Vec<usize>)>>>, preparing: &Arc<Mutex<std::collections::HashSet<u64>>>) -> client::VerdictFn {
+    let (p, g) = (pending.clone(), preparing.clone());
+    Arc::new(move |gid| {
+        if p.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(x, _)| *x == gid) {
+            client::Verdict::Commit
+        } else if g.lock().unwrap_or_else(|e| e.into_inner()).contains(&gid) {
+            client::Verdict::Wait
+        } else {
+            client::Verdict::Abort
+        }
+    })
 }
 
 impl Cluster {
     pub fn connect(config: &ClusterConfig) -> Result<Arc<Cluster>, SqlError> {
         config.validate().map_err(|e| SqlError::new(50000, e))?;
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().map_err(|e| SqlError::new(50000, e.to_string()))?;
+        let pending = Arc::new(Mutex::new(vec![]));
+        let preparing = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let verdict = make_verdict(&pending, &preparing);
         let shards = {
             let _g = rt.enter();
-            config.shards.iter().map(|s| ShardClient::new(s.id, &s.addr)).collect::<Result<Vec<_>, _>>()?
+            config.shards.iter().map(|s| ShardClient::new(s.id, &s.addr).map(|c| c.with_verdict(verdict.clone()))).collect::<Result<Vec<_>, _>>()?
         };
         let n = shards.len();
-        Ok(Arc::new(Cluster {
+        let cluster = Arc::new(Cluster {
             rt,
             shards: RwLock::new(shards),
             slots: RwLock::new((0..SLOTS).map(|i| (i % n) as u32).collect()),
@@ -120,8 +154,34 @@ impl Cluster {
             next_session: AtomicU64::new(fresh_session_base()),
             broadcast_limit: AtomicU64::new(100_000),
             lock_timeout_ms: AtomicU64::new(5000),
-            pending: Mutex::new(vec![]),
-            }))
+            pending,
+            preparing,
+            next_gid: AtomicU64::new(fresh_session_base()),
+            fault: Mutex::new(None),
+            deadlock_check_ms: AtomicU64::new(200),
+            victims: Mutex::new(Default::default()),
+            deadlocks: AtomicU64::new(0),
+        });
+        cluster.start_deadlock_monitor();
+        Ok(cluster)
+    }
+
+    /// For tests: a hook called at the points of two-phase commit (`"after_prepare"`: every participant has voted;
+    /// `"after_decision"`: the decision is recorded, nothing is committed yet). It may do anything a failure would (stop a
+    /// shard); returning true makes the commit stop there with error 50220, as if this control node had died.
+    #[doc(hidden)]
+    pub fn set_fault_hook(&self, hook: Option<FaultHook>) {
+        *self.fault.lock().unwrap_or_else(|e| e.into_inner()) = hook;
+    }
+
+    pub(crate) fn fault(&self, point: &str) -> bool {
+        let h = self.fault.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        h.map(|h| h(point)).unwrap_or(false)
+    }
+
+    /// How this control node settles a prepared transaction a shard holds (see [`make_verdict`]).
+    pub(crate) fn verdict_fn(&self) -> client::VerdictFn {
+        make_verdict(&self.pending, &self.preparing)
     }
 
     /// How long (milliseconds) a statement of a transaction waits for a lock on a shard before it fails with error 1222. Two
@@ -360,6 +420,20 @@ impl ClusterSession {
         for st in stmts {
             self.stmt_shards.set(0);
             if let Err(e) = cl.rt.block_on(self.exec_stmt(st, &mut events)) {
+                // the victim of a deadlock across shards: its wait was ended on the shard, and the transaction is rolled back
+                // everywhere, as SQL Server does (a deadlock inside one shard also comes back as 1205, with that shard's part
+                // already rolled back)
+                let mut e = e;
+                if e.number == 1205 || (e.number == 596 && cl.victims.lock().unwrap_or_else(|x| x.into_inner()).remove(&self.id)) {
+                    e = SqlError::with(1205, 13, 51, format!("Transaction (Process ID {}) was deadlocked on lock resources with another process and has been chosen as the deadlock victim. Rerun the transaction.", self.id));
+                    e.abort_batch = true;
+                    let tx = self.txn.borrow_mut().take();
+                    if let Some(tx) = tx {
+                        cl.rt.block_on(self.finish_rollback(&tx));
+                    }
+                    events.push(Event::Error(e));
+                    break;
+                }
                 // a statement that failed after changing several shards, or because a shard failed, leaves the
                 // transaction half done: it can only be rolled back
                 let fatal = matches!(e.number, 1222 | 1205 | 40613 | 3314 | 50200 | 50210);

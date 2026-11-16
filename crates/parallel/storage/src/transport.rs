@@ -4,21 +4,32 @@ use arrow_flight::client::FlightClient;
 use arrow_flight::Action;
 use futures::TryStreamExt;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tonic::transport::{Channel, Endpoint};
 use tsql_raft::{Msg, NodeId};
 use tsql_shared_ces::wire::ACTION_RAFT;
 
-pub fn spawn_sender(me: NodeId, peers: Vec<(NodeId, String)>, mut rx: UnboundedReceiver<(NodeId, Msg)>) {
+/// Where each replica can be reached. The replica keeps it up to date as the membership changes; a message to a replica it
+/// does not list is dropped.
+pub type AddressBook = Arc<Mutex<HashMap<NodeId, String>>>;
+
+pub fn spawn_sender(me: NodeId, book: AddressBook, mut rx: UnboundedReceiver<(NodeId, Msg)>) {
     tokio::spawn(async move {
-        let mut channels: HashMap<NodeId, Channel> = HashMap::new();
-        for (id, addr) in &peers {
-            if let Ok(ep) = Endpoint::from_shared(format!("http://{}", addr)) {
-                channels.insert(*id, ep.tcp_nodelay(true).connect_timeout(std::time::Duration::from_millis(300)).connect_lazy());
-            }
-        }
+        // a channel per replica, made again when its address changes
+        let mut channels: HashMap<NodeId, (String, Channel)> = HashMap::new();
         while let Some((to, msg)) = rx.recv().await {
-            let Some(ch) = channels.get(&to).cloned() else { continue };
+            let addr = book.lock().unwrap_or_else(|e| e.into_inner()).get(&to).cloned();
+            let Some(addr) = addr else { continue };
+            let ch = match channels.get(&to) {
+                Some((a, ch)) if *a == addr => ch.clone(),
+                _ => {
+                    let Ok(ep) = Endpoint::from_shared(format!("http://{}", addr)) else { continue };
+                    let ch = ep.tcp_nodelay(true).connect_timeout(std::time::Duration::from_millis(300)).connect_lazy();
+                    channels.insert(to, (addr, ch.clone()));
+                    ch
+                }
+            };
             let Ok(body) = postcard::to_allocvec(&Envelope { from: me, msg }) else { continue };
             tokio::spawn(async move {
                 let mut c = FlightClient::new(ch);
@@ -27,7 +38,7 @@ pub fn spawn_sender(me: NodeId, peers: Vec<(NodeId, String)>, mut rx: UnboundedR
                         let _ = s.try_next().await;
                     }
                 };
-                let _ = tokio::time::timeout(std::time::Duration::from_millis(500), send).await;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), send).await;
             });
         }
     });

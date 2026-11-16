@@ -26,6 +26,9 @@ async fn main() {
     let mut replica: Option<u64> = None;
     let mut peers: Vec<(u64, String)> = vec![];
     let mut raft_dir: Option<String> = None;
+    let mut join = false;
+    let mut addr: Option<String> = None;
+    let mut snapshot_every: Option<u64> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -34,6 +37,9 @@ async fn main() {
             "--data" => data = args.next(),
             "--replica" => replica = args.next().and_then(|v| v.parse().ok()),
             "--raft-dir" => raft_dir = args.next(),
+            "--join" => join = true,
+            "--addr" => addr = args.next(),
+            "--snapshot-every" => snapshot_every = args.next().and_then(|v| v.parse().ok()),
             "--peers" => {
                 for p in args.next().unwrap_or_default().split(',').filter(|p| !p.is_empty()) {
                     match p.split_once('=') {
@@ -66,7 +72,13 @@ async fn main() {
                 std::process::exit(2);
             };
             let dir = raft_dir.clone().unwrap_or_else(|| format!("{}.raft", d));
-            match ShardNode::replicated(id, server, ReplicaConfig::new(r, peers.clone(), dir)) {
+            let mut rc = ReplicaConfig::new(r, peers.clone(), dir);
+            rc.join = join;
+            rc.addr = addr.clone().unwrap_or_else(|| listen.to_string());
+            if let Some(n) = snapshot_every {
+                rc.snapshot_every = n;
+            }
+            match ShardNode::replicated(id, server, rc) {
                 Ok(n) => n,
                 Err(e) => {
                     eprintln!("tsql-shard: cannot start the replica: {}", e);

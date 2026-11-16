@@ -14,8 +14,57 @@ pub const ACTION_STATUS: &str = "status";
 /// A Raft message between the replicas of a shard.
 pub const ACTION_RAFT: &str = "raft";
 
+/// Two-phase commit. `prepare`: make the transaction of a session durable under an id (`PrepareReq`, reply: a `bool`, false
+/// when the transaction changed nothing); `settle`: commit or abort a prepared transaction by its id (`SettleReq`, reply: a
+/// `bool`, false when it was settled already); `prepared`: the ids of the prepared transactions of the shard and whether
+/// each is still open on a session (reply: `Vec<(u64, bool)>`).
+pub const ACTION_PREPARE: &str = "prepare";
+pub const ACTION_SETTLE: &str = "settle";
+pub const ACTION_PREPARED: &str = "prepared";
+
+/// Global deadlock detection. `waits`: who waits for whom on this shard, as control session ids (reply: `Vec<(u64, u64)>`,
+/// (waiter, holder)); `kill`: stop a session's statement and roll its transaction back on this shard (body: the session id),
+/// which ends a lock wait it is in with error 596.
+pub const ACTION_WAITS: &str = "waits";
+pub const ACTION_KILL: &str = "kill";
+
+/// Membership of a replicated shard (`MemberReq`, reply: the members, `Vec<(u64, String, bool)>`: id, address, voter). With
+/// nothing to add or remove it only lists them. Served by the leader.
+pub const ACTION_MEMBERS: &str = "members";
+
+/// The error number of a membership change that could not be made (the message says why).
+pub const MEMBERSHIP: i32 = 50230;
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct MemberReq {
+    /// add this replica (node id, address) to the group: it is caught up as a learner, then made a voter
+    pub add: Option<(u64, String)>,
+    /// remove the replica with this node id ...
+    pub remove: Option<u64>,
+    /// ... or the one at this address
+    pub remove_addr: Option<String>,
+    /// how long the change may take
+    pub timeout_secs: u64,
+}
+
 /// The error number of "this replica is not the leader": the message is `NOTLEADER|<address of the leader or empty>`.
 pub const NOT_LEADER: i32 = 50200;
+
+/// The error number of "this shard has in-doubt transactions": a shard that restarted (or failed over) with prepared
+/// transactions refuses statements until their coordinator has settled them.
+pub const IN_DOUBT: i32 = 50211;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PrepareReq {
+    pub session: u64,
+    pub gid: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SettleReq {
+    pub gid: u64,
+    pub commit: bool,
+}
 
 /// What a shard is asked to run.
 #[derive(Clone, Debug, Serialize, Deserialize)]

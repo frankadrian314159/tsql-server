@@ -575,11 +575,9 @@ fn a_participant_that_is_gone_at_prepare_aborts_the_whole_transaction() {
     assert!(matches!(bal[0][0], tsql_server::Value::Int(100)), "{:?}", bal);
 }
 
-#[test]
-fn a_deadlock_between_shards_is_broken_by_the_lock_timeout() {
-    let mut p = Pair::new(3);
-    setup_accounts(&mut p);
-    p.h.cluster.set_lock_timeout_ms(400);
+/// Two sessions, each holding a row on one shard and asking for the row the other holds on the other shard. Returns what
+/// became of each: Ok(()) committed, Err(number) the error number of the statement that failed.
+fn cross_shard_deadlock(p: &mut Pair) -> Vec<Result<(), i32>> {
     let (k0, k1) = keys_on_two_shards(&p.h.cluster, 0, 1);
     let barrier = Arc::new(std::sync::Barrier::new(2));
     let mut handles = vec![];
@@ -591,21 +589,78 @@ fn a_deadlock_between_shards_is_broken_by_the_lock_timeout() {
             barrier.wait();
             let r = s.execute(&format!("UPDATE acct SET bal = bal + 1 WHERE id = {}", second));
             match r.first_error() {
-                None => s.execute("COMMIT").first_error().is_none(),
+                None => match s.execute("COMMIT").first_error() {
+                    None => Ok(()),
+                    Some(e) => Err(e.number),
+                },
                 Some(e) => {
-                    assert_eq!(e.number, 1222, "{:?}", e);
-                    s.execute("ROLLBACK");
-                    false
+                    let n = e.number;
+                    // the victim's transaction is already gone; the other kind of failure leaves one to roll back
+                    if s.in_transaction() {
+                        s.execute("ROLLBACK");
+                    }
+                    assert!(!s.in_transaction());
+                    Err(n)
                 }
             }
         }));
     }
-    let outcomes: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-    assert!(outcomes.iter().any(|ok| !ok), "somebody must have been the victim: {:?}", outcomes);
-    // atomicity: both rows moved together; and nothing is left locked
+    let outcomes: Vec<Result<(), i32>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    // atomicity: nothing is left locked, and each row moved by the number of transactions that committed
+    let committed = outcomes.iter().filter(|o| o.is_ok()).count() as i64;
     let mut s = p.h.cluster.session();
-    let a = s.query(&format!("SELECT bal FROM acct WHERE id = {}", k0)).unwrap();
-    let b = s.query(&format!("SELECT bal FROM acct WHERE id = {}", k1)).unwrap();
-    assert_eq!(display(&a[0][0]), display(&b[0][0]));
+    for k in [k0, k1] {
+        let v = s.query(&format!("SELECT bal FROM acct WHERE id = {}", k)).unwrap();
+        assert_eq!(display(&v[0][0]), (100 + committed).to_string(), "row {} after {:?}", k, outcomes);
+    }
     assert!(s.execute(&format!("UPDATE acct SET bal = 0 WHERE id IN ({}, {})", k0, k1)).first_error().is_none());
+    outcomes
+}
+
+#[test]
+fn a_deadlock_between_shards_is_detected_and_one_transaction_is_the_victim() {
+    let mut p = Pair::new(3);
+    setup_accounts(&mut p);
+    // a lock timeout far longer than the test: only the detector can end this
+    p.h.cluster.set_lock_timeout_ms(60_000);
+    let t = std::time::Instant::now();
+    let outcomes = cross_shard_deadlock(&mut p);
+    assert!(t.elapsed() < std::time::Duration::from_secs(20), "the deadlock took {:?} to resolve", t.elapsed());
+    assert_eq!(outcomes.iter().filter(|o| o.is_ok()).count(), 1, "exactly one survives: {:?}", outcomes);
+    assert!(outcomes.contains(&Err(1205)), "the victim is told it was a deadlock victim: {:?}", outcomes);
+    assert!(p.h.cluster.deadlocks_broken() >= 1);
+}
+
+#[test]
+fn without_the_detector_the_lock_timeout_still_breaks_a_deadlock_between_shards() {
+    let mut p = Pair::new(3);
+    setup_accounts(&mut p);
+    p.h.cluster.set_deadlock_check_ms(0);
+    p.h.cluster.set_lock_timeout_ms(400);
+    let outcomes = cross_shard_deadlock(&mut p);
+    assert!(outcomes.iter().any(|o| o.is_err()), "somebody must have been the victim: {:?}", outcomes);
+    assert!(outcomes.iter().all(|o| matches!(o, Ok(()) | Err(1222))), "{:?}", outcomes);
+    assert_eq!(p.h.cluster.deadlocks_broken(), 0);
+}
+
+#[test]
+fn a_wait_that_is_not_a_cycle_is_left_alone() {
+    let mut p = Pair::new(3);
+    setup_accounts(&mut p);
+    p.h.cluster.set_lock_timeout_ms(30_000);
+    let (k0, _) = keys_on_two_shards(&p.h.cluster, 0, 1);
+    let mut a = p.h.cluster.session();
+    assert!(a.execute(&format!("BEGIN TRANSACTION; UPDATE acct SET bal = bal + 1 WHERE id = {}", k0)).first_error().is_none());
+    let mut b = p.h.cluster.session();
+    let waiter = std::thread::spawn(move || {
+        let r = b.execute(&format!("UPDATE acct SET bal = bal + 5 WHERE id = {}", k0));
+        r.first_error().map(|e| e.number)
+    });
+    // long enough for the detector to look several times
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    assert!(a.execute("COMMIT").first_error().is_none());
+    assert_eq!(waiter.join().unwrap(), None, "the waiter must not be chosen as a victim");
+    assert_eq!(p.h.cluster.deadlocks_broken(), 0);
+    let v = a.query(&format!("SELECT bal FROM acct WHERE id = {}", k0)).unwrap();
+    assert_eq!(display(&v[0][0]), "106");
 }

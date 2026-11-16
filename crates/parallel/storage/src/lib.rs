@@ -20,7 +20,8 @@ use std::sync::{Arc, Mutex};
 use tonic::{Request, Response, Status, Streaming};
 use tsql_server::{Connection, Event, ResultSet, Server};
 use tsql_shared_ces::arrowconv;
-use tsql_shared_ces::wire::{self, status_for, Fragment, RunReply, WireError, WireEvent, Work, ACTION_CLOSE_SESSION, ACTION_RAFT, ACTION_RUN, ACTION_STATUS, NOT_LEADER};
+use tsql_shared_ces::wire::{self, status_for, Fragment, PrepareReq, RunReply, SettleReq, WireError, WireEvent, Work, ACTION_CLOSE_SESSION, ACTION_PREPARE, ACTION_KILL, ACTION_MEMBERS, ACTION_PREPARED, ACTION_RAFT, ACTION_RUN, ACTION_SETTLE, ACTION_STATUS, ACTION_WAITS, IN_DOUBT, MEMBERSHIP, NOT_LEADER};
+use tsql_shared_ces::wire::MemberReq;
 
 pub mod replica;
 mod transport;
@@ -35,11 +36,15 @@ pub struct ShardNode {
     /// set when this node is one replica of a replicated shard
     replica: Option<Arc<Replica>>,
     sessions: Mutex<HashMap<u64, Arc<Mutex<Connection>>>>,
+    /// the session that holds each prepared transaction that is still open (by transaction id)
+    prepared_by: Mutex<HashMap<u64, u64>>,
+    /// the engine's session id of each session (readable while the session's statement runs, which holds its connection)
+    spids: Mutex<HashMap<u64, i32>>,
 }
 
 impl ShardNode {
     pub fn new(shard_id: u32, server: Server) -> ShardNode {
-        ShardNode { shard_id, server: Arc::new(server), replica: None, sessions: Mutex::new(HashMap::new()) }
+        ShardNode { shard_id, server: Arc::new(server), replica: None, sessions: Mutex::new(HashMap::new()), prepared_by: Mutex::new(HashMap::new()), spids: Mutex::new(HashMap::new()) }
     }
 
     /// A node that is one replica of a replicated shard: `server` must be a persistent engine; the replica keeps its Raft log
@@ -47,7 +52,7 @@ impl ShardNode {
     pub fn replicated(shard_id: u32, server: Server, cfg: ReplicaConfig) -> std::io::Result<ShardNode> {
         let server = Arc::new(server);
         let replica = Replica::start(cfg, server.clone())?;
-        Ok(ShardNode { shard_id, server, replica: Some(replica), sessions: Mutex::new(HashMap::new()) })
+        Ok(ShardNode { shard_id, server, replica: Some(replica), sessions: Mutex::new(HashMap::new()), prepared_by: Mutex::new(HashMap::new()), spids: Mutex::new(HashMap::new()) })
     }
 
     pub fn replica(&self) -> Option<&Arc<Replica>> {
@@ -55,12 +60,24 @@ impl ShardNode {
     }
 
     /// A replicated shard serves requests on its leader only; any other replica says where the leader is.
-    fn check_serving(&self) -> Result<(), Status> {
+    fn check_leader(&self) -> Result<(), Status> {
         if let Some(r) = &self.replica {
             if !r.can_serve() {
                 let hint = r.leader_addr().unwrap_or_default();
                 return Err(status_for(&WireError { number: NOT_LEADER, severity: 16, state: 1, message: format!("NOTLEADER|{}", hint) }));
             }
+        }
+        Ok(())
+    }
+
+    /// Whether statements may run: this is the leader (or not replicated), and no prepared transaction is in doubt (one that
+    /// voted before this node restarted or took over: what it would change is unsettled, so nothing may read or change it
+    /// until its coordinator says whether it committed).
+    fn check_serving(&self) -> Result<(), Status> {
+        self.check_leader()?;
+        let d = self.server.in_doubt();
+        if !d.is_empty() {
+            return Err(status_for(&WireError { number: IN_DOUBT, severity: 16, state: 1, message: format!("Shard {} has in-doubt transactions {:?}: their coordinator must settle them before statements run.", self.shard_id, d) }));
         }
         Ok(())
     }
@@ -71,7 +88,13 @@ impl ShardNode {
 
     fn session(&self, id: u64) -> Arc<Mutex<Connection>> {
         let mut m = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        m.entry(id).or_insert_with(|| Arc::new(Mutex::new(self.server.connect()))).clone()
+        m.entry(id)
+            .or_insert_with(|| {
+                let c = self.server.connect();
+                self.spids.lock().unwrap_or_else(|e| e.into_inner()).insert(id, c.spid());
+                Arc::new(Mutex::new(c))
+            })
+            .clone()
     }
 
     pub fn into_service(self) -> FlightServiceServer<ShardNode> {
@@ -160,9 +183,111 @@ impl FlightService for ShardNode {
                 .map_err(|e| Status::internal(format!("the statement panicked: {}", e)))?;
                 postcard::to_allocvec(&reply).map_err(|e| Status::internal(e.to_string()))?
             }
+            ACTION_PREPARE => {
+                self.check_leader()?;
+                let req: PrepareReq = postcard::from_bytes(&action.body).map_err(|e| Status::invalid_argument(format!("bad request: {}", e)))?;
+                let conn = self.session(req.session);
+                let prepared = tokio::task::spawn_blocking(move || {
+                    let mut c = conn.lock().unwrap_or_else(|e| e.into_inner());
+                    c.prepare_transaction(req.gid)
+                })
+                .await
+                .map_err(|e| Status::internal(format!("the prepare panicked: {}", e)))?
+                .map_err(|e| status_for(&WireError::from_sql(&e)))?;
+                if prepared {
+                    self.prepared_by.lock().unwrap_or_else(|e| e.into_inner()).insert(req.gid, req.session);
+                }
+                postcard::to_allocvec(&prepared).map_err(|e| Status::internal(e.to_string()))?
+            }
+            ACTION_SETTLE => {
+                self.check_leader()?;
+                let req: SettleReq = postcard::from_bytes(&action.body).map_err(|e| Status::invalid_argument(format!("bad request: {}", e)))?;
+                let server = self.server.clone();
+                // a transaction still open on a session is settled by that session; one that is in doubt, by the engine
+                let holder = match server.prepared_state(req.gid) {
+                    Some(true) => Some(self.prepared_by.lock().unwrap_or_else(|e| e.into_inner()).get(&req.gid).copied().and_then(|s| self.sessions.lock().unwrap_or_else(|e| e.into_inner()).get(&s).cloned())),
+                    _ => None,
+                };
+                let done = tokio::task::spawn_blocking(move || -> Result<bool, tsql_server::SqlError> {
+                    match holder {
+                        Some(Some(conn)) => {
+                            let mut c = conn.lock().unwrap_or_else(|e| e.into_inner());
+                            let res = c.execute(if req.commit { "COMMIT TRANSACTION" } else { "ROLLBACK TRANSACTION" });
+                            match res.first_error() {
+                                Some(e) => Err(e.clone()),
+                                None => Ok(true),
+                            }
+                        }
+                        // open, but its session is not known here (the node holding it is another life of this one)
+                        Some(None) => Err(tsql_server::SqlError::new(IN_DOUBT, format!("Transaction {} is open on a session this node cannot find.", req.gid))),
+                        None => server.resolve_prepared(req.gid, req.commit),
+                    }
+                })
+                .await
+                .map_err(|e| Status::internal(format!("the settlement panicked: {}", e)))?
+                .map_err(|e| status_for(&WireError::from_sql(&e)))?;
+                self.prepared_by.lock().unwrap_or_else(|e| e.into_inner()).remove(&req.gid);
+                postcard::to_allocvec(&done).map_err(|e| Status::internal(e.to_string()))?
+            }
+            ACTION_PREPARED => {
+                self.check_leader()?;
+                let mut v: Vec<(u64, bool)> = vec![];
+                let ids = self.server.in_doubt();
+                for g in ids {
+                    v.push((g, false));
+                }
+                for (g, _) in self.prepared_by.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                    if self.server.prepared_state(*g) == Some(true) {
+                        v.push((*g, true));
+                    }
+                }
+                postcard::to_allocvec(&v).map_err(|e| Status::internal(e.to_string()))?
+            }
+            ACTION_MEMBERS => {
+                let req: MemberReq = postcard::from_bytes(&action.body).map_err(|e| Status::invalid_argument(format!("bad request: {}", e)))?;
+                let Some(r) = self.replica.clone() else {
+                    return Err(status_for(&WireError { number: MEMBERSHIP, severity: 16, state: 1, message: "this shard is not replicated".into() }));
+                };
+                // listing too: a follower may be an entry behind
+                self.check_leader()?;
+                let members = tokio::task::spawn_blocking(move || -> Result<Vec<replica::MemberInfo>, String> {
+                    let t = std::time::Duration::from_secs(req.timeout_secs.max(1));
+                    if let Some((id, addr)) = &req.add {
+                        r.add_replica(*id, addr, t)?;
+                    }
+                    if let Some(id) = req.remove {
+                        r.remove_replica(id, t)?;
+                    }
+                    if let Some(a) = &req.remove_addr {
+                        let id = r.members().iter().find(|m| &m.1 == a).map(|m| m.0).ok_or_else(|| format!("no replica at {}", a))?;
+                        r.remove_replica(id, t)?;
+                    }
+                    Ok(r.members())
+                })
+                .await
+                .map_err(|e| Status::internal(format!("the membership change panicked: {}", e)))?
+                .map_err(|m| status_for(&WireError { number: MEMBERSHIP, severity: 16, state: 1, message: m }))?;
+                postcard::to_allocvec(&members).map_err(|e| Status::internal(e.to_string()))?
+            }
+            ACTION_WAITS => {
+                self.check_leader()?;
+                let spids = self.spids.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let by_spid: HashMap<i32, u64> = spids.iter().map(|(s, p)| (*p, *s)).collect();
+                let edges: Vec<(u64, u64)> = self.server.wait_graph().into_iter().filter_map(|(w, h)| Some((*by_spid.get(&w)?, *by_spid.get(&h)?))).collect();
+                postcard::to_allocvec(&edges).map_err(|e| Status::internal(e.to_string()))?
+            }
+            ACTION_KILL => {
+                self.check_leader()?;
+                let session: u64 = postcard::from_bytes(&action.body).map_err(|e| Status::invalid_argument(e.to_string()))?;
+                if let Some(spid) = self.spids.lock().unwrap_or_else(|e| e.into_inner()).get(&session).copied() {
+                    self.server.kill_session(spid);
+                }
+                vec![]
+            }
             ACTION_CLOSE_SESSION => {
                 let id: u64 = postcard::from_bytes(&action.body).map_err(|e| Status::invalid_argument(e.to_string()))?;
                 self.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                self.spids.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
                 vec![]
             }
             ACTION_RAFT => {
@@ -211,7 +336,7 @@ impl FlightService for ShardNode {
         Err(Status::unimplemented("do_exchange"))
     }
     async fn list_actions(&self, _r: Request<Empty>) -> Result<Response<Self::ListActionsStream>, Status> {
-        let acts = [ACTION_RUN, ACTION_CLOSE_SESSION, ACTION_STATUS].iter().map(|n| Ok(ActionType { r#type: n.to_string(), description: String::new() })).collect::<Vec<_>>();
+        let acts = [ACTION_RUN, ACTION_CLOSE_SESSION, ACTION_STATUS, ACTION_PREPARE, ACTION_SETTLE, ACTION_PREPARED, ACTION_WAITS, ACTION_KILL, ACTION_MEMBERS].iter().map(|n| Ok(ActionType { r#type: n.to_string(), description: String::new() })).collect::<Vec<_>>();
         Ok(Response::new(stream::iter(acts).boxed()))
     }
 }

@@ -60,6 +60,7 @@ impl<'a> Engine<'a> {
         }
         let snap = iso == Isolation::Snapshot || self.db_rcsi();
         let (id, start) = self.srv.core.begin(snap);
+        self.srv.core.tag_tx(id, self.ses.spid);
         let tx = Tx::new(id, iso, implicit, start);
         self.ses.tx = Some(tx);
         Ok(())
@@ -138,6 +139,10 @@ impl<'a> Engine<'a> {
                 return Err(e);
             }
         }
+        // the record that commits a prepared transaction also settled it
+        if let Some(gid) = self.ses.prepared_gid.take() {
+            self.srv.prepared.lock().unwrap_or_else(|e| e.into_inner()).remove(&gid);
+        }
         // stamp versions, grouped per table
         let mut rows: Vec<(TabRef, Vec<RowId>)> = vec![];
         for u in undo.drain(..) {
@@ -174,6 +179,8 @@ impl<'a> Engine<'a> {
             None => return,
         };
         let id = tx.id;
+        // a prepared transaction that goes away without a decision stays in doubt (`abort_prepared` settles one on purpose)
+        self.abandon_prepared();
         self.ses.tx = Some(tx);
         self.undo_to(0);
         self.ses.tx = None;

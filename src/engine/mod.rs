@@ -167,6 +167,8 @@ pub struct SessionState {
     pub spid: i32,
     /// The record of the transaction that is committing, proposed to the replicator and not yet confirmed.
     pub pending_repl: Option<crate::persist::PendingRepl>,
+    /// The id this session's open transaction was prepared under (two-phase commit), if it was.
+    pub prepared_gid: Option<u64>,
     /// This session's entry in the session table (none for a session that is not registered).
     pub info: Option<crate::coord::SessionHandle>,
     pub stat_buf: std::sync::Arc<crate::coord::StatBuf>,
@@ -284,6 +286,7 @@ impl SessionState {
         SessionState {
             spid,
             pending_repl: None,
+            prepared_gid: None,
             info: None,
             stat_buf: Default::default(),
             login: "sa".into(),
@@ -1048,7 +1051,10 @@ impl<'a> Engine<'a> {
                         self.undo_to(mark);
                         self.ses.tx.as_mut().unwrap().savepoints.truncate(idx + 1);
                     }
-                    None => self.rollback_all(),
+                    None => {
+                        self.abort_prepared()?;
+                        self.rollback_all()
+                    }
                 }
             }
             Stmt::SaveTran(n) => {

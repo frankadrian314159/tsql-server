@@ -130,6 +130,13 @@ impl LockTable {
     pub fn clear_wait(&self, tx: TxId) {
         lock(&self.m).clear_wait(tx)
     }
+    /// Who waits for whom right now (transaction ids).
+    pub fn wait_edges(&self) -> Vec<(TxId, Vec<TxId>)> {
+        if !self.is_busy() && self.waiters.load(Ordering::SeqCst) == 0 {
+            return vec![];
+        }
+        lock(&self.m).wait_edges()
+    }
     pub fn cancel_pending(&self, tx: TxId) {
         if self.is_busy() {
             lock(&self.m).cancel_pending(tx)
@@ -604,6 +611,28 @@ impl Core {
     fn shard(&self, id: TxId) -> MutexGuard<'_, BTreeMap<TxId, TxInfo>> {
         lock(&self.active[(id as usize) % ACTIVE_SHARDS])
     }
+    /// Note the session that runs transaction `id` (so that the wait graph can be told in sessions).
+    pub fn tag_tx(&self, id: TxId, spid: i32) {
+        if let Some(t) = self.shard(id).get_mut(&id) {
+            t.spid = spid;
+        }
+    }
+    /// Who waits for whom, as sessions: (waiting session, session it waits for) for every lock wait in progress between
+    /// transactions whose sessions are known. The distributed edition joins the graphs of its shards with it.
+    pub fn wait_graph(&self) -> Vec<(i32, i32)> {
+        let mut out = vec![];
+        for (w, blockers) in self.locks.wait_edges() {
+            let Some(ws) = self.shard(w).get(&w).map(|t| t.spid).filter(|s| *s != 0) else { continue };
+            for b in blockers {
+                if let Some(bs) = self.shard(b).get(&b).map(|t| t.spid).filter(|s| *s != 0) {
+                    if bs != ws {
+                        out.push((ws, bs));
+                    }
+                }
+            }
+        }
+        out
+    }
     /// Register a new transaction. A snapshot transaction reads the clock and enters the active table in one step
     /// (under its shard's latch); [`Core::horizon`] reads the clock before it looks at any shard, so it can never
     /// pass a snapshot that is just starting. Returns the id and the clock value at the start.
@@ -611,7 +640,7 @@ impl Core {
         let id = self.next_tx.fetch_add(1, Ordering::SeqCst);
         let mut a = self.shard(id);
         let start = self.clock();
-        a.insert(id, TxInfo { snapshot_ts: if snapshot { Some(start) } else { None }, ddl: false });
+        a.insert(id, TxInfo { snapshot_ts: if snapshot { Some(start) } else { None }, ddl: false, spid: 0 });
         (id, start)
     }
     /// Take the next commit timestamp. Call with the commit lock held, so that the order of timestamps is the

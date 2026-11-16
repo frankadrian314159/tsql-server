@@ -240,6 +240,11 @@ impl LockManager {
         self.waits.remove(&tx);
     }
 
+    /// Who waits for whom right now: (waiting transaction, the transactions it waits for).
+    pub fn wait_edges(&self) -> Vec<(TxId, Vec<TxId>)> {
+        self.waits.iter().map(|(t, b)| (*t, b.clone())).collect()
+    }
+
     pub fn set_wait(&mut self, tx: TxId, blockers: Vec<TxId>) {
         self.waits.insert(tx, blockers);
     }

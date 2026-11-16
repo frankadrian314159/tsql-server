@@ -734,6 +734,8 @@ pub struct TxInfo {
     pub snapshot_ts: Option<u64>,
     /// The transaction has changed the catalog (it is not yet committed, so a backup must wait for it).
     pub ddl: bool,
+    /// The session that runs the transaction (0 until `Core::tag_tx` says), for the wait graph.
+    pub spid: i32,
 }
 
 pub struct ServerState {
@@ -760,6 +762,8 @@ pub struct ServerState {
     pub fk_cache: std::sync::Mutex<FkCache>,
     /// Set when this server is a replica of a group: every commit is proposed to it (see `persist::Replicator`).
     pub replicator: std::sync::Mutex<Option<Arc<dyn crate::persist::Replicator>>>,
+    /// Transactions that voted in a distributed commit and wait for its outcome (see `persist::LogOp::Prepare`), by id.
+    pub prepared: std::sync::Mutex<BTreeMap<u64, crate::persist::PreparedTxn>>,
 }
 
 /// Foreign-key facts about one table, valid for one catalog epoch.
@@ -788,6 +792,7 @@ impl ServerState {
             epoch: 0,
             fk_cache: std::sync::Mutex::new(FkCache::default()),
             replicator: std::sync::Mutex::new(None),
+            prepared: std::sync::Mutex::new(BTreeMap::new()),
         };
         for (i, n) in ["master", "tempdb", "model", "msdb"].iter().enumerate() {
             s.databases.insert(n.to_string(), Database::new(n, i as i32 + 1));

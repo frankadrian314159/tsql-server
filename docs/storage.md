@@ -1,5 +1,24 @@
 # Storage and durability
 
+## Prepared transactions (two-phase commit)
+
+`Connection::prepare_transaction(gid)` makes an open transaction's changes durable without committing it: a `Prepare` record
+(the redo operations its commit will log, under the id `gid`) is forced to the log (or, on a replica, committed by the group),
+and the transaction stays open with its locks. `COMMIT` then writes the usual commit record plus a `Resolve` operation in the
+same record, so the transaction is settled atomically with its commit; `ROLLBACK` writes a record with the `Resolve` alone.
+If the process dies, or the session ends, after the prepare, recovery finds the `Prepare` record without a `Resolve`: the
+transaction is *in doubt* (`Server::in_doubt`), nothing of it is applied, and `Server::resolve_prepared(gid, commit)` settles
+it, applying the changes from the record when `commit` (this is repeatable: settling twice is harmless). The log is not folded
+into a checkpoint while a transaction is prepared. A coordinator uses this to commit across servers: it prepares every
+participant, records its decision, then settles each. A server without prepared transactions is unaffected.
+
+## Snapshots of the whole state
+
+`Server::export_state_at(ts)` serialises everything committed (databases with their tables' rows, security, prepared transactions)
+as one blob, and `Server::install_state` replaces a server's state with such a blob (writing it to the log first). A replica
+group uses them to cut its log and to bring a replica that is far behind up to date; `Server::flush_log` forces the engine's log
+before the group forgets the entries it holds. See [distributed.md](distributed.md).
+
 ## Replication hook
 
 A server can be made one replica of a group (`Server::set_replicator`, used by the distributed edition, see [distributed.md](distributed.md)): each commit hands its redo record to a `Replicator` under the commit lock (so records enter the group's log in commit-timestamp order), and finishes (stamps its versions, releases its locks) only when the group has committed it; the record is written to this node's own log after that. `Server::apply_replicated` applies a record another replica committed, as log replay would, and ignores a record whose timestamp is not past the data's. Without a replicator nothing changes.

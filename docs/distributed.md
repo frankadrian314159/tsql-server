@@ -5,7 +5,7 @@ The single-node server in this repository's root crate runs the same engine on s
 optionally replicated for availability. It is a Cargo workspace beside the root package (`cargo build` / `cargo test` at
 the root still build only the single-node server; add `--workspace`, or `-p tsql-control` and so on, for the cluster).
 
-Two small, general hooks were added to the single-node engine for it (both do nothing unless installed, see
+A few small, general hooks were added to the single-node engine for it (they do nothing unless used, see
 [Engine hooks](#engine-hooks)); everything else is new code in the workspace.
 
 ## Parts
@@ -69,11 +69,15 @@ answer with a single node.
     correctness baseline, always exact, running at single-node speed after a one-time copy.
 * **Transactions.** `BEGIN TRANSACTION` begins on a shard when a statement first uses it, on that shard's session for this
   control session, so locks and uncommitted changes are held there and the session reads its own writes. `COMMIT`: one shard,
-  committed there; several shards, **two-phase commit** with a persisted decision (see `txn.rs`). Isolation is the shard
-  engines'. A statement that fails on several shards, or because a shard failed, dooms the transaction (error 3930; only
+  committed there; several shards, **two-phase commit** (see `txn.rs`): every participant makes its part durable (a `Prepare`
+  record in its log, or its Raft group's log) and keeps the transaction open, the decision is persisted in the control state,
+  then each participant commits, from its open transaction or, if it restarted since it voted, from its durable record.
+  Isolation is the shard engines'. A statement that fails on several shards, or because a shard failed, dooms the transaction (error 3930; only
   `ROLLBACK` works), as the shards cannot be told apart from half done. Nested `BEGIN`/`COMMIT` count as in SQL Server.
-  A transaction that waits for a lock fails after `set_lock_timeout_ms` (default 5 s, error 1222), which also breaks a deadlock
-  between two shards, which neither shard's detector sees.
+  A transaction that waits for a lock fails after `set_lock_timeout_ms` (default 5 s, error 1222). A **deadlock across shards**
+  (A waits for B on one shard, B for A on another) is found by the control node: every 200 ms (`set_deadlock_check_ms`) it asks
+  each shard who waits for whom, joins the graphs, and a cycle seen twice in a row is broken by killing the youngest member's
+  wait; that session gets error 1205 and its transaction is rolled back on every shard, as SQL Server does (`deadlock.rs`).
 * **Control plane and data plane.** Statements, errors and row counts are Flight *actions* and *tickets* whose bodies are the
   engine's syntax trees in postcard (the control node sends a rewritten query without a SQL printer); result sets are Arrow
   record batches (native columns for common kinds; decimals, dates, times and GUIDs travel as exact packed values).
@@ -100,6 +104,21 @@ cannot diverge through non-deterministic functions or lock timing. A replica tha
 it returns; without a majority nothing is served and nothing is lost (checked by tests that kill the leader, restart it, and
 take two of three replicas away).
 
+**Snapshots and log cutting.** After `--snapshot-every` applied entries (default 5000) a replica forces its engine's log to disk,
+exports the engine's whole state (`Server::export_state_at`: every database, its tables' rows, security, prepared transactions)
+on a helper thread, and Raft drops the log up to that entry. A replica that has fallen behind the start of the leader's log (it
+was down a long time, or is new) is sent the leader's snapshot in chunks and installs it into its engine (`install_state`, which
+also writes it to the engine's log so a restart finds it). The snapshot is taken while statements run, so it may hold changes of
+commits just after its index; the log's records set rows and objects to absolute values, so applying those entries again is
+harmless. A snapshot is held in memory, so a very large shard needs the memory of its data for the moment of the export.
+
+**Changing the replicas.** Start the new replica on an empty directory with `tsql-shard --id N --replica R --join --peers
+...` (`--addr` if its address differs from `--listen`), then `Cluster::add_replica(shard, R, addr)`: the leader adds it as a
+non-voting *learner*, sends it the snapshot and log, and when it has caught up makes it a voter (one voter changes at a time,
+as in the Raft dissertation); `Cluster::remove_replica(shard, addr)` takes one out, the leader included, and the control node
+and its state file follow (`replicas.rs`). A removed replica that keeps running cannot depose the group: a vote is refused
+while a leader has been heard from recently, and from a node that is not a voter.
+
 ## Serving SQL Server clients
 
 `tsql-cluster --listen PORT` serves the control node's own engine over TDS (logins, TLS options, prepared statements, MARS as in
@@ -113,7 +132,9 @@ parameters, server cursors, table-valued parameters and bulk load. Checked with 
 
 Added to the single-node crate, inert unless installed: **`Server::set_replicator`** (every commit proposes its redo record to a
 `Replicator` under the commit lock, and waits for the group before completing) with **`Server::apply_replicated`** (a follower
-applies a committed record, idempotently by commit timestamp); and **`Server::set_interceptor`** (an `Interceptor` per
+applies a committed record, idempotently by commit timestamp); and **`Connection::prepare_transaction`** with **`Server::in_doubt`** / **`Server::resolve_prepared`** (two-phase commit: a
+transaction makes its changes durable as a `Prepare` log record while it stays open; `COMMIT`/`ROLLBACK` settle it, and one
+whose process died is settled by id, see [storage.md](storage.md)); and **`Server::set_interceptor`** (an `Interceptor` per
 connection may take over a batch; `Server::connect_internal` is a connection that is never intercepted). The single-node test
 suite passes unchanged in all its modes.
 
@@ -122,7 +143,8 @@ suite passes unchanged in all its modes.
 `crates/parallel/control/tests/cluster.rs` runs every statement on a real cluster (control node and Flight shards over TCP) and
 on one engine: scans, `TOP`, `DISTINCT`, hidden sort keys, every aggregate with `GROUP BY` and `HAVING`; co-located, broadcast,
 repartition, left and right joins and the shapes that must gather; DML and the caches following it; transactions (commit across
-shards, rollback, read-your-own-writes, isolation, a dead participant, a deadlock broken by the timeout); adding and removing a
+shards, rollback, read-your-own-writes, isolation, a dead participant, a deadlock broken by the timeout); `twophase.rs`
+crashes shards between their vote and the commit and stops the control node before and after it decides; adding and removing a
 shard under data; a control restart from its state file. `replication.rs` starts three durable replicas with Raft logs on disk and
 kills the leader, restarts it, and removes the majority. `tests/simulation.rs` of `tsql-raft` runs 71 randomized schedules of
 message loss, reordering, partitions and crashes, checking at every step that no term has two leaders and no two nodes commit
@@ -133,16 +155,16 @@ generated rows.
 
 ## Limits (an error says so where a statement is refused)
 
-* **Two-phase commit has a window**: a participant that *loses its open transaction after it voted* (its process crashes, or a
-  replicated shard fails over, between prepare and commit) takes its part of the transaction with it while the others commit; the
-  commit reports error 50210 naming the shard. Closing it needs the participant's redo record made durable before it votes (it
-  could ride the same replicated log) plus recovery of the in-doubt transaction's locks. A control node that stops after
-  deciding to commit finishes the commit when it is opened on its state file (`resolve_pending`).
-* **No global wait-for graph**: a cross-shard deadlock is broken by the lock timeout, not by detecting the cycle and choosing a
-  victim (the engine's wait graph cannot yet be attributed to control sessions from outside).
-* **Raft has no log compaction or snapshots** (the log grows; a far-behind replica is caught up from the log) and a fixed
-  membership of replicas (changing a shard's replicas means a new shard and a move of its slots). A replicated shard's
-  transactions in flight at a failover are lost (the client sees an error and retries).
+* **Two-phase commit and the state file**: a vote is durable on the shard (it survives a crash, a restart and, on a replicated
+  shard, the loss of the leader), and a control node that stops after deciding finishes the commit when it is opened on its
+  state file. The state file is the coordinator's one point of failure: a control node that loses it cannot say how its
+  transactions were decided (the shards would roll them back). A prepared transaction that a shard holds in doubt keeps the
+  shard from serving statements, and its log from being checkpointed, until it is settled; a participant that cannot be
+  reached after the decision keeps its part (and refuses statements) until the control node reaches it again.
+* **Deadlock detection is periodic** (every 200 ms, a cycle must be seen twice), the victim is the youngest session rather than
+  the cheapest to roll back, and a wait that is not a cycle falls back on the lock timeout.
+* **Snapshots are in memory and fuzzy** (see Replication); a replicated shard's transactions in flight at a failover are lost
+  (the client sees an error and retries). Membership changes go through the shard's leader one voter at a time.
 * **Refused:** `IDENTITY` columns, foreign keys, `UNIQUE` constraints or unique indexes that do not contain the shard key,
   changing a shard key, views, procedures, triggers, `ALTER TABLE`, `CREATE DATABASE`/`USE`, temporal tables, DML with joins,
   subqueries, `OUTPUT` or `TOP`, savepoints, DDL inside a transaction.

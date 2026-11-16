@@ -6,7 +6,19 @@ use futures::TryStreamExt;
 use tonic::transport::{Channel, Endpoint};
 use tsql_server::{ResultSet, SqlError};
 use tsql_shared_ces::arrowconv;
-use tsql_shared_ces::wire::{sql_error_of, Fragment, RunReply, ShardStatus, Work, ACTION_CLOSE_SESSION, ACTION_RUN, ACTION_STATUS, NOT_LEADER};
+use tsql_shared_ces::wire::{sql_error_of, Fragment, PrepareReq, RunReply, SettleReq, ShardStatus, Work, ACTION_CLOSE_SESSION, ACTION_KILL, ACTION_MEMBERS, ACTION_PREPARE, ACTION_PREPARED, ACTION_RUN, ACTION_SETTLE, ACTION_STATUS, ACTION_WAITS, IN_DOUBT, NOT_LEADER};
+use tsql_shared_ces::wire::MemberReq;
+
+/// What became of a transaction that a shard holds prepared (decided by the coordinator, see `txn.rs`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Verdict {
+    Commit,
+    Abort,
+    /// the coordinator is deciding it right now
+    Wait,
+}
+
+pub type VerdictFn = std::sync::Arc<dyn Fn(u64) -> Verdict + Send + Sync>;
 
 /// One shard: a single node, or the replicas of a replicated shard (whose leader serves the requests).
 #[derive(Clone)]
@@ -17,6 +29,9 @@ pub struct ShardClient {
     channels: Vec<(String, Channel)>,
     /// the replica that served last (the leader, as far as is known)
     current: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// how the coordinator decided a prepared transaction: lets a statement that finds the shard with in-doubt transactions
+    /// (it restarted, or another replica took over) settle them and go on
+    verdict: Option<VerdictFn>,
 }
 
 fn flight_error(e: FlightError) -> SqlError {
@@ -41,7 +56,60 @@ impl ShardClient {
         if channels.is_empty() {
             return Err(SqlError::new(40613, "a shard needs an address"));
         }
-        Ok(ShardClient { id, addr: addr.to_string(), channels, current: Default::default() })
+        Ok(ShardClient { id, addr: addr.to_string(), channels, current: Default::default(), verdict: None })
+    }
+
+    /// The same shard, settling the in-doubt transactions it finds according to `v`.
+    pub fn with_verdict(mut self, v: VerdictFn) -> ShardClient {
+        self.verdict = Some(v);
+        self
+    }
+
+    /// Two-phase commit, phase one on this shard: make the session's transaction durable under `gid`. False: it changed
+    /// nothing here.
+    pub async fn prepare(&self, session: u64, gid: u64) -> Result<bool, SqlError> {
+        let body = postcard::to_allocvec(&PrepareReq { session, gid }).map_err(|e| SqlError::new(50000, e.to_string()))?;
+        let reply = self.action(ACTION_PREPARE, body).await?;
+        postcard::from_bytes(&reply).map_err(|e| SqlError::new(50000, format!("bad reply from shard {}: {}", self.id, e)))
+    }
+
+    /// Commit or abort the prepared transaction `gid` (repeating it is harmless). False: the shard had settled it already.
+    pub async fn settle(&self, gid: u64, commit: bool) -> Result<bool, SqlError> {
+        let body = postcard::to_allocvec(&SettleReq { gid, commit }).map_err(|e| SqlError::new(50000, e.to_string()))?;
+        let reply = self.action(ACTION_SETTLE, body).await?;
+        postcard::from_bytes(&reply).map_err(|e| SqlError::new(50000, format!("bad reply from shard {}: {}", self.id, e)))
+    }
+
+    /// The transactions the shard holds prepared: (id, still open on a session).
+    pub async fn prepared(&self) -> Result<Vec<(u64, bool)>, SqlError> {
+        let reply = self.action(ACTION_PREPARED, vec![]).await?;
+        postcard::from_bytes(&reply).map_err(|e| SqlError::new(50000, format!("bad reply from shard {}: {}", self.id, e)))
+    }
+
+    /// Settle the prepared transactions of the shard as the verdict says (`all`: also those still open on a session, which
+    /// is right for a coordinator that has just started and so has no session of its own). Returns how many were settled and
+    /// how many could not be (the coordinator is still deciding them).
+    pub async fn settle_prepared(&self, all: bool) -> Result<(usize, usize), SqlError> {
+        let Some(v) = self.verdict.clone() else { return Ok((0, 0)) };
+        let (mut done, mut waiting) = (0, 0);
+        for (gid, live) in self.prepared().await? {
+            if live && !all {
+                continue;
+            }
+            match v(gid) {
+                Verdict::Wait => waiting += 1,
+                d => {
+                    self.settle(gid, d == Verdict::Commit).await?;
+                    done += 1;
+                }
+            }
+        }
+        Ok((done, waiting))
+    }
+
+    /// A statement found in-doubt transactions: settle them and say whether the statement can be tried again.
+    async fn after_in_doubt(&self, e: &SqlError) -> bool {
+        e.number == IN_DOUBT && self.verdict.is_some() && matches!(self.settle_prepared(false).await, Ok((n, 0)) if n > 0)
     }
 
     /// Try a call on the replica that served last; when it is unreachable or not the leader, on the one it names or the
@@ -94,16 +162,26 @@ impl ShardClient {
     /// Run work on the shard's session; the reply says what happened (errors are inside the reply).
     pub async fn run(&self, session: u64, work: Work) -> Result<RunReply, SqlError> {
         let body = postcard::to_allocvec(&Fragment { session, work }).map_err(|e| SqlError::new(50000, e.to_string()))?;
-        let reply = self.action(ACTION_RUN, body).await?;
+        let reply = match self.action(ACTION_RUN, body.clone()).await {
+            Err(e) if self.after_in_doubt(&e).await => self.action(ACTION_RUN, body).await?,
+            r => r?,
+        };
         postcard::from_bytes(&reply).map_err(|e| SqlError::new(50000, format!("bad reply from shard {}: {}", self.id, e)))
     }
 
     /// Run work and return its first result set (an error of the statement is returned as the error).
     pub async fn query(&self, session: u64, work: Work) -> Result<ResultSet, SqlError> {
         let ticket = postcard::to_allocvec(&Fragment { session, work }).map_err(|e| SqlError::new(50000, e.to_string()))?;
+        match self.query_ticket(&ticket).await {
+            Err(e) if self.after_in_doubt(&e).await => self.query_ticket(&ticket).await,
+            r => r,
+        }
+    }
+
+    async fn query_ticket(&self, ticket: &[u8]) -> Result<ResultSet, SqlError> {
         let id = self.id;
         self.on_leader(|ch| {
-            let ticket = ticket.clone();
+            let ticket = ticket.to_vec();
             async move {
                 let mut c = FlightClient::new(ch);
                 let mut stream = c.do_get(Ticket::new(ticket)).await.map_err(flight_error)?;
@@ -116,6 +194,26 @@ impl ShardClient {
             }
         })
         .await
+    }
+
+    /// The members of a replicated shard, after making the change `req` asks for (none: just list them): (node id, address,
+    /// voter). The leader serves it.
+    pub async fn members(&self, req: MemberReq) -> Result<Vec<(u64, String, bool)>, SqlError> {
+        let body = postcard::to_allocvec(&req).map_err(|e| SqlError::new(50000, e.to_string()))?;
+        let reply = self.action(ACTION_MEMBERS, body).await?;
+        postcard::from_bytes(&reply).map_err(|e| SqlError::new(50000, format!("bad reply from shard {}: {}", self.id, e)))
+    }
+
+    /// Who waits for whom on this shard (control session ids: (waiter, holder)).
+    pub async fn waits(&self) -> Result<Vec<(u64, u64)>, SqlError> {
+        let reply = self.action(ACTION_WAITS, vec![]).await?;
+        postcard::from_bytes(&reply).map_err(|e| SqlError::new(50000, format!("bad reply from shard {}: {}", self.id, e)))
+    }
+
+    /// Stop the session's statement on this shard and roll its transaction back there (a lock wait ends with error 596).
+    pub async fn kill(&self, session: u64) -> Result<(), SqlError> {
+        let body = postcard::to_allocvec(&session).map_err(|e| SqlError::new(50000, e.to_string()))?;
+        self.action(ACTION_KILL, body).await.map(|_| ())
     }
 
     pub async fn close_session(&self, session: u64) {

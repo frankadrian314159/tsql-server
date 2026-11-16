@@ -43,6 +43,31 @@ impl<'a> Engine<'a> {
         if let Some(e) = self.srv.store.failed() {
             return Err(SqlError::with(823, 24, 2, format!("The transaction cannot be committed because the storage engine has failed: {}", e)));
         }
+        let mut ops = self.redo_ops(tx, undo);
+        if let Some(gid) = self.ses.prepared_gid {
+            // the commit of a prepared transaction settles it in the same record
+            ops.push(LogOp::Resolve { gid });
+        }
+        if ops.is_empty() {
+            return Ok(None);
+        }
+        let (oid, rv) = (self.srv.core.object_id(), self.srv.core.rowversion());
+        let repl = self.srv.replicator.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(r) = repl {
+            // a replica: the record goes to the group's log first and is written to this node's own log once the group
+            // has committed it (see `replicate_wait`), so a record that the group never commits never reaches the log
+            let rec = crate::persist::WalRecord { lsn: 0, ts, wall: chrono::Utc::now().timestamp_micros(), next_object_id: oid, next_rowversion: rv, ops };
+            let ticket = r.propose(&rec).map_err(|e| SqlError::with(3314, 21, 1, format!("The commit could not be replicated: {}", e)))?;
+            self.ses.pending_repl = Some(crate::persist::PendingRepl { ticket, rec });
+            return Ok(None);
+        }
+        let mut g = self.srv.persist();
+        let lsn = g.as_mut().unwrap().append_buffered(ts, oid, rv, ops)?;
+        Ok(Some(lsn))
+    }
+
+    /// The redo operations of a transaction's changes, as its commit logs them.
+    fn redo_ops(&self, tx: TxId, undo: &[Undo]) -> Vec<LogOp> {
         let mut ops: Vec<LogOp> = vec![];
         let mut dbs: HashSet<String> = HashSet::new();
         // objects (re)defined by this transaction, with the heap they had before it (None = new object)
@@ -149,22 +174,82 @@ impl<'a> Engine<'a> {
                 }
             }
         }
+        ops
+    }
+
+    /// Two-phase commit, phase one: make the open explicit transaction's changes durable under `gid` (a `Prepare` record in
+    /// the log, replicated when this server is a replica) while it stays open with its locks. After this the server will
+    /// finish the commit when told to, even if it restarts or fails over first (`Server::resolve_prepared`); commit the
+    /// transaction with `COMMIT` as usual, which settles it, or `ROLLBACK`, which settles it as aborted. Returns false when
+    /// the transaction changed nothing (nothing to prepare, so nothing to wait for).
+    pub fn prepare_tx(&mut self, gid: u64) -> Result<bool> {
+        let Some(tx) = self.ses.tx.as_ref() else {
+            return Err(SqlError::new(3902, "There is no open transaction to prepare."));
+        };
+        if self.ses.doomed {
+            return Err(SqlError::new(3930, "The current transaction cannot be committed and cannot support operations that write to the log file. Roll back the transaction."));
+        }
+        if self.ses.prepared_gid.is_some() || self.srv.prepared.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&gid) {
+            return Err(SqlError::new(50212, format!("Transaction id {} is already prepared.", gid)));
+        }
+        if let Some(e) = self.srv.store.failed() {
+            return Err(SqlError::with(823, 24, 2, format!("The transaction cannot be prepared because the storage engine has failed: {}", e)));
+        }
+        let ops = self.redo_ops(tx.id, &tx.undo);
         if ops.is_empty() {
-            return Ok(None);
+            return Ok(false);
         }
-        let (oid, rv) = (self.srv.core.object_id(), self.srv.core.rowversion());
+        let core = self.srv.core.clone();
+        let commit = core.commit_lock();
+        let ts = core.alloc_commit_ts();
+        let (oid, rv) = (core.object_id(), core.rowversion());
+        let rec_ops = vec![LogOp::Prepare { gid, ops: ops.clone() }];
         let repl = self.srv.replicator.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some(r) = repl {
-            // a replica: the record goes to the group's log first and is written to this node's own log once the group
-            // has committed it (see `replicate_wait`), so a record that the group never commits never reaches the log
-            let rec = crate::persist::WalRecord { lsn: 0, ts, wall: chrono::Utc::now().timestamp_micros(), next_object_id: oid, next_rowversion: rv, ops };
-            let ticket = r.propose(&rec).map_err(|e| SqlError::with(3314, 21, 1, format!("The commit could not be replicated: {}", e)))?;
-            self.ses.pending_repl = Some(crate::persist::PendingRepl { ticket, rec });
-            return Ok(None);
+        let outcome: Result<()> = if let Some(r) = repl {
+            let rec = crate::persist::WalRecord { lsn: 0, ts, wall: chrono::Utc::now().timestamp_micros(), next_object_id: oid, next_rowversion: rv, ops: rec_ops };
+            match r.propose(&rec) {
+                Err(e) => Err(SqlError::with(3314, 21, 1, format!("The prepare could not be replicated: {}", e))),
+                Ok(ticket) => {
+                    self.ses.pending_repl = Some(crate::persist::PendingRepl { ticket, rec });
+                    drop(commit);
+                    self.replicate_wait()
+                }
+            }
+        } else if self.srv.persist().is_some() {
+            let appended = self.srv.persist().as_mut().unwrap().append_buffered(ts, oid, rv, rec_ops);
+            drop(commit);
+            appended.and_then(|lsn| self.sync_log(lsn))
+        } else {
+            drop(commit);
+            Ok(())
+        };
+        core.finish_commit_ts(ts);
+        outcome?;
+        self.srv.prepared.lock().unwrap_or_else(|e| e.into_inner()).insert(gid, crate::persist::PreparedTxn { ops, live: true });
+        self.ses.prepared_gid = Some(gid);
+        Ok(true)
+    }
+
+    /// The session's prepared transaction is being rolled back on purpose: settle it as aborted (durably) so that a restart
+    /// does not bring it back. Nothing to do for a session that has not prepared.
+    pub fn abort_prepared(&mut self) -> Result<()> {
+        let Some(gid) = self.ses.prepared_gid else { return Ok(()) };
+        if let Some((ts, _rec)) = self.srv.log_settlement(gid, false, true)? {
+            self.srv.prepared.lock().unwrap_or_else(|e| e.into_inner()).remove(&gid);
+            self.srv.core.finish_commit_ts(ts);
         }
-        let mut g = self.srv.persist();
-        let lsn = g.as_mut().unwrap().append_buffered(ts, oid, rv, ops)?;
-        Ok(Some(lsn))
+        self.ses.prepared_gid = None;
+        Ok(())
+    }
+
+    /// The session's prepared transaction is going away without a decision (the session ended, or its commit failed): the
+    /// transaction becomes *in doubt* — only its `Prepare` record remains, until `Server::resolve_prepared` settles it.
+    pub fn abandon_prepared(&mut self) {
+        if let Some(gid) = self.ses.prepared_gid.take() {
+            if let Some(p) = self.srv.prepared.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&gid) {
+                p.live = false;
+            }
+        }
     }
 
     /// Wait until the group has committed the record that `write_redo` proposed (nothing to do for a server that is not a
