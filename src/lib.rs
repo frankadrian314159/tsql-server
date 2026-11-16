@@ -64,6 +64,10 @@ struct Shared {
 /// cluster. A server without an interceptor behaves as it always has.
 pub trait Interceptor: Send {
     fn handle(&mut self, sql: &str, sink: &mut dyn FnMut(Streamed) -> bool) -> bool;
+    /// The same for statements that are already parsed (what the bulk load of the TDS listener runs); declining is the default.
+    fn handle_stmts(&mut self, _stmts: &[crate::ast::Stmt], _sink: &mut dyn FnMut(Streamed) -> bool) -> bool {
+        false
+    }
 }
 
 /// Makes the interceptor of a new connection.
@@ -523,6 +527,18 @@ impl Connection {
     /// Execute statements that are already parsed as one batch (a driver that builds statements itself, like the bulk load
     /// of the TDS listener, avoids the text).
     pub fn execute_stmts(&mut self, stmts: &[crate::ast::Stmt]) -> BatchResult {
+        if let Some(i) = self.interceptor.as_mut() {
+            let mut events = vec![];
+            let handled = i.handle_stmts(stmts, &mut |item| {
+                if let Streamed::Event(e) = item {
+                    events.push(e);
+                }
+                true
+            });
+            if handled {
+                return BatchResult { events };
+            }
+        }
         let shared = &self.server.shared;
         let guard = SrvGuard::new(&shared.state);
         let mut eng = Engine::new(guard, &mut self.session);

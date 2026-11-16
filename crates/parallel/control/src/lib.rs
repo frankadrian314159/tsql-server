@@ -24,9 +24,11 @@
 pub mod astutil;
 pub mod client;
 pub mod deadlock;
+pub mod fk;
 pub mod front;
 pub mod joins;
 pub mod merge;
+pub mod nested;
 pub mod plan;
 pub mod rebalance;
 pub mod replicas;
@@ -34,6 +36,7 @@ pub mod txn;
 
 use astutil::*;
 use client::ShardClient;
+use fk::{without_fks, FkDef};
 use futures::future::join_all;
 use plan::Shape;
 use std::collections::HashMap;
@@ -74,6 +77,17 @@ pub struct DistTable {
     pub loaded: Option<u64>,
     /// (version, row count), for choosing how to run a join
     pub rows: Option<(u64, u64)>,
+    /// the IDENTITY column the control node numbers (the shards' copies of the table have no identity of their own)
+    pub identity: Option<Identity>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Identity {
+    /// the position of the column
+    pub col: usize,
+    /// the next value to hand out
+    pub next: i64,
+    pub inc: i64,
 }
 
 pub struct Cluster {
@@ -96,6 +110,11 @@ pub struct Cluster {
     broadcast_limit: AtomicU64,
     /// how long a statement of a transaction waits for a lock on a shard (ms); a deadlock between shards is broken by it
     lock_timeout_ms: AtomicU64,
+    /// the views (by table id) as their `CREATE VIEW` statements: a query that reads one is rewritten around its definition
+    /// (see `nested.rs`), since the shards hold no views
+    views: Mutex<HashMap<String, Stmt>>,
+    /// the foreign keys, which the shards do not enforce (see `fk.rs`)
+    fks: Mutex<Vec<FkDef>>,
     /// transactions whose commit was decided but not yet confirmed by every shard: (transaction id, shards still to finish)
     pending: Arc<Mutex<Vec<(u64, Vec<usize>)>>>,
     /// transactions of this control node that are being prepared right now (not yet decided)
@@ -154,6 +173,8 @@ impl Cluster {
             next_session: AtomicU64::new(fresh_session_base()),
             broadcast_limit: AtomicU64::new(100_000),
             lock_timeout_ms: AtomicU64::new(5000),
+            views: Mutex::new(HashMap::new()),
+            fks: Mutex::new(vec![]),
             pending,
             preparing,
             next_gid: AtomicU64::new(fresh_session_base()),
@@ -189,6 +210,37 @@ impl Cluster {
     /// timeout breaks such a deadlock (the statement fails, and the transaction is rolled back, releasing its locks).
     pub fn set_lock_timeout_ms(&self, ms: u64) {
         self.lock_timeout_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Reserve `count` identity values of a table: the first of them and the increment. Saved with the control state, so that a
+    /// restart goes on from there.
+    pub(crate) fn take_identity(&self, id: &str, count: usize) -> Option<(i64, i64)> {
+        let out = {
+            let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+            let ident = t.get_mut(id)?.identity.as_mut()?;
+            let first = ident.next;
+            ident.next += ident.inc * count as i64;
+            (first, ident.inc)
+        };
+        self.save_state();
+        Some(out)
+    }
+
+    /// An explicit value was inserted into an IDENTITY column: the numbers handed out from now on are past it.
+    pub(crate) fn raise_identity(&self, id: &str, value: i64) {
+        let changed = {
+            let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+            match t.get_mut(id).and_then(|t| t.identity.as_mut()) {
+                Some(i) if (i.inc > 0 && value >= i.next) || (i.inc < 0 && value <= i.next) => {
+                    i.next = value + i.inc;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            self.save_state();
+        }
     }
 
     pub fn shard_count(&self) -> usize {
@@ -227,7 +279,7 @@ impl Cluster {
     }
 
     pub fn session(self: &Arc<Self>) -> ClusterSession {
-        ClusterSession { cluster: self.clone(), id: self.next_session.fetch_add(1, Ordering::Relaxed), mirror: self.mirror.connect_internal(), plan: vec![], temp_counter: 0, txn: std::cell::RefCell::new(None), stmt_shards: std::cell::Cell::new(0), commit_seq: 0, vars: HashMap::new() }
+        ClusterSession { cluster: self.clone(), id: self.next_session.fetch_add(1, Ordering::Relaxed), mirror: self.mirror.connect_internal(), plan: vec![], temp_counter: 0, txn: std::cell::RefCell::new(None), stmt_shards: std::cell::Cell::new(0), commit_seq: 0, vars: HashMap::new(), local_tables: HashMap::new(), tvars: HashMap::new(), identity_insert: Default::default(), last_identity: None }
     }
 
     pub fn shard_status(&self) -> Vec<Result<ShardStatus, SqlError>> {
@@ -255,10 +307,22 @@ pub struct ClusterSession {
     commit_seq: u64,
     /// the variables of the session (`DECLARE`, `SET`, the parameters of `sp_executesql`), see `front.rs`
     vars: HashMap<String, Value>,
+    /// the temporary tables of the statement being run (results of CTEs and derived tables, see `nested.rs`)
+    local_tables: HashMap<String, DistTable>,
+    /// the tables whose IDENTITY column may be given values (`SET IDENTITY_INSERT t ON`), by table id
+    identity_insert: std::collections::HashSet<String>,
+    /// the last identity value this session handed out (`SCOPE_IDENTITY()`, `@@IDENTITY`)
+    last_identity: Option<i64>,
+    /// the table variables of the session (by lower-case name) with their columns and rows: a query that reads one has its
+    /// rows sent to the shards as a temporary table (see `nested.rs`). (The engine keeps variables for one batch only, so the
+    /// session keeps these itself.)
+    tvars: HashMap<String, ResultSet>,
 }
 
 /// A transaction of a control session: the shards that have begun it, and what it has changed.
 struct TxnState {
+    /// the savepoints, oldest first: the name and the shards that had begun the transaction when it was made
+    savepoints: Vec<(String, std::collections::BTreeSet<usize>)>,
     shards: std::collections::BTreeSet<usize>,
     depth: u32,
     doomed: bool,
@@ -269,6 +333,20 @@ struct TxnState {
 /// earlier life): they start at the clock.
 fn fresh_session_base() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(1) << 8
+}
+
+/// The variables a `SELECT @a = ..., @b = ...` assigns (with the operator of `+=` and the like), when every item is an
+/// assignment.
+fn assign_targets(q: &Query) -> Option<Vec<(String, Option<BinOp>)>> {
+    let QueryBody::Select(s) = &q.body else { return None };
+    if s.items.is_empty() || !s.items.iter().all(|i| matches!(i, SelectItem::Assign { .. })) {
+        return None;
+    }
+    Some(s.items.iter().filter_map(|i| if let SelectItem::Assign { var, op, .. } = i { Some((var.clone(), *op)) } else { None }).collect())
+}
+
+fn exprs_have_subquery(u: &Update) -> bool {
+    u.where_.iter().any(has_subquery) || u.sets.iter().any(|s| matches!(s, SetItem::Col { e, .. } if has_subquery(e)))
 }
 
 fn unsupported(what: &str) -> SqlError {
@@ -454,6 +532,29 @@ impl ClusterSession {
         self.txn.borrow().is_some()
     }
 
+    /// `SELECT @a = e1, @b = e2 FROM ...`: run the query for its values and assign the last row's to the variables (no row:
+    /// they keep their values), as the engine does.
+    async fn select_assign(&mut self, q: &Query, targets: Vec<(String, Option<BinOp>)>) -> Result<(), SqlError> {
+        let mut plain = q.clone();
+        if let QueryBody::Select(s) = &mut plain.body {
+            s.items = s.items.iter().map(|i| if let SelectItem::Assign { e, .. } = i { SelectItem::Expr { e: e.clone(), alias: None } } else { i.clone() }).collect();
+        }
+        let rs = self.run_query(&plain).await?;
+        let Some(row) = rs.rows.last() else { return Ok(()) };
+        for ((var, op), v) in targets.into_iter().zip(row.iter()) {
+            let key = var.to_lowercase();
+            let new = match op {
+                None => v.clone(),
+                Some(op) => {
+                    let old = self.vars.get(&key).cloned().unwrap_or(Value::Null);
+                    self.eval_scalar(&Expr::Binary(op, Box::new(Expr::Lit(old)), Box::new(Expr::Lit(v.clone())))).await?
+                }
+            };
+            self.vars.insert(key, new);
+        }
+        Ok(())
+    }
+
     /// The rows of a query (the first result set).
     pub fn query(&mut self, sql: &str) -> Result<Vec<Vec<Value>>, SqlError> {
         let res = self.execute(sql);
@@ -466,10 +567,16 @@ impl ClusterSession {
     // ------------------------------------------------------------------ helpers
 
     fn table_by_id(&self, id: &str) -> Option<DistTable> {
+        if let Some(t) = self.local_tables.get(id) {
+            return Some(t.clone());
+        }
         self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned()
     }
 
     fn table(&self, name: &Name) -> Result<DistTable, SqlError> {
+        if self.cluster.views.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&table_id(name)) {
+            return Err(unsupported("INSERT, UPDATE or DELETE through a view"));
+        }
         self.table_by_id(&table_id(name)).ok_or_else(|| SqlError::new(208, format!("Invalid object name '{}'.", name.join("."))))
     }
 
@@ -537,7 +644,8 @@ impl ClusterSession {
     async fn broadcast(&mut self, st: &Stmt) -> Result<(), SqlError> {
         merge::check(&self.mirror.execute_stmts(std::slice::from_ref(st)))?;
         let shards = self.all_shards();
-        self.fan_run(&shards, |_| Work::Stmts(vec![st.clone()])).await?;
+        let on_shards = shard_form(st);
+        self.fan_run(&shards, |_| Work::Stmts(vec![on_shards.clone()])).await?;
         self.plan.push(format!("broadcast {} to {} shards", stmt_kind(st), shards.len()));
         Ok(())
     }
@@ -550,20 +658,21 @@ impl ClusterSession {
                 let mut t = self.txn.borrow_mut();
                 match t.as_mut() {
                     Some(x) => x.depth += 1,
-                    None => *t = Some(TxnState { shards: Default::default(), depth: 1, doomed: false, wrote: Default::default() }),
+                    None => *t = Some(TxnState { shards: Default::default(), depth: 1, doomed: false, wrote: Default::default(), savepoints: vec![] }),
                 }
                 return Ok(());
             }
             Stmt::Commit(_) => return self.commit_txn(events).await,
-            Stmt::Rollback(_) => return self.rollback_txn().await,
-            Stmt::SaveTran(_) => return Err(unsupported("savepoints")),
+            Stmt::Rollback(Some(name)) => return self.rollback_to_savepoint(name).await,
+            Stmt::Rollback(None) => return self.rollback_txn().await,
+            Stmt::SaveTran(name) => return self.save_savepoint(name).await,
             _ => {}
         }
         if let Some(t) = self.txn.borrow().as_ref() {
             if t.doomed {
                 return Err(SqlError::new(3930, "The current transaction cannot be committed and cannot support operations that write to the log file. Roll back the transaction."));
             }
-            if matches!(st, Stmt::CreateTable { .. } | Stmt::Drop { .. } | Stmt::CreateIndex { .. } | Stmt::DropIndex { .. } | Stmt::Truncate(_)) {
+            if matches!(st, Stmt::CreateTable { .. } | Stmt::AlterTable { .. } | Stmt::CreateView { .. } | Stmt::Drop { .. } | Stmt::CreateIndex { .. } | Stmt::DropIndex { .. } | Stmt::Truncate(_)) {
                 return Err(unsupported("schema changes and TRUNCATE inside a transaction"));
             }
         }
@@ -579,13 +688,57 @@ impl ClusterSession {
         let st = &bound;
         match st {
             Stmt::CreateTable { name, defs, versioning } => self.create_table(st, name, defs, versioning.is_some()).await,
+            Stmt::AlterTable { name, action } => self.alter_table(st, name, action).await,
+            Stmt::CreateView { name, alter, or_alter, .. } => {
+                let id = table_id(name);
+                let known = self.cluster.views.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&id);
+                if self.table_by_id(&id).is_some() || (known && !*alter && !*or_alter) {
+                    return Err(SqlError::new(2714, format!("There is already an object named '{}' in the database.", name.last().cloned().unwrap_or_default())));
+                }
+                if *alter && !known {
+                    return Err(SqlError::new(208, format!("Invalid object name '{}'.", name.join("."))));
+                }
+                // the control node's own engine checks the definition (it holds the schema of every table) ...
+                merge::check(&self.mirror.execute_stmts(std::slice::from_ref(st)))?;
+                // ... and the control node keeps it: the shards hold no views
+                self.cluster.views.lock().unwrap_or_else(|e| e.into_inner()).insert(id, st.clone());
+                self.cluster.log_schema(st);
+                Ok(())
+            }
+            Stmt::Drop { what, names, if_exists } if what.eq_ignore_ascii_case("VIEW") => {
+                for n in names {
+                    let id = table_id(n);
+                    if !self.cluster.views.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&id) && !*if_exists {
+                        return Err(SqlError::new(3701, format!("Cannot drop the view '{}', because it does not exist or you do not have permission.", n.join("."))));
+                    }
+                }
+                merge::check(&self.mirror.execute_stmts(std::slice::from_ref(st)))?;
+                let mut v = self.cluster.views.lock().unwrap_or_else(|e| e.into_inner());
+                for n in names {
+                    v.remove(&table_id(n));
+                }
+                drop(v);
+                self.cluster.log_schema(st);
+                Ok(())
+            }
             Stmt::Drop { what, names, .. } if what.eq_ignore_ascii_case("TABLE") => {
+                for n in names {
+                    let id = table_id(n);
+                    // (a table may be dropped together with the tables that refer to it)
+                    if self.cluster.fks_of_parent(&id).iter().any(|f| f.child != id && !names.iter().any(|m| table_id(m) == f.child)) {
+                        return Err(SqlError::new(3726, format!("Could not drop object '{}' because it is referenced by a FOREIGN KEY constraint.", n.join("."))));
+                    }
+                }
                 self.broadcast(st).await?;
                 let mut t = self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner());
                 for n in names {
                     t.remove(&table_id(n));
                 }
                 drop(t);
+                {
+                    let ids: Vec<String> = names.iter().map(|n| table_id(n)).collect();
+                    self.cluster.fks.lock().unwrap_or_else(|e| e.into_inner()).retain(|f| !ids.contains(&f.child) && !ids.contains(&f.parent));
+                }
                 self.cluster.log_schema(st);
                 Ok(())
             }
@@ -608,9 +761,35 @@ impl ClusterSession {
                 self.cluster.log_schema(st);
                 Ok(())
             }
-            Stmt::SetOpts(_) => self.broadcast(st).await,
+            Stmt::SetOpts(opts) => {
+                // IDENTITY_INSERT is about the numbers the control node hands out: the shards' tables have no identity
+                let mut rest: Vec<SetOpt> = vec![];
+                for o in opts {
+                    match o {
+                        SetOpt::IdentityInsert(name, on) => {
+                            let id = table_id(name);
+                            if self.table_by_id(&id).is_none() {
+                                rest.push(o.clone());
+                            } else if *on {
+                                self.identity_insert.insert(id);
+                            } else {
+                                self.identity_insert.remove(&id);
+                            }
+                        }
+                        other => rest.push(other.clone()),
+                    }
+                }
+                if rest.is_empty() {
+                    Ok(())
+                } else {
+                    self.broadcast(&Stmt::SetOpts(rest)).await
+                }
+            }
             Stmt::Truncate(Target::Table(name)) => {
                 let t = self.table(name)?;
+                if self.cluster.fks_of_parent(&t.id).iter().any(|f| f.child != t.id) {
+                    return Err(SqlError::new(4712, format!("Cannot truncate table '{}' because it is being referenced by a FOREIGN KEY constraint.", name.join("."))));
+                }
                 self.broadcast(st).await?;
                 self.bump(&t.id);
                 Ok(())
@@ -619,6 +798,9 @@ impl ClusterSession {
             Stmt::Update(u) => self.update(u, events).await,
             Stmt::Delete(d) => self.delete(d, events).await,
             Stmt::Query(q) => {
+                if let Some(assigns) = assign_targets(q) {
+                    return self.select_assign(q, assigns).await;
+                }
                 let rs = self.run_query(q).await?;
                 events.push(Event::Rows(rs));
                 Ok(())
@@ -634,14 +816,14 @@ impl ClusterSession {
         let mut cols: Vec<ColInfo> = vec![];
         let mut pk: Vec<String> = vec![];
         let mut uniques: Vec<Vec<String>> = vec![];
+        let mut identity: Option<(usize, i64, i64)> = None;
         for d in defs {
             match d {
                 TableDef::Column(cd) => {
-                    if cd.identity.is_some() {
-                        return Err(unsupported("IDENTITY columns (the shards would each hand out the same numbers)"));
-                    }
-                    if cd.fk.is_some() {
-                        return Err(unsupported("FOREIGN KEY constraints"));
+                    if let Some((seed, inc)) = &cd.identity {
+                        let seed = self.eval_scalar(seed).await?;
+                        let inc = self.eval_scalar(inc).await?;
+                        identity = Some((cols.len(), seed.as_i64().unwrap_or(1), inc.as_i64().unwrap_or(1)));
                     }
                     if cd.pk.is_some() {
                         pk = vec![cd.name.clone()];
@@ -655,11 +837,14 @@ impl ClusterSession {
                 TableDef::PrimaryKey { cols: c, .. } => pk = c.iter().map(|(n, _)| n.clone()).collect(),
                 TableDef::Unique { cols: c, .. } => uniques.push(c.iter().map(|(n, _)| n.clone()).collect()),
                 TableDef::Index { cols: c, unique: true, .. } => uniques.push(c.iter().map(|(n, _)| n.clone()).collect()),
-                TableDef::ForeignKey(_) => return Err(unsupported("FOREIGN KEY constraints")),
                 TableDef::Period { .. } => return Err(unsupported("system-versioned tables")),
                 _ => {}
             }
         }
+        // foreign keys are the control node's to enforce (the shards and its own engine are not given them)
+        let fks = self.declared_fks(name, defs, &pk)?;
+        let stripped = without_fks(st);
+        let st = &stripped;
         // the shard key: the first column of the primary key, else the first column
         let key_name = pk.first().cloned().or_else(|| cols.iter().find(|c| !c.computed).map(|c| c.name.clone())).ok_or_else(|| SqlError::new(1113, "A table needs at least one column."))?;
         let key = cols.iter().position(|c| c.name.eq_ignore_ascii_case(&key_name)).ok_or_else(|| SqlError::new(1911, format!("Column name '{}' does not exist in the target table.", key_name)))?;
@@ -682,7 +867,126 @@ impl ClusterSession {
             return Err(e);
         }
         let id = table_id(name);
-        self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), DistTable { id, name: name.clone(), cols, dist: Dist::Sharded { key, class }, version: 0, loaded: None, rows: None });
+        self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), DistTable { id, name: name.clone(), cols, dist: Dist::Sharded { key, class }, version: 0, loaded: None, rows: None, identity: identity.map(|(col, next, inc)| Identity { col, next, inc }) });
+        self.cluster.fks.lock().unwrap_or_else(|e| e.into_inner()).extend(fks);
+        self.cluster.log_schema(st);
+        Ok(())
+    }
+
+    /// `ALTER TABLE`: run on the control node's engine and on every shard, and keep the columns the control node knows. What
+    /// would change how rows are placed or numbered (the shard key, an IDENTITY column, a primary key) is refused.
+    async fn alter_table(&mut self, st: &Stmt, name: &Name, action: &AlterAction) -> Result<(), SqlError> {
+        let t = self.table(name)?;
+        let key_col = match &t.dist {
+            Dist::Sharded { key, .. } => Some(t.cols[*key].name.clone()),
+            Dist::Replicated => None,
+        };
+        let ident_col = t.identity.as_ref().map(|i| t.cols[i.col].name.clone());
+        let is = |c: &str, of: &Option<String>| of.as_deref().map(|k| k.eq_ignore_ascii_case(c)).unwrap_or(false);
+        match action {
+            AlterAction::AddDefs(defs) => {
+                for d in defs {
+                    match d {
+                        TableDef::Column(cd) => {
+                            if cd.identity.is_some() {
+                                return Err(unsupported("adding an IDENTITY column"));
+                            }
+                            if cd.pk.is_some() {
+                                return Err(unsupported("adding a primary key"));
+                            }
+                            if cd.unique.is_some() {
+                                return Err(unsupported("adding a UNIQUE column"));
+                            }
+                        }
+                        TableDef::PrimaryKey { .. } => return Err(unsupported("adding a primary key")),
+                        TableDef::Unique { cols, .. } => {
+                            if !cols.iter().any(|(c, _)| is(c, &key_col)) && key_col.is_some() {
+                                return Err(unsupported("a UNIQUE constraint that does not contain the shard key"));
+                            }
+                        }
+                        TableDef::Period { .. } => return Err(unsupported("system-versioned tables")),
+                        _ => {}
+                    }
+                }
+            }
+            AlterAction::DropColumn(cols, _) => {
+                if cols.iter().any(|c| is(c, &key_col) || is(c, &ident_col)) {
+                    return Err(unsupported("dropping the shard key or an IDENTITY column"));
+                }
+            }
+            AlterAction::AlterColumn { col, .. } => {
+                if is(col, &key_col) || is(col, &ident_col) {
+                    return Err(unsupported("changing the shard key or an IDENTITY column"));
+                }
+            }
+            AlterAction::SetVersioning(_) => return Err(unsupported("system-versioned tables")),
+            AlterAction::DropConstraint(..) | AlterAction::AlterMask { .. } | AlterAction::CheckConstraint { .. } => {}
+        }
+        // foreign keys are the control node's: a new one is checked against the rows that exist, and none goes to the shards
+        let mut st_owned = st.clone();
+        let mut new_fks: Vec<FkDef> = vec![];
+        let mut dropped_fks: Vec<String> = vec![];
+        if let Stmt::AlterTable { action, .. } = &mut st_owned {
+            match action {
+                AlterAction::AddDefs(defs) => {
+                    new_fks = self.declared_fks(name, defs, &[])?;
+                    defs.retain(|d| !matches!(d, TableDef::ForeignKey(_)));
+                    for d in defs.iter_mut() {
+                        if let TableDef::Column(cd) = d {
+                            cd.fk = None;
+                        }
+                    }
+                    if defs.is_empty() {
+                        for fk in &new_fks {
+                            self.fk_validate_existing(fk).await?;
+                        }
+                        self.cluster.fks.lock().unwrap_or_else(|e| e.into_inner()).extend(new_fks);
+                        self.cluster.save_state();
+                        return Ok(());
+                    }
+                }
+                AlterAction::DropConstraint(names, _) => {
+                    let known: Vec<String> = self.cluster.fks_of_child(&t.id).into_iter().map(|f| f.name).collect();
+                    dropped_fks = names.iter().filter(|n| known.iter().any(|k| k.eq_ignore_ascii_case(n))).cloned().collect();
+                    names.retain(|n| !dropped_fks.iter().any(|d| d.eq_ignore_ascii_case(n)));
+                    if names.is_empty() {
+                        self.cluster.fks.lock().unwrap_or_else(|e| e.into_inner()).retain(|f| !(f.child == t.id && dropped_fks.iter().any(|d| d.eq_ignore_ascii_case(&f.name))));
+                        self.cluster.save_state();
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            }
+        }
+        for fk in &new_fks {
+            self.fk_validate_existing(fk).await?;
+        }
+        let st = &st_owned;
+        self.broadcast(st).await?;
+        self.cluster.fks.lock().unwrap_or_else(|e| e.into_inner()).extend(new_fks);
+        self.cluster.fks.lock().unwrap_or_else(|e| e.into_inner()).retain(|f| !(f.child == t.id && dropped_fks.iter().any(|d| d.eq_ignore_ascii_case(&f.name))));
+        // the columns as the control node's engine now has them
+        let shown = format!("[{}].[{}]", if name.len() >= 2 { name[name.len() - 2].clone() } else { "dbo".to_string() }, name.last().cloned().unwrap_or_default());
+        if let Some(info) = self.mirror.table_info(&shown) {
+            let cols: Vec<ColInfo> = info.columns.iter().map(|c| ColInfo { name: c.name.clone(), computed: c.computed, type_name: c.ty.split('(').next().unwrap_or("").trim().to_lowercase() }).collect();
+            let mut tables = self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(e) = tables.get_mut(&t.id) {
+                if let (Dist::Sharded { key, .. }, Some(k)) = (&mut e.dist, &key_col) {
+                    if let Some(p) = cols.iter().position(|c| c.name.eq_ignore_ascii_case(k)) {
+                        *key = p;
+                    }
+                }
+                if let (Some(i), Some(ic)) = (e.identity.as_mut(), &ident_col) {
+                    if let Some(p) = cols.iter().position(|c| c.name.eq_ignore_ascii_case(ic)) {
+                        i.col = p;
+                    }
+                }
+                e.cols = cols;
+                e.version += 1;
+                e.loaded = None;
+                e.rows = None;
+            }
+        }
         self.cluster.log_schema(st);
         Ok(())
     }
@@ -718,13 +1022,59 @@ impl ClusterSession {
             return Ok(v.clone());
         }
         let q = simple_query(Select { distinct: false, top: None, items: vec![SelectItem::Expr { e: e.clone(), alias: None }], into: None, from: vec![], where_: None, group: None, having: None });
+        if has_subquery(e) {
+            // a subquery may read distributed tables: the cluster answers it
+            let rs = self.run_query(&q).await?;
+            return rs.rows.first().and_then(|r| r.first()).cloned().ok_or_else(|| SqlError::new(50000, "an expression returned no value"));
+        }
         let res = self.mirror.execute_stmts(&[Stmt::Query(Box::new(q))]);
         merge::check(&res)?;
         res.resultsets().first().and_then(|r| r.rows.first()).and_then(|r| r.first()).cloned().ok_or_else(|| SqlError::new(50000, "an expression returned no value"))
     }
 
     async fn insert(&mut self, ins: &Insert, events: &mut Vec<Event>) -> Result<(), SqlError> {
-        let Target::Table(name) = &ins.target else { return Err(unsupported("INSERT into a table variable")) };
+        let name = match &ins.target {
+            Target::Table(name) => name,
+            Target::Var(v) if self.tvars.contains_key(&v.to_lowercase()) => {
+                let key = v.to_lowercase();
+                let values: Vec<Vec<Value>> = match &ins.src {
+                    InsertSrc::Values(rows) => {
+                        let mut out = vec![];
+                        for r in rows {
+                            let mut vals = vec![];
+                            for e in r {
+                                let b = self.bind_expr(e)?;
+                                vals.push(self.eval_scalar(&b).await?);
+                            }
+                            out.push(vals);
+                        }
+                        out
+                    }
+                    // (what it is filled from may be read from the shards)
+                    InsertSrc::Query(q) => self.run_query(q).await?.rows,
+                    _ => return Err(unsupported("this INSERT into a table variable")),
+                };
+                let tv = self.tvars.get_mut(&key).expect("a table variable");
+                let ncols = tv.columns.len();
+                // the columns the values are for: those named, or all in order
+                let order: Vec<usize> = match &ins.cols {
+                    Some(names) => names.iter().map(|n| tv.columns.iter().position(|c| c.eq_ignore_ascii_case(n)).ok_or_else(|| SqlError::new(207, format!("Invalid column name '{}'.", n)))).collect::<Result<_, _>>()?,
+                    None => (0..ncols).collect(),
+                };
+                for vals in values {
+                    if vals.len() != order.len() {
+                        return Err(SqlError::new(213, "Column name or number of supplied values does not match table definition."));
+                    }
+                    let mut row = vec![Value::Null; ncols];
+                    for (v, &i) in vals.into_iter().zip(&order) {
+                        row[i] = v;
+                    }
+                    tv.rows.push(row);
+                }
+                return Ok(());
+            }
+            Target::Var(_) => return Err(unsupported("INSERT into a table variable that is not declared in this batch")),
+        };
         let t = self.table(name)?;
         if ins.output.is_some() || ins.top.is_some() || !ins.ctes.is_empty() {
             return Err(unsupported("INSERT with OUTPUT, TOP or CTEs"));
@@ -739,11 +1089,53 @@ impl ClusterSession {
             InsertSrc::Exec(_) => return Err(unsupported("INSERT ... EXEC")),
         };
         let n = self.cluster.shard_count();
-        let names: Vec<String> = ins.cols.clone().unwrap_or_else(|| t.cols.iter().filter(|c| !c.computed).map(|c| c.name.clone()).collect());
+        let ident_col = t.identity.as_ref().map(|i| t.cols[i.col].name.clone());
+        let given: Option<Vec<String>> = ins.cols.clone();
+        // without a column list the values are for the columns that are not computed (and not the identity column, unless
+        // IDENTITY_INSERT is on)
+        let mut names: Vec<String> = given.clone().unwrap_or_else(|| {
+            t.cols.iter().filter(|c| !c.computed && !(ident_col.as_deref() == Some(c.name.as_str()) && !self.identity_insert.contains(&t.id))).map(|c| c.name.clone()).collect()
+        });
         if let Some(bad) = rows.iter().find(|r| r.len() != names.len()) {
             return Err(SqlError::new(213, format!("Column name or number of supplied values does not match table definition ({} values for {} columns).", bad.len(), names.len())));
         }
-        let make = |rows: Vec<Vec<Expr>>| Stmt::Insert(Box::new(Insert { ctes: vec![], target: ins.target.clone(), cols: ins.cols.clone(), output: None, src: InsertSrc::Values(rows), top: None }));
+        let mut rows = rows;
+        if let Some(ic) = &ident_col {
+            let explicit = names.iter().any(|c| c.eq_ignore_ascii_case(ic));
+            if explicit && !self.identity_insert.contains(&t.id) {
+                return Err(SqlError::new(544, format!("Cannot insert explicit value for identity column in table '{}' when IDENTITY_INSERT is set to OFF.", t.name.last().cloned().unwrap_or_default())));
+            }
+            if !explicit {
+                // the control node numbers the rows: the same numbers whichever shard a row goes to
+                if let Some((first, inc)) = self.cluster.take_identity(&t.id, rows.len()) {
+                    let is_big = t.cols.iter().find(|c| c.name.eq_ignore_ascii_case(ic)).map(|c| c.type_name == "bigint").unwrap_or(false);
+                    for (k, r) in rows.iter_mut().enumerate() {
+                        let v = first + inc * k as i64;
+                        r.push(Expr::Lit(if is_big { Value::BigInt(v) } else { Value::Int(v as i32) }));
+                    }
+                    names.push(ic.clone());
+                    self.last_identity = Some(first + inc * (rows.len().saturating_sub(1)) as i64);
+                }
+            } else if let Some(pos) = names.iter().position(|c| c.eq_ignore_ascii_case(ic)) {
+                // an explicit value moves the counter if it is past it (as the engine does)
+                let mut top: Option<i64> = None;
+                for r in &rows {
+                    if let Expr::Lit(v) = &r[pos] {
+                        if let Some(x) = v.as_i64() {
+                            top = Some(top.map_or(x, |t| t.max(x)));
+                        }
+                    }
+                }
+                if let Some(top) = top {
+                    self.cluster.raise_identity(&t.id, top);
+                }
+            }
+        }
+        if !self.cluster.fks_of_child(&t.id).is_empty() {
+            self.fk_check_insert(&t, &names, &rows).await?;
+        }
+        let cols_for_shards: Option<Vec<String>> = if ident_col.is_some() || given.is_some() { Some(names.clone()) } else { None };
+        let make = |rows: Vec<Vec<Expr>>| Stmt::Insert(Box::new(Insert { ctes: vec![], target: ins.target.clone(), cols: cols_for_shards.clone(), output: None, src: InsertSrc::Values(rows), top: None }));
         let count: i64;
         match &t.dist {
             Dist::Replicated => {
@@ -800,12 +1192,19 @@ impl ClusterSession {
             return Err(unsupported("UPDATE with FROM, OUTPUT, TOP, CURRENT OF or CTEs"));
         }
         let mut exprs: Vec<&Expr> = u.where_.iter().collect();
+        let mut moves_key = false;
         for s in &u.sets {
             match s {
                 SetItem::Col { parts, e, .. } => {
+                    let col = parts.last().cloned().unwrap_or_default();
+                    if let Some(i) = &t.identity {
+                        if t.cols[i.col].name.eq_ignore_ascii_case(&col) {
+                            return Err(SqlError::new(8102, format!("Cannot update identity column '{}'.", col)));
+                        }
+                    }
                     if let Dist::Sharded { key, .. } = &t.dist {
-                        if parts.last().map(|p| p.eq_ignore_ascii_case(&t.cols[*key].name)).unwrap_or(false) {
-                            return Err(unsupported("changing the shard key of a row"));
+                        if col.eq_ignore_ascii_case(&t.cols[*key].name) {
+                            moves_key = true;
                         }
                     }
                     exprs.push(e);
@@ -813,11 +1212,85 @@ impl ClusterSession {
                 SetItem::Var { .. } => return Err(unsupported("UPDATE that assigns variables")),
             }
         }
-        if exprs.iter().any(|e| has_subquery(e) || has_window_or_session(e)) {
-            return Err(unsupported("subqueries, variables or window functions in UPDATE"));
+        if exprs.iter().any(|e| has_window_or_session(e)) {
+            return Err(unsupported("variables or window functions in UPDATE"));
+        }
+        if exprs.iter().any(|e| has_subquery(e)) {
+            // subqueries that do not depend on the row are evaluated first
+            return match self.resolve_stmt(&Stmt::Update(Box::new(u.clone()))).await? {
+                Some(Stmt::Update(u2)) if !exprs_have_subquery(&u2) => Box::pin(self.update(&u2, events)).await,
+                _ => Err(unsupported("correlated subqueries in UPDATE")),
+            };
+        }
+        self.fk_check_update(&t, u).await?;
+        if moves_key {
+            return self.update_moving_key(&t, u, events).await;
         }
         let shards = self.dml_shards(&t, u.where_.as_ref());
         self.run_dml(&t, Stmt::Update(Box::new(u.clone())), shards, events).await
+    }
+
+    /// An UPDATE that changes the shard key moves rows between shards: the new rows are read (the engine evaluates the new
+    /// values), the old ones deleted and the new ones inserted, in one transaction.
+    async fn update_moving_key(&mut self, t: &DistTable, u: &Update, events: &mut Vec<Event>) -> Result<(), SqlError> {
+        let own_txn = self.txn.borrow().is_none();
+        if own_txn {
+            *self.txn.borrow_mut() = Some(TxnState { shards: Default::default(), depth: 1, doomed: false, wrote: Default::default(), savepoints: vec![] });
+        }
+        let out = self.move_rows(t, u, events).await;
+        if own_txn {
+            match out {
+                Ok(()) => self.commit_txn(events).await,
+                Err(e) => {
+                    let _ = self.rollback_txn().await;
+                    Err(e)
+                }
+            }
+        } else {
+            out
+        }
+    }
+
+    async fn move_rows(&mut self, t: &DistTable, u: &Update, events: &mut Vec<Event>) -> Result<(), SqlError> {
+        let cols: Vec<&ColInfo> = t.cols.iter().filter(|c| !c.computed).collect();
+        // the new row: each column as it is, or the value it is set to
+        let items: Vec<SelectItem> = cols
+            .iter()
+            .map(|c| {
+                let set = u.sets.iter().find_map(|s| match s {
+                    SetItem::Col { parts, e, .. } if parts.last().map(|p| p.eq_ignore_ascii_case(&c.name)).unwrap_or(false) => Some(e.clone()),
+                    _ => None,
+                });
+                SelectItem::Expr { e: set.unwrap_or_else(|| col(&c.name)), alias: Some(c.name.clone()) }
+            })
+            .collect();
+        let alias = match &u.target {
+            Target::Table(n) => n.last().cloned().unwrap_or_default(),
+            _ => String::new(),
+        };
+        let read = simple_query(Select { distinct: false, top: None, items, into: None, from: vec![TableRef::Table { name: t.name.clone(), alias: Some(alias), hints: vec![] }], where_: u.where_.clone(), group: None, having: None });
+        let rs = self.run_query(&read).await?;
+        let del = Delete { ctes: vec![], target: u.target.clone(), from: vec![], where_: u.where_.clone(), output: None, top: None, current_of: None };
+        let mut none = vec![];
+        let shards = self.dml_shards(t, u.where_.as_ref());
+        self.run_dml(t, Stmt::Delete(Box::new(del)), shards, &mut none).await?;
+        let moved = rs.rows.len() as i64;
+        if moved > 0 {
+            let names: Vec<String> = cols.iter().map(|c| c.name.clone()).collect();
+            let rows: Vec<Vec<Expr>> = rs.rows.into_iter().map(|r| r.into_iter().map(Expr::Lit).collect()).collect();
+            let ins = Insert { ctes: vec![], target: u.target.clone(), cols: Some(names), output: None, src: InsertSrc::Values(rows), top: None };
+            // (the identity column, if any, is given: the rows keep their numbers)
+            let had = self.identity_insert.contains(&t.id);
+            self.identity_insert.insert(t.id.clone());
+            let r = self.insert(&ins, &mut none).await;
+            if !had {
+                self.identity_insert.remove(&t.id);
+            }
+            r?;
+        }
+        self.plan.push("update of the shard key: rows read, deleted and inserted again".into());
+        events.push(Event::RowCount(moved));
+        Ok(())
     }
 
     async fn delete(&mut self, d: &Delete, events: &mut Vec<Event>) -> Result<(), SqlError> {
@@ -827,17 +1300,24 @@ impl ClusterSession {
             return Err(unsupported("DELETE with FROM, OUTPUT, TOP, CURRENT OF or CTEs"));
         }
         if let Some(w) = &d.where_ {
-            if has_subquery(w) || has_window_or_session(w) {
-                return Err(unsupported("subqueries or variables in DELETE"));
+            if has_window_or_session(w) {
+                return Err(unsupported("variables in DELETE"));
+            }
+            if has_subquery(w) {
+                return match self.resolve_stmt(&Stmt::Delete(Box::new(d.clone()))).await? {
+                    Some(Stmt::Delete(d2)) if !d2.where_.as_ref().map(has_subquery).unwrap_or(false) => Box::pin(self.delete(&d2, events)).await,
+                    _ => Err(unsupported("correlated subqueries in DELETE")),
+                };
             }
         }
+        self.fk_before_delete(&t, d.where_.as_ref(), events).await?;
         let shards = self.dml_shards(&t, d.where_.as_ref());
         self.run_dml(&t, Stmt::Delete(Box::new(d.clone())), shards, events).await
     }
 
     // ------------------------------------------------------------------ queries
 
-    async fn run_query(&mut self, q: &Query) -> Result<ResultSet, SqlError> {
+    async fn run_query_flat(&mut self, q: &Query) -> Result<ResultSet, SqlError> {
         let ids = referenced_tables(q);
         let tables: Vec<DistTable> = ids.iter().filter_map(|i| self.table_by_id(i)).collect();
         if tables.is_empty() {

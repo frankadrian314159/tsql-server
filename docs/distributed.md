@@ -43,15 +43,23 @@ answer with a single node.
 
 ## How a statement runs
 
-* **DDL** (`CREATE`/`DROP TABLE`, indexes, `SET`) runs on the control node's own *mirror* engine first (which checks it and
-  keeps the schema), then on every shard; a table that cannot be created everywhere is removed again.
+* **DDL** (`CREATE`/`DROP TABLE`, `ALTER TABLE`, indexes, `SET`) runs on the control node's own *mirror* engine first (which
+  checks it and keeps the schema), then on every shard; a table that cannot be created everywhere is removed again.
+  `ALTER TABLE` may add, change (not the shard key or an identity column) and drop columns and constraints; adding a primary key
+  or a `UNIQUE` constraint without the shard key is refused. **Views** are kept by the control node (the shards hold none): a
+  query that reads a view is rewritten around its definition, as a derived table (see subqueries below); writes through a view
+  are refused. **`IDENTITY` columns** are numbered by the control node (a counter per table in its state, so the numbers do not
+  depend on the shard a row lands on, and survive a restart); the shards' tables have no identity of their own.
+  `SET IDENTITY_INSERT`, `SCOPE_IDENTITY()` and `@@IDENTITY` work. **Foreign keys** are enforced by the control node, see
+  [Foreign keys](#foreign-keys).
 * **Distribution.** A table is *sharded* by default, on the first column of its primary key (else its first column), by an
   integer, character or `uniqueidentifier` key. `DISTRIBUTE TABLE t BY column` picks another column and `DISTRIBUTE TABLE t
   REPLICATED` puts the same rows on every shard (small reference tables); both need an empty table. A key belongs to one of
   1024 hash *slots* and each slot to one shard (the slot map).
 * **`INSERT`** is split by the key of each row; every shard gets its rows in one statement.
 * **`UPDATE` / `DELETE`** of one table go to the shards that can hold the rows (one when the `WHERE` fixes the key); counts
-  are added.
+  are added. A condition may have subqueries that do not depend on the row (they are evaluated first, as for `SELECT`). An
+  `UPDATE` that changes the shard key reads the new rows, deletes the old ones and inserts the new ones in one transaction.
 * **`SELECT`**:
   * *route*: the `WHERE` fixes the key, so the whole query goes to one shard;
   * *scatter-gather*: a scan or aggregate over one sharded table. Each shard runs a shard query; the control node merges the
@@ -64,8 +72,14 @@ answer with a single node.
     need no copy. **Repartition** (shuffle): a table is re-spread over the shards by its join column with the hash the other
     table's shard key uses. The planner picks which tables stay put so as to move the fewest rows. An outer join is planned
     only when its preserved side is partitioned over the shards; full joins and joins on expressions are gathered;
-  * *gather*: everything else (subqueries, CTEs, windows, `DISTINCT` aggregates, `ROLLUP`, set operations, ...): the tables
-    are copied into the control node's mirror (kept until a change bumps their version) and the query runs there. This is the
+  * *subqueries, CTEs, derived tables and views* (`nested.rs`): the parts that do not depend on the outer query are evaluated
+    first, each by the cluster itself, and the outer query is rewritten around their results: a scalar subquery becomes its
+    value, `EXISTS` a true or false condition, `x IN (SELECT ...)` a list (up to 20,000 values), and a CTE, derived table, view
+    or table variable becomes a small *replicated* temporary table on every shard (up to the broadcast limit) that the rest of
+    the query joins like any replicated table. The rewritten query then goes through the planning above. A correlated subquery
+    (it does not bind alone), a recursive CTE, `ANY`/`ALL`, and a result too big to list or broadcast are not rewritten;
+  * *gather*: everything else (those, windows, `DISTINCT` aggregates, `ROLLUP`, set operations, ...): the tables are copied
+    into the control node's mirror (kept until a change bumps their version) and the query runs there. This is the
     correctness baseline, always exact, running at single-node speed after a one-time copy.
 * **Transactions.** `BEGIN TRANSACTION` begins on a shard when a statement first uses it, on that shard's session for this
   control session, so locks and uncommitted changes are held there and the session reads its own writes. `COMMIT`: one shard,
@@ -73,7 +87,9 @@ answer with a single node.
   record in its log, or its Raft group's log) and keeps the transaction open, the decision is persisted in the control state,
   then each participant commits, from its open transaction or, if it restarted since it voted, from its durable record.
   Isolation is the shard engines'. A statement that fails on several shards, or because a shard failed, dooms the transaction (error 3930; only
-  `ROLLBACK` works), as the shards cannot be told apart from half done. Nested `BEGIN`/`COMMIT` count as in SQL Server.
+  `ROLLBACK` works), as the shards cannot be told apart from half done. Nested `BEGIN`/`COMMIT` count as in SQL Server. `SAVE TRANSACTION name` makes a savepoint on the shards that have begun the
+  transaction; `ROLLBACK TRANSACTION name` takes them back to it, undoes everything on a shard that joined later, and clears a
+  doomed state.
   A transaction that waits for a lock fails after `set_lock_timeout_ms` (default 5 s, error 1222). A **deadlock across shards**
   (A waits for B on one shard, B for A on another) is found by the control node: every 200 ms (`set_deadlock_check_ms`) it asks
   each shard who waits for whom, joins the graphs, and a cycle seen twice in a row is broken by killing the youngest member's
@@ -119,14 +135,30 @@ as in the Raft dissertation); `Cluster::remove_replica(shard, addr)` takes one o
 and its state file follow (`replicas.rs`). A removed replica that keeps running cannot depose the group: a vote is refused
 while a leader has been heard from recently, and from a node that is not a voter.
 
+## Foreign keys
+
+The shards cannot see each other's rows, so they are not given foreign keys; the control node keeps the definitions (in its
+state) and checks every statement that could break one before sending it (`fk.rs`): an insert into a child table, or an update
+of its key columns, needs the keys to exist in the parent (compared by the control node's engine, so collation applies); a
+delete from a parent table, or an update of the columns a key refers to, looks for child rows that refer to the rows concerned:
+`NO ACTION` makes that error 547, `ON DELETE CASCADE` deletes them (their own children in turn) and `ON DELETE SET NULL` sets
+their key columns to null; `TRUNCATE` or `DROP` of a table that is referred to is refused. A key to the same table works. The
+checks run inside the statement's transaction, so a transaction sees its own changes, but **nothing locks the rows the checks
+read across shards**: two sessions at the same moment can still produce an orphan (a child inserted while its parent is
+deleted). `ON UPDATE` actions other than `NO ACTION` and `SET DEFAULT` are not supported.
+
 ## Serving SQL Server clients
 
 `tsql-cluster --listen PORT` serves the control node's own engine over TDS (logins, TLS options, prepared statements, MARS as in
 `tsql-serve`). An interceptor on that engine sends the batches that touch distributed tables to the cluster, including
 parameterized statements (`sp_executesql`, whose input parameters become session variables) and transactions, and declines the
 rest (`SET`, `SELECT @@VERSION`, system views), which the engine runs itself. A batch that mentions a distributed table and is
-not understood is an error, never an answer from the mirror's empty copy. Not supported through the front end: OUTPUT
-parameters, server cursors, table-valued parameters and bulk load. Checked with tiberius (`tests/tds_front.rs`).
+not understood is an error, never an answer from the mirror's empty copy. Also supported: `OUTPUT` parameters of
+`sp_executesql` (their values come back to the variables they were passed as; `SELECT @v = ...` and `SET @v = (SELECT ...)`
+read the cluster), **table-valued parameters** and table variables (a query that reads one has its rows sent to the shards as
+a temporary table), **server cursors** (static and keyset, updatable ones included: they run their statements through the
+same interception) and **bulk load** (`INSERT BULK`: the rows are split over the shards like an `INSERT`, in a transaction
+that a failed load rolls back). Checked with tiberius and a raw protocol client (`tests/tds_front.rs`, `tests/tds_rpc.rs`).
 
 ## Engine hooks
 
@@ -165,9 +197,13 @@ generated rows.
   the cheapest to roll back, and a wait that is not a cycle falls back on the lock timeout.
 * **Snapshots are in memory and fuzzy** (see Replication); a replicated shard's transactions in flight at a failover are lost
   (the client sees an error and retries). Membership changes go through the shard's leader one voter at a time.
-* **Refused:** `IDENTITY` columns, foreign keys, `UNIQUE` constraints or unique indexes that do not contain the shard key,
-  changing a shard key, views, procedures, triggers, `ALTER TABLE`, `CREATE DATABASE`/`USE`, temporal tables, DML with joins,
-  subqueries, `OUTPUT` or `TOP`, savepoints, DDL inside a transaction.
-* **Gather moves whole tables** (queries with subqueries or CTEs run at single-node speed on the control node), results are
+* **Refused** (error 50100 says so): `UNIQUE` constraints or unique indexes that do not contain the shard key, stored
+  procedures, functions and triggers (they would need an interpreter next to the data), `CREATE DATABASE`/`USE`, temporal
+  tables, DML with joins (`UPDATE ... FROM`), `OUTPUT` or `TOP` in DML, `INSERT ... DEFAULT VALUES`/`EXEC`, correlated
+  subqueries in DML, and schema changes inside a transaction. Views cannot be written through.
+* **Foreign keys and identity values are the control node's**: the checks are not atomic across sessions (see Foreign keys),
+  and a control node that loses its state file loses the identity counters and the foreign keys with it.
+* **Gather moves whole tables** (queries with correlated subqueries, windows and the like run at single-node speed on the
+  control node), a CTE, view or derived table bigger than the broadcast limit makes the whole query gather, results are
   collected on a shard before they are sent, and the control node merges in memory.
 * Elasticity moves slots one pair of shards at a time under a pause, and only the last shard can be removed.

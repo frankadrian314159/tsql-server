@@ -1,7 +1,7 @@
 //! The control node as an ordinary SQL Server to its clients: a TDS client (tiberius) connects to the control node, creates
 //! tables, inserts, queries with parameters, and runs transactions; the rows end up spread over the shards.
 use std::sync::Arc;
-use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
+use tiberius::{AuthMethod, Client, Config, EncryptionLevel, IntoRow};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use tsql_control::Cluster;
@@ -113,4 +113,43 @@ fn an_ordinary_sql_client_uses_the_cluster() {
     assert_eq!(total, 50);
     f.listener.shutdown();
     let _ = &f.cluster;
+}
+
+#[test]
+fn bulk_load_spreads_rows_over_the_shards_and_a_failed_load_leaves_nothing() {
+    let f = start(3);
+    f.rt.block_on(async {
+        let mut c = login(&f.listener).await;
+        run(&mut c, "CREATE TABLE bulky (id INT PRIMARY KEY, name NVARCHAR(40) NULL, amount FLOAT NULL)").await;
+        let mut req = c.bulk_insert("bulky").await.unwrap();
+        for i in 0..3000i32 {
+            let name: Option<String> = if i % 10 == 0 { None } else { Some(format!("n\u{e9}{}", i)) };
+            req.send((i, name, i as f64 * 0.5).into_row()).await.unwrap();
+        }
+        assert_eq!(req.finalize().await.unwrap().total(), 3000);
+        let r = strings(&mut c, "SELECT COUNT(*) AS n, COUNT(name) AS named FROM bulky").await;
+        assert!(r[0][0].contains("3000") && r[0][1].contains("2700"), "{:?}", r);
+        let r = strings(&mut c, "SELECT name FROM bulky WHERE id = 1234").await;
+        assert!(r[0][0].contains("n\u{e9}1234"), "{:?}", r);
+        // a load with a duplicate key fails, and none of its rows is kept
+        let mut req = c.bulk_insert("bulky").await.unwrap();
+        for i in 5000..5100i32 {
+            req.send((i, Some(format!("x{}", i)), 1.0f64).into_row()).await.unwrap();
+        }
+        req.send((17i32, Some("dup".to_string()), 1.0f64).into_row()).await.unwrap();
+        assert!(req.finalize().await.is_err(), "a duplicate key must fail the load");
+        let r = strings(&mut c, "SELECT COUNT(*) AS n FROM bulky").await;
+        assert!(r[0][0].contains("3000"), "{:?}", r);
+    });
+    let mut total = 0;
+    for s in &f.shards {
+        let n = match s.server.connect().query("SELECT COUNT(*) FROM bulky").unwrap()[0][0].clone() {
+            tsql_server::Value::Int(n) => n,
+            other => panic!("{:?}", other),
+        };
+        assert!(n > 500, "a shard holds {} of 3000 rows", n);
+        total += n;
+    }
+    assert_eq!(total, 3000);
+    f.listener.shutdown();
 }

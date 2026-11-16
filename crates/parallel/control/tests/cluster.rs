@@ -205,8 +205,11 @@ fn what_cannot_be_scattered_is_gathered_and_still_exact() {
     }
     let plan = p.check("SELECT c.name, o.amount FROM customers c JOIN orders o ON o.customer_id = c.id WHERE o.id < 10", false);
     assert!(plan.iter().any(|l| l.starts_with("join over shards")), "{:?}", plan);
-    // a subquery is still gathered
+    // a subquery that does not depend on the outer query is evaluated first and the outer query runs over the shards
     let plan = p.check("SELECT c.name FROM customers c WHERE c.id IN (SELECT customer_id FROM orders WHERE amount > 990)", false);
+    assert!(!plan.iter().any(|l| l.starts_with("gather")), "{:?}", plan);
+    // a correlated one is gathered
+    let plan = p.check("SELECT c.name FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.amount > 990)", false);
     assert!(plan.iter().any(|l| l.starts_with("gather")), "{:?}", plan);
 }
 
@@ -260,7 +263,7 @@ fn errors_come_back_as_the_engine_gives_them() {
     let a = p.cl.execute("SELECT * FROM nothing_here");
     assert_eq!(a.first_error().map(|e| e.number), Some(208));
     // what is not supported says so
-    for sql in ["CREATE TABLE bad (id INT IDENTITY PRIMARY KEY)", "SAVE TRANSACTION sp1", "CREATE VIEW v AS SELECT 1 AS x", "UPDATE t SET id = 9 WHERE id = 1"] {
+    for sql in ["CREATE PROCEDURE p AS SELECT 1", "CREATE DATABASE other", "UPDATE TOP (1) t SET v = 'x'", "DELETE FROM t OUTPUT deleted.id WHERE id = 1"] {
         let a = p.cl.execute(sql);
         assert_eq!(a.first_error().map(|e| e.number), Some(50100), "{}: {:?}", sql, a.first_error());
     }
@@ -663,4 +666,373 @@ fn a_wait_that_is_not_a_cycle_is_left_alone() {
     assert_eq!(p.h.cluster.deadlocks_broken(), 0);
     let v = a.query(&format!("SELECT bal FROM acct WHERE id = {}", k0)).unwrap();
     assert_eq!(display(&v[0][0]), "106");
+}
+
+#[test]
+fn subqueries_ctes_and_derived_tables_are_evaluated_around_the_shards() {
+    let mut p = Pair::new(3);
+    p.load();
+    // (query, ordered, what the plan must say)
+    let cases: Vec<(&str, bool, &str)> = vec![
+        ("SELECT id, name FROM customers WHERE id IN (SELECT customer_id FROM orders WHERE amount > 900) ORDER BY id", true, "IN subquery evaluated first"),
+        ("SELECT COUNT(*) FROM customers WHERE id NOT IN (SELECT customer_id FROM orders WHERE amount > 900)", false, "IN subquery evaluated first"),
+        ("SELECT COUNT(*) FROM orders WHERE amount > (SELECT AVG(amount) FROM orders)", false, "subquery evaluated first"),
+        ("SELECT id FROM customers WHERE EXISTS (SELECT 1 FROM orders WHERE amount > 999) ORDER BY id", true, "subquery evaluated first"),
+        ("SELECT id FROM customers WHERE NOT EXISTS (SELECT 1 FROM orders WHERE amount > 99999999) AND id < 5 ORDER BY id", true, "subquery evaluated first"),
+        ("SELECT TOP 5 id, (SELECT MAX(amount) FROM orders) AS m FROM customers ORDER BY id", true, "subquery evaluated first"),
+        ("SELECT COUNT(*) FROM customers WHERE id IN (SELECT customer_id FROM orders WHERE amount > (SELECT AVG(amount) FROM orders))", false, "subquery evaluated first"),
+        ("WITH big AS (SELECT customer_id, SUM(amount) AS s FROM orders GROUP BY customer_id) SELECT c.name, b.s FROM customers c JOIN big b ON b.customer_id = c.id WHERE b.s > 5000 ORDER BY c.name", true, "materialized"),
+        ("WITH a AS (SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id), b AS (SELECT customer_id FROM a WHERE n > 10) SELECT COUNT(*) FROM b", false, "materialized"),
+        ("SELECT d.region, COUNT(*) AS n FROM (SELECT region FROM customers WHERE credit > 100) d GROUP BY d.region ORDER BY d.region", true, "materialized"),
+        ("SELECT c.id, d.total FROM customers c JOIN (SELECT customer_id, SUM(qty) AS total FROM orders GROUP BY customer_id) d ON d.customer_id = c.id WHERE c.id <= 20 ORDER BY c.id", true, "materialized"),
+        ("WITH r AS (SELECT region, COUNT(*) AS n FROM customers GROUP BY region) SELECT r.region, r.n, g.label FROM r JOIN regions g ON g.code = r.region ORDER BY r.region", true, "materialized"),
+    ];
+    for (sql, ordered, expect) in cases {
+        let plan = p.check(sql, ordered);
+        assert!(plan.iter().any(|l| l.contains(expect)), "{}\nexpected {:?} in the plan, got {:?}", sql, expect, plan);
+        assert!(!plan.iter().any(|l| l.starts_with("gather")), "{}\nthe tables should not be gathered: {:?}", sql, plan);
+    }
+    // what cannot be evaluated alone is gathered, and still exact: a correlated subquery, ANY / ALL
+    for sql in [
+        "SELECT c.id FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.amount > 990) ORDER BY c.id",
+        "SELECT c.id FROM customers c WHERE c.credit > (SELECT AVG(o.amount) FROM orders o WHERE o.customer_id = c.id) ORDER BY c.id",
+        "SELECT id FROM customers WHERE credit > ANY (SELECT amount FROM orders WHERE amount < 10) ORDER BY id",
+    ] {
+        let plan = p.check(sql, true);
+        assert!(plan.iter().any(|l| l.starts_with("gather")), "{}\nexpected a gather, got {:?}", sql, plan);
+    }
+    // a recursive CTE is left to one engine
+    p.check("WITH r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT SUM(n) FROM r", false);
+    // a result too big to broadcast is gathered
+    p.h.cluster.set_broadcast_limit(10);
+    let plan = p.check("SELECT d.region, COUNT(*) AS n FROM (SELECT region FROM customers) d GROUP BY d.region ORDER BY d.region", true);
+    assert!(plan.iter().any(|l| l.starts_with("gather")), "{:?}", plan);
+    // nothing is left behind on the shards
+    for s in &p.h.shards {
+        let mut c = s.server.connect();
+        let left = c.query("SELECT COUNT(*) FROM tempdb.sys.tables WHERE name LIKE '#dpn%'");
+        let _ = left; // (session temporary tables go with their sessions; the statement dropped its own)
+    }
+}
+
+#[test]
+fn nested_queries_inside_a_transaction_see_its_changes() {
+    let mut p = Pair::new(3);
+    p.load();
+    let sql = "BEGIN TRANSACTION; UPDATE orders SET amount = 0 WHERE id <= 600; SELECT COUNT(*) FROM customers WHERE id IN (SELECT customer_id FROM orders WHERE amount = 0); ROLLBACK";
+    let a = p.cl.execute(sql);
+    let b = p.oracle.execute(sql);
+    assert!(a.first_error().is_none(), "{:?}", a.first_error());
+    assert_eq!(rows_of(&a), rows_of(&b));
+}
+
+/// Both sides must give the same error number (or none) for a statement; returns it.
+fn same_outcome(p: &mut Pair, sql: &str) -> Option<i32> {
+    let a = p.cl.execute(sql);
+    let b = p.oracle.execute(sql);
+    assert_eq!(a.first_error().map(|e| e.number), b.first_error().map(|e| e.number), "{}: cluster {:?} / single {:?}", sql, a.first_error(), b.first_error());
+    a.first_error().map(|e| e.number)
+}
+
+#[test]
+fn identity_columns_are_numbered_by_the_control_node() {
+    let mut p = Pair::new(3);
+    p.both("CREATE TABLE seq_t (id INT IDENTITY(10, 5) PRIMARY KEY, name VARCHAR(10), v INT)");
+    p.both("INSERT seq_t (name, v) VALUES ('a', 1), ('b', 2), ('c', 3)");
+    // without a column list the values are for the columns after the identity one
+    p.both("INSERT seq_t VALUES ('d', 4), ('e', 5)");
+    p.both("INSERT seq_t (name, v) SELECT name, v + 100 FROM seq_t WHERE v < 3");
+    p.check("SELECT id, name, v FROM seq_t ORDER BY id", true);
+    // the numbers do not depend on the shard a row lands on, and the rows are spread
+    let holding = p.h.shards.iter().filter(|s| matches!(s.server.connect().query("SELECT COUNT(*) FROM seq_t").unwrap()[0][0], tsql_server::Value::Int(k) if k > 0)).count();
+    assert!(holding >= 2, "the rows are spread over the shards ({} hold some)", holding);
+    // SCOPE_IDENTITY() and @@IDENTITY
+    let sql = "INSERT seq_t (name, v) VALUES ('f', 6); SELECT SCOPE_IDENTITY() AS s, @@IDENTITY AS i";
+    let a = p.cl.execute(sql);
+    let b = p.oracle.execute(sql);
+    assert!(a.first_error().is_none(), "{:?}", a.first_error());
+    assert_eq!(rows_of(&a), rows_of(&b));
+    // an explicit value needs IDENTITY_INSERT, which then moves the counter
+    assert_eq!(same_outcome(&mut p, "INSERT seq_t (id, name, v) VALUES (500, 'x', 9)"), Some(544));
+    assert_eq!(same_outcome(&mut p, "SET IDENTITY_INSERT seq_t ON"), None);
+    assert_eq!(same_outcome(&mut p, "INSERT seq_t (id, name, v) VALUES (500, 'x', 9)"), None);
+    assert_eq!(same_outcome(&mut p, "SET IDENTITY_INSERT seq_t OFF"), None);
+    p.both("INSERT seq_t (name, v) VALUES ('after', 10)");
+    p.check("SELECT id, name, v FROM seq_t ORDER BY id", true);
+    // the identity column cannot be updated
+    assert_eq!(same_outcome(&mut p, "UPDATE seq_t SET id = 1 WHERE name = 'a'"), Some(8102));
+    // a bigint identity, and a table whose shard key is not the identity column
+    p.both("CREATE TABLE seq2 (k VARCHAR(8) PRIMARY KEY, n BIGINT IDENTITY(1, 1))");
+    p.both("INSERT seq2 (k) VALUES ('x'), ('y'), ('z')");
+    p.check("SELECT k, n FROM seq2 ORDER BY k", true);
+}
+
+#[test]
+fn identity_numbers_survive_a_restart_of_the_control_node() {
+    let h = start(2);
+    let cfg = ClusterConfig { shards: h.shards.iter().enumerate().map(|(i, s)| ShardInfo { id: i as u32, addr: s.addr.to_string() }).collect() };
+    let path = std::env::temp_dir().join(format!("tsql_identity_state_{}.bin", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let cluster = Cluster::open(&path, &cfg).unwrap();
+        let mut cl = cluster.session();
+        assert!(cl.execute("CREATE TABLE t (id INT IDENTITY PRIMARY KEY, v INT)").first_error().is_none());
+        assert!(cl.execute("INSERT t (v) VALUES (1), (2), (3)").first_error().is_none());
+    }
+    let cluster = Cluster::open(&path, &ClusterConfig::default()).unwrap();
+    let mut cl = cluster.session();
+    assert!(cl.execute("INSERT t (v) VALUES (4)").first_error().is_none());
+    let rows: Vec<String> = cl.query("SELECT id FROM t ORDER BY id").unwrap().iter().map(|r| display(&r[0])).collect();
+    assert_eq!(rows, vec!["1", "2", "3", "4"]);
+    // a new shard gets the table without identity of its own
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn updates_and_deletes_may_have_subqueries_and_may_change_the_shard_key() {
+    let mut p = Pair::new(3);
+    p.load();
+    for sql in [
+        "UPDATE orders SET status = 'Z' WHERE customer_id IN (SELECT id FROM customers WHERE region = 'north')",
+        "DELETE FROM orders WHERE amount < (SELECT AVG(amount) FROM orders) / 10",
+        "UPDATE orders SET qty = qty + 1 WHERE EXISTS (SELECT 1 FROM customers WHERE credit > 890) AND id <= 50",
+        "DELETE FROM orders WHERE customer_id NOT IN (SELECT id FROM customers WHERE id <= 150)",
+    ] {
+        p.both(sql);
+        p.check("SELECT status, COUNT(*) AS n, SUM(qty) AS q FROM orders GROUP BY status ORDER BY status", true);
+        p.check("SELECT COUNT(*) AS n FROM orders", false);
+    }
+    // a correlated subquery is not supported in UPDATE (an error, not a wrong answer)
+    let r = p.cl.execute("UPDATE orders SET qty = 0 WHERE amount > (SELECT AVG(o2.amount) FROM orders o2 WHERE o2.customer_id = orders.customer_id)");
+    assert_eq!(r.first_error().map(|e| e.number), Some(50100));
+    // changing the shard key moves rows between shards, atomically
+    p.both("CREATE TABLE kt (id INT PRIMARY KEY, v INT)");
+    p.both(&format!("INSERT kt VALUES {}", (1..=40).map(|i| format!("({}, {})", i, i * 10)).collect::<Vec<_>>().join(",")));
+    p.both("UPDATE kt SET id = id + 1000 WHERE id <= 10");
+    p.check("SELECT id, v FROM kt ORDER BY id", true);
+    p.both("UPDATE kt SET id = id + 1, v = v + 1 WHERE id BETWEEN 1005 AND 1010");
+    p.check("SELECT id, v FROM kt ORDER BY id", true);
+    // a collision with an existing key fails and changes nothing
+    assert_eq!(same_outcome(&mut p, "UPDATE kt SET id = 20 WHERE id = 30"), Some(2627));
+    p.check("SELECT id, v FROM kt ORDER BY id", true);
+    // inside a transaction it is part of it
+    let sql = "BEGIN TRANSACTION; UPDATE kt SET id = id + 5000 WHERE id > 1000; SELECT COUNT(*) FROM kt WHERE id > 5000; ROLLBACK";
+    let a = p.cl.execute(sql);
+    let b = p.oracle.execute(sql);
+    assert!(a.first_error().is_none(), "{:?}", a.first_error());
+    assert_eq!(rows_of(&a), rows_of(&b));
+    p.check("SELECT id, v FROM kt ORDER BY id", true);
+}
+
+#[test]
+fn views_are_expanded_around_the_shards() {
+    let mut p = Pair::new(3);
+    p.load();
+    p.both("CREATE VIEW big_orders AS SELECT id, customer_id, amount FROM orders WHERE amount > 500");
+    p.check("SELECT COUNT(*) AS n, SUM(amount) AS s FROM big_orders", false);
+    p.check("SELECT c.name, b.amount FROM customers c JOIN big_orders b ON b.customer_id = c.id WHERE c.id < 20 ORDER BY c.name, b.amount", true);
+    // a view over a view, with an aggregate, and one with a column list and a replicated table
+    p.both("CREATE VIEW vip AS SELECT customer_id, SUM(amount) AS s FROM big_orders GROUP BY customer_id");
+    p.check("SELECT TOP 5 customer_id, s FROM vip ORDER BY s DESC, customer_id", true);
+    p.both("CREATE VIEW north (code, who) AS SELECT c.id, c.name FROM customers c JOIN regions r ON r.code = c.region WHERE r.code = 'north'");
+    p.check("SELECT who FROM north WHERE code < 40 ORDER BY code", true);
+    // a view used in a subquery and in a CTE
+    p.check("SELECT COUNT(*) AS n FROM customers WHERE id IN (SELECT customer_id FROM big_orders)", false);
+    p.check("WITH t AS (SELECT customer_id FROM vip WHERE s > 3000) SELECT COUNT(*) AS n FROM t", false);
+    // ALTER VIEW changes it for later queries; the definition survives
+    p.both("ALTER VIEW big_orders AS SELECT id, customer_id, amount FROM orders WHERE amount > 900");
+    p.check("SELECT COUNT(*) AS n FROM big_orders", false);
+    // errors as the engine gives them, and writes through a view are refused (not answered wrongly)
+    assert_eq!(p.cl.execute("CREATE VIEW big_orders AS SELECT 1 AS x").first_error().map(|e| e.number), Some(2714));
+    assert_eq!(p.cl.execute("DELETE FROM big_orders WHERE id = 1").first_error().map(|e| e.number), Some(50100));
+    p.both("DROP VIEW north");
+    assert_eq!(p.cl.execute("SELECT * FROM north").first_error().map(|e| e.number), Some(208));
+    assert_eq!(p.cl.execute("DROP VIEW north").first_error().map(|e| e.number), Some(3701));
+}
+
+#[test]
+fn views_survive_a_restart_of_the_control_node() {
+    let h = start(2);
+    let cfg = ClusterConfig { shards: h.shards.iter().enumerate().map(|(i, s)| ShardInfo { id: i as u32, addr: s.addr.to_string() }).collect() };
+    let path = std::env::temp_dir().join(format!("tsql_views_state_{}.bin", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let cluster = Cluster::open(&path, &cfg).unwrap();
+        let mut cl = cluster.session();
+        assert!(cl.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").first_error().is_none());
+        assert!(cl.execute("INSERT t VALUES (1, 10), (2, 20), (3, 30)").first_error().is_none());
+        assert!(cl.execute("CREATE VIEW big AS SELECT id, v FROM t WHERE v > 10").first_error().is_none());
+    }
+    let cluster = Cluster::open(&path, &ClusterConfig::default()).unwrap();
+    let mut cl = cluster.session();
+    let rows: Vec<String> = cl.query("SELECT id FROM big ORDER BY id").unwrap().iter().map(|r| display(&r[0])).collect();
+    assert_eq!(rows, vec!["2", "3"]);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn alter_table_changes_the_columns_on_every_shard() {
+    let mut p = Pair::new(3);
+    p.load();
+    p.both("ALTER TABLE customers ADD note VARCHAR(20) NULL");
+    p.both("UPDATE customers SET note = 'x' WHERE id < 10");
+    p.check("SELECT id, note FROM customers WHERE id < 12 ORDER BY id", true);
+    // a column with a default: the rows that exist get it
+    p.both("ALTER TABLE customers ADD flag INT NOT NULL DEFAULT 7");
+    p.check("SELECT COUNT(*) AS n, SUM(flag) AS s FROM customers", false);
+    p.both("INSERT INTO customers (id, name, region, credit) VALUES (1001, 'new', 'north', 1.0)");
+    p.check("SELECT id, flag FROM customers WHERE id = 1001", false);
+    // a wider column, a constraint that later statements must satisfy, and a dropped column
+    p.both("ALTER TABLE customers ALTER COLUMN name VARCHAR(60)");
+    p.both("ALTER TABLE orders ADD CONSTRAINT ck_qty CHECK (qty >= 0)");
+    assert_eq!(same_outcome(&mut p, "INSERT INTO orders VALUES (9001, 1, 1.0, 'A', '2024-01-01', -5, 0.5)"), Some(547));
+    p.both("ALTER TABLE orders DROP CONSTRAINT ck_qty");
+    assert_eq!(same_outcome(&mut p, "INSERT INTO orders VALUES (9001, 1, 1.0, 'A', '2024-01-01', -5, 0.5)"), None);
+    p.both("ALTER TABLE customers DROP COLUMN note");
+    p.check("SELECT TOP 5 * FROM customers ORDER BY id", true);
+    p.check("SELECT region, COUNT(*) AS n FROM customers GROUP BY region ORDER BY region", true);
+    // dropping a column before the shard key moves it: rows still go where they belong
+    p.both("CREATE TABLE moved (junk INT, id INT PRIMARY KEY, v INT)");
+    p.cl.execute("DISTRIBUTE TABLE moved BY id");
+    p.both("INSERT INTO moved VALUES (0, 1, 10), (0, 2, 20), (0, 3, 30)");
+    p.both("ALTER TABLE moved DROP COLUMN junk");
+    p.both("INSERT INTO moved VALUES (4, 40), (5, 50)");
+    p.check("SELECT id, v FROM moved WHERE id = 4", false);
+    p.check("SELECT id, v FROM moved ORDER BY id", true);
+    // what would change how rows are placed is refused, not done wrongly
+    for sql in ["ALTER TABLE customers ALTER COLUMN id BIGINT", "ALTER TABLE customers DROP COLUMN id", "ALTER TABLE customers ADD z INT IDENTITY", "ALTER TABLE customers ADD CONSTRAINT u UNIQUE (name)"] {
+        assert_eq!(p.cl.execute(sql).first_error().map(|e| e.number), Some(50100), "{}", sql);
+    }
+}
+
+#[test]
+fn savepoints_roll_back_part_of_a_transaction_on_every_shard() {
+    let mut p = Pair::new(3);
+    setup_accounts(&mut p);
+    let both_rows = |p: &mut Pair, sql: &str| {
+        let a = p.cl.execute(sql);
+        let b = p.oracle.execute(sql);
+        assert_eq!(a.first_error().map(|e| e.number), b.first_error().map(|e| e.number), "{}: {:?} / {:?}", sql, a.first_error(), b.first_error());
+        assert_eq!(rows_of(&a), rows_of(&b), "{}", sql);
+    };
+    // the work before the savepoint stays; what shards did after it is undone, including a shard that joined after it
+    both_rows(&mut p, "BEGIN TRANSACTION; UPDATE acct SET bal = 1 WHERE id = 1; SAVE TRANSACTION sp; UPDATE acct SET bal = 2 WHERE id <= 12; ROLLBACK TRANSACTION sp; SELECT id, bal FROM acct WHERE id <= 12 ORDER BY id");
+    both_rows(&mut p, "UPDATE acct SET bal = bal + 1000 WHERE id = 3; SELECT id, bal FROM acct WHERE id <= 4 ORDER BY id; COMMIT");
+    p.check("SELECT id, bal FROM acct ORDER BY id", true);
+    // nested savepoints: going back to the outer one forgets the inner
+    both_rows(
+        &mut p,
+        "BEGIN TRANSACTION; UPDATE acct SET bal = 10 WHERE id = 1; SAVE TRANSACTION a; UPDATE acct SET bal = 20 WHERE id = 2; SAVE TRANSACTION b; UPDATE acct SET bal = 30 WHERE id <= 12; ROLLBACK TRANSACTION b; SELECT id, bal FROM acct WHERE id <= 3 ORDER BY id; ROLLBACK TRANSACTION a; SELECT id, bal FROM acct WHERE id <= 3 ORDER BY id; COMMIT",
+    );
+    p.check("SELECT id, bal FROM acct ORDER BY id", true);
+    // an unknown savepoint, and a savepoint outside a transaction
+    let r = p.cl.execute("BEGIN TRANSACTION; ROLLBACK TRANSACTION nope");
+    assert_eq!(r.first_error().map(|e| e.number), Some(6401));
+    assert!(p.cl.execute("ROLLBACK").first_error().is_none());
+    assert_eq!(p.cl.execute("SAVE TRANSACTION x").first_error().map(|e| e.number), Some(628));
+    // a statement that fails on several shards dooms the transaction, and a savepoint before it undoes the damage
+    let r = p.cl.execute("BEGIN TRANSACTION; UPDATE acct SET bal = 77 WHERE id = 1; SAVE TRANSACTION safe; UPDATE acct SET bal = 1 / 0");
+    assert!(r.first_error().is_some());
+    assert_eq!(p.cl.execute("UPDATE acct SET bal = 5 WHERE id = 1").first_error().map(|e| e.number), Some(3930));
+    assert!(p.cl.execute("ROLLBACK TRANSACTION safe").first_error().is_none());
+    assert!(p.cl.execute("UPDATE acct SET bal = 5 WHERE id = 2").first_error().is_none(), "the transaction goes on after the rollback to the savepoint");
+    assert!(p.cl.execute("COMMIT").first_error().is_none());
+    let v = p.cl.query("SELECT id, bal FROM acct WHERE id <= 2 ORDER BY id").unwrap();
+    assert_eq!((display(&v[0][1]), display(&v[1][1])), ("77".to_string(), "5".to_string()));
+}
+
+#[test]
+fn foreign_keys_are_enforced_across_shards() {
+    let mut p = Pair::new(3);
+    p.both("CREATE TABLE parent (id INT PRIMARY KEY, name VARCHAR(10))");
+    p.both("CREATE TABLE child (id INT PRIMARY KEY, pid INT NULL, CONSTRAINT fk_child_parent FOREIGN KEY (pid) REFERENCES parent (id))");
+    p.both(&format!("INSERT INTO parent VALUES {}", (1..=30).map(|i| format!("({}, 'p{}')", i, i)).collect::<Vec<_>>().join(",")));
+    // a child needs its parent, a null key needs none
+    p.both(&format!("INSERT INTO child VALUES {}", (1..=30).map(|i| format!("({}, {})", i, i)).collect::<Vec<_>>().join(",")));
+    p.both("INSERT INTO child VALUES (100, NULL)");
+    assert_eq!(same_outcome(&mut p, "INSERT INTO child VALUES (101, 999)"), Some(547));
+    assert_eq!(same_outcome(&mut p, "INSERT INTO child VALUES (102, 5), (103, 998)"), Some(547));
+    p.check("SELECT COUNT(*) AS n FROM child", false);
+    // changing a foreign key column is checked too
+    assert_eq!(same_outcome(&mut p, "UPDATE child SET pid = 777 WHERE id = 3"), Some(547));
+    p.both("UPDATE child SET pid = 7 WHERE id = 3");
+    // a parent that has children cannot be deleted or have its key changed
+    assert_eq!(same_outcome(&mut p, "DELETE FROM parent WHERE id = 7"), Some(547));
+    assert_eq!(same_outcome(&mut p, "DELETE FROM parent WHERE id <= 10"), Some(547));
+    assert_eq!(same_outcome(&mut p, "UPDATE parent SET id = id + 100 WHERE id = 5"), Some(547));
+    p.both("UPDATE parent SET name = 'renamed' WHERE id = 5"); // not the key: no problem
+    p.both("DELETE FROM child WHERE pid >= 20");
+    p.both("DELETE FROM parent WHERE id >= 20");
+    p.check("SELECT COUNT(*) AS n FROM parent", false);
+    // a transaction sees its own changes in the checks
+    let sql = "BEGIN TRANSACTION; DELETE FROM child WHERE pid = 1; DELETE FROM parent WHERE id = 1; SELECT COUNT(*) FROM parent; ROLLBACK";
+    let a = p.cl.execute(sql);
+    let b = p.oracle.execute(sql);
+    assert!(a.first_error().is_none(), "{:?}", a.first_error());
+    assert_eq!(rows_of(&a), rows_of(&b));
+    p.check("SELECT COUNT(*) AS n FROM parent", false);
+    // truncating or dropping a referenced table is refused; dropping them together works
+    assert_eq!(same_outcome(&mut p, "TRUNCATE TABLE parent"), Some(4712));
+    assert_eq!(same_outcome(&mut p, "DROP TABLE parent"), Some(3726));
+    // adding a key checks the rows that exist
+    p.both("CREATE TABLE child2 (id INT PRIMARY KEY, pid INT)");
+    p.both("INSERT INTO child2 VALUES (1, 1), (2, 2), (3, 555)");
+    assert_eq!(same_outcome(&mut p, "ALTER TABLE child2 ADD CONSTRAINT fk2 FOREIGN KEY (pid) REFERENCES parent (id)"), Some(547));
+    p.both("DELETE FROM child2 WHERE id = 3");
+    p.both("ALTER TABLE child2 ADD CONSTRAINT fk2 FOREIGN KEY (pid) REFERENCES parent (id)");
+    assert_eq!(same_outcome(&mut p, "INSERT INTO child2 VALUES (9, 9999)"), Some(547));
+    p.both("ALTER TABLE child2 DROP CONSTRAINT fk2");
+    p.both("INSERT INTO child2 VALUES (9, 9999)");
+}
+
+#[test]
+fn foreign_key_actions_and_keys_that_refer_to_their_own_table() {
+    let mut p = Pair::new(3);
+    p.both("CREATE TABLE dept (id INT PRIMARY KEY, name VARCHAR(10))");
+    p.both("CREATE TABLE emp (id INT PRIMARY KEY, dept_id INT NULL REFERENCES dept (id) ON DELETE CASCADE, boss INT NULL)");
+    p.both("CREATE TABLE badge (id INT PRIMARY KEY, emp_id INT NULL, CONSTRAINT fk_badge FOREIGN KEY (emp_id) REFERENCES emp (id) ON DELETE SET NULL)");
+    p.both("INSERT INTO dept VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+    p.both(&format!("INSERT INTO emp VALUES {}", (1..=30).map(|i| format!("({}, {}, NULL)", i, i % 3 + 1)).collect::<Vec<_>>().join(",")));
+    p.both(&format!("INSERT INTO badge VALUES {}", (1..=30).map(|i| format!("({}, {})", i, i)).collect::<Vec<_>>().join(",")));
+    // deleting a department deletes its employees, and their badges lose the employee
+    p.both("DELETE FROM dept WHERE id = 2");
+    p.check("SELECT COUNT(*) AS n FROM emp", false);
+    p.check("SELECT COUNT(*) AS n, COUNT(emp_id) AS with_emp FROM badge", false);
+    p.check("SELECT dept_id, COUNT(*) AS n FROM emp GROUP BY dept_id ORDER BY dept_id", true);
+    // a key to the same table: the rows of one statement may refer to each other
+    p.both("CREATE TABLE tree (id INT PRIMARY KEY, up INT NULL REFERENCES tree (id))");
+    p.both("INSERT INTO tree VALUES (1, NULL), (2, 1), (3, 2)");
+    assert_eq!(same_outcome(&mut p, "INSERT INTO tree VALUES (4, 99)"), Some(547));
+    p.both("INSERT INTO tree VALUES (10, 11), (11, NULL)");
+    p.check("SELECT id, up FROM tree ORDER BY id", true);
+    // a case-insensitive key: the engine's comparison decides
+    p.both("CREATE TABLE codes (code VARCHAR(5) PRIMARY KEY)");
+    p.both("CREATE TABLE uses (id INT PRIMARY KEY, code VARCHAR(5) REFERENCES codes (code))");
+    p.both("INSERT INTO codes VALUES ('ab'), ('cd')");
+    p.both("INSERT INTO uses VALUES (1, 'AB'), (2, 'cd')");
+    assert_eq!(same_outcome(&mut p, "INSERT INTO uses VALUES (3, 'zz')"), Some(547));
+    // ON UPDATE actions are not supported
+    let r = p.cl.execute("CREATE TABLE x (id INT PRIMARY KEY, d INT REFERENCES dept (id) ON UPDATE CASCADE)");
+    assert_eq!(r.first_error().map(|e| e.number), Some(50100));
+}
+
+#[test]
+fn foreign_keys_survive_a_restart_of_the_control_node() {
+    let h = start(2);
+    let cfg = ClusterConfig { shards: h.shards.iter().enumerate().map(|(i, s)| ShardInfo { id: i as u32, addr: s.addr.to_string() }).collect() };
+    let path = std::env::temp_dir().join(format!("tsql_fk_state_{}.bin", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let cluster = Cluster::open(&path, &cfg).unwrap();
+        let mut cl = cluster.session();
+        for sql in ["CREATE TABLE p (id INT PRIMARY KEY)", "CREATE TABLE c (id INT PRIMARY KEY, pid INT REFERENCES p (id))", "INSERT p VALUES (1), (2)"] {
+            assert!(cl.execute(sql).first_error().is_none(), "{}", sql);
+        }
+    }
+    let cluster = Cluster::open(&path, &ClusterConfig::default()).unwrap();
+    let mut cl = cluster.session();
+    assert_eq!(cl.execute("INSERT c VALUES (1, 99)").first_error().map(|e| e.number), Some(547));
+    assert!(cl.execute("INSERT c VALUES (1, 2)").first_error().is_none());
+    assert_eq!(cl.execute("DELETE FROM p WHERE id = 2").first_error().map(|e| e.number), Some(547));
+    let _ = std::fs::remove_file(&path);
 }

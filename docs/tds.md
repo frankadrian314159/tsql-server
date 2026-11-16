@@ -141,7 +141,7 @@ requests.
 
 ## Interceptors (the control node of a cluster)
 
-`Server::set_interceptor` installs a factory of per-connection `Interceptor`s: for each batch a connection is asked to run, the interceptor either runs it and reports to the sink, or declines and the engine runs it as usual (`Server::connect_internal` makes a connection that is never intercepted). The listener is unaware: the control node of the distributed edition serves its own engine over TDS and an interceptor sends the batches that touch distributed tables to the cluster (see [distributed.md](distributed.md)). Without an interceptor nothing changes.
+`Server::set_interceptor` installs a factory of per-connection `Interceptor`s: for each batch a connection is asked to run, the interceptor either runs it and reports to the sink, or declines and the engine runs it as usual (`Server::connect_internal` makes a connection that is never intercepted). For pre-parsed statements (what bulk load runs) the interceptor has `handle_stmts`. The listener is unaware: the control node of the distributed edition serves its own engine over TDS and an interceptor sends the batches that touch distributed tables to the cluster (see [distributed.md](distributed.md)). Without an interceptor nothing changes.
 
 ## MARS
 

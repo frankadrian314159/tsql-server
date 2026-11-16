@@ -30,6 +30,8 @@ struct State {
     slots: Vec<u32>,
     tables: Vec<DistTable>,
     schema_log: Vec<Stmt>,
+    views: Vec<(String, Stmt)>,
+    fks: Vec<crate::fk::FkDef>,
 }
 
 impl Cluster {
@@ -38,14 +40,14 @@ impl Cluster {
     /// written. The control node can then be restarted without losing track of the data on the shards.
     pub fn open(state_path: impl Into<PathBuf>, config: &ClusterConfig) -> Result<Arc<Cluster>, SqlError> {
         let path: PathBuf = state_path.into();
-        let (addrs, slots, tables, log, pending) = match std::fs::read(&path) {
+        let (addrs, slots, tables, log, pending, views, fks) = match std::fs::read(&path) {
             Ok(bytes) => {
                 let st: State = postcard::from_bytes(&bytes).map_err(|e| SqlError::new(50000, format!("{}: bad cluster state: {}", path.display(), e)))?;
-                (st.shard_addrs, Some(st.slots), st.tables, st.schema_log, st.pending)
+                (st.shard_addrs, Some(st.slots), st.tables, st.schema_log, st.pending, st.views, st.fks)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 config.validate().map_err(|e| SqlError::new(50000, e))?;
-                (config.shards.iter().map(|s| s.addr.clone()).collect(), None, vec![], vec![], vec![])
+                (config.shards.iter().map(|s| s.addr.clone()).collect(), None, vec![], vec![], vec![], vec![], vec![])
             }
             Err(e) => return Err(SqlError::new(50000, format!("{}: {}", path.display(), e))),
         };
@@ -88,6 +90,8 @@ impl Cluster {
             next_session: AtomicU64::new(crate::fresh_session_base()),
             broadcast_limit: AtomicU64::new(100_000),
             lock_timeout_ms: AtomicU64::new(5000),
+            views: Mutex::new(views.into_iter().collect()),
+            fks: Mutex::new(fks),
             pending,
             preparing,
             next_gid: AtomicU64::new(crate::fresh_session_base()),
@@ -120,6 +124,8 @@ impl Cluster {
             slots: self.slots.read().unwrap_or_else(|e| e.into_inner()).clone(),
             tables: self.tables.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect(),
             schema_log: self.schema_log.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            views: self.views.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            fks: self.fks.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         };
         if let Ok(bytes) = postcard::to_allocvec(&st) {
             let tmp = path.with_extension("tmp");
@@ -142,7 +148,10 @@ impl Cluster {
             let r = async {
                 let log = s.cluster.schema_log.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 for st in log {
-                    s.fan_run(&[id], |_| Work::Stmts(vec![st.clone()])).await?;
+                    if matches!(&st, Stmt::CreateView { .. }) || matches!(&st, Stmt::Drop { what, .. } if what.eq_ignore_ascii_case("VIEW")) {
+                        continue;
+                    }
+                    s.fan_run(&[id], |_| Work::Stmts(vec![shard_form(&st)])).await?;
                 }
                 // a replicated table is the same on every shard
                 let tables: Vec<DistTable> = s.cluster.tables.lock().unwrap_or_else(|e| e.into_inner()).values().filter(|t| matches!(t.dist, Dist::Replicated)).cloned().collect();

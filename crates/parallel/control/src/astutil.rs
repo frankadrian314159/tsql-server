@@ -102,6 +102,28 @@ pub fn simple_query(select: Select) -> Query {
     Query { ctes: vec![], body: QueryBody::Select(Box::new(select)), order: vec![], offset: None, fetch: None, for_clause: None, maxrecursion: None, options: vec![] }
 }
 
+/// The form of a schema statement the shards run: a table the control node numbers (IDENTITY) is made on the shards without
+/// the property, since each shard would hand out the same numbers.
+pub fn shard_form(st: &Stmt) -> Stmt {
+    match st {
+        Stmt::CreateTable { name, defs, versioning } => {
+            let defs = defs
+                .iter()
+                .map(|d| match d {
+                    TableDef::Column(cd) if cd.identity.is_some() => {
+                        let mut c = cd.clone();
+                        c.identity = None;
+                        TableDef::Column(c)
+                    }
+                    other => other.clone(),
+                })
+                .collect();
+            Stmt::CreateTable { name: name.clone(), defs, versioning: versioning.clone() }
+        }
+        other => other.clone(),
+    }
+}
+
 /// The normalized id of a table name: `schema.table` in lower case (the schema defaults to dbo; a database prefix is
 /// ignored, as a cluster serves one database).
 pub fn table_id(name: &[String]) -> String {
@@ -155,7 +177,7 @@ pub fn has_nested_query(q: &Query) -> bool {
             serde_json::Value::Object(m) => {
                 // (`Paren` is both a parenthesised expression and a parenthesised query; the query has a `ctes` field)
                 let paren_query = matches!(m.get("Paren"), Some(serde_json::Value::Object(inner)) if inner.contains_key("ctes"));
-                paren_query || m.keys().any(|k| matches!(k.as_str(), "InQuery" | "CmpQuant" | "Exists" | "Subquery" | "Derived")) || m.values().any(walk)
+                paren_query || m.keys().any(|k| matches!(k.as_str(), "InQuery" | "CmpQuant" | "Exists" | "Subquery" | "Derived" | "TableVar")) || m.values().any(walk)
             }
             serde_json::Value::Array(a) => a.iter().any(walk),
             _ => false,

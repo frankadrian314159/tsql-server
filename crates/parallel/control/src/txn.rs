@@ -51,6 +51,80 @@ impl ClusterSession {
         self.bump_written(tx);
     }
 
+    /// `SAVE TRANSACTION name`: every shard that has begun the transaction makes the savepoint; a shard that begins later has
+    /// nothing to go back to but its start.
+    pub(crate) async fn save_savepoint(&mut self, name: &str) -> Result<(), SqlError> {
+        let shards: Vec<usize> = match self.txn.borrow().as_ref() {
+            None => return Err(SqlError::new(628, "Cannot issue SAVE TRANSACTION when there is no active transaction.")),
+            Some(t) if t.doomed => return Err(SqlError::new(3930, "The current transaction cannot be committed and cannot support operations that write to the log file. Roll back the transaction.")),
+            Some(t) => t.shards.iter().copied().collect(),
+        };
+        let clients: Vec<ShardClient> = shards.iter().map(|&i| self.cluster.shard(i)).collect();
+        let sql = format!("SAVE TRANSACTION [{}]", name.replace(']', "]]"));
+        for r in join_all(clients.iter().map(|c| c.run(self.id, Work::Sql(sql.clone())))).await {
+            if let Some(e) = r?.first_error() {
+                return Err(e.to_sql());
+            }
+        }
+        if let Some(t) = self.txn.borrow_mut().as_mut() {
+            t.savepoints.push((name.to_string(), shards.into_iter().collect()));
+        }
+        Ok(())
+    }
+
+    /// `ROLLBACK TRANSACTION name`: the shards that had begun the transaction at the savepoint go back to it, the ones that
+    /// began since lose all they did, and the transaction goes on (and is no longer doomed: nothing is left of what failed).
+    pub(crate) async fn rollback_to_savepoint(&mut self, name: &str) -> Result<(), SqlError> {
+        let (at, current): (std::collections::BTreeSet<usize>, Vec<usize>) = {
+            let t = self.txn.borrow();
+            let Some(tx) = t.as_ref() else { return Err(no_txn("ROLLBACK")) };
+            let Some(i) = tx.savepoints.iter().rposition(|(n, _)| n.eq_ignore_ascii_case(name)) else {
+                return Err(SqlError::new(6401, format!("Cannot roll back {}. No transaction or savepoint of that name was found.", name)));
+            };
+            (tx.savepoints[i].1.clone(), tx.shards.iter().copied().collect())
+        };
+        let (keep, wipe): (Vec<usize>, Vec<usize>) = current.iter().partition(|s| at.contains(s));
+        let sql = format!("ROLLBACK TRANSACTION [{}]", name.replace(']', "]]"));
+        let clients: Vec<ShardClient> = keep.iter().map(|&i| self.cluster.shard(i)).collect();
+        let mut failure = None;
+        for r in join_all(clients.iter().map(|c| c.run(self.id, Work::Sql(sql.clone())))).await {
+            match r {
+                Ok(reply) => {
+                    if let Some(e) = reply.first_error() {
+                        failure = failure.or(Some(e.to_sql()));
+                    }
+                }
+                Err(e) => failure = failure.or(Some(e)),
+            }
+        }
+        let clients: Vec<ShardClient> = wipe.iter().map(|&i| self.cluster.shard(i)).collect();
+        let _ = join_all(clients.iter().map(|c| c.run(self.id, Work::Sql("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION".into())))).await;
+        let wrote = {
+            let mut t = self.txn.borrow_mut();
+            let tx = t.as_mut().expect("a transaction");
+            for s in &wipe {
+                tx.shards.remove(s);
+            }
+            if let Some(i) = tx.savepoints.iter().rposition(|(n, _)| n.eq_ignore_ascii_case(name)) {
+                tx.savepoints.truncate(i + 1);
+            }
+            tx.doomed = failure.is_some();
+            tx.wrote.clone()
+        };
+        // what the mirror's copies and the row counts held while the transaction was open is not what is left
+        let mut tables = self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner());
+        for id in &wrote {
+            if let Some(e) = tables.get_mut(id) {
+                e.version += 1;
+                e.loaded = None;
+            }
+        }
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     pub(crate) async fn rollback_txn(&mut self) -> Result<(), SqlError> {
         let Some(tx) = self.txn.borrow_mut().take() else { return Err(no_txn("ROLLBACK")) };
         self.finish_rollback(&tx).await;
