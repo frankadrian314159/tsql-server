@@ -667,7 +667,12 @@ pub async fn spawn_on(node: ShardNode, listener: tokio::net::TcpListener) -> std
     let control = node.control();
     let svc = node.into_service();
     let join = tokio::spawn(async move {
+        // (many sessions share one connection from the control node: lift the limits that would otherwise close it under load)
         let _ = tonic::transport::Server::builder()
+            .max_concurrent_streams(Some(1024))
+            .http2_max_pending_accept_reset_streams(Some(4096))
+            .initial_stream_window_size(Some(1 << 20))
+            .initial_connection_window_size(Some(8 << 20))
             .add_service(svc)
             .serve_with_incoming_shutdown(incoming, async {
                 let _ = stopped.await;

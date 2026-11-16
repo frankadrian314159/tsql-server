@@ -155,6 +155,10 @@ impl ShardClient {
                 let mut c = FlightClient::new(ch);
                 let mut results = c.do_action(Action::new(kind, body)).await.map_err(flight_error)?;
                 let first = results.try_next().await.map_err(flight_error)?;
+                // (read the stream to its end: dropping it half read makes the connection send a reset for the stream, and a
+                // server that sees many of them under load closes the connection with ENHANCE_YOUR_CALM, error 40613
+                // "ResourceExhausted: h2 protocol error")
+                while results.try_next().await.map_err(flight_error)?.is_some() {}
                 Ok(first.map(|b| b.to_vec()).unwrap_or_default())
             }
         })

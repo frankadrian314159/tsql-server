@@ -503,10 +503,20 @@ where
     D: Sql + Send + 'static,
     F: Fn() -> D,
 {
+    drive_with(connect, cfg, terminals, secs, client, 0)
+}
+
+/// Like [`drive`] for a driver that is one of several (processes, machines): its terminals are numbers `first`, `first + 1`, ...
+/// of all of them, which decides their home warehouses and random streams (so no two drivers run the same sequence).
+pub fn drive_with<D, F>(connect: F, cfg: std::sync::Arc<Cfg>, terminals: usize, secs: f64, client: bool, first: usize) -> Tally
+where
+    D: Sql + Send + 'static,
+    F: Fn() -> D,
+{
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut hs = vec![];
     for t in 0..terminals {
-        let mut term = Terminal::new(connect(), 77 + t as u64, cfg.clone(), (t as i64 % cfg.warehouses) + 1, client);
+        let mut term = Terminal::new(connect(), 77 + (first + t) as u64, cfg.clone(), ((first + t) as i64 % cfg.warehouses) + 1, client);
         let stop = stop.clone();
         hs.push(std::thread::spawn(move || {
             let mut tally = Tally::new();

@@ -83,13 +83,41 @@ tables sharded on the item), and its table shows how each query ran (`split`, `s
     or table variable becomes a small *replicated* temporary table on every shard (up to the broadcast limit) that the rest of
     the query joins like any replicated table. The rewritten query then goes through the planning above. A correlated subquery
     (it does not bind alone), a recursive CTE, `ANY`/`ALL`, and a result too big to list or broadcast are not rewritten;
+  * *staged joins* (`mpp.rs`): a join whose tables are sharded on different keys (TPC-H Q9: `lineitem` and `orders` by the order key,
+    `partsupp` by the part key) is done in stages that move rows from shard to shard. The *group* of tables joined so far starts as
+    the largest sharded table, partitioned by its shard key; the next table is added where it is when the shards can do it alone
+    (replicated, co-located on the group's partition column, or small enough to broadcast), otherwise a *stage* runs a scan on
+    every shard and sends each row to the shard that owns the hash of the next join column (the `shuffle` action, shard to shard,
+    into a session temporary table), either the group (re-spread by the column that joins the next table) or the next table
+    (re-spread by its join column), whichever moves fewer rows. When all tables are in, the query (its select list, `GROUP BY`
+    and so on rewritten over the temporary tables) runs shard by shard as an ordinary scatter-gather with two-phase
+    aggregation, and only the groups reach the control node. Inner and cross joins of base tables only; the conditions of the
+    `WHERE` that mention one table are applied in the scan that moves it;
+  * *derived tables merged* (`flatten.rs`): `SELECT ... FROM (SELECT ... FROM a, b, c WHERE ...) d GROUP BY ...`, where the derived
+    table is a plain select-project-join of several tables (no `DISTINCT`, `TOP`, grouping, aggregate, window, set operation or
+    subquery), is one query: its tables and conditions join the outer ones and each reference to one of its columns becomes
+    the expression it is. Without it the join's whole result (rows, not groups) would be made at the control node first. A derived
+    table over one table is left alone;
+  * *subqueries the shards answer themselves* (`pushdown.rs`): a subquery in the `WHERE` of a query over one sharded table is left
+    where it is, and the whole query runs shard by shard, when each shard can answer it from its own rows: it reads only replicated
+    tables (this is also what a long `IN (SELECT ...)` becomes: a result over `set_in_list_limit` rows, 20,000 by default, is made a
+    replicated temporary table, up to the broadcast limit, and the shards run `x IN (SELECT k FROM that table)`), or it is
+    *co-located* with the outer table: it reads one sharded table and an equality in its `WHERE` ties that table's shard key to the
+    outer table's (`EXISTS (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey AND ...)` from `orders`, both sharded on the order
+    key; rows that agree on the key are on one shard, so anything else the subquery asks of them can be asked there). The outer
+    query may join several tables when its sharded ones are co-located (TPC-H Q4 and Q21 are this case; before they were gathered,
+    18 times slower than one node in the Q4 case);
   * *correlated subqueries* (`decorrelate.rs`): the common shapes are rewritten as joins first, so that their parts do not
     depend on the outer rows. A scalar aggregate subquery in a comparison of the `WHERE`
     (`x > (SELECT AVG(y) FROM t WHERE t.k = o.k)`, also under arithmetic) becomes a join with a grouped derived table (a row
     with no match gets NULL, which fails the comparison, as the join dropping it does; `COUNT` is left alone, it gives 0 for no
     rows). `EXISTS (... WHERE t.k = o.k ..)` becomes `o.k IN (SELECT t.k ..)`, and `NOT EXISTS` the same with `NOT IN`, written
     so that a NULL key counts as no match. Only equalities between a column of the subquery and a qualified column of the outer
-    query are recognised; a rewrite that does not bind is undone and the statement runs as it was;
+    query are recognised (an unqualified column is placed by the tables' schemas); a rewrite that does not bind is undone and the
+    statement runs as it was. The grouped table is *restricted to the keys the outer query can meet*: the conditions of the outer
+    `WHERE` that mention the outer table of the key alone become `inner_key IN (SELECT DISTINCT outer_key FROM that_table WHERE ...)`
+    inside it (TPC-H Q17 wants the average quantity of about twenty parts, not of all of them; this took it from 4 times slower than
+    one node to faster than it);
   * *set operations* (`split.rs`): `UNION`, `INTERSECT` and `EXCEPT` (also nested, with `ALL`, `TOP` in a branch, `ORDER BY`
     over the result) run each branch as a query of its own, over the shards, and combine the answers on the control node;
   * *windows, `ROLLUP`/`CUBE`/`GROUPING SETS` and `DISTINCT` aggregates* (`plan_split`, `split.rs`): an *inner* query returns
@@ -98,10 +126,12 @@ tables sharded on the item), and its table shows how each query ran (`split`, `s
     *outer* query over its answer: the grouping sets re-aggregate the partials, a `COUNT(DISTINCT x)` counts the `x` column,
     and windows (also over aggregates, `SUM(SUM(x)) OVER (..)`) see the aggregated rows. Only one distinct expression per
     query is supported (more gather);
-  * *gather*: everything else (a correlated subquery that is not an equality, `STDEV` and the like, more than one distinct
-    expression, recursive CTEs, ...): the tables are copied into the control node's mirror (kept until a change
-    bumps their version) and the query runs there. This is the correctness baseline, always exact, running at single-node
-    speed after a one-time copy.
+  * *gather*: everything else (a correlated subquery that is not an equality, `STDEV` and the like, recursive CTEs, outer joins that
+    the join planner cannot place, ...): the tables are copied into the control node's mirror and the query runs there. This is the
+    correctness baseline, always exact, running at single-node speed. A table of at most the broadcast limit is copied whole and
+    kept until a change bumps its version; a bigger one is copied for this query only, with just the columns the query mentions
+    and the rows that pass the `WHERE` conditions that mention that table alone (when the query is a plain inner join), every
+    shard answering its part at once.
 * **Transactions.** `BEGIN TRANSACTION` begins on a shard when a statement first uses it, on that shard's session for this
   control session, so locks and uncommitted changes are held there and the session reads its own writes. `COMMIT`: one shard,
   committed there; several shards, **two-phase commit** (see `txn.rs`): every participant makes its part durable (a `Prepare`
@@ -227,6 +257,15 @@ running (`tsql-shard` on other machines), otherwise `--shards N` starts them in 
   must agree (error 50100, a statement the cluster refuses on purpose, is counted). It found three bugs now fixed: a rewritten query
   that had to gather lost its temporary tables, a grand total over nothing gave NULL for `COUNT`, and a table joined with itself was
   routed to one shard when a key condition named one of its aliases.
+
+**More than one control node.** One control node (its planner, its own engine and the sessions of every terminal) saturates first on small
+machines: in the TPC-C run on ten 2-vCPU machines it was at 100% while the nine shards averaged 7%. `Cluster::attach(state_file)` makes
+another *front end* over the same shards: it reads the catalogue from the state file of the control node that owns the schema and
+serves sessions of its own; it does not write that file and does not settle the prepared transactions the shards hold (they may be live
+ones of the other front ends), and schema changes, elasticity and identity counters stay with the owner. `oltp_cluster --frontends N`
+divides the terminals over N attached control nodes in one process; for several machines, `--load-only --state S` on one, then
+`--attach --state S --terminals K --first I*K --start-at EPOCH` on each client, then `--attach --check-only --state S`. Deadlocks that
+span front ends are found by each front end's detector (it sees every wait on the shards) or end at the lock timeout.
 
 A join whose tables' keys are all fixed by `key = literal` conditions to the same shard (TPC-C Stock-Level) runs on that shard alone.
 

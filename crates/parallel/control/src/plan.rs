@@ -111,15 +111,25 @@ fn last_part_eq(a: &Expr, b: &Expr) -> bool {
 /// Plan a query over a single sharded table (the caller has checked that it reads nothing else and has no nested
 /// query). None: not a shape this planner handles.
 pub fn plan_scatter(q: &Query) -> Option<Shape> {
-    plan_scatter_with(q, false)
+    plan_scatter_with(q, false, false)
+}
+
+/// Like [`plan_scatter`] for a query whose `WHERE` has subqueries that the shards evaluate themselves (see `pushdown.rs`: the
+/// caller has checked that): they stay inside the shard query.
+pub fn plan_scatter_sub(q: &Query) -> Option<Shape> {
+    let multi = match &q.body {
+        QueryBody::Select(s) => !matches!(s.from.as_slice(), [TableRef::Table { .. }]),
+        _ => false,
+    };
+    plan_scatter_with(q, multi, true)
 }
 
 /// Like [`plan_scatter`] for a query whose `FROM` is a join that already runs shard by shard (see `joins.rs`).
 pub fn plan_scatter_multi(q: &Query) -> Option<Shape> {
-    plan_scatter_with(q, true)
+    plan_scatter_with(q, true, false)
 }
 
-fn plan_scatter_with(q: &Query, multi: bool) -> Option<Shape> {
+fn plan_scatter_with(q: &Query, multi: bool, where_subqueries: bool) -> Option<Shape> {
     let sel = only_select(q)?;
     if !multi && !matches!(sel.from.as_slice(), [TableRef::Table { .. }]) {
         return None;
@@ -150,7 +160,9 @@ fn plan_scatter_with(q: &Query, multi: bool) -> Option<Shape> {
             }
         }
     }
-    if all.iter().any(|e| has_window_or_session(e) || has_subquery(e)) {
+    // (a subquery of the WHERE that the shards evaluate is allowed: it is the last of `all` that is the WHERE only when given)
+    let where_ptr = sel.where_.as_ref().map(|w| w as *const Expr);
+    if all.iter().any(|e| has_window_or_session(e) || (has_subquery(e) && !(where_subqueries && Some(*e as *const Expr) == where_ptr))) {
         return None;
     }
     let mut has_agg = false;

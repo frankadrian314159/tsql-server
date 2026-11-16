@@ -40,20 +40,35 @@ impl Cluster {
     /// the cluster is restored from it (and `config` is not consulted), else it is created from `config` and the file is
     /// written. The control node can then be restarted without losing track of the data on the shards.
     pub fn open(state_path: impl Into<PathBuf>, config: &ClusterConfig) -> Result<Arc<Cluster>, SqlError> {
-        let path: PathBuf = state_path.into();
+        Cluster::open_inner(state_path.into(), config, false)
+    }
+
+    /// Another front end for a cluster that is running: a control node that reads the catalogue (shards, slot map, tables) from the
+    /// state file another control node keeps, and serves sessions of its own over the same shards. It does not write the state
+    /// file, and it does not settle the prepared transactions the shards hold (they may be live ones of the other front ends).
+    /// Use it for more clients (several processes, or machines, each with a control node of its own, so that no one control
+    /// node's single engine and planner is the limit); schema changes, elasticity and the identity counters stay with the
+    /// control node that owns the state. Deadlocks across front ends are found by each one's detector (it sees all waits on the
+    /// shards) or end at the lock timeout.
+    pub fn attach(state_path: impl Into<PathBuf>) -> Result<Arc<Cluster>, SqlError> {
+        Cluster::open_inner(state_path.into(), &ClusterConfig::default(), true)
+    }
+
+    fn open_inner(path: PathBuf, config: &ClusterConfig, attach: bool) -> Result<Arc<Cluster>, SqlError> {
         let (addrs, slots, tables, log, pending, views, fks) = match std::fs::read(&path) {
             Ok(bytes) => {
                 let st: State = postcard::from_bytes(&bytes).map_err(|e| SqlError::new(50000, format!("{}: bad cluster state: {}", path.display(), e)))?;
                 (st.shard_addrs, Some(st.slots), st.tables, st.schema_log, st.pending, st.views, st.fks)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !attach => {
                 config.validate().map_err(|e| SqlError::new(50000, e))?;
                 (config.shards.iter().map(|s| s.addr.clone()).collect(), None, vec![], vec![], vec![], vec![], vec![])
             }
             Err(e) => return Err(SqlError::new(50000, format!("{}: {}", path.display(), e))),
         };
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().map_err(|e| SqlError::new(50000, e.to_string()))?;
-        let pending = Arc::new(Mutex::new(pending));
+        // (transactions decided by the control node that owns the state are its to finish)
+        let pending = Arc::new(Mutex::new(if attach { vec![] } else { pending }));
         let preparing = Arc::new(Mutex::new(std::collections::HashSet::new()));
         let verdict = crate::make_verdict(&pending, &preparing);
         let shards = {
@@ -83,13 +98,14 @@ impl Cluster {
             shards: RwLock::new(shards),
             slots: RwLock::new(slots),
             schema_log: Mutex::new(log),
-            state_path: Some(path),
+            state_path: if attach { None } else { Some(path) },
             migration: RwLock::new(()),
             mirror,
             tables: Mutex::new(tables),
             gather: Mutex::new(()),
             next_session: AtomicU64::new(crate::fresh_session_base()),
             broadcast_limit: AtomicU64::new(100_000),
+            in_list_limit: AtomicU64::new(20_000),
             lock_timeout_ms: AtomicU64::new(5000),
             views: Mutex::new(views.into_iter().collect()),
             fks: Mutex::new(fks),
@@ -102,6 +118,9 @@ impl Cluster {
             deadlocks: AtomicU64::new(0),
         });
         cluster.start_deadlock_monitor();
+        if attach {
+            return Ok(cluster);
+        }
         cluster.save_state();
         // transactions that were decided to commit when the control node stopped are finished, and the ones that were not
         // decided are rolled back (a shard that prepared one holds it until it is told)

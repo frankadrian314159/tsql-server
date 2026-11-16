@@ -437,6 +437,17 @@ where
     D: Sql + Send + 'static,
     F: Fn() -> D,
 {
+    drive_with(connect, cfg, terminals, secs, client, 0)
+}
+
+/// Like [`drive`] for a driver that is one of several (processes, machines): its terminals are numbers `first`, `first + 1`, ...
+/// of all of them (the random streams differ), and the ids of the trades it makes start in a range of its own.
+pub fn drive_with<D, F>(connect: F, cfg: Arc<Cfg>, terminals: usize, secs: f64, client: bool, first: usize) -> Tally
+where
+    D: Sql + Send + 'static,
+    F: Fn() -> D,
+{
+    NEXT_TRADE.fetch_max(10_000_000 + first as i64 * 1_000_000, std::sync::atomic::Ordering::SeqCst);
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let queue: Arc<Mutex<VecDeque<(i64, i64)>>> = Arc::new(Mutex::new(VecDeque::new()));
     let mut hs = vec![];
@@ -444,7 +455,7 @@ where
         let mut conn = connect();
         let (stop, queue, cfg) = (stop.clone(), queue.clone(), cfg.clone());
         hs.push(std::thread::spawn(move || {
-            let mut rng = Rng::new(900 + t as u64);
+            let mut rng = Rng::new(900 + (first + t) as u64);
             let mut tally = Tally::new();
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 // the mix of the specification, with Trade-Update's 2% given to Trade-Status

@@ -18,9 +18,6 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
-/// The longest list a subquery `IN (SELECT ...)` is turned into.
-const IN_LIST_LIMIT: usize = 20_000;
-
 /// The errors a subquery gives when it refers to a column of the query around it: evaluated alone, the name does not bind.
 fn is_correlation_error(e: &SqlError) -> bool {
     matches!(e.number, 207 | 4104)
@@ -81,6 +78,18 @@ fn rename_table(v: &mut J, from: &str, to: &str) {
 
 fn json_err(e: serde_json::Error) -> SqlError {
     SqlError::new(50000, format!("the query could not be rewritten for the cluster: {}", e))
+}
+
+/// A literal for a value. The rewrite goes through JSON, which has no number for a decimal beyond 64 bits (a sum of money over
+/// many rows): such a value is written as a cast of its text, which says the same thing.
+fn lit(v: &Value) -> Expr {
+    if let Value::Dec(d) = v {
+        if serde_json::to_value(v).is_err() {
+            let ty = TypeRef { parts: vec!["decimal".into()], args: vec![38, d.s as i64], xml_schema: None };
+            return Expr::Cast { e: Box::new(Expr::Lit(Value::Str(v.to_string()))), ty, try_: false, style: None };
+        }
+    }
+    Expr::Lit(v.clone())
 }
 
 fn lit_true(yes: bool) -> Expr {
@@ -159,6 +168,20 @@ impl ClusterSession {
             self.plan.push("views expanded into their definitions".into());
             return Box::pin(self.run_query(&expanded)).await;
         }
+        // a derived table that is a plain join of several tables is merged into the query that reads it (see `flatten.rs`)
+        if let Some(flat) = crate::flatten::flatten_derived(q) {
+            self.plan.push("derived table merged into the query".into());
+            return Box::pin(self.run_query(&flat)).await;
+        }
+        // a subquery co-located with the outer table by shard key runs on the shards, before anything is evaluated around them
+        if has_nested_query(q) {
+            let ids = referenced_tables(q);
+            if ids.iter().filter_map(|i| self.table_by_id(i)).any(|t| matches!(t.dist, Dist::Sharded { .. })) {
+                if let Some(rs) = self.try_pushdown(q, true).await? {
+                    return Ok(rs);
+                }
+            }
+        }
         if !has_nested_query(q) {
             return self.run_query_flat(q).await;
         }
@@ -224,7 +247,9 @@ impl ClusterSession {
         if decorrelate {
             if let Ok(mut typed) = serde_json::from_value::<Query>(v.clone()) {
                 let mut counter = self.temp_counter;
-                if crate::decorrelate::decorrelate(&mut typed, &mut counter) {
+                // (the columns of the tables it reads: how an unqualified name is told to be the subquery's or the outer query's)
+                let schema: HashMap<String, Vec<String>> = referenced_tables(&typed).iter().filter_map(|i| self.table_by_id(i).map(|t| (i.clone(), t.cols.iter().map(|c| c.name.to_lowercase()).collect()))).collect();
+                if crate::decorrelate::decorrelate(&mut typed, &mut counter, schema) {
                     self.temp_counter = counter;
                     self.plan.push("correlated subquery rewritten as a join".into());
                     *rewrote = true;
@@ -281,7 +306,7 @@ impl ClusterSession {
                                     if rs.rows.len() > 1 {
                                         return Err(SqlError::new(512, "Subquery returned more than 1 value. This is not permitted when the subquery follows =, !=, <, <= , >, >= or when the subquery is used as an expression."));
                                     }
-                                    Expr::Lit(rs.rows.first().map(|r| r[0].clone()).unwrap_or(Value::Null))
+                                    rs.rows.first().map(|r| lit(&r[0])).unwrap_or(Expr::Lit(Value::Null))
                                 };
                                 self.plan.push(format!("subquery evaluated first ({} rows)", rs.rows.len()));
                                 *v = serde_json::to_value(&e).map_err(json_err)?;
@@ -302,11 +327,18 @@ impl ClusterSession {
                                 if rs.columns.len() != 1 {
                                     return Err(SqlError::new(116, "Only one expression can be specified in the select list when the subquery is not introduced with EXISTS."));
                                 }
-                                if rs.rows.len() > IN_LIST_LIMIT {
-                                    return Ok(false);
+                                if rs.rows.len() as u64 > self.cluster.in_list_limit.load(Ordering::Relaxed) {
+                                    // too long for a list: the result becomes a replicated temporary table (up to the broadcast limit),
+                                    // and the condition `x IN (SELECT k FROM that table)` is run by the shards, which have it all
+                                    let renamed = ResultSet { columns: vec!["k".into()], ..rs.clone() };
+                                    let Some(temp) = self.materialize(renamed, Some(vec!["k".into()]), temps).await? else { return Ok(false) };
+                                    let sub = simple_query(Select { distinct: false, top: None, items: vec![SelectItem::Expr { e: col("k"), alias: None }], into: None, from: vec![TableRef::Table { name: vec![temp], alias: None, hints: vec![] }], where_: None, group: None, having: None });
+                                    let e = Expr::InQuery(Box::new(a), Box::new(sub), neg);
+                                    *v = serde_json::to_value(&e).map_err(json_err)?;
+                                    return Ok(true);
                                 }
                                 self.plan.push(format!("IN subquery evaluated first ({} values)", rs.rows.len()));
-                                let e = if rs.rows.is_empty() { lit_true(neg) } else { Expr::InList(Box::new(a), rs.rows.iter().map(|r| Expr::Lit(r[0].clone())).collect(), neg) };
+                                let e = if rs.rows.is_empty() { lit_true(neg) } else { Expr::InList(Box::new(a), rs.rows.iter().map(|r| lit(&r[0])).collect(), neg) };
                                 *v = serde_json::to_value(&e).map_err(json_err)?;
                                 return Ok(true);
                             }

@@ -14,9 +14,44 @@
 //! Only equalities between a column of the subquery and a *qualified* column of the outer query are recognised; anything else
 //! is left alone (and the statement is gathered, which is always exact). A rewrite that turns out not to bind is undone by the
 //! caller, which runs the original.
+use std::cell::RefCell;
+use std::collections::HashMap;
 use tsql_server::ast::*;
 
 use crate::astutil::*;
+
+thread_local! {
+    /// the columns (lower case) of the tables the query reads, by table id: how an unqualified column name is told to belong to
+    /// the subquery or to the query around it
+    static SCHEMA: RefCell<HashMap<String, Vec<String>>> = RefCell::new(HashMap::new());
+    /// the columns of the tables of the subquery being taken apart, and of the outer query
+    static COLS: RefCell<(Vec<String>, Vec<String>)> = RefCell::new((vec![], vec![]));
+    /// the plain tables of the outer query: (alias in lower case, the table reference, its columns in lower case)
+    static OUTER: RefCell<Vec<(String, TableRef, Vec<String>)>> = RefCell::new(vec![]);
+}
+
+/// The columns of the tables in a `FROM` (from the schema given to [`decorrelate`]).
+fn columns_of(from: &[TableRef]) -> Vec<String> {
+    fn one(t: &TableRef, out: &mut Vec<String>) {
+        match t {
+            TableRef::Table { name, .. } => SCHEMA.with(|s| {
+                if let Some(c) = s.borrow().get(&table_id(name)) {
+                    out.extend(c.iter().cloned());
+                }
+            }),
+            TableRef::Join { left, right, .. } => {
+                one(left, out);
+                one(right, out);
+            }
+            _ => {}
+        }
+    }
+    let mut out = vec![];
+    for t in from {
+        one(t, &mut out);
+    }
+    out
+}
 
 /// The names (aliases, or table names) a `FROM` makes visible.
 fn aliases(from: &[TableRef], out: &mut Vec<String>) {
@@ -81,7 +116,19 @@ fn side(e: &Expr, inner: &[String], outer: &[String]) -> Side {
                 Some(q) if inner.contains(&q) => has_inner = true,
                 Some(q) if outer.contains(&q) => has_outer = true,
                 Some(_) => bad = true,
-                None => has_inner = true,
+                // (an unqualified name binds to the subquery's tables first, then to the outer query's)
+                None => {
+                    let n = p.last().map(|s| s.to_lowercase()).unwrap_or_default();
+                    let (in_sub, in_outer) = COLS.with(|c| {
+                        let c = c.borrow();
+                        (c.0.contains(&n), c.1.contains(&n))
+                    });
+                    if !in_sub && in_outer {
+                        has_outer = true
+                    } else {
+                        has_inner = true
+                    }
+                }
             }
         }
         Expr::Exists(_) | Expr::Subquery(_) | Expr::InQuery(..) | Expr::CmpQuant(..) | Expr::Var(_) | Expr::SysVar(_) => bad = true,
@@ -119,6 +166,7 @@ fn take_apart(q: &Query, outer: &[String]) -> Option<Parts> {
     };
     let mut inner = vec![];
     aliases(&s.from, &mut inner);
+    COLS.with(|c| c.borrow_mut().0 = columns_of(&s.from));
     // the subquery's own tables must be plain: no nested queries anywhere in it
     if s.from.iter().any(|t| !matches!(t, TableRef::Table { .. } | TableRef::Join { .. })) {
         return None;
@@ -185,8 +233,20 @@ fn aggregate_only(e: &Expr) -> bool {
 }
 
 /// Rewrite the correlated subqueries of the top-level `WHERE` of `q`. True when something was rewritten.
-pub fn decorrelate(q: &mut Query, counter: &mut u64) -> bool {
+pub fn decorrelate(q: &mut Query, counter: &mut u64, schema: HashMap<String, Vec<String>>) -> bool {
+    SCHEMA.with(|s| *s.borrow_mut() = schema);
     let QueryBody::Select(sel) = &mut q.body else { return false };
+    COLS.with(|c| c.borrow_mut().1 = columns_of(&sel.from));
+    OUTER.with(|o| {
+        *o.borrow_mut() = sel
+            .from
+            .iter()
+            .filter_map(|t| match t {
+                TableRef::Table { name, alias, .. } => Some((alias.clone().or_else(|| name.last().cloned())?.to_lowercase(), t.clone(), columns_of(std::slice::from_ref(t)))),
+                _ => None,
+            })
+            .collect()
+    });
     let Some(w) = sel.where_.clone() else { return false };
     let mut outer = vec![];
     aliases(&sel.from, &mut outer);
@@ -195,13 +255,13 @@ pub fn decorrelate(q: &mut Query, counter: &mut u64) -> bool {
     let mut changed = false;
     let mut out: Vec<Expr> = vec![];
     let mut extra_from: Vec<TableRef> = vec![];
-    for c in conj {
-        match rewrite_conjunct(&c, &outer, counter, &mut extra_from) {
+    for (i, c) in conj.iter().enumerate() {
+        match rewrite_conjunct(c, &conj, i, &outer, counter, &mut extra_from) {
             Some(r) => {
                 changed = true;
                 out.extend(r);
             }
-            None => out.push(c),
+            None => out.push(c.clone()),
         }
     }
     if changed {
@@ -211,7 +271,74 @@ pub fn decorrelate(q: &mut Query, counter: &mut u64) -> bool {
     changed
 }
 
-fn rewrite_conjunct(c: &Expr, outer: &[String], counter: &mut u64, extra_from: &mut Vec<TableRef>) -> Option<Vec<Expr>> {
+/// The restriction of the grouped inner query to the keys that can matter: the subquery is evaluated for every key of its table, but
+/// the outer query only meets the keys of the outer rows that survive the conditions of its `WHERE` that mention the outer table
+/// of the key alone. So the derived table is restricted to `inner_key IN (SELECT DISTINCT outer_key FROM that_table WHERE those
+/// conditions)`: a superset of what is needed (the other conditions only remove outer rows), and often a tiny one (TPC-H Q17 wants
+/// the averages of about twenty parts, not of all of them). None when no condition says anything about that table.
+fn reduction(parts: &Parts, conj: &[Expr], me: usize) -> Option<Expr> {
+    OUTER.with(|o| {
+        let o = o.borrow();
+        // the outer table a column reference names
+        let owner = |p: &[String]| -> Option<usize> {
+            let n = p.last()?.to_lowercase();
+            if p.len() >= 2 {
+                let q = p[p.len() - 2].to_lowercase();
+                return o.iter().position(|(a, _, _)| *a == q);
+            }
+            let mut found = None;
+            for (i, (_, _, cols)) in o.iter().enumerate() {
+                if cols.contains(&n) {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(i);
+                }
+            }
+            found
+        };
+        for (inner, outer_e) in &parts.keys {
+            let Expr::Col(p) = outer_e else { continue };
+            let Some(a) = owner(p) else { continue };
+            let mut filters: Vec<Expr> = vec![];
+            for (i, c) in conj.iter().enumerate() {
+                if i == me {
+                    continue;
+                }
+                let (mut only, mut any, mut risky) = (true, false, false);
+                walk_expr(c, &mut |x| match x {
+                    Expr::Col(q) => match owner(q) {
+                        Some(b) if b == a => any = true,
+                        _ => only = false,
+                    },
+                    // (a scalar or EXISTS subquery may refer to other tables of the outer query; an IN list's subquery is taken as it is)
+                    Expr::Exists(_) | Expr::Subquery(_) | Expr::CmpQuant(..) | Expr::Var(_) | Expr::SysVar(_) => risky = true,
+                    _ => {}
+                });
+                if only && any && !risky {
+                    filters.push(c.clone());
+                }
+            }
+            if filters.is_empty() {
+                continue;
+            }
+            let list = simple_query(Select {
+                distinct: true,
+                top: None,
+                items: vec![SelectItem::Expr { e: outer_e.clone(), alias: None }],
+                into: None,
+                from: vec![o[a].1.clone()],
+                where_: and_all(filters),
+                group: None,
+                having: None,
+            });
+            return Some(Expr::InQuery(Box::new(inner.clone()), Box::new(list), false));
+        }
+        None
+    })
+}
+
+fn rewrite_conjunct(c: &Expr, conj: &[Expr], me: usize, outer: &[String], counter: &mut u64, extra_from: &mut Vec<TableRef>) -> Option<Vec<Expr>> {
     match c {
         Expr::Exists(sq) => exists(sq, false, outer),
         Expr::Not(inner) => match &**inner {
@@ -236,7 +363,11 @@ fn rewrite_conjunct(c: &Expr, outer: &[String], counter: &mut u64, extra_from: &
             let mut items: Vec<SelectItem> = parts.keys.iter().enumerate().map(|(i, (k, _))| SelectItem::Expr { e: k.clone(), alias: Some(format!("dk{}", i)) }).collect();
             items.push(SelectItem::Expr { e: item, alias: Some("dv".into()) });
             let group: Vec<GroupItem> = parts.keys.iter().map(|(k, _)| GroupItem::Expr(k.clone())).collect();
-            let derived = simple_query(Select { distinct: false, top: None, items, into: None, from: parts.from.clone(), where_: and_all(parts.rest.clone()), group: Some(group), having: None });
+            let mut inner_where = parts.rest.clone();
+            if let Some(r) = reduction(&parts, conj, me) {
+                inner_where.push(r);
+            }
+            let derived = simple_query(Select { distinct: false, top: None, items, into: None, from: parts.from.clone(), where_: and_all(inner_where), group: Some(group), having: None });
             extra_from.push(TableRef::Derived { query: Box::new(derived), alias: Some(alias.clone()), cols: None });
             let value = Expr::Col(vec![alias.clone(), "dv".into()]);
             let replaced = if on_left { Expr::Binary(*op, Box::new(replace_subquery(a, &value)), b.clone()) } else { Expr::Binary(*op, a.clone(), Box::new(replace_subquery(b, &value))) };
@@ -292,8 +423,9 @@ fn exists(sq: &Query, negated: bool, outer: &[String]) -> Option<Vec<Expr>> {
     if negated {
         rest.push(Expr::IsNull(Box::new(inner_key.clone()), true));
     }
+    // (distinct: the list is a set, and a long one is made a replicated table, so it must not repeat itself)
     let list = simple_query(Select {
-        distinct: false,
+        distinct: true,
         top: None,
         items: vec![SelectItem::Expr { e: inner_key, alias: None }],
         into: None,

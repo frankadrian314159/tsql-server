@@ -27,11 +27,15 @@ pub mod client;
 pub mod deadlock;
 pub mod decorrelate;
 pub mod fk;
+pub mod flatten;
+pub mod gather;
 pub mod front;
 pub mod joins;
 pub mod merge;
+pub mod mpp;
 pub mod nested;
 pub mod ops;
+pub mod pushdown;
 pub mod plan;
 pub mod rebalance;
 pub mod split;
@@ -112,6 +116,8 @@ pub struct Cluster {
     next_session: AtomicU64,
     /// the largest table (in rows) a join broadcasts to every shard
     broadcast_limit: AtomicU64,
+    /// the longest list an `IN (SELECT ...)` is turned into (longer results become replicated temporary tables)
+    in_list_limit: AtomicU64,
     /// how long a statement of a transaction waits for a lock on a shard (ms); a deadlock between shards is broken by it
     lock_timeout_ms: AtomicU64,
     /// the views (by table id) as their `CREATE VIEW` statements: a query that reads one is rewritten around its definition
@@ -176,6 +182,7 @@ impl Cluster {
             gather: Mutex::new(()),
             next_session: AtomicU64::new(fresh_session_base()),
             broadcast_limit: AtomicU64::new(100_000),
+            in_list_limit: AtomicU64::new(20_000),
             lock_timeout_ms: AtomicU64::new(5000),
             views: Mutex::new(HashMap::new()),
             fks: Mutex::new(vec![]),
@@ -283,6 +290,11 @@ impl Cluster {
 
     /// Tables of at most this many rows are broadcast to every shard to join with a sharded table (default 100,000); a
     /// bigger one is repartitioned instead.
+    /// The longest list an `IN (SELECT ...)` is turned into; a longer result is made a replicated temporary table.
+    pub fn set_in_list_limit(&self, rows: u64) {
+        self.in_list_limit.store(rows, Ordering::Relaxed);
+    }
+
     pub fn set_broadcast_limit(&self, rows: u64) {
         self.broadcast_limit.store(rows, Ordering::Relaxed);
     }
@@ -1401,6 +1413,13 @@ impl ClusterSession {
         if let Some(rs) = self.run_setop(q).await? {
             return Ok(rs);
         }
+        // subqueries that the shards evaluate themselves (over replicated tables, or co-located with the outer table): the whole
+        // query runs shard by shard with them inside
+        if has_nested_query(q) && tables.iter().any(|t| matches!(t.dist, Dist::Sharded { .. })) {
+            if let Some(rs) = self.try_pushdown(q, false).await? {
+                return Ok(rs);
+            }
+        }
         // (one table read once: a table joined with itself is two row sources, and a condition on the key of one says nothing
         // about the other)
         if tables.len() == 1 && !has_nested_query(q) && matches!(&q.body, QueryBody::Select(s) if matches!(s.from.as_slice(), [TableRef::Table { .. }])) {
@@ -1423,11 +1442,39 @@ impl ClusterSession {
             if let Some(rs) = self.try_join(q, &tables).await? {
                 return Ok(rs);
             }
+            if let Some(rs) = self.try_mpp(q, &tables).await? {
+                return Ok(rs);
+            }
         }
         if let Some(rs) = self.run_split(q).await? {
             return Ok(rs);
         }
         self.gather(q, &tables).await
+    }
+
+    /// Run a query whose `WHERE` subqueries the shards can evaluate (see `pushdown.rs`) as a scatter-gather with them inside.
+    /// `need_colocated`: only when some subquery reads a sharded table (the case that would otherwise be gathered).
+    pub(crate) async fn try_pushdown(&mut self, q: &Query, need_colocated: bool) -> Result<Option<ResultSet>, SqlError> {
+        let ids = referenced_tables(q);
+        let map: HashMap<String, DistTable> = ids.iter().filter_map(|i| self.table_by_id(i).map(|t| (i.clone(), t))).collect();
+        let lookup = |id: &str| map.get(id).cloned();
+        if !pushdown::pushdown_ok(q, &lookup, need_colocated) {
+            return Ok(None);
+        }
+        let Some(shape) = plan::plan_scatter_sub(q) else { return Ok(None) };
+        // (one table: the shards its WHERE can reach; several, co-located: all of them)
+        let shards = match &q.body {
+            QueryBody::Select(s) => match s.from.as_slice() {
+                [TableRef::Table { name, .. }] => match map.get(&table_id(name)) {
+                    Some(outer) => prune_shards(query_where(q), outer, &self.cluster),
+                    None => return Ok(None),
+                },
+                _ => self.all_shards(),
+            },
+            _ => return Ok(None),
+        };
+        self.plan.push(format!("pushdown: the subqueries run on the shards {:?} with the rest of the query", shards));
+        self.scatter(shape, &shards).await.map(Some)
     }
 
     /// The number of rows of a table (cached until the table changes).
@@ -1510,6 +1557,66 @@ impl ClusterSession {
         out.map(Some)
     }
 
+    /// A join that needs the shuffle between its joins (`mpp.rs`): the stages move rows from shard to shard into session
+    /// temporary tables, then the rewritten query runs shard by shard. None when the query is not of that kind.
+    async fn try_mpp(&mut self, q: &Query, tables: &[DistTable]) -> Result<Option<ResultSet>, SqlError> {
+        if tables.len() < 2 {
+            return Ok(None);
+        }
+        let map: HashMap<String, DistTable> = tables.iter().map(|t| (t.id.clone(), t.clone())).collect();
+        let mut rows = HashMap::new();
+        for t in tables {
+            if !matches!(t.dist, Dist::Replicated) {
+                let n = self.table_rows(t).await?;
+                rows.insert(t.id.clone(), n);
+            }
+        }
+        let limit = self.cluster.broadcast_limit.load(Ordering::Relaxed);
+        let n = self.cluster.shard_count();
+        let sid = self.id;
+        let mut counter = self.temp_counter;
+        let plan = mpp::plan_mpp(q, &map, &rows, limit, n, &mut || {
+            counter += 1;
+            format!("#dpm_{}_{}", sid, counter)
+        });
+        self.temp_counter = counter;
+        let Some(plan) = plan else { return Ok(None) };
+        let shards = self.all_shards();
+        let slots = self.cluster.slot_map();
+        let peers: Vec<String> = self.cluster.shard_list().iter().map(|s| s.addr.clone()).collect();
+        let mut made: Vec<String> = vec![];
+        let out: Result<ResultSet, SqlError> = async {
+            for stage in &plan.stages {
+                // the temporary table has the columns of the scan
+                let mut create = stage.scan.clone();
+                create.top = Some(Top { e: Expr::Lit(Value::Int(0)), percent: false, ties: false });
+                create.into = Some(vec![stage.temp.clone()]);
+                made.push(stage.temp.clone());
+                let create = Stmt::Query(Box::new(simple_query(create)));
+                self.fan_run(&shards, |_| Work::Stmts(vec![create.clone()])).await?;
+                // every shard runs the scan and sends each row to the shard that needs it, straight there
+                let clients: Vec<ShardClient> = shards.iter().map(|&i| self.cluster.shard(i)).collect();
+                let futs: Vec<_> = clients
+                    .iter()
+                    .zip(&shards)
+                    .map(|(c, &me)| c.shuffle(tsql_shared_ces::wire::ShuffleReq { session: self.id, scan: Stmt::Query(Box::new(simple_query(stage.scan.clone()))), key: stage.hash, table: stage.temp.clone(), slots: slots.clone(), peers: peers.clone(), me }))
+                    .collect();
+                for r in join_all(futs).await {
+                    r?;
+                }
+            }
+            let shape = plan::plan_scatter_multi(&plan.query).ok_or_else(|| SqlError::new(50000, "the query could not be rewritten for the cluster"))?;
+            self.plan.push(format!("mpp: {} ({} stages)", plan.description, plan.stages.len()));
+            self.scatter(shape, &shards).await
+        }
+        .await;
+        for t in made {
+            let drop = Stmt::Drop { what: "TABLE".into(), names: vec![vec![t]], if_exists: true };
+            let _ = self.fan_run(&shards, |_| Work::Stmts(vec![drop.clone()])).await;
+        }
+        out.map(Some)
+    }
+
     /// Make the session temporary copy of a table on every shard: all its rows (broadcast) or the rows each shard owns by
     /// the hash of the join column (repartition).
     async fn prepare_copy(&mut self, p: &joins::PrepSpec) -> Result<(), SqlError> {
@@ -1583,27 +1690,7 @@ impl ClusterSession {
         })
     }
 
-    /// Copy the tables to the mirror (unless it already has their current rows) and run the query there.
-    async fn gather(&mut self, q: &Query, tables: &[DistTable]) -> Result<ResultSet, SqlError> {
-        self.plan.push(format!("gather {} into the control node, run there", tables.iter().map(|t| t.id.clone()).collect::<Vec<_>>().join(", ")));
-        let cl = self.cluster.clone();
-        let _guard = cl.gather.lock().unwrap_or_else(|e| e.into_inner());
-        for t in tables {
-            self.refresh_mirror(t).await?;
-        }
-        let r = self.mirror_query(q);
-        if self.txn.borrow().is_some() {
-            // (the copies hold what this transaction sees, which others must not: they are not kept)
-            for t in tables {
-                if let Some(e) = self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&t.id) {
-                    e.loaded = None;
-                }
-            }
-        }
-        r
-    }
-
-    async fn refresh_mirror(&mut self, t: &DistTable) -> Result<(), SqlError> {
+    pub(crate) async fn refresh_mirror(&mut self, t: &DistTable) -> Result<(), SqlError> {
         let current = self.table_by_id(&t.id).ok_or_else(|| SqlError::new(208, format!("Invalid object name '{}'.", t.name.join("."))))?;
         if current.loaded == Some(current.version) {
             return Ok(());

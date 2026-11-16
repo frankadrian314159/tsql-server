@@ -51,7 +51,7 @@ impl Peers {
                 let mut c = FlightClient::new(self.channel(a)?);
                 let r = async {
                     let mut results = c.do_action(Action::new(ACTION_LOAD, body.clone())).await.map_err(status_of)?;
-                    results.try_next().await.map_err(status_of)?;
+                    while results.try_next().await.map_err(status_of)?.is_some() {}
                     Ok::<(), Status>(())
                 }
                 .await;

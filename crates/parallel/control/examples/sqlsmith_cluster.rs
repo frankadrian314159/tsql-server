@@ -3,7 +3,7 @@
 //! cluster refuses on purpose (error 50100, "not supported in a cluster") is counted, not reported; anything else that differs
 //! (an answer, an error number, success against failure, a panic) is a problem.
 //!
-//!   cargo run --release -p tsql-control --example sqlsmith_cluster -- [iterations] [--seed N] [--shards 3] [--verbose]
+//!   cargo run --release -p tsql-control --example sqlsmith_cluster -- [iterations] [--seed N] [--shards 3] [--broadcast N] [--verbose]
 //!
 //! `t1` and `t2` are sharded on `id`; `t3` is replicated (so queries mix sharded and replicated tables). Every 20 iterations
 //! a data change (`UPDATE`, `DELETE`, `INSERT`) is applied to both and the tables must stay identical; every 100 the data is
@@ -79,6 +79,10 @@ fn main() {
     }
     let cfg = ClusterConfig { shards: shards.iter().enumerate().map(|(i, s)| ShardInfo { id: i as u32, addr: s.addr.to_string() }).collect() };
     let cluster = Cluster::connect(&cfg).unwrap();
+    // `--broadcast N`: no table over N rows is broadcast, so that joins have to shuffle (the staged joins of `mpp.rs`)
+    if let Some(n) = flag("--broadcast") {
+        cluster.set_broadcast_limit(n);
+    }
     let mut cs = cluster.session();
     load_both(&mut one, &mut cs);
 
@@ -110,7 +114,7 @@ fn main() {
                 continue;
             }
         };
-        let kind = cs.last_plan().iter().map(|p| p.split_whitespace().next().unwrap_or("").trim_end_matches(':').to_string()).find(|k| matches!(k.as_str(), "gather" | "split" | "set" | "scatter-gather" | "route" | "join" | "direct" | "local")).unwrap_or_else(|| "other".into());
+        let kind = cs.last_plan().iter().map(|p| p.split_whitespace().next().unwrap_or("").trim_end_matches(':').to_string()).find(|k| matches!(k.as_str(), "gather" | "mpp" | "split" | "set" | "scatter-gather" | "route" | "join" | "direct" | "local")).unwrap_or_else(|| "other".into());
         *plans.entry(kind).or_default() += 1;
         match (&a, &b) {
             (Ok(x), Ok(y)) => match smith::same(x, y) {

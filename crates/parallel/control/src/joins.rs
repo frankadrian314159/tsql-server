@@ -20,12 +20,12 @@ use std::collections::HashMap;
 use tsql_server::ast::*;
 use tsql_shared_ces::route::KeyClass;
 
-struct Leaf {
-    table: DistTable,
-    alias: String,
+pub(crate) struct Leaf {
+    pub(crate) table: DistTable,
+    pub(crate) alias: String,
 }
 
-enum Node {
+pub(crate) enum Node {
     Leaf(usize),
     Join(JoinKind, Box<Node>, Box<Node>),
 }
@@ -51,7 +51,7 @@ pub struct JoinPlan {
     pub description: String,
 }
 
-fn conjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+pub(crate) fn conjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
     match e {
         Expr::And(a, b) => {
             conjuncts(a, out);
@@ -62,7 +62,7 @@ fn conjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
     }
 }
 
-fn build(tr: &TableRef, tables: &HashMap<String, DistTable>, leaves: &mut Vec<Leaf>, on_preds: &mut Vec<Expr>) -> Option<Node> {
+pub(crate) fn build(tr: &TableRef, tables: &HashMap<String, DistTable>, leaves: &mut Vec<Leaf>, on_preds: &mut Vec<Expr>) -> Option<Node> {
     match tr {
         TableRef::Table { name, alias, .. } => {
             let table = tables.get(&table_id(name))?.clone();
@@ -91,7 +91,7 @@ fn build(tr: &TableRef, tables: &HashMap<String, DistTable>, leaves: &mut Vec<Le
 }
 
 /// The leaf and column a column reference stands for.
-fn resolve(leaves: &[Leaf], parts: &[String]) -> Option<(usize, usize)> {
+pub(crate) fn resolve(leaves: &[Leaf], parts: &[String]) -> Option<(usize, usize)> {
     let col = parts.last()?;
     let by_col = |t: &DistTable| t.cols.iter().position(|c| c.name.eq_ignore_ascii_case(col));
     if parts.len() >= 2 {
@@ -111,7 +111,7 @@ fn resolve(leaves: &[Leaf], parts: &[String]) -> Option<(usize, usize)> {
     found
 }
 
-fn key_of(t: &DistTable) -> Option<(usize, KeyClass)> {
+pub(crate) fn key_of(t: &DistTable) -> Option<(usize, KeyClass)> {
     match t.dist {
         Dist::Sharded { key, class } => Some((key, class)),
         Dist::Replicated => None,

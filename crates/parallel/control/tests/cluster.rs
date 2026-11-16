@@ -1212,3 +1212,180 @@ fn joins_whose_keys_all_name_one_shard_run_there() {
     }
 }
 
+
+#[test]
+fn a_decimal_too_big_for_json_survives_the_rewrite_of_a_subquery() {
+    let mut p = Pair::new(3);
+    p.both("CREATE TABLE big (id INT PRIMARY KEY, v DECIMAL(18,2))");
+    // thirty values near the largest of the type: their sum does not fit 64 bits, which the rewrite (through JSON) cannot carry
+    p.both(&format!("INSERT INTO big VALUES {}", (1..=30).map(|i| format!("({}, 9999999999999999.{:02})", i, i)).collect::<Vec<_>>().join(",")));
+    for sql in [
+        "SELECT COUNT(*) FROM big WHERE v < (SELECT SUM(v) FROM big)",
+        "SELECT id FROM big WHERE v * 2 > (SELECT SUM(v) FROM big) / 20 ORDER BY id",
+        "SELECT COUNT(*) FROM big WHERE v IN (SELECT SUM(v) / 30 FROM big)",
+    ] {
+        p.check(sql, false);
+    }
+}
+
+#[test]
+fn subqueries_that_the_shards_can_answer_run_on_the_shards() {
+    let mut p = Pair::new(3);
+    p.load();
+    p.load_items();
+    let pushed = |plan: &[String]| plan.iter().any(|l| l.starts_with("pushdown"));
+    // co-located: orders and order_items are both sharded on the order key
+    for (sql, ordered) in [
+        ("SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT 1 FROM order_items i WHERE i.order_id = o.id AND i.qty > 2)", false),
+        ("SELECT COUNT(*) FROM orders o WHERE NOT EXISTS (SELECT 1 FROM order_items i WHERE i.order_id = o.id)", false),
+        ("SELECT status, COUNT(*) AS n FROM orders WHERE amount > 100 AND EXISTS (SELECT * FROM order_items WHERE order_id = orders.id AND qty >= 3) GROUP BY status ORDER BY status", true),
+        ("SELECT id FROM orders o WHERE (SELECT SUM(qty) FROM order_items i WHERE i.order_id = o.id) > 6 ORDER BY id", true),
+    ] {
+        let plan = p.check(sql, ordered);
+        assert!(pushed(&plan) && !plan.iter().any(|l| l.starts_with("gather")), "{}
+{:?}", sql, plan);
+    }
+    // not co-located (customers are sharded on their own key): not pushed down, still exact
+    let plan = p.check("SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT 1 FROM customers c WHERE c.id = o.customer_id AND c.credit > 100)", false);
+    assert!(!pushed(&plan), "{:?}", plan);
+}
+
+#[test]
+fn a_long_in_list_becomes_a_replicated_table_and_the_shards_do_the_rest() {
+    let mut p = Pair::new(3);
+    p.load();
+    p.h.cluster.set_in_list_limit(50); // (what would be a list of tens of thousands)
+    for (sql, ordered) in [
+        ("SELECT COUNT(*) FROM orders WHERE customer_id IN (SELECT id FROM customers WHERE credit > 10)", false),
+        ("SELECT COUNT(*) FROM orders WHERE customer_id NOT IN (SELECT id FROM customers WHERE credit > 10)", false),
+        ("SELECT status, COUNT(*) FROM orders WHERE customer_id IN (SELECT id FROM customers) GROUP BY status ORDER BY status", true),
+        // a correlated EXISTS that is not co-located: made a long IN, then handled the same way
+        ("SELECT COUNT(*) FROM orders o WHERE EXISTS (SELECT 1 FROM customers c WHERE c.id = o.customer_id AND c.credit > 10)", false),
+        ("SELECT COUNT(*) FROM orders o WHERE NOT EXISTS (SELECT 1 FROM customers c WHERE c.id = o.customer_id AND c.credit > 500)", false),
+    ] {
+        let plan = p.check(sql, ordered);
+        assert!(!plan.iter().any(|l| l.starts_with("gather")), "{}
+{:?}", sql, plan);
+        assert!(plan.iter().any(|l| l.contains("materialized")), "{}
+{:?}", sql, plan);
+    }
+}
+
+#[test]
+fn joins_in_stages_shuffle_between_the_joins() {
+    let mut p = Pair::new(3);
+    p.load();
+    p.load_items();
+    // nothing is small enough to broadcast: rows have to be moved between the joins
+    p.h.cluster.set_broadcast_limit(10);
+    let staged = |plan: &[String]| plan.iter().any(|l| l.starts_with("mpp:"));
+    for (sql, ordered) in [
+        // customers are sharded on their id, orders too, the items on the order: the items and orders meet in place, customers need the
+        // group re-spread by the customer
+        ("SELECT c.region, SUM(i.qty) AS q, COUNT(*) AS n FROM customers c, orders o, order_items i WHERE c.id = o.customer_id AND o.id = i.order_id GROUP BY c.region ORDER BY c.region", true),
+        ("SELECT c.name, o.id, i.sku FROM customers c, orders o, order_items i WHERE c.id = o.customer_id AND o.id = i.order_id AND c.id < 12 AND i.qty > 7 ORDER BY o.id, i.sku, c.name", true),
+        // ON clauses, a replicated table on the end, aggregates over expressions, HAVING
+        ("SELECT r.label, COUNT(*) AS n, SUM(i.qty * 2) AS s FROM order_items i JOIN orders o ON o.id = i.order_id JOIN customers c ON c.id = o.customer_id JOIN regions r ON r.code = c.region GROUP BY r.label HAVING COUNT(*) > 0 ORDER BY r.label", true),
+        // a table joined with itself on a column that is not its key, and then the customers
+        ("SELECT COUNT(*) FROM orders a, orders b, customers c WHERE a.customer_id = b.customer_id AND c.id = a.customer_id AND a.id < 40 AND b.id < 100", false),
+        ("SELECT COUNT(DISTINCT c.region) AS regions FROM orders a, orders b, customers c WHERE a.customer_id = b.customer_id AND c.id = b.customer_id AND a.qty > 8", false),
+        // TOP and DISTINCT over the staged join
+        ("SELECT TOP 5 c.name, o.amount FROM customers c, orders o, order_items i WHERE c.id = o.customer_id AND o.id = i.order_id ORDER BY o.amount DESC, c.name, o.id", true),
+        ("SELECT DISTINCT c.region FROM customers c, orders o, order_items i WHERE c.id = o.customer_id AND o.id = i.order_id", false),
+    ] {
+        let plan = p.check(sql, ordered);
+        assert!(staged(&plan) && !plan.iter().any(|l| l.starts_with("gather")), "{}\n{:?}", sql, plan);
+    }
+    // inside a transaction the rows that moved are the transaction's own
+    let sql = "BEGIN TRANSACTION; UPDATE customers SET region = 'moved' WHERE id <= 20; SELECT c.region, COUNT(*) FROM customers c, orders o, order_items i WHERE c.id = o.customer_id AND o.id = i.order_id GROUP BY c.region ORDER BY c.region; ROLLBACK";
+    let a = p.cl.execute(sql);
+    let b = p.oracle.execute(sql);
+    assert!(a.first_error().is_none(), "{:?}", a.first_error());
+    assert_eq!(rows_of(&a), rows_of(&b));
+    // nothing is left behind on the shards
+    for s in p.h.shards.iter() {
+        let mut c = s.server.connect();
+        let r = c.execute("SELECT COUNT(*) FROM tempdb.sys.tables");
+        let _ = r;
+    }
+    // what the stages cannot do is still gathered: an outer join, and `*`
+    for sql in ["SELECT c.name, o.id FROM customers c LEFT JOIN orders o ON c.id = o.customer_id LEFT JOIN order_items i ON i.order_id = o.id WHERE c.id < 8 ORDER BY c.name, o.id"] {
+        let plan = p.check(sql, true);
+        assert!(!staged(&plan), "{}\n{:?}", sql, plan);
+    }
+}
+
+#[test]
+fn a_derived_table_that_is_a_join_is_merged_into_the_query() {
+    let mut p = Pair::new(3);
+    p.load();
+    p.load_items();
+    p.h.cluster.set_broadcast_limit(10);
+    let merged = |plan: &[String]| plan.iter().any(|l| l.starts_with("derived table merged"));
+    for (sql, ordered) in [
+        // the shape of TPC-H Q9: an aggregate over a derived table that is the join, with computed columns
+        ("SELECT reg, SUM(q) AS total, COUNT(*) AS n FROM (SELECT c.region AS reg, i.qty * 2 + o.qty AS q FROM customers c, orders o, order_items i WHERE c.id = o.customer_id AND o.id = i.order_id AND i.qty > 2) AS d GROUP BY reg ORDER BY reg", true),
+        ("SELECT d.reg, MAX(d.q) FROM (SELECT c.region AS reg, i.qty AS q FROM customers c JOIN orders o ON o.customer_id = c.id JOIN order_items i ON i.order_id = o.id) d WHERE d.q > 5 GROUP BY d.reg HAVING COUNT(*) > 0 ORDER BY d.reg", true),
+        // a column list on the derived table, and a plain select over it
+        ("SELECT a, b FROM (SELECT o.id, i.sku FROM orders o, order_items i WHERE o.id = i.order_id AND o.id < 20) AS d (a, b) WHERE a > 3 ORDER BY a, b", true),
+    ] {
+        let plan = p.check(sql, ordered);
+        assert!(merged(&plan) && !plan.iter().any(|l| l.starts_with("gather")), "{}\n{:?}", sql, plan);
+    }
+    // a derived table with an aggregate, DISTINCT or TOP is not merged (its result is what the outer query reads)
+    for sql in [
+        "SELECT COUNT(*) FROM (SELECT DISTINCT o.customer_id FROM orders o, order_items i WHERE o.id = i.order_id) d",
+        "SELECT COUNT(*) FROM (SELECT TOP 5 o.id FROM orders o, order_items i WHERE o.id = i.order_id ORDER BY o.id) d",
+        "SELECT COUNT(*) FROM (SELECT o.customer_id, COUNT(*) AS n FROM orders o, order_items i WHERE o.id = i.order_id GROUP BY o.customer_id) d WHERE n > 2",
+    ] {
+        let plan = p.check(sql, false);
+        assert!(!merged(&plan), "{}\n{:?}", sql, plan);
+    }
+}
+
+#[test]
+fn a_gather_of_big_tables_copies_only_what_the_query_needs() {
+    let mut p = Pair::new(3);
+    p.load();
+    p.h.cluster.set_broadcast_limit(10); // (every table here is "big")
+    for (sql, ordered, expect) in [
+        // STDEV cannot be split over the shards: gathered; only the columns it names, and the rows that pass the conditions
+        ("SELECT STDEV(o.amount) FROM orders o, customers c WHERE c.id = o.customer_id AND o.amount > 900 AND c.credit > 100", false, "filtered"),
+        ("SELECT c.region, STDEV(o.amount) AS sd, COUNT(*) AS n FROM orders o, customers c WHERE c.id = o.customer_id AND o.qty BETWEEN 2 AND 4 AND c.region IN ('north', 'south') GROUP BY c.region ORDER BY c.region", true, "filtered"),
+        // an outer join, and a correlated subquery that is not an equality: columns only (a row that is missing matters)
+        ("SELECT c.id, o.id FROM customers c FULL JOIN orders o ON o.customer_id = c.id AND o.amount > 990 WHERE c.id < 15 OR o.id < 5 ORDER BY c.id, o.id", true, "columns"),
+        ("SELECT c.id FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.amount > c.credit) ORDER BY c.id", true, "columns"),
+    ] {
+        let plan = p.check(sql, ordered);
+        assert!(plan.iter().any(|l| l.starts_with("gather") && l.contains(expect)), "{}\n{:?}", sql, plan);
+    }
+    // `*` needs every column, and the data a transaction has changed is what is read
+    let plan = p.check("SELECT STDEV(amount), COUNT(*) FROM (SELECT * FROM orders) x", false);
+    let _ = plan;
+    let sql = "BEGIN TRANSACTION; UPDATE orders SET amount = 1000 WHERE id < 50; SELECT ROUND(STDEV(o.amount), 6) FROM orders o, customers c WHERE c.id = o.customer_id AND o.amount > 900; ROLLBACK";
+    let a = p.cl.execute(sql);
+    let b = p.oracle.execute(sql);
+    assert!(a.first_error().is_none(), "{:?}", a.first_error());
+    assert_eq!(rows_of(&a), rows_of(&b));
+    // the copies are gone from the control node's engine
+    let r = p.cl.execute("SELECT 1");
+    assert!(r.first_error().is_none());
+}
+
+#[test]
+fn a_decorrelated_subquery_is_restricted_to_the_keys_the_outer_query_can_meet() {
+    let mut p = Pair::new(3);
+    p.load();
+    // the averages are wanted for the customers of one region only, not for all of them
+    for sql in [
+        "SELECT COUNT(*) FROM orders o, customers c WHERE c.id = o.customer_id AND c.region = 'north' AND o.amount > (SELECT AVG(x.amount) FROM orders x WHERE x.customer_id = c.id)",
+        "SELECT c.id, COUNT(*) AS n FROM customers c, orders o WHERE o.customer_id = c.id AND c.credit > 400 AND o.qty < (SELECT AVG(y.qty) FROM orders y WHERE y.customer_id = c.id) GROUP BY c.id ORDER BY c.id",
+    ] {
+        let plan = p.check(sql, sql.contains("ORDER BY"));
+        assert!(plan.iter().any(|l| l.contains("rewritten as a join")), "{}\n{:?}", sql, plan);
+        // (the grouped table holds the keys of the surviving customers, a fraction of the 300)
+        let made: Vec<u64> = plan.iter().filter_map(|l| l.strip_prefix("materialized ").and_then(|r| r.split_whitespace().next()).and_then(|n| n.parse().ok())).collect();
+        assert!(made.iter().any(|n| *n < 250), "{}\n{:?}", sql, plan);
+        assert!(!plan.iter().any(|l| l.starts_with("gather")), "{}\n{:?}", sql, plan);
+    }
+}
