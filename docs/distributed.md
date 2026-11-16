@@ -153,6 +153,14 @@ tables sharded on the item), and its table shows how each query ran (`split`, `s
     still coerced to its column's type): about 2.5 times faster than inserting (about 430,000 rows a second into a heap table and
     290,000 into one with a primary key, against 190,000 and 100,000). A durable server, a session in a transaction, and a table with
     an identity column, a foreign key or an INSTEAD OF trigger take the ordinary `INSERT`. The shards load shuffled rows the same way.
+    A per-query copy is made an index on the columns the query equates (`a.x = b.y`, in table order), built after the load, and is a
+    table of the mirror under a name of its own (`dpg_...`) that is dropped afterwards, not a `#temporary` table: the engine does not
+    seek into the indexes of a temporary table from a correlated subquery, and without the index TPC-C's consistency condition 10 (a
+    correlated subquery joining `orders` and `order_line`) scanned the 180,000-row copy once per customer and did not finish.
+  * *plain point statements* (`SELECT ... FROM t WHERE ...` with no subquery, view, CTE, grouping or long literal list, on a replicated
+    table or one whose key the condition fixes) are routed without walking the query in its serialized form: that took a routed
+    SELECT from 0.78 ms to 0.59 ms (a bare round trip to a shard is 0.33 ms, a statement through the shard client 0.5 ms).
+    `TSQL_PLAN_TRACE=1` prints one line per statement with how the cluster ran it.
 * **Transactions.** `BEGIN TRANSACTION` begins on a shard when a statement first uses it, on that shard's session for this
   control session, so locks and uncommitted changes are held there and the session reads its own writes. `COMMIT`: one shard,
   committed there; several shards, **two-phase commit** (see `txn.rs`): every participant makes its part durable (a `Prepare`

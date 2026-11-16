@@ -69,6 +69,32 @@ fn rename_by_id(v: &mut J, id: &str, to: &str) {
     }
 }
 
+/// The names of the columns the query compares with another column for equality (`a.x = b.y`): the ones worth an index on a copy.
+fn equated_columns(v: &J, out: &mut HashSet<String>) {
+    match v {
+        J::Object(m) => {
+            if let Some(J::Array(a)) = m.get("Binary") {
+                if a.len() == 3 && a[0].as_str() == Some("Eq") {
+                    let name = |e: &J| e.get("Col").and_then(|c| c.as_array()).and_then(|c| c.last()).and_then(|n| n.as_str()).map(|n| n.to_lowercase());
+                    if let (Some(x), Some(y)) = (name(&a[1]), name(&a[2])) {
+                        out.insert(x);
+                        out.insert(y);
+                    }
+                }
+            }
+            for c in m.values() {
+                equated_columns(c, out);
+            }
+        }
+        J::Array(a) => {
+            for c in a {
+                equated_columns(c, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// A condition that a row which is not there cannot satisfy, so that dropping the rows that fail it early changes nothing.
 pub(crate) fn pushable(e: &Expr) -> bool {
     let mut ok = true;
@@ -88,6 +114,8 @@ impl ClusterSession {
         let mut qj = serde_json::to_value(q).map_err(|e| SqlError::new(50000, format!("the query could not be rewritten for the cluster: {}", e)))?;
         let mut used = HashSet::new();
         let star = !used_columns(&qj, &mut used);
+        let mut eq_cols = HashSet::new();
+        equated_columns(&qj, &mut eq_cols);
         // the tables as a plain join, for the conditions that can be applied while copying (None: not a plain join)
         let map: HashMap<String, DistTable> = tables.iter().map(|t| (t.id.clone(), t.clone())).collect();
         let join = match &q.body {
@@ -163,7 +191,9 @@ impl ClusterSession {
                     fs.into_iter().reduce(|a, b| Expr::And(Box::new(a), Box::new(b))).map(|f| (f, alias))
                 });
                 self.temp_counter += 1;
-                let temp = format!("#dpg_{}_{}", self.id, self.temp_counter);
+                // (a table of the control node's engine, not a #temporary one: the engine does not use the indexes of a temporary table to seek into
+                // it from a correlated subquery, and the copy's index is what keeps such a query from scanning it once per row)
+                let temp = format!("dpg_{}_{}", self.id, self.temp_counter);
                 let names: Vec<String> = cols.iter().map(|c| c.name.clone()).collect();
                 // the copy has the columns (and the types) of the table's own, in the control node's engine
                 let create = simple_query(Select {
@@ -206,6 +236,15 @@ impl ClusterSession {
                         let t1 = std::time::Instant::now();
                         self.mirror.load_rows(std::slice::from_ref(&temp), None, chunk)?;
                         insert += t1.elapsed().as_secs_f64();
+                    }
+                }
+                // the copy is a plain heap: an index on the columns the query equates, so that a join or a correlated lookup on the control
+                // node seeks where it would otherwise scan the copy once per row
+                if n > 1000 {
+                    let keys: Vec<(String, bool)> = names.iter().filter(|c| eq_cols.contains(&c.to_lowercase())).map(|c| (c.clone(), false)).collect();
+                    if !keys.is_empty() {
+                        let ix = Stmt::CreateIndex { name: format!("ix_{}", temp.trim_start_matches('#')), table: vec![temp.clone()], cols: keys, unique: false, include: vec![], filter: None, xml: None, spatial: None };
+                        merge::check(&self.mirror.execute_stmts(&[ix]))?;
                     }
                 }
                 let _ = &mut convert;

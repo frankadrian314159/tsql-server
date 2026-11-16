@@ -218,8 +218,66 @@ impl ClusterSession {
         Ok(Some(serde_json::from_value(v).map_err(json_err)?))
     }
 
+    /// The common case, answered without walking the query in its serialized form (which the general path does several times):
+    /// a plain `SELECT ... FROM t WHERE ...` with no subquery, view, CTE, grouping or long literal list, on a table that is
+    /// replicated or whose key the condition fixes. None: not that case (the general path runs it).
+    async fn run_point_select(&mut self, q: &Query) -> Result<Option<ResultSet>, SqlError> {
+        if !q.ctes.is_empty() || q.maxrecursion.is_some() {
+            return Ok(None);
+        }
+        let QueryBody::Select(sel) = &q.body else { return Ok(None) };
+        let [TableRef::Table { name, .. }] = sel.from.as_slice() else { return Ok(None) };
+        if sel.into.is_some() || sel.group.is_some() || sel.having.is_some() || name.last().map_or(true, |n| n.starts_with('#') || n.starts_with('@')) {
+            return Ok(None);
+        }
+        let min = self.cluster.in_join_min.load(Ordering::Relaxed) as usize;
+        let mut plain = true;
+        let mut check = |e: &Expr| {
+            walk_expr(e, &mut |x| match x {
+                Expr::InQuery(..) | Expr::CmpQuant(..) | Expr::Exists(_) | Expr::Subquery(_) | Expr::Var(_) | Expr::SysVar(_) => plain = false,
+                Expr::InList(_, items, _) if items.len() >= min => plain = false,
+                _ => {}
+            })
+        };
+        for it in &sel.items {
+            match it {
+                SelectItem::Expr { e, .. } => check(e),
+                SelectItem::Star(_) => {}
+                SelectItem::Assign { .. } => return Ok(None),
+            }
+        }
+        if let Some(w) = &sel.where_ {
+            check(w);
+        }
+        if !plain {
+            return Ok(None);
+        }
+        let id = table_id(name);
+        if self.cluster.views.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&id) {
+            return Ok(None);
+        }
+        let Some(t) = self.table_by_id(&id) else { return Ok(None) };
+        match &t.dist {
+            Dist::Replicated => {
+                self.plan.push("direct: replicated tables, on shard 0".into());
+                Ok(Some(self.direct(0, q).await?))
+            }
+            Dist::Sharded { .. } => {
+                let shards = prune_shards(sel.where_.as_ref(), &t, &self.cluster);
+                if shards.len() != 1 {
+                    return Ok(None);
+                }
+                self.plan.push(format!("route: the key fixes the shard ({})", shards[0]));
+                Ok(Some(self.direct(shards[0], q).await?))
+            }
+        }
+    }
+
     /// Run a query. One with subqueries or CTEs is rewritten around the results of its independent parts when it can be.
     pub(crate) async fn run_query(&mut self, q: &Query) -> Result<ResultSet, SqlError> {
+        if let Some(rs) = self.run_point_select(q).await? {
+            return Ok(rs);
+        }
         if let Some(expanded) = self.with_views_expanded(q)? {
             self.plan.push("views expanded into their definitions".into());
             return Box::pin(self.run_query(&expanded)).await;

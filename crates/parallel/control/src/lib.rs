@@ -564,7 +564,16 @@ impl ClusterSession {
             return BatchResult { events };
         }
         match tsql_server::parser::parse(sql) {
-            Ok(stmts) => self.run_stmts(&stmts),
+            Ok(stmts) => {
+                let r = self.run_stmts(&stmts);
+                // TSQL_PLAN_TRACE=1: one line per statement with its first words and how the cluster ran it (to see which statements
+                // of a workload are gathered, joined or scattered)
+                if std::env::var_os("TSQL_PLAN_TRACE").is_some() {
+                    let head: String = sql.split_whitespace().take(8).collect::<Vec<_>>().join(" ");
+                    eprintln!("plan: {} => {}", head, self.plan.join(" | "));
+                }
+                r
+            }
             Err(e) => {
                 events.push(Event::Error(e));
                 BatchResult { events }
