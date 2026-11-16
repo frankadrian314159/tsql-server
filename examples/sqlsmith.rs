@@ -16,38 +16,38 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use tsql_server::{Connection, Server};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Ty {
+pub enum Ty {
     Int,
     Str,
     Dec,
     Date,
 }
 
-struct Col {
-    name: &'static str,
-    ty: Ty,
+pub struct Col {
+    pub name: &'static str,
+    pub ty: Ty,
 }
 
-struct Tbl {
-    name: &'static str,
-    cols: Vec<Col>,
+pub struct Tbl {
+    pub name: &'static str,
+    pub cols: Vec<Col>,
 }
 
 /// A column that expressions may refer to: its qualifier and name.
 #[derive(Clone)]
-struct Avail {
-    alias: String,
-    name: String,
-    ty: Ty,
+pub struct Avail {
+    pub alias: String,
+    pub name: String,
+    pub ty: Ty,
 }
 
-struct Gen {
-    rng: StdRng,
-    tables: Vec<Tbl>,
-    counter: usize,
+pub struct Gen {
+    pub rng: StdRng,
+    pub tables: Vec<Tbl>,
+    pub counter: usize,
 }
 
-fn tables() -> Vec<Tbl> {
+pub fn tables() -> Vec<Tbl> {
     let c = |name, ty| Col { name, ty };
     vec![
         Tbl { name: "t1", cols: vec![c("id", Ty::Int), c("a", Ty::Int), c("b", Ty::Int), c("c", Ty::Str), c("d", Ty::Dec), c("e", Ty::Date)] },
@@ -59,14 +59,20 @@ fn tables() -> Vec<Tbl> {
 const STRS: [&str; 8] = ["x", "y", "ab", "abc", "ba", "", "zz", "a b"];
 
 fn load(c: &mut Connection, seed: u64) {
+    load_with(&mut |sql| match c.execute(sql).first_error() {
+        None => Ok(()),
+        Some(e) => Err(format!("{:?}", e)),
+    }, seed)
+}
+
+/// Make the three tables and fill them, through any way of running a statement (the cluster fuzzer uses its own).
+pub fn load_with(exec: &mut dyn FnMut(&str) -> Result<(), String>, seed: u64) {
     let mut rng = StdRng::seed_from_u64(seed);
     for t in ["t1", "t2", "t3"] {
-        let r = c.execute(&format!("CREATE TABLE {} (id INT PRIMARY KEY, a INT, b INT, c VARCHAR(10), d DECIMAL(8,2), e DATE)", t));
-        assert!(r.first_error().is_none(), "{:?}", r.first_error());
+        exec(&format!("CREATE TABLE {} (id INT PRIMARY KEY, a INT, b INT, c VARCHAR(10), d DECIMAL(8,2), e DATE)", t)).unwrap();
     }
     for sql in ["CREATE INDEX i1a ON t1 (a)", "CREATE INDEX i1c ON t1 (c)", "CREATE INDEX i2ab ON t2 (a, b)", "CREATE INDEX i2c ON t2 (c)", "CREATE INDEX i3a ON t3 (a)"] {
-        let r = c.execute(sql);
-        assert!(r.first_error().is_none());
+        exec(sql).unwrap();
     }
     for (t, n) in [("t1", 40), ("t2", 35), ("t3", 25)] {
         let mut rows = vec![];
@@ -77,8 +83,7 @@ fn load(c: &mut Connection, seed: u64) {
             let e = if rng.gen_bool(0.15) { "NULL".to_string() } else { format!("'2020-{:02}-{:02}'", rng.gen_range(1..13), rng.gen_range(1..28)) };
             rows.push(format!("({}, {}, {}, {}, {}, {})", id, int(&mut rng, 8), int(&mut rng, 5), s, d, e));
         }
-        let r = c.execute(&format!("INSERT {} VALUES {}", t, rows.join(",")));
-        assert!(r.first_error().is_none(), "{:?}", r.first_error());
+        exec(&format!("INSERT {} VALUES {}", t, rows.join(","))).unwrap();
     }
 }
 
@@ -95,7 +100,7 @@ impl Gen {
     }
 
     // ------------------------------------------------------------- expressions
-    fn int_expr(&mut self, scope: &[Avail], d: u32) -> String {
+    pub fn int_expr(&mut self, scope: &[Avail], d: u32) -> String {
         let cols = self.cols_of(scope, Ty::Int);
         if d == 0 || self.rng.gen_bool(0.3) {
             if !cols.is_empty() && self.rng.gen_bool(0.75) {
@@ -125,7 +130,7 @@ impl Gen {
         }
     }
 
-    fn str_expr(&mut self, scope: &[Avail], d: u32) -> String {
+    pub fn str_expr(&mut self, scope: &[Avail], d: u32) -> String {
         let cols = self.cols_of(scope, Ty::Str);
         if d == 0 || self.rng.gen_bool(0.35) {
             if !cols.is_empty() && self.rng.gen_bool(0.75) {
@@ -147,7 +152,7 @@ impl Gen {
         }
     }
 
-    fn dec_expr(&mut self, scope: &[Avail], d: u32) -> String {
+    pub fn dec_expr(&mut self, scope: &[Avail], d: u32) -> String {
         let cols = self.cols_of(scope, Ty::Dec);
         if d == 0 || self.rng.gen_bool(0.35) {
             if !cols.is_empty() && self.rng.gen_bool(0.75) {
@@ -177,7 +182,7 @@ impl Gen {
         format!("DATEADD(day, {}, {})", self.rng.gen_range(-40..40), self.date_expr(scope, d - 1))
     }
 
-    fn pred(&mut self, scope: &[Avail], d: u32) -> String {
+    pub fn pred(&mut self, scope: &[Avail], d: u32) -> String {
         let cmp = ["=", "<>", "<", "<=", ">", ">="];
         if d == 0 {
             return format!("{} {} {}", self.int_expr(scope, 0), self.pick(&cmp), self.rng.gen_range(0..8));
@@ -298,7 +303,7 @@ impl Gen {
     }
 
     /// A random query and whether its row order is irrelevant (always true here: results are compared as sets).
-    fn query(&mut self) -> String {
+    pub fn query(&mut self) -> String {
         let (from, scope) = self.from_clause();
         let where_ = if self.rng.gen_bool(0.7) { format!(" WHERE {}", self.pred(&scope, 2)) } else { String::new() };
         match self.rng.gen_range(0..12) {
@@ -409,7 +414,7 @@ fn close(a: &str, b: &str) -> bool {
     }
 }
 
-fn same(a: &[Vec<String>], b: &[Vec<String>]) -> Option<String> {
+pub fn same(a: &[Vec<String>], b: &[Vec<String>]) -> Option<String> {
     if a.len() != b.len() {
         return Some(format!("{} rows against {}", a.len(), b.len()));
     }
@@ -426,7 +431,7 @@ fn same(a: &[Vec<String>], b: &[Vec<String>]) -> Option<String> {
 
 /// Error numbers a generated query may legitimately provoke. Anything else, or text that names an internal failure,
 /// is reported.
-fn suspicious(num: i32, msg: &str) -> bool {
+pub fn suspicious(num: i32, msg: &str) -> bool {
     let m = msg.to_lowercase();
     m.contains("internal") || m.contains("panic") || m.contains("unexpected") || m.contains("not implemented") || m.contains("unsupported") || num == 0
 }

@@ -425,6 +425,67 @@ fn prune_shards(where_: Option<&Expr>, t: &DistTable, cluster: &Cluster) -> Vec<
     best.unwrap_or(all)
 }
 
+/// The one shard that holds every row a join of tables reads, when each sharded table's key is fixed by a `key = literal`
+/// conjunct of the `WHERE` (a table's key column must be unambiguous: qualified by the table's name or alias, or not a column of
+/// any other table in the `FROM`) and the literals all hash to the same shard. Only for plain `FROM a, b, ...` lists; the
+/// replicated tables are on every shard.
+fn pin_shard(q: &Query, tables: &HashMap<String, DistTable>, cluster: &Cluster) -> Option<usize> {
+    let QueryBody::Select(sel) = &q.body else { return None };
+    let w = sel.where_.as_ref()?;
+    let mut refs: Vec<(String, DistTable)> = vec![];
+    for t in &sel.from {
+        let TableRef::Table { name, alias, .. } = t else { return None };
+        let dt = tables.get(&table_id(name))?;
+        refs.push((alias.clone().or_else(|| name.last().cloned())?.to_lowercase(), dt.clone()));
+    }
+    fn conjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+        match e {
+            Expr::And(a, b) => {
+                conjuncts(a, out);
+                conjuncts(b, out);
+            }
+            Expr::Paren(a) => conjuncts(a, out),
+            other => out.push(other),
+        }
+    }
+    let mut cs = vec![];
+    conjuncts(w, &mut cs);
+    let mut pinned: Option<usize> = None;
+    for (alias, dt) in &refs {
+        let Dist::Sharded { key, class } = &dt.dist else { continue };
+        let key_name = dt.cols[*key].name.to_lowercase();
+        // the key column named only by this table
+        let others = refs.iter().filter(|(a, _)| a != alias).any(|(_, o)| o.cols.iter().any(|c| c.name.eq_ignore_ascii_case(&key_name)));
+        let names_key = |e: &Expr| match e {
+            Expr::Col(p) if p.last().map(|s| s.to_lowercase()) == Some(key_name.clone()) => match p.len() {
+                1 => !others,
+                n => p[n - 2].to_lowercase() == *alias,
+            },
+            _ => false,
+        };
+        let mut shard: Option<usize> = None;
+        for c in &cs {
+            if let Expr::Binary(BinOp::Eq, a, b) = c {
+                let lit = match (&**a, &**b) {
+                    (x, Expr::Lit(v)) if names_key(x) => Some(v),
+                    (Expr::Lit(v), x) if names_key(x) => Some(v),
+                    _ => None,
+                };
+                if let Some(h) = lit.and_then(|v| key_hash(v, *class)) {
+                    shard = Some(cluster.shard_of_hash(h));
+                    break;
+                }
+            }
+        }
+        let s = shard?;
+        if pinned.map(|p| p != s).unwrap_or(false) {
+            return None;
+        }
+        pinned = Some(s);
+    }
+    pinned
+}
+
 fn query_where(q: &Query) -> Option<&Expr> {
     match &q.body {
         QueryBody::Select(s) => s.where_.as_ref(),
@@ -1338,7 +1399,9 @@ impl ClusterSession {
         if let Some(rs) = self.run_setop(q).await? {
             return Ok(rs);
         }
-        if tables.len() == 1 && !has_nested_query(q) {
+        // (one table read once: a table joined with itself is two row sources, and a condition on the key of one says nothing
+        // about the other)
+        if tables.len() == 1 && !has_nested_query(q) && matches!(&q.body, QueryBody::Select(s) if matches!(s.from.as_slice(), [TableRef::Table { .. }])) {
             let t = &tables[0];
             let shards = prune_shards(query_where(q), t, &self.cluster);
             if shards.len() == 1 {
@@ -1350,6 +1413,11 @@ impl ClusterSession {
             }
         }
         if !has_nested_query(q) {
+            let map: HashMap<String, DistTable> = tables.iter().map(|t| (t.id.clone(), t.clone())).collect();
+            if let Some(shard) = pin_shard(q, &map, &self.cluster) {
+                self.plan.push(format!("route: every table's key fixes the shard ({})", shard));
+                return self.direct(shard, q).await;
+            }
             if let Some(rs) = self.try_join(q, &tables).await? {
                 return Ok(rs);
             }

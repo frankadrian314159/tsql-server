@@ -1068,6 +1068,12 @@ fn windows_grouping_sets_and_distinct_aggregates_run_over_the_shards() {
         ("SELECT status, SUM(DISTINCT qty) AS sq, AVG(DISTINCT qty) AS aq, MAX(amount) AS hi FROM orders GROUP BY status ORDER BY status", true),
         ("SELECT COUNT(DISTINCT customer_id), COUNT(DISTINCT customer_id) + 1 AS plus FROM orders WHERE id < 0", false),
         ("SELECT c.region, COUNT(DISTINCT o.customer_id) AS buyers FROM orders o JOIN customers c ON c.id = o.customer_id GROUP BY c.region ORDER BY c.region", true),
+        // several distinct expressions: the partial rows are grouped by each of them
+        ("SELECT COUNT(DISTINCT customer_id), COUNT(DISTINCT status), COUNT(*) FROM orders", false),
+        ("SELECT qty, COUNT(DISTINCT customer_id) AS c, SUM(DISTINCT customer_id) AS s FROM orders WHERE qty < 4 GROUP BY qty ORDER BY qty", true),
+        // a grand total over nothing: a count is 0, not NULL
+        ("SELECT status, COUNT(*) AS n, SUM(amount) AS s FROM orders WHERE id < 0 GROUP BY ROLLUP(status)", false),
+        ("SELECT status, qty, COUNT(*) AS n, COUNT_BIG(*) AS nb, GROUPING(qty) AS g FROM orders WHERE id < 0 GROUP BY CUBE(status, qty)", false),
     ] {
         let plan = p.check(sql, ordered);
         no_gather(&plan, sql);
@@ -1158,3 +1164,50 @@ fn a_shuffle_sends_rows_from_shard_to_shard() {
     assert_eq!(rows_of(&a), rows_of(&b));
     p.h.cluster.set_broadcast_limit(100_000);
 }
+
+#[test]
+fn a_rewritten_query_that_has_to_gather_falls_back_to_the_original() {
+    let mut p = Pair::new(3);
+    p.load();
+    // the derived table is made a replicated temporary table, and a right join with a sharded table cannot run over the shards:
+    // the statement is gathered, and the control node's engine does not have the temporary table
+    for sql in [
+        "SELECT COUNT(*), SUM(d.n) FROM customers c RIGHT JOIN (SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id) d ON c.id = d.customer_id",
+        "WITH d AS (SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id) SELECT COUNT(*) FROM d FULL JOIN customers c ON c.id = d.customer_id AND d.n > 3",
+    ] {
+        p.check(sql, false);
+    }
+}
+
+#[test]
+fn joins_whose_keys_all_name_one_shard_run_there() {
+    let mut p = Pair::new(3);
+    p.load();
+    p.load_items();
+    let routed = |plan: &[String]| plan.iter().any(|l| l.starts_with("route: every table's key"));
+    for sql in [
+        "SELECT o.id, i.sku FROM orders o, order_items i WHERE o.id = 7 AND i.order_id = 7 AND i.order_id = o.id",
+        "SELECT COUNT(*) FROM orders o, order_items i, regions r WHERE o.id = 12 AND i.order_id = 12 AND r.code = 'north'",
+    ] {
+        let plan = p.check(sql, false);
+        assert!(routed(&plan), "{}
+{:?}", sql, plan);
+    }
+    // not every table is pinned, or the key names are ambiguous, or the shards differ: not routed (and still exact)
+    for sql in [
+        "SELECT COUNT(*) FROM orders o, order_items i WHERE o.id = 7 AND i.order_id = o.id",
+        "SELECT COUNT(*) FROM orders a, orders b WHERE a.id = 7 AND b.customer_id = a.customer_id",
+        "SELECT COUNT(*) FROM orders o, order_items i WHERE o.id = 7 AND i.order_id = 8",
+        "SELECT COUNT(*) FROM orders a, orders b WHERE id = 7",
+    ] {
+        let r = p.cl.execute(sql);
+        let b = p.oracle.execute(sql);
+        assert_eq!(r.first_error().map(|e| e.number), b.first_error().map(|e| e.number), "{}", sql);
+        if r.first_error().is_none() {
+            assert_eq!(rows_of(&r), rows_of(&b), "{}", sql);
+            assert!(!routed(p.cl.last_plan()), "{}
+{:?}", sql, p.cl.last_plan());
+        }
+    }
+}
+

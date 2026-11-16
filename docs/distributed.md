@@ -39,7 +39,7 @@ tsql-cluster --config cluster.json --state cluster.state --plan < script.sql    
 started on an existing file picks the cluster up where it was and ignores `--config`. From Rust: `Cluster::connect(&config)` or
 `Cluster::open(state_file, &config)`, then `cluster.session()` and `session.execute(sql)`; `session.last_plan()` says how each
 statement ran. `cargo run --release -p tsql-control --example tpch_cluster` runs TPC-H on a cluster and compares every
-answer with a single node; `--example tpcds_cluster` does the same for the 24 TPC-DS-style queries (dimensions replicated, fact
+answer with a single node; `--example tpcds_cluster` does the same for the 24 TPC-DS-style queries (and `oltp_cluster` runs TPC-C and the reduced TPC-E, `bench_cluster` the engine micro-benchmark and `sqlsmith_cluster` the fuzzer, each against one engine; see *Benchmarks on a cluster*) (dimensions replicated, fact
 tables sharded on the item), and its table shows how each query ran (`split`, `set`, `correlated`, `join`, `scatter-gather`,
 `gather`): none gathers.
 
@@ -155,6 +155,27 @@ non-voting *learner*, sends it the snapshot and log, and when it has caught up m
 as in the Raft dissertation); `Cluster::remove_replica(shard, addr)` takes one out, the leader included, and the control node
 and its state file follow (`replicas.rs`). A removed replica that keeps running cannot depose the group: a vote is refused
 while a leader has been heard from recently, and from a node that is not a voter.
+
+## Benchmarks on a cluster
+
+The drivers of the single-node examples run against a cluster too, through a cluster session (`util::Sql` is implemented for
+`Connection` and for `ClusterSession`); with `--config cluster.json` the control node connects to shard nodes that are already
+running (`tsql-shard` on other machines), otherwise `--shards N` starts them in the process.
+
+* `oltp_cluster [c|e]`: TPC-C and the reduced TPC-E. A cluster has no stored procedures or sequences, so the transactions are
+  **client-side**: the terminal sends `BEGIN`, each statement and `COMMIT` itself (`c.rs` / `e.rs` with `client = true`; the single-node
+  `tpc_oltp --client` runs the same code on one engine, and without `--client` it still calls the procedures). TPC-C is sharded on
+  the warehouse (the item table is replicated), TPC-E on each table's first key column (`security` replicated); transactions that
+  touch two shards (history rows, remote warehouses) commit by two-phase commit; a deadlock victim is retried. The consistency
+  conditions are checked before and after the run. `tests/oltp.rs` runs both for a moment.
+* `bench_cluster`: the micro-benchmark's workloads (loops, procedures and `sp_executesql` left out) on one engine and the cluster,
+  with both times, the plan and whether the answers agree, and concurrent sessions of the cluster.
+* `sqlsmith_cluster`: the fuzzer's random queries on one engine and the cluster; answers, error numbers and the effect of data changes
+  must agree (error 50100, a statement the cluster refuses on purpose, is counted). It found three bugs now fixed: a rewritten query
+  that had to gather lost its temporary tables, a grand total over nothing gave NULL for `COUNT`, and a table joined with itself was
+  routed to one shard when a key condition named one of its aliases.
+
+A join whose tables' keys are all fixed by `key = literal` conditions to the same shard (TPC-C Stock-Level) runs on that shard alone.
 
 ## Foreign keys
 

@@ -4,6 +4,48 @@ use rand::{rngs::StdRng, Rng as _, SeedableRng};
 use std::time::Instant;
 use tsql_server::Connection;
 
+/// Where a benchmark's statements go: the in-process engine (`Connection`), or a cluster session (the cluster examples
+/// implement this for it), so the same drivers run against both.
+pub trait Sql {
+    /// Run a batch: the rows of its first result set (as text; NULL is `NULL`) and the number of rows it changed, or its
+    /// first error.
+    fn exec(&mut self, sql: &str) -> Result<Out, DbErr>;
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct Out {
+    pub rows: Vec<Vec<String>>,
+    pub affected: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct DbErr {
+    pub number: i32,
+    pub text: String,
+}
+
+impl std::fmt::Display for DbErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.text)
+    }
+}
+
+/// The result of a batch as the benchmarks want it.
+pub fn out_of(r: &tsql_server::BatchResult) -> Result<Out, DbErr> {
+    if let Some(e) = r.first_error() {
+        return Err(DbErr { number: e.number, text: e.to_string() });
+    }
+    let rows = r.resultsets().first().map(|rs| rs.rows.iter().map(|row| row.iter().map(|v| if v.is_null() { "NULL".to_string() } else { v.to_string() }).collect()).collect()).unwrap_or_default();
+    let affected = r.events.iter().map(|e| if let tsql_server::Event::RowCount(n) = e { *n } else { 0 }).sum();
+    Ok(Out { rows, affected })
+}
+
+impl Sql for Connection {
+    fn exec(&mut self, sql: &str) -> Result<Out, DbErr> {
+        out_of(&self.execute(sql))
+    }
+}
+
 pub struct Rng(StdRng);
 
 impl Rng {
@@ -39,16 +81,15 @@ pub fn q(s: &str) -> String {
 }
 
 /// Run a batch, panicking with the statement on an error.
-pub fn must(c: &mut Connection, sql: &str) {
-    let r = c.execute(sql);
-    if let Some(e) = r.first_error() {
+pub fn must<D: Sql + ?Sized>(c: &mut D, sql: &str) {
+    if let Err(e) = c.exec(sql) {
         let head: String = sql.chars().take(200).collect();
         panic!("{}\n=> {}", head, e);
     }
 }
 
 /// `INSERT table VALUES (...),(...)` in batches of 500 rows; each element of `rows` is one parenthesised tuple.
-pub fn insert_rows(c: &mut Connection, table: &str, rows: &[String]) {
+pub fn insert_rows<D: Sql + ?Sized>(c: &mut D, table: &str, rows: &[String]) {
     for chunk in rows.chunks(500) {
         must(c, &format!("INSERT {} VALUES {}", table, chunk.join(",")));
     }
@@ -78,15 +119,11 @@ impl Report {
 }
 
 /// Run a query, returning its rows as strings (or the error text) and the time it took.
-pub fn timed(c: &mut Connection, sql: &str) -> (Result<Vec<Vec<String>>, String>, f64) {
+pub fn timed<D: Sql + ?Sized>(c: &mut D, sql: &str) -> (Result<Vec<Vec<String>>, String>, f64) {
     let t = Instant::now();
-    let r = c.execute(sql);
+    let r = c.exec(sql);
     let dt = t.elapsed().as_secs_f64();
-    if let Some(e) = r.first_error() {
-        return (Err(format!("{}", e)), dt);
-    }
-    let rows = r.resultsets().first().map(|rs| rs.rows.iter().map(|row| row.iter().map(|v| v.to_string()).collect()).collect()).unwrap_or_default();
-    (Ok(rows), dt)
+    (r.map(|o| o.rows).map_err(|e| e.to_string()), dt)
 }
 
 pub fn num(s: &str) -> f64 {

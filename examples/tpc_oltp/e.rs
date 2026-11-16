@@ -9,7 +9,6 @@ use crate::util::*;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tsql_server::Connection;
 
 pub struct Cfg {
     pub customers: i64,
@@ -158,10 +157,21 @@ fn symb(i: i64) -> String {
     format!("S{:04}", i)
 }
 
-pub fn load(c: &mut Connection, cfg: &Cfg) {
-    must(c, SCHEMA);
-    for p in PROCS {
-        must(c, p);
+/// Create and fill the tables. `client`: no stored procedures and no sequence (the transactions are statements sent by the
+/// terminals); `replicated`: also `DISTRIBUTE TABLE security REPLICATED` (a cluster: the read-only table lives on every shard).
+pub fn load<D: Sql + ?Sized>(c: &mut D, cfg: &Cfg, client: bool, replicated: bool) {
+    if client {
+        must(c, &SCHEMA.lines().filter(|l| !l.contains("CREATE SEQUENCE")).collect::<Vec<_>>().join("\n"));
+    } else {
+        must(c, SCHEMA);
+    }
+    if replicated {
+        must(c, "DISTRIBUTE TABLE security REPLICATED");
+    }
+    if !client {
+        for p in PROCS {
+            must(c, p);
+        }
     }
     let mut rng = Rng::new(424_242);
     insert_rows(c, "customer", &(1..=cfg.customers).map(|i| format!("({}, 'customer {}', {})", i, i, rng.int(1, 3))).collect::<Vec<_>>());
@@ -252,14 +262,186 @@ impl Tally {
     }
 }
 
-/// Run the mix on every terminal for `secs` seconds. Trade-Order queues the trades it creates for Trade-Result,
-/// which stands in for the market exchange emulator completing them.
-pub fn drive(server: &tsql_server::Server, cfg: Arc<Cfg>, terminals: usize, secs: f64) -> Tally {
+/// The ids of the trades Trade-Order makes when the transactions run as statements (a cluster has no sequences).
+static NEXT_TRADE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(10_000_000);
+
+/// One transaction with its inputs.
+#[derive(Clone, Debug)]
+enum Req {
+    BrokerVolume(i64),
+    CustomerPosition(i64),
+    MarketFeed(String, String),
+    MarketWatch(i64),
+    SecurityDetail(String),
+    TradeLookup(i64),
+    /// account, security, quantity, buy (1) or sell (0)
+    TradeOrder(i64, String, i64, i64),
+    /// trade, price
+    TradeResult(i64, String),
+    TradeStatus(i64),
+}
+
+impl Req {
+    /// The call of the stored procedure.
+    fn exec_text(&self) -> String {
+        match self {
+            Req::BrokerVolume(q) => format!("EXEC broker_volume {}", q),
+            Req::CustomerPosition(c) => format!("EXEC customer_position {}", c),
+            Req::MarketFeed(s, p) => format!("EXEC market_feed '{}', {}", s, p),
+            Req::MarketWatch(w) => format!("EXEC market_watch {}", w),
+            Req::SecurityDetail(s) => format!("EXEC security_detail '{}'", s),
+            Req::TradeLookup(a) => format!("EXEC trade_lookup {}", a),
+            Req::TradeOrder(a, s, q, b) => format!("EXEC trade_order {}, '{}', {}, {}", a, s, q, b),
+            Req::TradeResult(t, p) => format!("EXEC trade_result {}, {}", t, p),
+            Req::TradeStatus(a) => format!("EXEC trade_status {}", a),
+        }
+    }
+}
+
+fn int(s: &str) -> Option<i64> {
+    if s == "NULL" {
+        None
+    } else {
+        s.split('.').next().and_then(|x| x.parse().ok())
+    }
+}
+
+fn cents(s: &str) -> i64 {
+    let neg = s.starts_with('-');
+    let s = s.trim_start_matches('-');
+    let (whole, frac) = s.split_once('.').unwrap_or((s, ""));
+    let frac = format!("{:0<2}", frac);
+    let v = whole.parse::<i64>().unwrap_or(0) * 100 + frac[..2].parse::<i64>().unwrap_or(0);
+    if neg {
+        -v
+    } else {
+        v
+    }
+}
+
+fn money(cents: i64) -> String {
+    format!("{}{}.{:02}", if cents < 0 { "-" } else { "" }, cents.abs() / 100, cents.abs() % 100)
+}
+
+/// Trade-Result as statements: true when the trade completed, false when it was not pending or was cancelled. The
+/// transaction has begun; this commits or rolls it back.
+fn trade_result<D: Sql>(db: &mut D, t_id: i64, price: &str) -> Result<bool, DbErr> {
+    let row = db.exec(&format!("SELECT t_st_id, t_ca_id, t_s_symb, t_qty, t_tt_id FROM trade WITH (UPDLOCK) WHERE t_id = {}", t_id))?.rows;
+    let Some(r) = row.first() else {
+        db.exec("ROLLBACK TRANSACTION")?;
+        return Ok(false);
+    };
+    if r[0].trim() != "PNDG" {
+        db.exec("ROLLBACK TRANSACTION")?;
+        return Ok(false);
+    }
+    let (ca, symb, qty, tt) = (int(&r[1]).unwrap_or(0), r[2].clone(), int(&r[3]).unwrap_or(0), r[4].trim().to_string());
+    let amt = qty * cents(price);
+    let comm = (amt + 500) / 1000;
+    let sign;
+    if tt == "TMS" {
+        let have = db.exec(&format!("SELECT ISNULL(SUM(h_qty), 0) FROM holding WITH (UPDLOCK) WHERE h_ca_id = {} AND h_s_symb = '{}'", ca, symb))?.rows.first().and_then(|r| int(&r[0])).unwrap_or(0);
+        if have < qty {
+            db.exec(&format!("UPDATE trade SET t_st_id = 'CNCL' WHERE t_id = {}", t_id))?;
+            db.exec(&format!("INSERT trade_history (th_t_id, th_dts, th_st_id) VALUES ({}, GETDATE(), 'CNCL')", t_id))?;
+            db.exec("COMMIT TRANSACTION")?;
+            return Ok(false);
+        }
+        let mut left = qty;
+        while left > 0 {
+            let h = db.exec(&format!("SELECT TOP 1 h_t_id, h_qty FROM holding WITH (UPDLOCK) WHERE h_ca_id = {} AND h_s_symb = '{}' ORDER BY h_t_id", ca, symb))?.rows;
+            let (h_id, h_qty) = h.first().and_then(|r| Some((int(&r[0])?, int(&r[1])?))).ok_or_else(|| DbErr { number: 50000, text: "the holdings ran out".into() })?;
+            if h_qty <= left {
+                db.exec(&format!("DELETE FROM holding WHERE h_t_id = {}", h_id))?;
+                left -= h_qty;
+            } else {
+                db.exec(&format!("UPDATE holding SET h_qty = h_qty - {} WHERE h_t_id = {}", left, h_id))?;
+                left = 0;
+            }
+        }
+        db.exec(&format!("UPDATE holding_summary SET hs_qty = hs_qty - {} WHERE hs_ca_id = {} AND hs_s_symb = '{}'", qty, ca, symb))?;
+        sign = 1;
+    } else {
+        db.exec(&format!("INSERT holding (h_t_id, h_ca_id, h_s_symb, h_qty, h_price) VALUES ({}, {}, '{}', {}, {})", t_id, ca, symb, qty, price))?;
+        let n = db.exec(&format!("UPDATE holding_summary SET hs_qty = hs_qty + {} WHERE hs_ca_id = {} AND hs_s_symb = '{}'", qty, ca, symb))?.affected;
+        if n == 0 {
+            db.exec(&format!("INSERT holding_summary (hs_ca_id, hs_s_symb, hs_qty) VALUES ({}, '{}', {})", ca, symb, qty))?;
+        }
+        sign = -1;
+    }
+    db.exec(&format!("UPDATE trade SET t_st_id = 'CMPT', t_trade_price = {}, t_comm = {} WHERE t_id = {}", price, money(comm), t_id))?;
+    db.exec(&format!("INSERT trade_history (th_t_id, th_dts, th_st_id) VALUES ({}, GETDATE(), 'CMPT')", t_id))?;
+    db.exec(&format!("UPDATE customer_account SET ca_bal = ca_bal + {} - {} WHERE ca_id = {}", money(sign * amt), money(comm), ca))?;
+    let b = db.exec(&format!("SELECT ca_b_id FROM customer_account WHERE ca_id = {}", ca))?.rows.first().and_then(|r| int(&r[0])).ok_or_else(|| DbErr { number: 50000, text: "no account".into() })?;
+    db.exec(&format!("UPDATE broker SET b_num_trades = b_num_trades + 1, b_comm_total = b_comm_total + {} WHERE b_id = {}", money(comm), b))?;
+    db.exec("COMMIT TRANSACTION")?;
+    Ok(true)
+}
+
+/// One transaction as statements. Returns the id of the trade a Trade-Order made.
+fn run_client<D: Sql>(db: &mut D, req: &Req) -> Result<Option<i64>, DbErr> {
+    let transaction = |db: &mut D, body: &dyn Fn(&mut D) -> Result<Option<i64>, DbErr>| -> Result<Option<i64>, DbErr> {
+        db.exec("BEGIN TRANSACTION")?;
+        let r = body(db);
+        if r.is_err() {
+            // (a deadlock victim has been rolled back already)
+            let _ = db.exec("ROLLBACK TRANSACTION");
+        }
+        r
+    };
+    match req {
+        Req::BrokerVolume(q) => {
+            db.exec(&format!("SELECT b.b_name, SUM(t.t_qty * t.t_bid_price) AS volume FROM trade t JOIN customer_account a ON a.ca_id = t.t_ca_id JOIN broker b ON b.b_id = a.ca_b_id WHERE t.t_st_id = 'PNDG' AND t.t_qty >= {} GROUP BY b.b_name ORDER BY volume DESC, b.b_name", q))?;
+        }
+        Req::CustomerPosition(c) => {
+            db.exec(&format!("SELECT a.ca_id, a.ca_bal, ISNULL(SUM(hs.hs_qty * lt.lt_price), 0) AS assets FROM customer_account a LEFT JOIN holding_summary hs ON hs.hs_ca_id = a.ca_id LEFT JOIN last_trade lt ON lt.lt_s_symb = hs.hs_s_symb WHERE a.ca_c_id = {} GROUP BY a.ca_id, a.ca_bal", c))?;
+        }
+        Req::MarketFeed(s, p) => {
+            db.exec(&format!("UPDATE last_trade SET lt_price = {}, lt_vol = lt_vol + 100 WHERE lt_s_symb = '{}'", p, s))?;
+        }
+        Req::MarketWatch(w) => {
+            db.exec(&format!("SELECT 100.0 * SUM(lt.lt_price) / NULLIF(SUM(lt.lt_open_price), 0) - 100.0 AS pct_change FROM watch_item w JOIN last_trade lt ON lt.lt_s_symb = w.wi_s_symb WHERE w.wi_wl_id = {}", w))?;
+        }
+        Req::SecurityDetail(s) => {
+            db.exec(&format!("SELECT s.s_name, s.s_ex, lt.lt_price, lt.lt_open_price, lt.lt_vol FROM security s JOIN last_trade lt ON lt.lt_s_symb = s.s_symb WHERE s.s_symb = '{}'", s))?;
+            db.exec(&format!("SELECT TOP 5 t_id, t_dts, t_qty, t_trade_price FROM trade WHERE t_s_symb = '{}' AND t_st_id = 'CMPT' ORDER BY t_dts DESC, t_id DESC", s))?;
+        }
+        Req::TradeLookup(a) => {
+            db.exec(&format!("SELECT TOP 20 t.t_id, t.t_s_symb, t.t_qty, t.t_trade_price, t.t_st_id, h.th_st_id, h.th_dts FROM trade t JOIN trade_history h ON h.th_t_id = t.t_id WHERE t.t_ca_id = {} ORDER BY t.t_dts DESC, t.t_id DESC, h.th_dts", a))?;
+        }
+        Req::TradeStatus(a) => {
+            db.exec(&format!("SELECT TOP 50 t.t_id, t.t_dts, t.t_st_id, t.t_tt_id, t.t_s_symb, t.t_qty, s.s_name FROM trade t JOIN security s ON s.s_symb = t.t_s_symb WHERE t.t_ca_id = {} ORDER BY t.t_dts DESC, t.t_id DESC", a))?;
+        }
+        Req::TradeOrder(a, s, qty, buy) => {
+            let price = db.exec(&format!("SELECT lt_price FROM last_trade WHERE lt_s_symb = '{}'", s))?.rows.first().map(|r| r[0].clone()).ok_or_else(|| DbErr { number: 50000, text: format!("no security {}", s) })?;
+            let t_id = NEXT_TRADE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return transaction(db, &|db| {
+                db.exec(&format!("INSERT trade (t_id, t_dts, t_st_id, t_tt_id, t_s_symb, t_qty, t_bid_price, t_ca_id, t_trade_price, t_chrg, t_comm) VALUES ({}, GETDATE(), 'PNDG', '{}', '{}', {}, {}, {}, NULL, 1.00, 0)", t_id, if *buy == 1 { "TMB" } else { "TMS" }, s, qty, price, a))?;
+                db.exec(&format!("INSERT trade_history (th_t_id, th_dts, th_st_id) VALUES ({}, GETDATE(), 'PNDG')", t_id))?;
+                db.exec("COMMIT TRANSACTION")?;
+                Ok(Some(t_id))
+            });
+        }
+        Req::TradeResult(t, p) => {
+            transaction(db, &|db| trade_result(db, *t, p).map(|_| None))?;
+        }
+    }
+    Ok(None)
+}
+
+/// Run the mix on every terminal for `secs` seconds; `connect` makes a terminal's connection. Trade-Order queues the
+/// trades it creates for Trade-Result, which stands in for the market exchange emulator completing them. `client`: the
+/// transactions run as statements sent by the terminal (the only way on a cluster) instead of as stored procedures.
+pub fn drive<D, F>(connect: F, cfg: Arc<Cfg>, terminals: usize, secs: f64, client: bool) -> Tally
+where
+    D: Sql + Send + 'static,
+    F: Fn() -> D,
+{
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let queue: Arc<Mutex<VecDeque<(i64, i64)>>> = Arc::new(Mutex::new(VecDeque::new()));
     let mut hs = vec![];
     for t in 0..terminals {
-        let mut conn = server.connect();
+        let mut conn = connect();
         let (stop, queue, cfg) = (stop.clone(), queue.clone(), cfg.clone());
         hs.push(std::thread::spawn(move || {
             let mut rng = Rng::new(900 + t as u64);
@@ -286,31 +468,34 @@ pub fn drive(server: &tsql_server::Server, cfg: Arc<Cfg>, terminals: usize, secs
                 }
                 let acct = rng.int(1, cfg.accounts());
                 let s = symb(rng.int(1, cfg.securities));
-                let sql = match kind {
-                    BROKER_VOLUME => format!("EXEC broker_volume {}", rng.int(1, 300)),
-                    CUSTOMER_POSITION => format!("EXEC customer_position {}", rng.int(1, cfg.customers)),
-                    MARKET_FEED => format!("EXEC market_feed '{}', {}.{:02}", s, rng.int(10, 99), rng.int(0, 99)),
-                    MARKET_WATCH => format!("EXEC market_watch {}", rng.int(1, cfg.customers)),
-                    SECURITY_DETAIL => format!("EXEC security_detail '{}'", s),
-                    TRADE_LOOKUP => format!("EXEC trade_lookup {}", acct),
-                    TRADE_ORDER => format!("EXEC trade_order {}, '{}', {}, {}", acct, s, rng.int(1, 200), rng.int(0, 1)),
+                let req = match kind {
+                    BROKER_VOLUME => Req::BrokerVolume(rng.int(1, 300)),
+                    CUSTOMER_POSITION => Req::CustomerPosition(rng.int(1, cfg.customers)),
+                    MARKET_FEED => Req::MarketFeed(s, format!("{}.{:02}", rng.int(10, 99), rng.int(0, 99))),
+                    MARKET_WATCH => Req::MarketWatch(rng.int(1, cfg.customers)),
+                    SECURITY_DETAIL => Req::SecurityDetail(s),
+                    TRADE_LOOKUP => Req::TradeLookup(acct),
+                    TRADE_ORDER => Req::TradeOrder(acct, s, rng.int(1, 200), rng.int(0, 1)),
                     TRADE_RESULT => {
                         let (id, _) = completes.unwrap();
-                        format!("EXEC trade_result {}, {}.{:02}", id, rng.int(10, 99), rng.int(0, 99))
+                        Req::TradeResult(id, format!("{}.{:02}", rng.int(10, 99), rng.int(0, 99)))
                     }
-                    _ => format!("EXEC trade_status {}", acct),
+                    _ => Req::TradeStatus(acct),
                 };
+                let sql = req.exec_text();
                 let t0 = Instant::now();
                 let mut retries = 0;
                 loop {
-                    let r = conn.execute(&sql);
-                    match r.first_error() {
-                        None => {
+                    let r = if client {
+                        run_client(&mut conn, &req)
+                    } else {
+                        conn.exec(&sql).map(|o| if kind == TRADE_ORDER { o.rows.first().and_then(|row| int(&row[0])) } else { None })
+                    };
+                    match r {
+                        Ok(made) => {
                             if kind == TRADE_ORDER {
-                                if let Some(rs) = r.resultsets().first() {
-                                    if let Some(id) = rs.rows.first().and_then(|row| row[0].to_string().parse::<i64>().ok()) {
-                                        queue.lock().unwrap().push_back((id, acct));
-                                    }
+                                if let Some(id) = made {
+                                    queue.lock().unwrap().push_back((id, acct));
                                 }
                             }
                             tally.done[kind] += 1;
@@ -318,10 +503,10 @@ pub fn drive(server: &tsql_server::Server, cfg: Arc<Cfg>, terminals: usize, secs
                             tally.lat[kind].push(t0.elapsed().as_secs_f64());
                             break;
                         }
-                        Some(e) if e.number == 1205 && retries < 20 => {
+                        Err(e) if e.number == 1205 && retries < 20 => {
                             retries += 1;
                         }
-                        Some(e) => {
+                        Err(e) => {
                             tally.failed[kind] += 1;
                             if tally.errors.len() < 10 {
                                 tally.errors.push(format!("{}: {} [{}]", NAMES[kind], e, sql.chars().take(100).collect::<String>()));

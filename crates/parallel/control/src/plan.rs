@@ -272,7 +272,7 @@ fn plan_agg(q: &Query, sel: &Select, split: bool) -> Option<AggPlan> {
     // the aggregate calls of the select list, HAVING and ORDER BY, each once
     let mut calls: Vec<FuncCall> = vec![];
     let mut unsupported = false;
-    let mut distinct_arg: Option<Expr> = None;
+    let mut distinct_args: Vec<Expr> = vec![];
     let mut collect = |e: &Expr| {
         walk_expr(e, &mut |x| {
             if let Expr::Func(fc) = x {
@@ -286,13 +286,11 @@ fn plan_agg(q: &Query, sel: &Select, split: bool) -> Option<AggPlan> {
                     }
                     let mut ok = matches!(fc.name.as_str(), "COUNT" | "COUNT_BIG" | "SUM" | "AVG" | "MIN" | "MAX") && fc.within.is_none();
                     if fc.distinct {
-                        // one distinct expression for all of them: the partial rows are grouped by it as well
+                        // the partial rows are grouped by each distinct expression as well (the finer grain keeps every
+                        // distinct value, and a distinct aggregate of the outer query counts them again)
                         ok = ok && split && fc.args.len() == 1 && !fc.star;
-                        if ok {
-                            match &distinct_arg {
-                                None => distinct_arg = Some(fc.args[0].clone()),
-                                Some(d) => ok = expr_key(d) == expr_key(&fc.args[0]),
-                            }
+                        if ok && !distinct_args.iter().any(|d| expr_key(d) == expr_key(&fc.args[0])) {
+                            distinct_args.push(fc.args[0].clone());
                         }
                     }
                     if !ok {
@@ -322,13 +320,14 @@ fn plan_agg(q: &Query, sel: &Select, split: bool) -> Option<AggPlan> {
         shard_items.push(SelectItem::Expr { e: g.clone(), alias: Some(format!("g{}", i)) });
     }
     let dcol = shard_items.len();
-    if let Some(d) = &distinct_arg {
-        shard_items.push(SelectItem::Expr { e: d.clone(), alias: Some("gd".into()) });
+    for (i, d) in distinct_args.iter().enumerate() {
+        shard_items.push(SelectItem::Expr { e: d.clone(), alias: Some(format!("gd{}", i)) });
     }
     let mut aggs = vec![];
     for c in &calls {
         if c.distinct {
-            aggs.push(AggInfo { key: expr_key(&Expr::Func(Box::new(c.clone()))), name: c.name.clone(), kind: AggKind::Distinct, col: dcol, count_col: None });
+            let at = distinct_args.iter().position(|d| expr_key(d) == expr_key(&c.args[0])).unwrap_or(0);
+            aggs.push(AggInfo { key: expr_key(&Expr::Func(Box::new(c.clone()))), name: c.name.clone(), kind: AggKind::Distinct, col: dcol + at, count_col: None });
             continue;
         }
         let col = shard_items.len();
@@ -357,7 +356,7 @@ fn plan_agg(q: &Query, sel: &Select, split: bool) -> Option<AggPlan> {
     // (a split plan groups by every expression that any grouping set uses, and by the distinct expression: the finest grain)
     let shard_group = if split {
         let mut g: Vec<GroupItem> = group_exprs.iter().cloned().map(GroupItem::Expr).collect();
-        if let Some(d) = &distinct_arg {
+        for d in &distinct_args {
             g.push(GroupItem::Expr(d.clone()));
         }
         if g.is_empty() {
@@ -397,7 +396,9 @@ impl AggPlan {
     fn combine(&self, info: &AggInfo, types: &[DataType]) -> Expr {
         let c = |i: usize| col(&cname(i));
         match info.kind {
-            AggKind::Count | AggKind::CountBig | AggKind::Sum => func("SUM", vec![c(info.col)]),
+            // (a count is 0, not NULL, when there are no partial rows: a grand total over nothing)
+            AggKind::Count | AggKind::CountBig => func("ISNULL", vec![func("SUM", vec![c(info.col)]), Expr::Lit(tsql_server::Value::Int(0))]),
+            AggKind::Sum => func("SUM", vec![c(info.col)]),
             AggKind::Min => func("MIN", vec![c(info.col)]),
             AggKind::Max => func("MAX", vec![c(info.col)]),
             AggKind::Distinct => Expr::Func(Box::new(FuncCall { name: info.name.clone(), schema: None, parts: vec![], args: vec![c(info.col)], distinct: true, star: false, over: None, within: None })),

@@ -5,7 +5,6 @@
 //! and run in process, so the numbers measure the engine under concurrent transactions rather than a certified tpmC.
 use crate::util::*;
 use std::time::Instant;
-use tsql_server::Connection;
 
 pub struct Cfg {
     pub warehouses: i64,
@@ -134,10 +133,17 @@ pub fn last_name(n: i64) -> String {
     format!("{}{}{}", SYLLABLES[((n / 100) % 10) as usize], SYLLABLES[((n / 10) % 10) as usize], SYLLABLES[(n % 10) as usize])
 }
 
-pub fn load(c: &mut Connection, cfg: &Cfg) {
+/// Create and fill the tables. `client`: no stored procedures (the transactions are statements sent by the terminals);
+/// `replicated`: also `DISTRIBUTE TABLE item REPLICATED` (a cluster: the read-only item table lives on every shard).
+pub fn load<D: Sql + ?Sized>(c: &mut D, cfg: &Cfg, client: bool, replicated: bool) {
     must(c, SCHEMA);
-    for p in PROCS {
-        must(c, p);
+    if replicated {
+        must(c, "DISTRIBUTE TABLE item REPLICATED");
+    }
+    if !client {
+        for p in PROCS {
+            must(c, p);
+        }
     }
     let mut rng = Rng::new(1_234_567);
     insert_rows(c, "item", &(1..=cfg.items).map(|i| format!("({}, 'item {}', {}.{:02}, '{}')", i, i, rng.int(1, 100), rng.int(0, 99), rng.text(3))).collect::<Vec<_>>());
@@ -199,11 +205,14 @@ pub fn consistency() -> Vec<(&'static str, &'static str)> {
 }
 
 /// One terminal: a connection bound to a home warehouse that runs the transaction mix.
-pub struct Terminal {
-    conn: Connection,
+pub struct Terminal<D: Sql> {
+    conn: D,
     rng: Rng,
     cfg: std::sync::Arc<Cfg>,
     home: i64,
+    /// run each transaction as statements sent one by one (the transaction logic is here, in the client), instead of calling
+    /// the stored procedure; a cluster has no procedures
+    client: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -217,9 +226,135 @@ pub enum Kind {
 
 pub const KINDS: [Kind; 5] = [Kind::NewOrder, Kind::Payment, Kind::OrderStatus, Kind::Delivery, Kind::StockLevel];
 
-impl Terminal {
-    pub fn new(conn: Connection, seed: u64, cfg: std::sync::Arc<Cfg>, home: i64) -> Terminal {
-        Terminal { conn, rng: Rng::new(seed), cfg, home }
+/// One transaction with its inputs.
+#[derive(Clone, Debug)]
+pub enum Txn {
+    /// warehouse, district, customer, lines (item, supplying warehouse, quantity), all lines local
+    NewOrder(i64, i64, i64, Vec<(i64, i64, i64)>, i64),
+    /// warehouse, district, customer's warehouse and district, customer (0: by name), name, amount (cents)
+    Payment(i64, i64, i64, i64, i64, String, i64),
+    /// warehouse, district, customer (0: by name), name
+    OrderStatus(i64, i64, i64, String),
+    /// warehouse, carrier
+    Delivery(i64, i64),
+    /// warehouse, district, threshold
+    StockLevel(i64, i64, i64),
+}
+
+fn money(cents: i64) -> String {
+    format!("{}{}.{:02}", if cents < 0 { "-" } else { "" }, cents.abs() / 100, cents.abs() % 100)
+}
+
+/// A decimal in text (`12.34`) as cents.
+fn cents(s: &str) -> i64 {
+    let neg = s.starts_with('-');
+    let s = s.trim_start_matches('-');
+    let (whole, frac) = s.split_once('.').unwrap_or((s, ""));
+    let frac = format!("{:0<2}", frac);
+    let v = whole.parse::<i64>().unwrap_or(0) * 100 + frac[..2].parse::<i64>().unwrap_or(0);
+    if neg {
+        -v
+    } else {
+        v
+    }
+}
+
+fn int(s: &str) -> Option<i64> {
+    if s == "NULL" {
+        None
+    } else {
+        s.split('.').next().and_then(|x| x.parse().ok())
+    }
+}
+
+/// The first value of the first row, None for no row or NULL.
+fn scalar<D: Sql>(db: &mut D, sql: &str) -> Result<Option<String>, DbErr> {
+    Ok(db.exec(sql)?.rows.first().and_then(|r| r.first()).filter(|v| v.as_str() != "NULL").cloned())
+}
+
+fn no_row(what: &str) -> DbErr {
+    DbErr { number: 50000, text: format!("no row for {}", what) }
+}
+
+/// The customer (a warehouse's district) with this last name that is in the middle of those sorted by first name.
+fn middle_customer<D: Sql>(db: &mut D, w: i64, d: i64, name: &str) -> Result<i64, DbErr> {
+    let rows = db.exec(&format!("SELECT c_id FROM customer WHERE c_w_id = {} AND c_d_id = {} AND c_last = '{}' ORDER BY c_first, c_id", w, d, q(name)))?.rows;
+    if rows.is_empty() {
+        return Err(no_row(&format!("customer {}", name)));
+    }
+    int(&rows[(rows.len() + 1) / 2 - 1][0]).ok_or_else(|| no_row("customer"))
+}
+
+/// New-Order as statements: false when it rolled back on purpose (an unused item), true when it committed.
+fn neword<D: Sql>(db: &mut D, w: i64, d: i64, c: i64, lines: &[(i64, i64, i64)], all_local: i64) -> Result<bool, DbErr> {
+    scalar(db, &format!("SELECT w_tax FROM warehouse WHERE w_id = {}", w))?.ok_or_else(|| no_row("warehouse"))?;
+    let row = db.exec(&format!("SELECT d_next_o_id, d_tax FROM district WITH (UPDLOCK) WHERE d_w_id = {} AND d_id = {}", w, d))?.rows;
+    let o_id = row.first().and_then(|r| int(&r[0])).ok_or_else(|| no_row("district"))?;
+    db.exec(&format!("UPDATE district SET d_next_o_id = {} WHERE d_w_id = {} AND d_id = {}", o_id + 1, w, d))?;
+    scalar(db, &format!("SELECT c_discount FROM customer WHERE c_w_id = {} AND c_d_id = {} AND c_id = {}", w, d, c))?.ok_or_else(|| no_row("customer"))?;
+    db.exec(&format!("INSERT orders (o_w_id, o_d_id, o_id, o_c_id, o_entry_d, o_carrier_id, o_ol_cnt, o_all_local) VALUES ({}, {}, {}, {}, GETDATE(), NULL, {}, {})", w, d, o_id, c, lines.len(), all_local))?;
+    db.exec(&format!("INSERT new_order (no_w_id, no_d_id, no_o_id) VALUES ({}, {}, {})", w, d, o_id))?;
+    let mut rows = vec![];
+    for (n, (item, sw, qty)) in lines.iter().enumerate() {
+        let Some(price) = scalar(db, &format!("SELECT i_price FROM item WHERE i_id = {}", item))? else {
+            db.exec("ROLLBACK TRANSACTION")?;
+            return Ok(false);
+        };
+        let s_q = scalar(db, &format!("SELECT s_quantity FROM stock WITH (UPDLOCK) WHERE s_i_id = {} AND s_w_id = {}", item, sw))?.and_then(|v| int(&v)).ok_or_else(|| no_row("stock"))?;
+        let remote = if sw != &w { 1 } else { 0 };
+        let new_q = if s_q - qty >= 10 { s_q - qty } else { s_q - qty + 91 };
+        db.exec(&format!("UPDATE stock SET s_quantity = {}, s_ytd = s_ytd + {}, s_order_cnt = s_order_cnt + 1, s_remote_cnt = s_remote_cnt + {} WHERE s_i_id = {} AND s_w_id = {}", new_q, qty, remote, item, sw))?;
+        rows.push(format!("({}, {}, {}, {}, {}, {}, NULL, {}, {}, 'dist')", w, d, o_id, n + 1, item, sw, qty, money(qty * cents(&price))));
+    }
+    db.exec(&format!("INSERT order_line (ol_w_id, ol_d_id, ol_o_id, ol_number, ol_i_id, ol_supply_w_id, ol_delivery_d, ol_quantity, ol_amount, ol_dist_info) VALUES {}", rows.join(", ")))?;
+    db.exec("COMMIT TRANSACTION")?;
+    Ok(true)
+}
+
+fn payment<D: Sql>(db: &mut D, w: i64, d: i64, cw: i64, cd: i64, c: i64, name: &str, amount: i64) -> Result<(), DbErr> {
+    let amt = money(amount);
+    db.exec(&format!("UPDATE warehouse SET w_ytd = w_ytd + {} WHERE w_id = {}", amt, w))?;
+    db.exec(&format!("UPDATE district SET d_ytd = d_ytd + {} WHERE d_w_id = {} AND d_id = {}", amt, w, d))?;
+    let c = if c == 0 { middle_customer(db, cw, cd, name)? } else { c };
+    db.exec(&format!("UPDATE customer SET c_balance = c_balance - {a}, c_ytd_payment = c_ytd_payment + {a}, c_payment_cnt = c_payment_cnt + 1 WHERE c_w_id = {} AND c_d_id = {} AND c_id = {}", cw, cd, c, a = amt))?;
+    db.exec(&format!("INSERT history (h_c_id, h_c_d_id, h_c_w_id, h_d_id, h_w_id, h_date, h_amount, h_data) VALUES ({}, {}, {}, {}, {}, GETDATE(), {}, 'pay')", c, cd, cw, d, w, amt))?;
+    db.exec("COMMIT TRANSACTION")?;
+    Ok(())
+}
+
+fn order_status<D: Sql>(db: &mut D, w: i64, d: i64, c: i64, name: &str) -> Result<(), DbErr> {
+    let c = if c == 0 { middle_customer(db, w, d, name)? } else { c };
+    db.exec(&format!("SELECT c_balance, c_first, c_middle, c_last FROM customer WHERE c_w_id = {} AND c_d_id = {} AND c_id = {}", w, d, c))?;
+    if let Some(o) = scalar(db, &format!("SELECT MAX(o_id) FROM orders WHERE o_w_id = {} AND o_d_id = {} AND o_c_id = {}", w, d, c))?.and_then(|v| int(&v)) {
+        db.exec(&format!("SELECT o_id, o_entry_d, o_carrier_id FROM orders WHERE o_w_id = {} AND o_d_id = {} AND o_id = {}", w, d, o))?;
+        db.exec(&format!("SELECT ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, ol_delivery_d FROM order_line WHERE ol_w_id = {} AND ol_d_id = {} AND ol_o_id = {}", w, d, o))?;
+    }
+    Ok(())
+}
+
+fn delivery<D: Sql>(db: &mut D, w: i64, carrier: i64) -> Result<(), DbErr> {
+    for d in 1..=10 {
+        let Some(o) = scalar(db, &format!("SELECT MIN(no_o_id) FROM new_order WITH (UPDLOCK) WHERE no_w_id = {} AND no_d_id = {}", w, d))?.and_then(|v| int(&v)) else { continue };
+        db.exec(&format!("DELETE FROM new_order WHERE no_w_id = {} AND no_d_id = {} AND no_o_id = {}", w, d, o))?;
+        let c = scalar(db, &format!("SELECT o_c_id FROM orders WHERE o_w_id = {} AND o_d_id = {} AND o_id = {}", w, d, o))?.and_then(|v| int(&v)).ok_or_else(|| no_row("order"))?;
+        db.exec(&format!("UPDATE orders SET o_carrier_id = {} WHERE o_w_id = {} AND o_d_id = {} AND o_id = {}", carrier, w, d, o))?;
+        db.exec(&format!("UPDATE order_line SET ol_delivery_d = GETDATE() WHERE ol_w_id = {} AND ol_d_id = {} AND ol_o_id = {}", w, d, o))?;
+        let amt = scalar(db, &format!("SELECT SUM(ol_amount) FROM order_line WHERE ol_w_id = {} AND ol_d_id = {} AND ol_o_id = {}", w, d, o))?.unwrap_or_else(|| "0".into());
+        db.exec(&format!("UPDATE customer SET c_balance = c_balance + {}, c_delivery_cnt = c_delivery_cnt + 1 WHERE c_w_id = {} AND c_d_id = {} AND c_id = {}", amt, w, d, c))?;
+    }
+    db.exec("COMMIT TRANSACTION")?;
+    Ok(())
+}
+
+fn stock_level<D: Sql>(db: &mut D, w: i64, d: i64, threshold: i64) -> Result<(), DbErr> {
+    let next = scalar(db, &format!("SELECT d_next_o_id FROM district WHERE d_w_id = {} AND d_id = {}", w, d))?.and_then(|v| int(&v)).ok_or_else(|| no_row("district"))?;
+    db.exec(&format!("SELECT COUNT(DISTINCT s_i_id) AS low_stock FROM order_line, stock WHERE ol_w_id = {w} AND ol_d_id = {d} AND ol_o_id < {n} AND ol_o_id >= {n} - 20 AND s_w_id = {w} AND s_i_id = ol_i_id AND s_quantity < {t}", w = w, d = d, n = next, t = threshold))?;
+    Ok(())
+}
+
+impl<D: Sql> Terminal<D> {
+    pub fn new(conn: D, seed: u64, cfg: std::sync::Arc<Cfg>, home: i64, client: bool) -> Terminal<D> {
+        Terminal { conn, rng: Rng::new(seed), cfg, home, client }
     }
 
     /// The mix of clause 5.2.3: 45% New-Order, 43% Payment, 4% each of the others.
@@ -247,11 +382,11 @@ impl Terminal {
         }
     }
 
-    /// Run one transaction, retrying when it is chosen as a deadlock victim. Returns (retries, committed).
-    pub fn run(&mut self, kind: Kind) -> Result<(u32, bool), String> {
+    /// The inputs of a transaction of this kind.
+    fn make(&mut self, kind: Kind) -> Txn {
         let w = self.home;
         let d = self.rng.int(1, 10);
-        let sql = match kind {
+        match kind {
             Kind::NewOrder => {
                 let c = self.customer();
                 let n = self.rng.int(5, 15);
@@ -266,34 +401,69 @@ impl Terminal {
                     } else {
                         w
                     };
-                    lines.push(format!("{}:{}:{}", item, supply, self.rng.int(1, 10)));
+                    lines.push((item, supply, self.rng.int(1, 10)));
                 }
-                format!("EXEC neword {}, {}, {}, '{}', {}", w, d, c, lines.join(";"), all_local)
+                Txn::NewOrder(w, d, c, lines, all_local)
             }
             Kind::Payment => {
                 let (cw, cd) = if self.cfg.warehouses > 1 && self.rng.chance(0.15) { ((w % self.cfg.warehouses) + 1, self.rng.int(1, 10)) } else { (w, d) };
                 let (c, name) = self.by_name();
-                format!("EXEC payment {}, {}, {}, {}, {}, '{}', {}.{:02}", w, d, cw, cd, c, name, self.rng.int(1, 5000), self.rng.int(0, 99))
+                Txn::Payment(w, d, cw, cd, c, name, self.rng.int(1, 5000) * 100 + self.rng.int(0, 99))
             }
             Kind::OrderStatus => {
                 let (c, name) = self.by_name();
-                format!("EXEC ordstat {}, {}, {}, '{}'", w, d, c, name)
+                Txn::OrderStatus(w, d, c, name)
             }
-            Kind::Delivery => format!("EXEC delivery {}, {}", w, self.rng.int(1, 10)),
-            Kind::StockLevel => format!("EXEC slev {}, {}, {}", w, d, self.rng.int(10, 20)),
+            Kind::Delivery => Txn::Delivery(w, self.rng.int(1, 10)),
+            Kind::StockLevel => Txn::StockLevel(w, d, self.rng.int(10, 20)),
+        }
+    }
+
+    /// The call of the stored procedure for a transaction.
+    fn exec_text(t: &Txn) -> String {
+        match t {
+            Txn::NewOrder(w, d, c, lines, all_local) => format!("EXEC neword {}, {}, {}, '{}', {}", w, d, c, lines.iter().map(|(i, s, q)| format!("{}:{}:{}", i, s, q)).collect::<Vec<_>>().join(";"), all_local),
+            Txn::Payment(w, d, cw, cd, c, name, amt) => format!("EXEC payment {}, {}, {}, {}, {}, '{}', {}", w, d, cw, cd, c, name, money(*amt)),
+            Txn::OrderStatus(w, d, c, name) => format!("EXEC ordstat {}, {}, {}, '{}'", w, d, c, name),
+            Txn::Delivery(w, carrier) => format!("EXEC delivery {}, {}", w, carrier),
+            Txn::StockLevel(w, d, t) => format!("EXEC slev {}, {}, {}", w, d, t),
+        }
+    }
+
+    /// One attempt of a transaction as statements: BEGIN, the steps, COMMIT; a failure rolls it back.
+    fn attempt(&mut self, t: &Txn) -> Result<(), DbErr> {
+        let writes = !matches!(t, Txn::OrderStatus(..) | Txn::StockLevel(..));
+        if writes {
+            self.conn.exec("BEGIN TRANSACTION")?;
+        }
+        let r = match t {
+            Txn::NewOrder(w, d, c, lines, all_local) => neword(&mut self.conn, *w, *d, *c, lines, *all_local).map(|_| ()),
+            Txn::Payment(w, d, cw, cd, c, name, amt) => payment(&mut self.conn, *w, *d, *cw, *cd, *c, name, *amt),
+            Txn::OrderStatus(w, d, c, name) => order_status(&mut self.conn, *w, *d, *c, name),
+            Txn::Delivery(w, carrier) => delivery(&mut self.conn, *w, *carrier),
+            Txn::StockLevel(w, d, th) => stock_level(&mut self.conn, *w, *d, *th),
         };
+        if r.is_err() && writes {
+            // (a deadlock victim has been rolled back already; the statement then reports that there is nothing to roll back)
+            let _ = self.conn.exec("ROLLBACK TRANSACTION");
+        }
+        r
+    }
+
+    /// Run one transaction, retrying when it is chosen as a deadlock victim. Returns (retries, committed).
+    pub fn run(&mut self, kind: Kind) -> Result<(u32, bool), String> {
+        let txn = self.make(kind);
+        let sql = Self::exec_text(&txn);
         let mut retries = 0;
         loop {
-            let r = self.conn.execute(&sql);
-            match r.first_error() {
-                None => {
-                    // New-Order returns 1 (rolled back on purpose) for the invalid item; that is a success of the test
-                    return Ok((retries, true));
-                }
-                Some(e) if e.number == 1205 && retries < 20 => {
+            let r = if self.client { self.attempt(&txn) } else { self.conn.exec(&sql).map(|_| ()) };
+            match r {
+                // New-Order returns 1 (rolled back on purpose) for the invalid item; that is a success of the test
+                Ok(()) => return Ok((retries, true)),
+                Err(e) if e.number == 1205 && retries < 20 => {
                     retries += 1;
                 }
-                Some(e) => return Err(format!("{:?}: {} [{}]", kind, e, sql.chars().take(120).collect::<String>())),
+                Err(e) => return Err(format!("{:?}: {} [{}]", kind, e, sql.chars().take(120).collect::<String>())),
             }
         }
     }
@@ -326,12 +496,17 @@ impl Tally {
     }
 }
 
-/// Run the mix on every terminal for `secs` seconds.
-pub fn drive(server: &tsql_server::Server, cfg: std::sync::Arc<Cfg>, terminals: usize, secs: f64) -> Tally {
+/// Run the mix on every terminal for `secs` seconds; `connect` makes the connection of a terminal. `client`: the transactions
+/// run as statements sent by the terminal (the only way on a cluster) instead of as stored procedures.
+pub fn drive<D, F>(connect: F, cfg: std::sync::Arc<Cfg>, terminals: usize, secs: f64, client: bool) -> Tally
+where
+    D: Sql + Send + 'static,
+    F: Fn() -> D,
+{
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut hs = vec![];
     for t in 0..terminals {
-        let mut term = Terminal::new(server.connect(), 77 + t as u64, cfg.clone(), (t as i64 % cfg.warehouses) + 1);
+        let mut term = Terminal::new(connect(), 77 + t as u64, cfg.clone(), (t as i64 % cfg.warehouses) + 1, client);
         let stop = stop.clone();
         hs.push(std::thread::spawn(move || {
             let mut tally = Tally::new();

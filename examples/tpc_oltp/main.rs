@@ -1,7 +1,10 @@
 //! TPC-OLTP: the transaction-processing benchmarks, TPC-C and a reduced TPC-E, run against the engine by several
 //! concurrent terminals, followed by the benchmark's consistency checks.
 //!
-//! `cargo run --release --example tpc_oltp [c|e] [--terminals 4] [--secs 10] [--warehouses 2] [--durable] [--pool PAGES]`
+//! `cargo run --release --example tpc_oltp [c|e] [--terminals 4] [--secs 10] [--warehouses 2] [--durable] [--pool PAGES] [--client]`
+//!
+//! `--client` runs every transaction as statements sent one by one by the terminal (the transaction logic is in the driver
+//! instead of in stored procedures), which is how it runs against a cluster (see `tpcc_cluster` in the control crate).
 //!
 //! `--pool` runs on a disk-backed server with that many buffer-pool pages (a small number forces eviction while
 //! transactions run).
@@ -36,6 +39,7 @@ fn main() {
         Some(p) => Server::open_with(path, StorageOptions { pool_pages: p, temp_pool_pages: p }).unwrap(),
         None => Server::open(path).unwrap(),
     };
+    let client = args.iter().any(|a| a == "--client");
     let only_c = args.iter().any(|a| a == "c");
     let only_e = args.iter().any(|a| a == "e");
     let dir = tempfile::tempdir().unwrap();
@@ -47,7 +51,7 @@ fn main() {
         let mut conn = server.connect();
         let cfg = Arc::new(c::Cfg { warehouses, customers: 300, items: 1000 });
         let t = std::time::Instant::now();
-        c::load(&mut conn, &cfg);
+        c::load(&mut conn, &cfg, client, false);
         println!("loaded in {:.2}s", t.elapsed().as_secs_f64());
         // the initial database must satisfy the conditions too
         for (name, sql) in c::consistency() {
@@ -60,7 +64,7 @@ fn main() {
                 }
             }
         }
-        let mut tally = c::drive(&server, cfg.clone(), terminals, secs);
+        let mut tally = c::drive(|| server.connect(), cfg.clone(), terminals, secs, client);
         let names = ["New-Order", "Payment", "Order-Status", "Delivery", "Stock-Level"];
         println!("{:<14} {:>8} {:>7} {:>10} {:>10} {:>10}", "transaction", "done", "failed", "mean ms", "p90 ms", "max ms");
         for i in 0..5 {
@@ -101,9 +105,9 @@ fn main() {
         let mut conn = server.connect();
         let cfg = Arc::new(e::Cfg { customers: 500, securities: 200, accounts_per_customer: 2 });
         let t = std::time::Instant::now();
-        e::load(&mut conn, &cfg);
+        e::load(&mut conn, &cfg, client, false);
         println!("loaded in {:.2}s", t.elapsed().as_secs_f64());
-        let mut tally = e::drive(&server, cfg.clone(), terminals, secs);
+        let mut tally = e::drive(|| server.connect(), cfg.clone(), terminals, secs, client);
         println!("{:<18} {:>8} {:>7} {:>10} {:>10} {:>10}", "transaction", "done", "failed", "mean ms", "p90 ms", "max ms");
         for i in 0..e::NAMES.len() {
             let mean = if tally.lat[i].is_empty() { 0.0 } else { tally.lat[i].iter().sum::<f64>() / tally.lat[i].len() as f64 };

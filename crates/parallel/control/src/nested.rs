@@ -167,7 +167,12 @@ impl ClusterSession {
             let mut temps: Vec<String> = vec![];
             let mut rewrote = false;
             let out = match self.resolve_query(q, &mut temps, decorrelate, &mut rewrote).await {
-                Ok(Some(flat)) => self.run_query_flat(&flat).await,
+                Ok(Some(flat)) => match self.run_query_flat(&flat).await {
+                    // the rewritten query had to be gathered, and the control node's engine does not have the temporary tables
+                    // the pieces were put in (they are on the shards): gather the statement as it was
+                    Err(e) if e.number == 208 && e.message.contains("#dpn_") => self.run_query_flat(q).await,
+                    r => r,
+                },
                 // not rewritable: the whole statement is gathered
                 Ok(None) => self.run_query_flat(q).await,
                 Err(e) => Err(e),
