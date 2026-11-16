@@ -524,6 +524,31 @@ impl Connection {
         BatchResult { events: eng.out }
     }
 
+    /// Append rows to a table without the machinery of an `INSERT` (see `Engine::load_rows`): for a copy of data that has been
+    /// checked already, in a table nobody else uses. A durable server, or a session in a transaction, takes the ordinary `INSERT`.
+    /// `cols`: the columns the values are for, in order (None: every column that takes a value).
+    pub fn load_rows(&mut self, table: &[String], cols: Option<&[String]>, rows: Vec<Vec<Value>>) -> Result<usize, SqlError> {
+        let declined = {
+            let shared = &self.server.shared;
+            let guard = SrvGuard::new(&shared.state);
+            let mut eng = Engine::new(guard, &mut self.session);
+            eng.try_load_rows(table, cols, rows)?
+        };
+        match declined {
+            Ok(n) => Ok(n),
+            // the ordinary INSERT, with everything an INSERT does (and the statement's own commit, when there is no transaction)
+            Err(rows) => {
+                let n = rows.len();
+                let values: Vec<Vec<crate::ast::Expr>> = rows.into_iter().map(|r| r.into_iter().map(crate::ast::Expr::Lit).collect()).collect();
+                let ins = crate::ast::Stmt::Insert(Box::new(crate::ast::Insert { ctes: vec![], target: crate::ast::Target::Table(table.to_vec()), cols: cols.map(|c| c.to_vec()), output: None, src: crate::ast::InsertSrc::Values(values), top: None }));
+                match self.execute_stmts(&[ins]).first_error() {
+                    Some(e) => Err(e.clone()),
+                    None => Ok(n),
+                }
+            }
+        }
+    }
+
     /// Execute statements that are already parsed as one batch (a driver that builds statements itself, like the bulk load
     /// of the TDS listener, avoids the text).
     pub fn execute_stmts(&mut self, stmts: &[crate::ast::Stmt]) -> BatchResult {

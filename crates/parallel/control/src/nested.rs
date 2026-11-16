@@ -76,6 +76,62 @@ fn rename_table(v: &mut J, from: &str, to: &str) {
     }
 }
 
+/// The column a query joins the table (a common table expression) named `cte` to itself on: the most common name among the
+/// `a.col = b.col` conditions between two references to it. None when it is not joined to itself.
+fn join_column(query: &J, cte: &str) -> Option<String> {
+    let q: Query = serde_json::from_value(query.clone()).ok()?;
+    let QueryBody::Select(sel) = &q.body else { return None };
+    let mut mine: Vec<String> = vec![];
+    let mut on: Vec<Expr> = vec![];
+    fn walk(t: &TableRef, cte: &str, mine: &mut Vec<String>, on: &mut Vec<Expr>) {
+        match t {
+            TableRef::Table { name, alias, .. } if name.len() == 1 && name[0].eq_ignore_ascii_case(cte) => mine.push(alias.clone().unwrap_or_else(|| name[0].clone()).to_lowercase()),
+            TableRef::Join { left, right, on: cond, .. } => {
+                walk(left, cte, mine, on);
+                walk(right, cte, mine, on);
+                if let Some(c) = cond {
+                    on.push(c.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    for t in &sel.from {
+        walk(t, cte, &mut mine, &mut on);
+    }
+    if mine.len() < 2 {
+        return None;
+    }
+    if let Some(w) = &sel.where_ {
+        on.push(w.clone());
+    }
+    fn conj(e: &Expr, out: &mut Vec<Expr>) {
+        match e {
+            Expr::And(a, b) => {
+                conj(a, out);
+                conj(b, out);
+            }
+            Expr::Paren(a) => conj(a, out),
+            other => out.push(other.clone()),
+        }
+    }
+    let mut all = vec![];
+    for e in &on {
+        conj(e, &mut all);
+    }
+    let mut count: HashMap<String, usize> = HashMap::new();
+    for c in &all {
+        if let Expr::Binary(BinOp::Eq, a, b) = c {
+            if let (Expr::Col(x), Expr::Col(y)) = (&**a, &**b) {
+                if x.len() == 2 && y.len() == 2 && x[1].eq_ignore_ascii_case(&y[1]) && x[0] != y[0] && mine.contains(&x[0].to_lowercase()) && mine.contains(&y[0].to_lowercase()) {
+                    *count.entry(x[1].to_string()).or_default() += 1;
+                }
+            }
+        }
+    }
+    count.into_iter().max_by_key(|(_, n)| *n).map(|(c, _)| c)
+}
+
 fn json_err(e: serde_json::Error) -> SqlError {
     SqlError::new(50000, format!("the query could not be rewritten for the cluster: {}", e))
 }
@@ -232,7 +288,13 @@ impl ClusterSession {
             let cq: Query = serde_json::from_value(std::mem::take(&mut cq_json)).map_err(json_err)?;
             let Some(rs) = self.eval_nested(&cq).await? else { return Ok(None) };
             let cols: Option<Vec<String>> = cte.get("cols").and_then(|c| serde_json::from_value(c.clone()).ok());
-            let Some(temp) = self.materialize(rs, cols, temps).await? else { return Ok(None) };
+            // (a result too big to broadcast is spread over the shards by the column the query joins it on, when it joins it to itself)
+            let too_big = rs.rows.len() as u64 > self.cluster.broadcast_limit.load(Ordering::Relaxed);
+            let temp = match too_big.then(|| join_column(&v, &name)).flatten() {
+                Some(column) => self.materialize_spread(rs, cols, &column, temps).await?,
+                None => self.materialize(rs, cols, temps).await?,
+            };
+            let Some(temp) = temp else { return Ok(None) };
             let mut later = J::Array(rest);
             rename_table(&mut later, &name, &temp);
             rest = match later {
@@ -425,7 +487,7 @@ impl ClusterSession {
         let table = DistTable {
             id: table_id(std::slice::from_ref(&temp)),
             name: vec![temp.clone()],
-            cols: names.iter().zip(&types).map(|(n, t)| ColInfo { name: n.clone(), computed: false, type_name: t.to_string().to_lowercase() }).collect(),
+            cols: names.iter().zip(&types).map(|(n, t)| ColInfo { name: n.clone(), computed: false, type_name: t.to_string().to_lowercase().split('(').next().unwrap_or("").to_string() }).collect(),
             dist: Dist::Replicated,
             version: 0,
             loaded: None,
@@ -434,6 +496,73 @@ impl ClusterSession {
         };
         self.local_tables.insert(table.id.clone(), table);
         self.plan.push(format!("materialized {} rows as the replicated table {}", rs.rows.len(), temp));
+        Ok(Some(temp))
+    }
+
+    /// Put a result that is too big to broadcast in a temporary table that is *spread* over the shards: each row goes to the shard that
+    /// owns the hash of its `column`, exactly where a sharded table keyed on that column would have it, and the table is made known to
+    /// this session as such. A query that joins it to itself (or to a table sharded the same way) on that column then runs shard by
+    /// shard, in place. None when the column cannot be a shard key or the result has no usable names.
+    async fn materialize_spread(&mut self, rs: ResultSet, cols: Option<Vec<String>>, column: &str, temps: &mut Vec<String>) -> Result<Option<String>, SqlError> {
+        if rs.rows.len() > 5_000_000 {
+            return Ok(None);
+        }
+        let names: Vec<String> = match cols {
+            Some(c) if c.len() == rs.columns.len() => c,
+            Some(_) => return Ok(None),
+            None => rs.columns.clone(),
+        };
+        if names.iter().any(|n| n.is_empty()) || names.iter().enumerate().any(|(i, n)| names[..i].iter().any(|m| m.eq_ignore_ascii_case(n))) {
+            return Ok(None);
+        }
+        let Some(key) = names.iter().position(|n| n.eq_ignore_ascii_case(column)) else { return Ok(None) };
+        let types = merge::widen(&rs.types, &rs.rows);
+        let base = |t: &tsql_server::DataType| t.to_string().to_lowercase().split('(').next().unwrap_or("").to_string();
+        let Some(class) = KeyClass::of_type_name(&base(&types[key])) else { return Ok(None) };
+        self.temp_counter += 1;
+        let temp = format!("#dpn_{}_{}", self.id, self.temp_counter);
+        let defs: Vec<String> = names.iter().zip(&types).map(|(n, t)| format!("[{}] {} NULL", n.replace(']', "]]"), t)).collect();
+        let create = format!("CREATE TABLE {} ({})", temp, defs.join(", "));
+        let shards = self.all_shards();
+        self.fan_run(&shards, |_| Work::Sql(create.clone())).await?;
+        temps.push(temp.clone());
+        let n = rs.rows.len();
+        let mut per: Vec<Vec<Vec<Value>>> = vec![vec![]; shards.len()];
+        for row in rs.rows {
+            let h = key_hash(&row[key], class).unwrap_or(0);
+            per[self.cluster.shard_of_hash(h)].push(row);
+        }
+        let mut offset = 0;
+        loop {
+            let stmts: Vec<Option<Stmt>> = per
+                .iter()
+                .map(|rows| {
+                    if offset >= rows.len() {
+                        return None;
+                    }
+                    let chunk: Vec<Vec<Expr>> = rows[offset..(offset + 1000).min(rows.len())].iter().map(|r| r.iter().cloned().map(Expr::Lit).collect()).collect();
+                    Some(Stmt::Insert(Box::new(Insert { ctes: vec![], target: Target::Table(vec![temp.clone()]), cols: None, output: None, src: InsertSrc::Values(chunk), top: None })))
+                })
+                .collect();
+            let active: Vec<usize> = (0..stmts.len()).filter(|i| stmts[*i].is_some()).collect();
+            if active.is_empty() {
+                break;
+            }
+            self.fan_run(&active, |i| Work::Stmts(vec![stmts[i].clone().unwrap()])).await?;
+            offset += 1000;
+        }
+        let table = DistTable {
+            id: table_id(std::slice::from_ref(&temp)),
+            name: vec![temp.clone()],
+            cols: names.iter().zip(&types).map(|(n, t)| ColInfo { name: n.clone(), computed: false, type_name: base(t) }).collect(),
+            dist: Dist::Sharded { key, class },
+            version: 0,
+            loaded: None,
+            rows: Some((0, n as u64)),
+            identity: None,
+        };
+        self.local_tables.insert(table.id.clone(), table);
+        self.plan.push(format!("materialized {} rows spread over the shards by {} as {}", n, column, temp));
         Ok(Some(temp))
     }
 

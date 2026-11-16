@@ -112,6 +112,13 @@ fn main() {
     let (mut single_total, mut cluster_total) = (0.0, 0.0);
     println!("{:<40} {:>9} {:>9}  {:<18} answer", "query", "single", "cluster", "plan");
     for (name, sql) in h::queries(sf) {
+        // (`--only Q16,Q22`: just those queries, each with its whole plan)
+        if let Some(i) = args.iter().position(|a| a == "--only") {
+            let wanted = args.get(i + 1).cloned().unwrap_or_default();
+            if !wanted.split(',').any(|w| name.split_whitespace().next().map(|n| n.eq_ignore_ascii_case(w.trim())).unwrap_or(false)) {
+                continue;
+            }
+        }
         let (a, ta) = util::timed(&mut oc, &sql);
         let t = Instant::now();
         let res = cs.execute(&sql);
@@ -150,7 +157,7 @@ fn main() {
         };
         println!("{:<40} {:>8.3}s {:>8.3}s  {:<18} {}", name, ta, tb, plan, verdict);
         // (the whole plan of a query that is much slower than on one node)
-        if tb > 2.0 * ta + 0.5 || std::env::var("PLAN_ALL").is_ok() {
+        if tb > 2.0 * ta + 0.5 || std::env::var("PLAN_ALL").is_ok() || args.iter().any(|a| a == "--only") {
             for l in cs.last_plan() {
                 println!("      plan: {}", l);
             }

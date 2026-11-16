@@ -168,6 +168,51 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    /// Append rows to a table as committed rows with none of the machinery of an `INSERT`: no transaction, no row locks, no undo,
+    /// no constraint, uniqueness or foreign-key checks, no triggers. Each value is still coerced to its column's type. It is for
+    /// loading a copy of data that has been checked already into a table nobody else is using (the control node of a cluster
+    /// loads its gathered tables this way). Where it cannot be used (a durable server: the rows would not be logged; a session in
+    /// a transaction; an identity column, a foreign key or an INSTEAD OF trigger on the table) the rows are handed back (`Err`
+    /// of the inner result) for the caller to run as an ordinary `INSERT`. Returns the number of rows.
+    pub fn try_load_rows(&mut self, name: &[String], cols: Option<&[String]>, rows: Vec<Vec<Value>>) -> Result<std::result::Result<usize, Vec<Vec<Value>>>> {
+        let n = rows.len();
+        if n == 0 {
+            return Ok(Ok(0));
+        }
+        let ordinary = self.srv.persist().is_some() || self.ses.tx.is_some();
+        let loc = self.locate(name);
+        let Some(table) = self.table_ref(&loc) else { return Err(self.invalid_object(name)) };
+        let mut t = table.clone();
+        let ident_on = false;
+        let col_idx: Vec<usize> = match cols {
+            Some(cs) => {
+                let mut v = vec![];
+                for c in cs {
+                    v.push(t.col_index(c).ok_or_else(|| SqlError::new(207, format!("Invalid column name '{}'.", c)))?);
+                }
+                v
+            }
+            None => (0..t.columns.len()).filter(|&i| t.columns[i].computed.is_none() && !matches!(t.columns[i].ty, DataType::Timestamp) && t.columns[i].identity.is_none()).collect(),
+        };
+        let special = t.columns.iter().any(|c| c.identity.is_some()) || !t.fks.is_empty() || self.instead_trigger(&t, "INSERT").is_some();
+        if ordinary || special || self.ses.identity_insert.contains(&format!("{:?}", loc)) {
+            return Ok(Err(rows));
+        }
+        let mut built: Vec<Row> = Vec::with_capacity(n);
+        for r in rows {
+            if r.len() != col_idx.len() {
+                return Err(SqlError::new(213, "Column name or number of supplied values does not match table definition."));
+            }
+            let vals: Vec<Option<Value>> = r.into_iter().map(Some).collect();
+            built.push(self.build_row(&mut t, &col_idx, &vals, ident_on)?);
+        }
+        let d = &*t.data;
+        let items: Vec<(RowId, Option<Row>)> = built.into_iter().map(|row| (d.alloc(), Some(row))).collect();
+        d.push_versions(items, Stamp::Ts(0));
+        self.ses.rowcount = n as i64;
+        Ok(Ok(n))
+    }
+
     fn top_count(&mut self, e: &Expr, pct: bool, n: usize) -> Result<usize> {
         let v = self.ev(e, &Env::empty())?;
         if pct {

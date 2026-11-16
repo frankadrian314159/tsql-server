@@ -70,7 +70,7 @@ fn rename_by_id(v: &mut J, id: &str, to: &str) {
 }
 
 /// A condition that a row which is not there cannot satisfy, so that dropping the rows that fail it early changes nothing.
-fn pushable(e: &Expr) -> bool {
+pub(crate) fn pushable(e: &Expr) -> bool {
     let mut ok = true;
     walk_expr(e, &mut |x| match x {
         Expr::Col(_) | Expr::Lit(_) | Expr::Binary(..) | Expr::And(..) | Expr::Between(..) | Expr::InList(..) | Expr::Like(..) | Expr::Neg(_) | Expr::Paren(_) => {}
@@ -189,15 +189,28 @@ impl ClusterSession {
                     having: None,
                 });
                 let shards = self.all_shards();
+                let t_pull = std::time::Instant::now();
                 let results = self.fan_query(&shards, |_| Work::Stmts(vec![Stmt::Query(Box::new(scan.clone()))])).await?;
+                let pull = t_pull.elapsed().as_secs_f64();
                 let mut n = 0usize;
+                let (mut convert, mut insert) = (0.0f64, 0.0f64);
                 for rs in results {
                     n += rs.rows.len();
-                    for chunk in rs.rows.chunks(1000) {
-                        let rows: Vec<Vec<Expr>> = chunk.iter().map(|r| r.iter().cloned().map(Expr::Lit).collect()).collect();
-                        let ins = Stmt::Insert(Box::new(Insert { ctes: vec![], target: Target::Table(vec![temp.clone()]), cols: None, output: None, src: InsertSrc::Values(rows), top: None }));
-                        merge::check(&self.mirror.execute_stmts(&[ins]))?;
+                    // (the control node's engine takes the rows directly, as committed rows: see `Connection::load_rows`)
+                    let mut it = rs.rows.into_iter();
+                    loop {
+                        let chunk: Vec<Vec<Value>> = it.by_ref().take(20_000).collect();
+                        if chunk.is_empty() {
+                            break;
+                        }
+                        let t1 = std::time::Instant::now();
+                        self.mirror.load_rows(std::slice::from_ref(&temp), None, chunk)?;
+                        insert += t1.elapsed().as_secs_f64();
                     }
+                }
+                let _ = &mut convert;
+                if std::env::var("TSQL_GATHER_TRACE").is_ok() {
+                    eprintln!("gather {}: {} rows; pulling from the shards {:.2}s, making statements {:.2}s, inserting {:.2}s", t.id, n, pull, convert, insert);
                 }
                 rename_by_id(&mut qj, &t.id, &temp);
                 copies.push(format!("{} ({} of {} columns{}, {} rows)", t.id, names.len(), t.cols.len(), if filter.is_some() { ", filtered" } else { "" }, n));

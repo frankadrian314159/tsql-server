@@ -280,13 +280,15 @@ impl ShardNode {
         let conn = self.session(session);
         tokio::task::spawn_blocking(move || -> Result<(), WireError> {
             let mut c = conn.lock().unwrap_or_else(|e| e.into_inner());
-            for chunk in rows.chunks(1000) {
-                let values: Vec<Vec<tsql_server::ast::Expr>> = chunk.iter().map(|r| r.iter().cloned().map(tsql_server::ast::Expr::Lit).collect()).collect();
-                let ins = tsql_server::ast::Stmt::Insert(Box::new(tsql_server::ast::Insert { ctes: vec![], target: tsql_server::ast::Target::Table(vec![table.clone()]), cols: None, output: None, src: tsql_server::ast::InsertSrc::Values(values), top: None }));
-                let res = c.execute_stmts(&[ins]);
-                if let Some(e) = res.first_error() {
-                    return Err(WireError::from_sql(e));
+            // (the rows go in as committed rows, without the machinery of an INSERT: a durable shard or a session in a transaction
+            // takes the ordinary INSERT, see `Connection::load_rows`)
+            let mut it = rows.into_iter();
+            loop {
+                let part: Vec<Vec<tsql_server::Value>> = it.by_ref().take(20_000).collect();
+                if part.is_empty() {
+                    break;
                 }
+                c.load_rows(std::slice::from_ref(&table), None, part).map_err(|e| WireError::from_sql(&e))?;
             }
             Ok(())
         })

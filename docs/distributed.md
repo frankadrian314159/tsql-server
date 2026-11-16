@@ -83,6 +83,13 @@ tables sharded on the item), and its table shows how each query ran (`split`, `s
     or table variable becomes a small *replicated* temporary table on every shard (up to the broadcast limit) that the rest of
     the query joins like any replicated table. The rewritten query then goes through the planning above. A correlated subquery
     (it does not bind alone), a recursive CTE, `ANY`/`ALL`, and a result too big to list or broadcast are not rewritten;
+  * *an outer join from a replicated table, aggregated* (`outer_agg_ok` in `joins.rs`): `customer LEFT JOIN orders ... COUNT(o_orderkey)
+    GROUP BY c_custkey` (TPC-H Q13) puts the preserved rows that find no match on a shard in that shard's result, once per shard. That
+    is harmless when every aggregate is `COUNT`, `SUM`, `MIN`, `MAX` or `AVG` of an expression that is NULL for a missing row
+    (columns of the sharded side, literals, arithmetic and casts), without `DISTINCT`: the partial counts add up, and a missing
+    row adds 0. The grouping must be by preserved-side columns, and a `WHERE` condition on the sharded side must be one a missing row
+    cannot satisfy (a comparison, `BETWEEN`, `IN`, `LIKE`). `COUNT(*)`, `SUM(1)`, an aggregate over `CASE` or `ISNULL`, grouping by the
+    sharded side and `IS NULL` anti-joins are gathered (the fuzzer found `SUM(1)` counting the unmatched row on every shard);
   * *staged joins* (`mpp.rs`): a join whose tables are sharded on different keys (TPC-H Q9: `lineitem` and `orders` by the order key,
     `partsupp` by the part key) is done in stages that move rows from shard to shard. The *group* of tables joined so far starts as
     the largest sharded table, partitioned by its shard key; the next table is added where it is when the shards can do it alone
@@ -93,6 +100,9 @@ tables sharded on the item), and its table shows how each query ran (`split`, `s
     and so on rewritten over the temporary tables) runs shard by shard as an ordinary scatter-gather with two-phase
     aggregation, and only the groups reach the control node. Inner and cross joins of base tables only; the conditions of the
     `WHERE` that mention one table are applied in the scan that moves it;
+  * *a common table expression too big to broadcast*, joined to itself (TPC-DS Q11's `year_total`), is spread over the shards by the
+    column it is joined on, each row to the shard that owns the hash of that column, exactly as a table sharded on it would be, and
+    registered as such: the self-joins are then co-located and run shard by shard. Without a column to spread by it is gathered;
   * *derived tables merged* (`flatten.rs`): `SELECT ... FROM (SELECT ... FROM a, b, c WHERE ...) d GROUP BY ...`, where the derived
     table is a plain select-project-join of several tables (no `DISTINCT`, `TOP`, grouping, aggregate, window, set operation or
     subquery), is one query: its tables and conditions join the outer ones and each reference to one of its columns becomes
@@ -131,7 +141,11 @@ tables sharded on the item), and its table shows how each query ran (`split`, `s
     correctness baseline, always exact, running at single-node speed. A table of at most the broadcast limit is copied whole and
     kept until a change bumps its version; a bigger one is copied for this query only, with just the columns the query mentions
     and the rows that pass the `WHERE` conditions that mention that table alone (when the query is a plain inner join), every
-    shard answering its part at once.
+    shard answering its part at once. The rows go into the control node's engine through `Connection::load_rows`, which appends them as
+    committed rows without the machinery of an `INSERT` (no transaction, row locks, undo, constraint or key checks; each value is
+    still coerced to its column's type): about 2.5 times faster than inserting (about 430,000 rows a second into a heap table and
+    290,000 into one with a primary key, against 190,000 and 100,000). A durable server, a session in a transaction, and a table with
+    an identity column, a foreign key or an INSTEAD OF trigger take the ordinary `INSERT`. The shards load shuffled rows the same way.
 * **Transactions.** `BEGIN TRANSACTION` begins on a shard when a statement first uses it, on that shard's session for this
   control session, so locks and uncommitted changes are held there and the session reads its own writes. `COMMIT`: one shard,
   committed there; several shards, **two-phase commit** (see `txn.rs`): every participant makes its part durable (a `Prepare`

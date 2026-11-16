@@ -353,8 +353,11 @@ fn joins_run_shard_by_shard_when_the_rows_can_meet() {
     p.check_plan("SELECT c.region, SUM(o.amount) AS total, COUNT(*) AS n FROM orders o JOIN customers c ON c.id = o.customer_id GROUP BY c.region ORDER BY c.region", true, "repartition dbo.orders");
     p.check_plan("SELECT o.id, c.name FROM orders o LEFT JOIN customers c ON c.id = o.customer_id WHERE o.id <= 25 ORDER BY o.id", true, "repartition");
     p.h.cluster.set_broadcast_limit(100_000);
-    // an outer join that preserves a replicated table would repeat its unmatched rows on every shard: gathered
+    // an outer join that preserves a replicated table repeats its unmatched rows on every shard: harmless for a count of what matched
+    // (the partial counts add up), so that runs over the shards; one that counts the unmatched row itself is gathered
     let plan = p.check("SELECT r.code, COUNT(c.id) AS n FROM regions r LEFT JOIN customers c ON c.region = r.code GROUP BY r.code ORDER BY r.code", true);
+    assert!(plan.iter().any(|l| l.starts_with("join over shards")) && !plan.iter().any(|l| l.starts_with("gather")), "{:?}", plan);
+    let plan = p.check("SELECT r.code, COUNT(*) AS n FROM regions r LEFT JOIN customers c ON c.region = r.code GROUP BY r.code ORDER BY r.code", true);
     assert!(plan.iter().any(|l| l.starts_with("gather")), "{:?}", plan);
     // changes are seen by the next join (the statistics and copies follow the table versions)
     p.both("UPDATE customers SET region = 'north' WHERE id < 100");
@@ -1387,5 +1390,76 @@ fn a_decorrelated_subquery_is_restricted_to_the_keys_the_outer_query_can_meet() 
         let made: Vec<u64> = plan.iter().filter_map(|l| l.strip_prefix("materialized ").and_then(|r| r.split_whitespace().next()).and_then(|n| n.parse().ok())).collect();
         assert!(made.iter().any(|n| *n < 250), "{}\n{:?}", sql, plan);
         assert!(!plan.iter().any(|l| l.starts_with("gather")), "{}\n{:?}", sql, plan);
+    }
+}
+
+#[test]
+fn an_outer_join_from_a_replicated_table_is_aggregated_on_the_shards() {
+    let mut p = Pair::new(3);
+    p.load();
+    // a region that no customer has: its groups must come out with a count of 0 and a NULL sum
+    p.both("INSERT INTO regions VALUES ('zz', 'nowhere')");
+    let on_shards = |plan: &[String]| plan.iter().any(|l| l.starts_with("join over shards")) && !plan.iter().any(|l| l.starts_with("gather"));
+    for (sql, ordered) in [
+        // the shape of TPC-H Q13: counts of what matched, grouped by the preserved side
+        ("SELECT r.label, COUNT(c.id) AS n, SUM(c.credit) AS s, MIN(c.id) AS lo, MAX(c.name) AS hi FROM regions r LEFT JOIN customers c ON c.region = r.code GROUP BY r.label ORDER BY r.label", true),
+        ("SELECT r.code, AVG(c.credit) AS a, COUNT(c.credit) AS n FROM regions r LEFT OUTER JOIN customers c ON c.region = r.code AND c.credit > 300 GROUP BY r.code ORDER BY r.code", true),
+        ("SELECT COUNT(c.id), SUM(c.credit) FROM regions r LEFT JOIN customers c ON c.region = r.code", false),
+        // a condition on the partitioned side that a missing row cannot satisfy, HAVING, and an expression over the aggregates
+        ("SELECT r.label, COUNT(c.id) * 2 AS n2 FROM regions r LEFT JOIN customers c ON c.region = r.code WHERE r.code <> 'x' GROUP BY r.label HAVING COUNT(c.id) >= 0 ORDER BY r.label", true),
+        // RIGHT JOIN written the other way round
+        ("SELECT r.label, COUNT(c.id) AS n FROM customers c RIGHT JOIN regions r ON c.region = r.code GROUP BY r.label ORDER BY r.label", true),
+    ] {
+        let plan = p.check(sql, ordered);
+        assert!(on_shards(&plan), "{}\n{:?}", sql, plan);
+    }
+    // what is not a count of the matches is gathered (and exact): COUNT(*) and a preserved column's aggregate would count the unmatched
+    // row on every shard, a group by the partitioned side's values would exist on shards that have no row for it, an anti-join asks
+    // what is true of all the shards
+    for (sql, ordered) in [
+        ("SELECT r.label, COUNT(*) AS n FROM regions r LEFT JOIN customers c ON c.region = r.code GROUP BY r.label ORDER BY r.label", true),
+        ("SELECT r.label, COUNT(r.code) AS n FROM regions r LEFT JOIN customers c ON c.region = r.code GROUP BY r.label ORDER BY r.label", true),
+        ("SELECT c.region, COUNT(c.id) AS n FROM regions r LEFT JOIN customers c ON c.region = r.code GROUP BY c.region ORDER BY c.region", true),
+        ("SELECT r.label, COUNT(c.id) AS n FROM regions r LEFT JOIN customers c ON c.region = r.code WHERE c.id IS NULL GROUP BY r.label ORDER BY r.label", true),
+        ("SELECT r.label, COUNT(DISTINCT c.credit) AS n FROM regions r LEFT JOIN customers c ON c.region = r.code GROUP BY r.label ORDER BY r.label", true),
+        // an aggregate that is not NULL for a missing row (found by the fuzzer: `SUM(1)` over a join counted the unmatched row on every shard)
+        ("SELECT r.label, SUM(1) AS n, MIN(ABS(7)) AS m FROM regions r LEFT JOIN customers c ON c.region = r.code GROUP BY r.label ORDER BY r.label", true),
+        ("SELECT r.label, SUM(CASE WHEN c.id IS NULL THEN 1 ELSE 0 END) AS none FROM regions r LEFT JOIN customers c ON c.region = r.code GROUP BY r.label ORDER BY r.label", true),
+        ("SELECT r.label, COUNT(ISNULL(c.id, 0)) AS n FROM regions r LEFT JOIN customers c ON c.region = r.code GROUP BY r.label ORDER BY r.label", true),
+        ("SELECT (5 * 3) AS g, SUM(1) AS n, SUM(ABS(7)) AS sm FROM regions r RIGHT JOIN customers c ON r.code = c.region INNER JOIN orders o ON c.id = o.customer_id GROUP BY (5 * 3)", false),
+    ] {
+        p.check(sql, ordered);
+    }
+}
+
+#[test]
+fn a_common_table_expression_too_big_to_broadcast_is_spread_over_the_shards() {
+    let mut p = Pair::new(3);
+    p.load();
+    p.h.cluster.set_broadcast_limit(10); // (every result here is "too big")
+    // the shape of TPC-DS Q11: a UNION ALL of two aggregates, joined to itself on the customer
+    for (sql, ordered) in [
+        ("WITH y AS (SELECT customer_id AS cid, SUM(amount) AS tot, 'a' AS k FROM orders WHERE qty < 5 GROUP BY customer_id UNION ALL SELECT customer_id, SUM(amount), 'b' FROM orders WHERE qty >= 5 GROUP BY customer_id) SELECT TOP 20 a.cid FROM y a, y b WHERE a.cid = b.cid AND a.k = 'a' AND b.k = 'b' AND a.tot > b.tot ORDER BY a.cid", true),
+        ("WITH y AS (SELECT customer_id AS cid, COUNT(*) AS n FROM orders GROUP BY customer_id) SELECT COUNT(*), SUM(a.n * b.n) FROM y a JOIN y b ON a.cid = b.cid WHERE a.n >= b.n", false),
+    ] {
+        let plan = p.check(sql, ordered);
+        assert!(plan.iter().any(|l| l.contains("spread over the shards")) && !plan.iter().any(|l| l.starts_with("gather")), "{}\n{:?}", sql, plan);
+    }
+    // a CTE that is read once, or not joined to itself, has no column to spread by: gathered as before, and exact
+    let plan = p.check("WITH y AS (SELECT customer_id AS cid, COUNT(*) AS n FROM orders GROUP BY customer_id) SELECT COUNT(*) FROM y WHERE n > 5", false);
+    assert!(!plan.iter().any(|l| l.contains("spread over")), "{:?}", plan);
+}
+
+#[test]
+fn not_exists_is_restricted_to_the_keys_of_the_outer_rows_that_survive() {
+    let mut p = Pair::new(3);
+    p.load();
+    for sql in [
+        // the shape of TPC-H Q22: filters on the outer table (one with a subquery of its own), and a correlated NOT EXISTS
+        "SELECT c.region, COUNT(*) AS n, SUM(c.credit) AS s FROM customers c WHERE c.region IN ('north', 'south') AND c.credit > (SELECT AVG(credit) FROM customers WHERE credit > 0 AND region IN ('north', 'south')) AND NOT EXISTS (SELECT * FROM orders o WHERE o.customer_id = c.id AND o.qty > 8) GROUP BY c.region ORDER BY c.region",
+        "SELECT COUNT(*) FROM customers c WHERE c.credit > 300 AND EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.amount > 900)",
+    ] {
+        let plan = p.check(sql, sql.contains("ORDER BY"));
+        assert!(plan.iter().any(|l| l.contains("rewritten as a join")) && !plan.iter().any(|l| l.starts_with("gather")), "{}\n{:?}", sql, plan);
     }
 }

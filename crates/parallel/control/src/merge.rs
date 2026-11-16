@@ -9,7 +9,7 @@ use tsql_server::types::MAX;
 use tsql_server::{Connection, DataType, Event, ResultSet, SqlError, Value};
 
 const TMP: &str = "#__dp_merge";
-const CHUNK: usize = 500;
+const CHUNK: usize = 20_000;
 
 pub fn tmp_name() -> &'static str {
     TMP
@@ -87,12 +87,11 @@ pub fn run_final(
     let result = (|| {
         let mut it = rows.into_iter();
         loop {
-            let chunk: Vec<Vec<Expr>> = it.by_ref().take(CHUNK).map(|r| r.into_iter().map(Expr::Lit).collect()).collect();
+            let chunk: Vec<Vec<Value>> = it.by_ref().take(CHUNK).collect();
             if chunk.is_empty() {
                 break;
             }
-            let ins = Stmt::Insert(Box::new(Insert { ctes: vec![], target: Target::Table(vec![TMP.to_string()]), cols: None, output: None, src: InsertSrc::Values(chunk), top: None }));
-            check(&conn.execute_stmts(&[ins]))?;
+            conn.load_rows(&[TMP.to_string()], None, chunk)?;
         }
         let res = conn.execute_stmts(&[Stmt::Query(Box::new(query))]);
         check(&res)?;
@@ -115,11 +114,10 @@ pub fn load_table(conn: &mut Connection, name: &str, columns: &[String], types: 
     check(&conn.execute(&format!("CREATE TABLE {} ({})", name, defs.join(", "))))?;
     let mut it = rows.into_iter();
     loop {
-        let chunk: Vec<Vec<Expr>> = it.by_ref().take(CHUNK).map(|r| r.into_iter().map(Expr::Lit).collect()).collect();
+        let chunk: Vec<Vec<Value>> = it.by_ref().take(CHUNK).collect();
         if chunk.is_empty() {
             return Ok(());
         }
-        let ins = Stmt::Insert(Box::new(Insert { ctes: vec![], target: Target::Table(vec![name.to_string()]), cols: None, output: None, src: InsertSrc::Values(chunk), top: None }));
-        check(&conn.execute_stmts(&[ins]))?;
+        conn.load_rows(&[name.to_string()], None, chunk)?;
     }
 }

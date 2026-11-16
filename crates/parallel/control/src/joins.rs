@@ -139,6 +139,120 @@ fn outer_ok(n: &Node, part: &[bool]) -> bool {
     }
 }
 
+/// An outer join whose preserved side is *not* partitioned over the shards (a replicated table: every shard has all its rows) puts
+/// the rows that find no match on this shard in the result of every shard. That is harmless for an aggregate that only counts what
+/// matched: each shard gives the preserved row's group a partial count over the matches it holds (0 where it holds none), and the
+/// partials add up to the answer (`customer LEFT JOIN orders ... COUNT(o_orderkey) GROUP BY c_custkey`, TPC-H Q13). It holds when:
+///
+/// * every aggregate is `COUNT`, `SUM`, `MIN`, `MAX` or `AVG` of columns of the partitioned side only, without `DISTINCT` (`COUNT(*)`
+///   or an aggregate of a preserved column would count the unmatched row once per shard);
+/// * the grouping is by columns of the preserved side only (a group made of the partitioned side's values would show up on a shard
+///   that has no row for it), and so are the select items that are not aggregates;
+/// * a condition of the `WHERE` that mentions the partitioned side is one a missing row cannot satisfy (a comparison, `BETWEEN`,
+///   `IN` or `LIKE`): `WHERE o.x IS NULL` (an anti-join) asks what is true of *all* the shards.
+fn outer_agg_ok(q: &Query, leaves: &[Leaf], part: &[bool]) -> bool {
+    let QueryBody::Select(sel) = &q.body else { return false };
+    if sel.distinct || q.offset.is_some() || q.fetch.is_some() {
+        return false;
+    }
+    // the leaf of a column reference: Some(true) partitioned, Some(false) preserved side, None not a column of the query's tables
+    let side = |p: &[String]| resolve(leaves, p).map(|(l, _)| part[l]);
+    let mut aggregates = 0usize;
+    let mut ok = true;
+    let mut check_expr = |e: &Expr, in_group: bool| {
+        // columns outside the aggregate calls must be the preserved side's
+        map_expr(e, &mut |x| {
+            match x {
+                Expr::Func(fc) if fc.over.is_some() || fc.within.is_some() => ok = false,
+                Expr::Func(fc) if AGGREGATES.contains(&fc.name.as_str()) => {
+                    aggregates += 1;
+                    let allowed = matches!(fc.name.as_str(), "COUNT" | "COUNT_BIG" | "SUM" | "MIN" | "MAX" | "AVG") && !fc.distinct && !fc.star && !fc.args.is_empty() && !in_group;
+                    if !allowed {
+                        ok = false;
+                    }
+                    for a in &fc.args {
+                        // the argument must be NULL for a row that found no match (arithmetic and casts of the partitioned side's columns
+                        // are; a constant, `CASE`, `ISNULL`, a function are not: `SUM(1)` counts the unmatched row once per shard)
+                        let mut has_partitioned_col = false;
+                        walk_expr(a, &mut |y| match y {
+                            Expr::Col(p) => {
+                                if side(p) != Some(true) {
+                                    ok = false;
+                                } else {
+                                    has_partitioned_col = true;
+                                }
+                            }
+                            Expr::Lit(_) | Expr::Paren(_) | Expr::Neg(_) | Expr::Cast { .. } => {}
+                            Expr::Binary(op, _, _) if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod) => {}
+                            _ => ok = false,
+                        });
+                        if !has_partitioned_col {
+                            ok = false;
+                        }
+                    }
+                    return Some(x.clone());
+                }
+                Expr::Col(p) => {
+                    // (a column that is not inside an aggregate)
+                    if side(p) != Some(false) {
+                        ok = false;
+                    }
+                }
+                _ => {}
+            }
+            None
+        });
+    };
+    for it in &sel.items {
+        match it {
+            SelectItem::Expr { e, .. } => check_expr(e, false),
+            _ => return false,
+        }
+    }
+    if let Some(g) = &sel.group {
+        for gi in g {
+            match gi {
+                GroupItem::Expr(e) => check_expr(e, true),
+                _ => return false,
+            }
+        }
+    }
+    if let Some(h) = &sel.having {
+        // (the HAVING is evaluated over the merged groups: its aggregates must be of the same kind)
+        check_expr(h, false);
+    }
+    for o in &q.order {
+        if !matches!(&o.e, Expr::Lit(_)) && !matches!(&o.e, Expr::Col(p) if p.len() == 1 && sel.items.iter().any(|i| matches!(i, SelectItem::Expr { alias: Some(a), .. } if a.eq_ignore_ascii_case(&p[0])))) {
+            check_expr(&o.e, false);
+        }
+    }
+    if aggregates == 0 || !ok {
+        return false;
+    }
+    // the WHERE: conditions on the partitioned side must be ones a missing row cannot satisfy
+    if let Some(w) = &sel.where_ {
+        let mut cs = vec![];
+        conjuncts(w, &mut cs);
+        for c in cs {
+            let mut mentions = false;
+            let mut unknown = false;
+            walk_expr(c, &mut |x| match x {
+                Expr::Col(p) => match side(p) {
+                    Some(true) => mentions = true,
+                    Some(false) => {}
+                    None => unknown = true,
+                },
+                Expr::Exists(_) | Expr::Subquery(_) | Expr::InQuery(..) | Expr::CmpQuant(..) => unknown = true,
+                _ => {}
+            });
+            if unknown || (mentions && !crate::gather::pushable(c)) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn rewrite(tr: &TableRef, idx: &mut usize, leaves: &[Leaf], temps: &[Option<String>]) -> TableRef {
     match tr {
         TableRef::Table { .. } => {
@@ -311,7 +425,7 @@ pub fn plan_join(q: &Query, tables: &HashMap<String, DistTable>, rows: &HashMap<
             part[*l] = true;
         }
     }
-    if !outer_ok(&root, &part) {
+    if !outer_ok(&root, &part) && !outer_agg_ok(q, &leaves, &part) {
         return None;
     }
     // the conditions of the WHERE clause that mention one moved table only are applied while copying it

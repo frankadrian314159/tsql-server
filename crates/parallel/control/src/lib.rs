@@ -1710,10 +1710,13 @@ impl ClusterSession {
         let shards = if matches!(t.dist, Dist::Replicated) { vec![0] } else { self.all_shards() };
         let results = self.fan_query(&shards, |_| Work::Stmts(vec![Stmt::Query(Box::new(scan.clone()))])).await?;
         for rs in results {
-            for chunk in rs.rows.chunks(1000) {
-                let rows: Vec<Vec<Expr>> = chunk.iter().map(|r| r.iter().cloned().map(Expr::Lit).collect()).collect();
-                let ins = Stmt::Insert(Box::new(Insert { ctes: vec![], target: Target::Table(t.name.clone()), cols: Some(cols.clone()), output: None, src: InsertSrc::Values(rows), top: None }));
-                merge::check(&self.mirror.execute_stmts(&[ins]))?;
+            let mut it = rs.rows.into_iter();
+            loop {
+                let chunk: Vec<Vec<Value>> = it.by_ref().take(20_000).collect();
+                if chunk.is_empty() {
+                    break;
+                }
+                self.mirror.load_rows(&t.name, Some(&cols), chunk)?;
             }
         }
         if let Some(e) = self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&t.id) {

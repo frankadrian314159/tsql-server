@@ -14,6 +14,7 @@
 //! Only equalities between a column of the subquery and a *qualified* column of the outer query are recognised; anything else
 //! is left alone (and the statement is gathered, which is always exact). A rewrite that turns out not to bind is undone by the
 //! caller, which runs the original.
+use serde_json::Value as J;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use tsql_server::ast::*;
@@ -271,6 +272,34 @@ pub fn decorrelate(q: &mut Query, counter: &mut u64, schema: HashMap<String, Vec
     changed
 }
 
+/// Whether a subquery refers to nothing but its own tables (it does not depend on the query around it): every column it names is a
+/// column of a table of its own `FROM` (or qualified by one of its own aliases).
+fn uncorrelated(q: &Query) -> bool {
+    let QueryBody::Select(s) = &q.body else { return false };
+    let mut own_aliases = vec![];
+    aliases(&s.from, &mut own_aliases);
+    let own_cols = columns_of(&s.from);
+    fn walk(v: &J, aliases: &[String], cols: &[String]) -> bool {
+        match v {
+            J::Object(m) => m.iter().all(|(k, c)| {
+                if k == "Col" {
+                    let parts: Vec<String> = c.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_lowercase())).collect()).unwrap_or_default();
+                    match parts.len() {
+                        0 => false,
+                        1 => cols.contains(&parts[0]),
+                        n => aliases.contains(&parts[n - 2]),
+                    }
+                } else {
+                    walk(c, aliases, cols)
+                }
+            }),
+            J::Array(a) => a.iter().all(|c| walk(c, aliases, cols)),
+            _ => true,
+        }
+    }
+    serde_json::to_value(q).map(|v| walk(&v, &own_aliases, &own_cols)).unwrap_or(false)
+}
+
 /// The restriction of the grouped inner query to the keys that can matter: the subquery is evaluated for every key of its table, but
 /// the outer query only meets the keys of the outer rows that survive the conditions of its `WHERE` that mention the outer table
 /// of the key alone. So the derived table is restricted to `inner_key IN (SELECT DISTINCT outer_key FROM that_table WHERE those
@@ -311,8 +340,13 @@ fn reduction(parts: &Parts, conj: &[Expr], me: usize) -> Option<Expr> {
                         Some(b) if b == a => any = true,
                         _ => only = false,
                     },
-                    // (a scalar or EXISTS subquery may refer to other tables of the outer query; an IN list's subquery is taken as it is)
-                    Expr::Exists(_) | Expr::Subquery(_) | Expr::CmpQuant(..) | Expr::Var(_) | Expr::SysVar(_) => risky = true,
+                    // (a subquery that depends on the outer query may refer to other tables of it: only one that stands alone is taken)
+                    Expr::Exists(q) | Expr::Subquery(q) | Expr::InQuery(_, q, _) | Expr::CmpQuant(_, _, _, q) => {
+                        if !uncorrelated(q) {
+                            risky = true
+                        }
+                    }
+                    Expr::Var(_) | Expr::SysVar(_) => risky = true,
                     _ => {}
                 });
                 if only && any && !risky {
@@ -340,9 +374,9 @@ fn reduction(parts: &Parts, conj: &[Expr], me: usize) -> Option<Expr> {
 
 fn rewrite_conjunct(c: &Expr, conj: &[Expr], me: usize, outer: &[String], counter: &mut u64, extra_from: &mut Vec<TableRef>) -> Option<Vec<Expr>> {
     match c {
-        Expr::Exists(sq) => exists(sq, false, outer),
+        Expr::Exists(sq) => exists(sq, false, outer, conj, me),
         Expr::Not(inner) => match &**inner {
-            Expr::Exists(sq) => exists(sq, true, outer),
+            Expr::Exists(sq) => exists(sq, true, outer, conj, me),
             _ => None,
         },
         Expr::Binary(op, a, b) if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) => {
@@ -413,7 +447,7 @@ fn replace_subquery(e: &Expr, with: &Expr) -> Expr {
     }
 }
 
-fn exists(sq: &Query, negated: bool, outer: &[String]) -> Option<Vec<Expr>> {
+fn exists(sq: &Query, negated: bool, outer: &[String], conj: &[Expr], me: usize) -> Option<Vec<Expr>> {
     let parts = take_apart(sq, outer)?;
     if parts.keys.len() != 1 {
         return None;
@@ -423,6 +457,10 @@ fn exists(sq: &Query, negated: bool, outer: &[String]) -> Option<Vec<Expr>> {
     if negated {
         rest.push(Expr::IsNull(Box::new(inner_key.clone()), true));
     }
+    // (the grouped scalar case restricts its keys to those of the surviving outer rows, see `reduction`; here that was tried and made
+    // TPC-H Q22 slower: the restricted list is a long literal IN list, which the engine tests against every row of the scan. The
+    // `conj` and `me` arguments stay for when the engine tests long lists with a hash.)
+    let _ = (conj, me);
     // (distinct: the list is a set, and a long one is made a replicated table, so it must not repeat itself)
     let list = simple_query(Select {
         distinct: true,
