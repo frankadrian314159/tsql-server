@@ -128,7 +128,9 @@ after the other indexes. A real shredded index would be a change to the storage 
   values, the most common values with their shares and an equi-depth histogram. `col = lit`, ranges, `BETWEEN`, `IN`, `IS NULL`,
   `LIKE 'prefix%'`, `AND`, `OR` and `NOT` have a selectivity read off them. When a table is read through an index, the conditions the
   index does not answer (on other columns) multiply its estimate by their selectivity, so `WHERE indexed = 1 AND other = 2` is estimated
-  as fewer rows than `WHERE indexed = 1`. They order joins; they do not change an answer.
+  as fewer rows than `WHERE indexed = 1`. They order joins; they do not change an answer. Temporary tables, global temporary tables and
+  table variables are sampled in the same way; their statistics are kept in the session, by the heap they were taken from (the server's
+  are by page number, which the temporary store gives out again after a `DROP`), and go with the table.
 * **`IN (subquery)` of integers is tested with a hash**, and the rows of a subquery that does not use the outer row are shared, not copied,
   for each outer row. The keys of hash joins, groups and `DISTINCT` (`convert::key_into`) are written without a temporary string per value.
 * **Common conjuncts of an OR are factored out** when the statement is parsed: `(a AND b) OR (a AND c)` is

@@ -311,6 +311,21 @@ struct TableDataDesc {
 }
 
 // --------------------------------------------------------------- table data
+/// See `TableData::heap_ref`.
+#[derive(Clone)]
+pub struct HeapRef(std::sync::Weak<Tree>);
+
+impl HeapRef {
+    /// Whether `t` has the heap this was made from.
+    pub fn is_of(&self, t: &TableData) -> bool {
+        std::ptr::eq(self.0.as_ptr(), Arc::as_ptr(&t.heap))
+    }
+    /// Whether that heap still exists.
+    pub fn alive(&self) -> bool {
+        self.0.strong_count() > 0
+    }
+}
+
 /// The storage of one table: a heap tree (`RowId -> Slot`) and one tree per index. Handles are
 /// cheap to clone; clones share the pages (a clone is a second name for the same data, not a copy).
 #[derive(Clone, Debug)]
@@ -353,6 +368,12 @@ impl TableData {
     pub fn fresh(&self) -> TableData {
         let store = self.store().clone();
         TableData { heap: Arc::new(Tree::new(&store)), specs: self.specs.clone(), indexes: self.specs.iter().map(|_| Arc::new(Tree::new(&store))).collect(), mods: Default::default() }
+    }
+
+    /// A handle that recognises this table's heap later, for as long as the heap lives, and never mistakes another heap for it (a page
+    /// number may be given out again after a drop; the address of a heap that something still points to cannot be).
+    pub fn heap_ref(&self) -> HeapRef {
+        HeapRef(Arc::downgrade(&self.heap))
     }
 
     pub fn store(&self) -> &Arc<PageStore> {

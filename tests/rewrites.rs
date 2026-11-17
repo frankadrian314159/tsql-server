@@ -265,3 +265,34 @@ fn a_session_temporary_table_is_read_through_its_index() {
     exec(&mut c, "DECLARE @v TABLE (k INT PRIMARY KEY, v INT); INSERT @v VALUES (1, 10), (2, 20), (3, 30)");
     assert_eq!(rows(&mut c, "DECLARE @v TABLE (k INT PRIMARY KEY, v INT); INSERT @v VALUES (1, 10), (2, 20), (3, 30); SELECT v FROM @v WHERE k = 2"), vec![vec!["20".to_string()]]);
 }
+
+#[test]
+fn a_temporary_table_has_column_statistics_like_any_other() {
+    let mut c = conn();
+    // 6000 rows: g takes 100 values (60 rows each), tag is 'rare' for 1% of them
+    let fill = "DECLARE @i INT = 1; WHILE @i <= 6000 BEGIN INSERT #s VALUES (@i, @i % 100, CASE WHEN @i % 100 = 0 THEN 'rare' ELSE 'common' END); SET @i += 1 END";
+    exec(&mut c, "CREATE TABLE #s (id INT PRIMARY KEY, g INT NOT NULL, tag VARCHAR(10) NOT NULL)");
+    exec(&mut c, fill);
+    let eq = est_of(&mut c, "SELECT * FROM #s WHERE g = 7");
+    assert!((30.0..=120.0).contains(&eq), "g = 7 keeps about 60 of 6000 rows, not a third: {eq}");
+    let rare = est_of(&mut c, "SELECT * FROM #s WHERE tag = 'rare'");
+    assert!((30.0..=120.0).contains(&rare), "{rare}");
+    let common = est_of(&mut c, "SELECT * FROM #s WHERE tag = 'common'");
+    assert!(common > 5000.0, "{common}");
+    // the statistics follow the table: rows that change value without changing the count are sampled again
+    exec(&mut c, "UPDATE #s SET tag = 'rare' WHERE g < 50");
+    let after = est_of(&mut c, "SELECT * FROM #s WHERE tag = 'rare'");
+    assert!(after > 2000.0, "about 3000 rows now: {after}");
+    // a table made after another was dropped is not read through the old one's statistics, whatever page it is given
+    exec(&mut c, "DROP TABLE #s");
+    exec(&mut c, "CREATE TABLE #s (id INT PRIMARY KEY, g INT NOT NULL, tag VARCHAR(10) NOT NULL)");
+    exec(&mut c, &fill.replace("@i % 100", "@i % 4"));
+    let fewer = est_of(&mut c, "SELECT * FROM #s WHERE g = 1");
+    assert!((1000.0..=2000.0).contains(&fewer), "four values of g: about 1500 rows: {fewer}");
+    // and a join of two temporary tables, ordered by these estimates, gives the rows it should
+    exec(&mut c, "CREATE TABLE #t (id INT PRIMARY KEY, v INT NOT NULL)");
+    exec(&mut c, "DECLARE @i INT = 1; WHILE @i <= 6000 BEGIN INSERT #t VALUES (@i, @i % 7); SET @i += 1 END");
+    exec(&mut c, "UPDATE #s SET g = id % 100");
+    let rows = sorted(&mut c, "SELECT s.id, t.v FROM #t t JOIN #s s ON s.id = t.id WHERE s.g = 7");
+    assert_eq!(rows.len(), 60);
+}

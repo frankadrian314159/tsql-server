@@ -87,6 +87,7 @@ fn queries_over_big_tables_give_the_same_rows_with_and_without_the_pruning() {
 
 #[test]
 fn the_pruning_is_in_effect_and_says_so_in_the_plan() {
+    let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
     let mut c = data();
     exec(&mut c, "SELECT grp, SUM(amount) FROM plain GROUP BY grp");
     assert!(c.last_plan().iter().any(|l| l.contains("copies 2 of its 6 columns")), "{:?}", c.last_plan());

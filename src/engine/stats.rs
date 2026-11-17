@@ -149,16 +149,24 @@ use chrono::Datelike;
 
 impl<'a> Engine<'a> {
     /// The statistics of `t`, sampled now when there are none or they are stale (see the module comment); None for a table that is
-    /// small, temporary or cannot be sampled.
+    /// small or cannot be sampled. A temporary table or table variable is sampled like any other (a plan over `#t` that was filled
+    /// by an earlier statement of the batch is as much in need of them), but its statistics are kept in the session, by the heap
+    /// they were taken from: the server's are by page number, and the temporary store gives a page number out again after a drop.
     fn table_stats(&mut self, t: &Table) -> Option<Arc<TableStats>> {
         let slots = t.data.slot_count();
-        if slots < MIN_SLOTS || t.is_temp || !t.data.is_attached() {
+        if slots < MIN_SLOTS || !t.data.is_attached() {
             return None;
         }
         let id = t.data.heap_id();
         // (read before the sample, so writes made while it is taken count towards the next one)
         let mods = t.data.modifications();
-        if let Some(s) = self.srv.stats.lock().unwrap_or_else(|e| e.into_inner()).get(&id) {
+        if t.is_temp {
+            if let Some((_, s)) = self.ses.temp_stats.iter().find(|(h, _)| h.is_of(&t.data)) {
+                if fresh(s, slots, mods) {
+                    return Some(s.clone());
+                }
+            }
+        } else if let Some(s) = self.srv.stats.lock().unwrap_or_else(|e| e.into_inner()).get(&id) {
             if fresh(s, slots, mods) {
                 return Some(s.clone());
             }
@@ -176,7 +184,16 @@ impl<'a> Engine<'a> {
             return None;
         }
         let st = Arc::new(build(&rows, t.columns.len(), slots, mods));
-        self.srv.stats.lock().unwrap_or_else(|e| e.into_inner()).insert(id, st.clone());
+        if t.is_temp {
+            let mine = &mut self.ses.temp_stats;
+            mine.retain(|(h, _)| h.alive() && !h.is_of(&t.data));
+            if mine.len() >= 32 {
+                mine.remove(0);
+            }
+            mine.push((t.data.heap_ref(), st.clone()));
+        } else {
+            self.srv.stats.lock().unwrap_or_else(|e| e.into_inner()).insert(id, st.clone());
+        }
         Some(st)
     }
 
