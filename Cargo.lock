@@ -4477,6 +4477,7 @@ dependencies = [
  "egui",
  "egui_extras",
  "encoding_rs",
+ "futures-util",
  "md-5",
  "mimalloc",
  "postcard",

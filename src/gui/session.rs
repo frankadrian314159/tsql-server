@@ -1,12 +1,15 @@
 //! The app's one database session, which can run a script on a worker thread so a long query does not freeze the window.
 //!
-//! The `Connection` is moved to the worker while it runs and handed back with the results, so the transaction,
+//! The connection (a `Backend`) is moved to the worker while it runs and handed back with the results, so the transaction,
 //! isolation level and locks stay those of a single session. While a script runs the session is *busy*: it cannot be
 //! used (dereferencing it panics), so the UI must not touch it; the transaction count and login are cached for display.
 use std::ops::{Deref, DerefMut};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
-use tsql_server::{BatchResult, Connection};
+use crate::backend::Backend;
+use tsql_server::BatchResult;
+
+type Conn = Box<dyn Backend>;
 
 /// A finished background script.
 pub struct Finished {
@@ -15,20 +18,20 @@ pub struct Finished {
 }
 
 struct Job {
-    rx: Receiver<(Connection, Finished)>,
+    rx: Receiver<(Conn, Finished)>,
     started: Instant,
 }
 
 pub struct Session {
-    conn: Option<Connection>,
+    conn: Option<Conn>,
     job: Option<Job>,
     trancount: i32,
     login: String,
 }
 
 impl Session {
-    pub fn new(conn: Connection) -> Session {
-        let mut s = Session { conn: Some(conn), job: None, trancount: 0, login: String::new() };
+    pub fn new(conn: impl Backend + 'static) -> Session {
+        let mut s = Session { conn: Some(Box::new(conn)), job: None, trancount: 0, login: String::new() };
         s.refresh_cache();
         s
     }
@@ -66,12 +69,17 @@ impl Session {
 
     /// Run a script (`GO`-separated) on a worker thread. `wake` is called when it finishes.
     pub fn start(&mut self, script: String, wake: impl FnOnce() + Send + 'static) {
+        self.start_with(move |c| c.execute_script(&script), wake);
+    }
+
+    /// Run a job on the worker thread: any work on the connection that produces results (a bulk import, a backup).
+    pub fn start_with(&mut self, job: impl FnOnce(&mut dyn Backend) -> Vec<BatchResult> + Send + 'static, wake: impl FnOnce() + Send + 'static) {
         self.refresh_cache();
         let mut conn = self.conn.take().expect("a script is already running");
         let (tx, rx) = channel();
         std::thread::spawn(move || {
             let t = Instant::now();
-            let results = conn.execute_script(&script);
+            let results = job(&mut *conn);
             let _ = tx.send((conn, Finished { results, elapsed: t.elapsed() }));
             wake();
         });
@@ -115,8 +123,8 @@ impl Session {
     }
 
     /// Replace the connection (after switching servers). Only valid while idle.
-    pub fn replace(&mut self, conn: Connection) {
-        self.conn = Some(conn);
+    pub fn replace(&mut self, conn: impl Backend + 'static) {
+        self.conn = Some(Box::new(conn));
         self.job = None;
         self.refresh_cache();
     }
@@ -128,14 +136,14 @@ impl Session {
 }
 
 impl Deref for Session {
-    type Target = Connection;
-    fn deref(&self) -> &Connection {
-        self.conn.as_ref().expect("the session is busy running a script")
+    type Target = dyn Backend;
+    fn deref(&self) -> &(dyn Backend + 'static) {
+        &**self.conn.as_ref().expect("the session is busy running a script")
     }
 }
 
 impl DerefMut for Session {
-    fn deref_mut(&mut self) -> &mut Connection {
-        self.conn.as_mut().expect("the session is busy running a script")
+    fn deref_mut(&mut self) -> &mut (dyn Backend + 'static) {
+        &mut **self.conn.as_mut().expect("the session is busy running a script")
     }
 }

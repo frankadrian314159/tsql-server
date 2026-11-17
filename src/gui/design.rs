@@ -1,7 +1,8 @@
 //! Design view: a table's structure, with the common schema changes.
 use egui::{RichText, TextEdit};
 use tsql_server::inspect::TableInfo;
-use tsql_server::{tools, Connection};
+use crate::backend::Backend;
+use tsql_server::tools;
 
 use crate::ui::{Event, ACCENT, ERROR};
 
@@ -36,7 +37,7 @@ impl Design {
         self.dirty = true;
     }
 
-    pub fn refresh(&mut self, conn: &Connection) {
+    pub fn refresh(&mut self, conn: &mut dyn Backend) {
         self.dirty = false;
         self.info = conn.table_info(&self.table);
     }
@@ -103,7 +104,7 @@ impl Design {
         format!("ALTER TABLE {} DROP CONSTRAINT {}", self.quoted(), tools::bracket(name))
     }
 
-    fn run(&mut self, conn: &mut Connection, sql: Result<String, String>, ok: &str, ev: &mut Vec<Event>) {
+    fn run(&mut self, conn: &mut dyn Backend, sql: Result<String, String>, ok: &str, ev: &mut Vec<Event>) {
         match sql {
             Err(e) => ev.push(Event::Error(e)),
             Ok(sql) => match conn.run(&sql) {
@@ -117,11 +118,11 @@ impl Design {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, conn: &mut Connection, ev: &mut Vec<Event>) {
+    pub fn ui(&mut self, ui: &mut egui::Ui, conn: &mut dyn Backend, ev: &mut Vec<Event>) {
         ui.push_id(("design", self.table.clone()), |ui| self.show(ui, conn, ev));
     }
 
-    fn show(&mut self, ui: &mut egui::Ui, conn: &mut Connection, ev: &mut Vec<Event>) {
+    fn show(&mut self, ui: &mut egui::Ui, conn: &mut dyn Backend, ev: &mut Vec<Event>) {
         if self.dirty {
             self.refresh(conn);
         }
@@ -289,14 +290,14 @@ impl Design {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tsql_server::Server;
+    use tsql_server::{Connection, Server};
 
     fn setup() -> (Connection, Design) {
         let mut c = Server::new().connect();
         c.run("CREATE TABLE dbo.p (id INT PRIMARY KEY, name NVARCHAR(30) NOT NULL, amt INT NULL)").unwrap();
         c.run("INSERT p VALUES (1, N'a', 5)").unwrap();
         let mut d = Design::new("dbo.p".into());
-        d.refresh(&c);
+        d.refresh(&mut c);
         (c, d)
     }
 
@@ -344,7 +345,7 @@ mod tests {
         assert!(d.info.as_ref().unwrap().indexes.iter().all(|i| i.name != "ix_p_name_amt"));
         // a unique constraint is dropped as a constraint
         c.run("ALTER TABLE p ADD CONSTRAINT uq_name UNIQUE (name)").unwrap();
-        d.refresh(&c);
+        d.refresh(&mut c);
         let uq = d.info.clone().unwrap().indexes.into_iter().find(|i| i.name == "uq_name").unwrap();
         assert!(uq.constraint);
         let sql = d.drop_index_sql("uq_name", uq.constraint);
@@ -359,7 +360,7 @@ mod tests {
         let (mut c, _) = setup();
         c.run("CREATE TABLE dbo.k (id INT PRIMARY KEY, pid INT, CONSTRAINT fk_k_p FOREIGN KEY (pid) REFERENCES dbo.p(id))").unwrap();
         let mut d = Design::new("dbo.k".into());
-        d.refresh(&c);
+        d.refresh(&mut c);
         assert_eq!(d.info.as_ref().unwrap().foreign_keys.len(), 1);
         let sql = d.drop_fk_sql("fk_k_p");
         apply(&mut c, &mut d, Ok(sql)).unwrap();

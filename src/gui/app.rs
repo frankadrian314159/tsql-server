@@ -1,11 +1,15 @@
 //! Application shell: menu, navigation pane, tabs, dialogs, status bar.
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use egui::{Key, RichText};
 use tsql_server::inspect::{ObjectEntry, ObjectKind};
-use tsql_server::{tools, Server, StorageOptions};
+use tsql_server::{tools, BatchResult, Event as SqlEvent, Server, StorageOptions};
 
+use crate::backend::Backend;
 use crate::datasheet::Datasheet;
+use crate::remote::{RemoteBackend, Target};
 use crate::design::Design;
 use crate::query::QueryTab;
 use crate::sample::SAMPLE_SQL;
@@ -64,6 +68,8 @@ enum Confirm {
 enum Deferred {
     /// Open this data directory (`None`: a new in-memory database).
     Open(Option<PathBuf>),
+    /// Connect to this server.
+    Connect(Target),
     Exit,
 }
 
@@ -76,8 +82,60 @@ struct ImportDialog {
     error: Option<String>,
 }
 
+/// The "Connect to server" window.
+struct ConnectDialog {
+    target: Target,
+    port: String,
+    error: Option<String>,
+}
+
+/// "Export backup" and "Import backup".
+struct BackupDialog {
+    restore: bool,
+    path: String,
+    database: String,
+    /// Write a Microsoft SQL Server `.bak` instead of this server's own format (export only).
+    sql_server_format: bool,
+    /// Replace the database when it exists (import only).
+    replace: bool,
+    /// What the file is, read from its first bytes (a file on this machine only).
+    detected: Option<String>,
+    error: Option<String>,
+}
+
+const DELIMITERS: [(&str, char); 4] = [("comma", ','), ("tab", '\t'), ("semicolon", ';'), ("pipe", '|')];
+
+/// "Bulk import": a delimited file of any size into a table.
+struct BulkDialog {
+    path: String,
+    table: String,
+    delimiter: usize,
+    header: bool,
+    create: bool,
+    batch: String,
+    one_transaction: bool,
+    preview: Vec<Vec<String>>,
+    error: Option<String>,
+}
+
+/// A job that runs on the session's worker thread besides a query tab's script.
+struct Task {
+    label: String,
+    /// Rows done, for a job that counts them.
+    progress: Option<Arc<AtomicU64>>,
+    cancel: Arc<AtomicBool>,
+}
+
 pub struct App {
+    /// Things that must live as long as the window: the listener of a server this process started for itself.
+    held: Vec<Box<dyn std::any::Any>>,
     server: Server,
+    backup: Option<BackupDialog>,
+    bulk: Option<BulkDialog>,
+    task: Option<Task>,
+    /// `host:port` while the session is on a server over TDS (`server` is then an unused empty engine).
+    remote: Option<String>,
+    connect: Option<ConnectDialog>,
     conn: Session,
     dir: Option<PathBuf>,
     opts: StorageOptions,
@@ -112,6 +170,7 @@ fn kind_sql(k: &ObjectKind) -> &'static str {
         ObjectKind::Procedure => "PROCEDURE",
         ObjectKind::Function => "FUNCTION",
         ObjectKind::Sequence => "SEQUENCE",
+        ObjectKind::Synonym => "SYNONYM",
     }
 }
 
@@ -130,7 +189,13 @@ impl App {
         let server = Server::new();
         let conn = Session::new(server.connect());
         let mut app = App {
+            held: vec![],
             server,
+            remote: None,
+            connect: None,
+            backup: None,
+            bulk: None,
+            task: None,
             conn,
             dir: None,
             opts,
@@ -165,6 +230,7 @@ impl App {
         // release the old directory first: only one server may have it open
         self.server = Server::new();
         self.conn.replace(self.server.connect());
+        self.remote = None;
         self.dir = None;
         match &dir {
             None => {
@@ -191,6 +257,178 @@ impl App {
             self.confirm = Some(Confirm::Transaction(Deferred::Open(dir)));
         } else {
             self.open_dir(dir);
+        }
+    }
+
+    /// Keep `thing` alive as long as the app.
+    pub fn hold(&mut self, thing: impl std::any::Any) {
+        self.held.push(Box::new(thing));
+    }
+
+    /// Connect at start-up: when the server does not take the login, the connect window opens with the reason, ready for another try.
+    pub fn connect_or_ask(&mut self, t: Target) {
+        self.connect = Some(ConnectDialog { port: t.port.to_string(), target: t.clone(), error: None });
+        self.start_connect(t);
+    }
+
+    /// Connect to a server over TDS (asks first when a transaction is open).
+    pub fn start_connect(&mut self, t: Target) {
+        if self.conn.transaction_count() > 0 {
+            self.confirm = Some(Confirm::Transaction(Deferred::Connect(t)));
+        } else {
+            self.connect_remote(t);
+        }
+    }
+
+    /// Replace the session by one on a server; on failure the dialog (or the error line) says why and nothing changes.
+    pub fn connect_remote(&mut self, t: Target) -> bool {
+        match RemoteBackend::connect(&t) {
+            Ok(b) => {
+                self.tabs.clear();
+                self.active = 0;
+                self.server = Server::new();
+                self.remote = Some(format!("{}:{}", t.host, t.port));
+                self.conn.replace(b);
+                self.dir = None;
+                self.status = format!("Connected to {}:{}", t.host, t.port);
+                self.error = None;
+                self.connect = None;
+                self.isolation = "READ COMMITTED";
+                self.refresh_nav();
+                true
+            }
+            Err(e) => {
+                match self.connect.as_mut() {
+                    Some(d) => d.error = Some(e),
+                    None => self.error = Some(e),
+                }
+                false
+            }
+        }
+    }
+
+    /// Start a job on the session's worker thread; its outcome is shown when it finishes (`finish_task`).
+    fn start_task(&mut self, ctx: &egui::Context, label: String, progress: Option<Arc<AtomicU64>>, cancel: Arc<AtomicBool>, job: impl FnOnce(&mut dyn Backend) -> Vec<BatchResult> + Send + 'static) {
+        let c = ctx.clone();
+        self.conn.start_with(job, move || c.request_repaint());
+        self.status = label.clone();
+        self.error = None;
+        self.task = Some(Task { label, progress, cancel });
+    }
+
+    /// The job has finished: the first error, or what it said, goes to the status bar.
+    fn finish_task(&mut self, results: &[BatchResult], task: Task) {
+        let error = results.iter().find_map(|r| r.first_error());
+        match error {
+            Some(e) => self.error = Some(format!("{} failed: Msg {}: {}", task.label, e.number, e.message)),
+            None => {
+                let said = results.iter().flat_map(|r| r.events.iter()).filter_map(|e| if let SqlEvent::Message(m) = e { Some(m.clone()) } else { None }).last();
+                self.status = said.unwrap_or_else(|| format!("{}: done", task.label));
+                self.error = None;
+            }
+        }
+        self.after_change();
+    }
+
+    fn open_backup(&mut self, restore: bool) {
+        let db = if restore { String::new() } else { self.current_db.clone() };
+        self.backup = Some(BackupDialog { restore, path: String::new(), database: db, sql_server_format: false, replace: false, detected: None, error: None });
+    }
+
+    /// What kind of backup the file is, from its first bytes.
+    fn detect_backup(path: &str) -> Option<String> {
+        use std::io::Read;
+        let mut head = [0u8; 4096];
+        let n = std::fs::File::open(path).and_then(|mut f| f.read(&mut head)).ok()?;
+        if head[..n].starts_with(b"TSQLBAK1") {
+            Some("a tsql-server backup".into())
+        } else if tsql_server::mssqlbak::is_bak(&head[..n]) || tsql_server::mtf::is_mtf(&head[..n]) {
+            Some("a Microsoft SQL Server backup".into())
+        } else {
+            Some("not a backup this server reads".into())
+        }
+    }
+
+    /// Start the export or import the dialog describes (the dialog stays open, with the reason, when it cannot).
+    fn run_backup(&mut self, ctx: &egui::Context) {
+        let d = self.backup.as_mut().expect("the dialog is open");
+        if d.path.trim().is_empty() || d.database.trim().is_empty() {
+            d.error = Some("Give a file and a database".into());
+        } else {
+            let path = d.path.trim().replace('\'', "''");
+            let db = tools::bracket(d.database.trim());
+            let (sql, label) = if d.restore {
+                (format!("RESTORE DATABASE {db} FROM DISK = N'{path}'{}", if d.replace { " WITH REPLACE" } else { "" }), format!("Importing backup into {}", d.database.trim()))
+            } else {
+                (format!("BACKUP DATABASE {db} TO DISK = N'{path}'{}", if d.sql_server_format { " WITH SQL_SERVER_FORMAT" } else { "" }), format!("Exporting {} to a backup", d.database.trim()))
+            };
+            self.backup = None;
+            self.start_task(ctx, label, None, Arc::new(AtomicBool::new(false)), move |c| c.execute_script(&sql));
+        }
+    }
+
+    /// Start the bulk import the dialog describes.
+    fn run_bulk(&mut self, ctx: &egui::Context) {
+        let d = self.bulk.as_mut().expect("the dialog is open");
+        let batch = d.batch.trim().parse::<usize>().ok().filter(|n| *n > 0);
+        if d.path.trim().is_empty() || d.table.trim().is_empty() {
+            d.error = Some("Give a file and a table".into());
+        } else if batch.is_none() {
+            d.error = Some("Rows per batch must be a positive number".into());
+        } else {
+            match std::fs::File::open(d.path.trim()) {
+                Err(e) => d.error = Some(format!("Cannot read the file: {e}")),
+                Ok(f) => {
+                    let table = d.table.trim().to_string();
+                    let opts = tools::BulkOptions { delimiter: DELIMITERS[d.delimiter].1, header: d.header, create: d.create, batch: batch.unwrap_or(1000), one_transaction: d.one_transaction };
+                    let progress = Arc::new(AtomicU64::new(0));
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    let (p, c, t) = (progress.clone(), cancel.clone(), table.clone());
+                    self.bulk = None;
+                    self.start_task(ctx, format!("Importing into {table}"), Some(progress), cancel, move |conn| {
+                        let r = tools::bulk_import(conn, &t, std::io::BufReader::with_capacity(1 << 20, f), &opts, &mut |n| {
+                            p.store(n, Ordering::Relaxed);
+                            !c.load(Ordering::Relaxed)
+                        });
+                        let ev = match r {
+                            Ok(n) => SqlEvent::Message(format!("Imported {n} rows into {t}")),
+                            Err(e) => SqlEvent::Error(e),
+                        };
+                        vec![BatchResult { events: vec![ev] }]
+                    });
+                }
+            }
+        }
+    }
+
+    fn open_bulk(&mut self) {
+        self.bulk = Some(BulkDialog { path: String::new(), table: String::new(), delimiter: 0, header: true, create: true, batch: "1000".into(), one_transaction: true, preview: vec![], error: None });
+    }
+
+    /// Read the first records of the file for the preview, and suggest a table name.
+    fn bulk_preview(d: &mut BulkDialog) {
+        d.preview.clear();
+        d.error = None;
+        match std::fs::File::open(&d.path) {
+            Ok(f) => {
+                let mut rd = tools::CsvReader::new(std::io::BufReader::new(f), DELIMITERS[d.delimiter].1);
+                for _ in 0..6 {
+                    match rd.next_record() {
+                        Ok(Some(r)) => d.preview.push(r),
+                        Ok(None) => break,
+                        Err(e) => {
+                            d.error = Some(e);
+                            break;
+                        }
+                    }
+                }
+                if d.table.trim().is_empty() {
+                    if let Some(stem) = std::path::Path::new(&d.path).file_stem() {
+                        d.table = stem.to_string_lossy().into_owned();
+                    }
+                }
+            }
+            Err(e) => d.error = Some(format!("Cannot read the file: {e}")),
         }
     }
 
@@ -342,10 +580,27 @@ impl App {
                         ui.close();
                         self.start_open(None);
                     }
+                    if ui.button("Connect to server...").on_hover_text("Work on a server over TDS: a cluster's control node or any SQL Server work-alike").clicked() {
+                        ui.close();
+                        self.connect = Some(ConnectDialog { target: Target::default(), port: "1433".into(), error: None });
+                    }
+                    ui.separator();
+                    if ui.button("Import backup (.bak)...").on_hover_text("Restore a database from a backup file: this server's own format or a Microsoft SQL Server .bak").clicked() {
+                        ui.close();
+                        self.open_backup(true);
+                    }
+                    if ui.button("Export backup (.bak)...").on_hover_text("Back a database up to a file, in this server's own format or as a Microsoft SQL Server .bak").clicked() {
+                        ui.close();
+                        self.open_backup(false);
+                    }
                     ui.separator();
                     if ui.button("Import CSV...").clicked() {
                         ui.close();
                         self.pick_import();
+                    }
+                    if ui.button("Bulk import...").on_hover_text("Load a large delimited file into a table, a batch of rows at a time").clicked() {
+                        ui.close();
+                        self.open_bulk();
                     }
                     if ui.button("Export current grid to CSV...").clicked() {
                         ui.close();
@@ -403,8 +658,12 @@ impl App {
                     ui.separator();
                     if ui.button("Checkpoint").on_hover_text("Write all changes to the data files and empty the log").clicked() {
                         ui.close();
-                        self.server.checkpoint();
-                        self.status = if self.dir.is_some() { "Checkpoint requested".into() } else { "In-memory database: nothing to checkpoint".into() };
+                        if self.remote.is_some() {
+                            self.run_script("CHECKPOINT", "Checkpoint requested");
+                        } else {
+                            self.server.checkpoint();
+                            self.status = if self.dir.is_some() { "Checkpoint requested".into() } else { "In-memory database: nothing to checkpoint".into() };
+                        }
                     }
                     if ui.button("Storage statistics...").clicked() {
                         ui.close();
@@ -474,7 +733,7 @@ impl App {
                                             ev.push(Event::OpenQuery { name: Some(o.name.clone()), sql: d });
                                         }
                                     }
-                                    ObjectKind::Sequence => {}
+                                    ObjectKind::Sequence | ObjectKind::Synonym => {}
                                 }
                             }
                             r.context_menu(|ui| {
@@ -549,9 +808,10 @@ impl App {
     fn status_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                match &self.dir {
-                    Some(p) => ui.label(RichText::new(p.display().to_string()).weak()),
-                    None => ui.label(RichText::new("in-memory database").weak()),
+                match (&self.remote, &self.dir) {
+                    (Some(a), _) => ui.label(RichText::new(format!("server {a}")).weak()),
+                    (None, Some(p)) => ui.label(RichText::new(p.display().to_string()).weak()),
+                    (None, None) => ui.label(RichText::new("in-memory database").weak()),
                 };
                 ui.separator();
                 ui.label(RichText::new(format!("{}  ·  {}", self.conn.login(), self.isolation.to_lowercase())).weak());
@@ -628,7 +888,7 @@ impl App {
             });
             if go {
                 if let Some(d) = &mut self.import {
-                    match tools::import_csv(&mut self.conn, d.name.trim(), &d.text, d.create) {
+                    match tools::import_csv(&mut *self.conn, d.name.trim(), &d.text, d.create) {
                         Ok(n) => {
                             let name = d.name.trim().to_string();
                             self.import = None;
@@ -644,6 +904,261 @@ impl App {
                 }
             } else if !open {
                 self.import = None;
+            }
+        }
+
+        // ---- a job on the worker thread (bulk import, backup, restore)
+        if let Some(t) = &self.task {
+            let done = t.progress.as_ref().map(|p| p.load(Ordering::Relaxed));
+            let label = t.label.clone();
+            let cancel = t.cancel.clone();
+            let counted = t.progress.is_some();
+            egui::Window::new("Working...").collapsible(false).resizable(false).show(ctx, |ui| {
+                ui.label(&label);
+                match done {
+                    Some(n) => {
+                        ui.label(format!("{n} rows so far"));
+                    }
+                    None => {
+                        ui.spinner();
+                    }
+                }
+                if counted && ui.button("Stop").on_hover_text("Stop the import; a single transaction is rolled back").clicked() {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            });
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+
+        // ---- import or export a backup
+        if self.backup.is_some() {
+            let mut go = false;
+            let mut cancel = false;
+            let remote = self.remote.is_some();
+            let dbs = self.databases.clone();
+            if let Some(d) = self.backup.as_mut() {
+                let title = if d.restore { "Import backup" } else { "Export backup" };
+                egui::Window::new(title).collapsible(false).resizable(false).show(ctx, |ui| {
+                    egui::Grid::new("backup").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                        ui.label(if remote { "File on the server" } else { "File" });
+                        ui.horizontal(|ui| {
+                            if ui.add(egui::TextEdit::singleline(&mut d.path).desired_width(340.0)).changed() && d.restore && !remote {
+                                d.detected = Self::detect_backup(&d.path);
+                            }
+                            if !remote && ui.button("Browse...").clicked() {
+                                let dlg = rfd::FileDialog::new().add_filter("Backup", &["bak"]);
+                                let pick = if d.restore { dlg.pick_file() } else { dlg.set_file_name(format!("{}.bak", d.database)).save_file() };
+                                if let Some(p) = pick {
+                                    d.path = p.display().to_string();
+                                    if d.restore {
+                                        d.detected = Self::detect_backup(&d.path);
+                                        if d.database.trim().is_empty() {
+                                            d.database = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                        ui.end_row();
+                        if d.restore {
+                            ui.label("Restore as database");
+                            ui.text_edit_singleline(&mut d.database);
+                            ui.end_row();
+                            ui.label("The file is");
+                            ui.label(d.detected.clone().unwrap_or_else(|| if remote { "read by the server".into() } else { "(choose a file)".into() }));
+                            ui.end_row();
+                            ui.label("");
+                            ui.checkbox(&mut d.replace, "Replace the database if it exists");
+                            ui.end_row();
+                        } else {
+                            ui.label("Database");
+                            egui::ComboBox::from_id_salt("backup_db").selected_text(d.database.clone()).show_ui(ui, |ui| {
+                                for n in &dbs {
+                                    ui.selectable_value(&mut d.database, n.clone(), n);
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("Format");
+                            ui.vertical(|ui| {
+                                ui.radio_value(&mut d.sql_server_format, false, "tsql-server (this server's own format)");
+                                ui.radio_value(&mut d.sql_server_format, true, "Microsoft SQL Server .bak");
+                            });
+                            ui.end_row();
+                        }
+                    });
+                    if d.restore {
+                        ui.label(RichText::new("Either kind of file is read: the format is told from the first bytes of the file.").weak());
+                    }
+                    if let Some(e) = &d.error {
+                        ui.colored_label(ERROR, e);
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(if d.restore { "Import" } else { "Export" }).clicked() {
+                            go = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            }
+            if cancel {
+                self.backup = None;
+            } else if go {
+                self.run_backup(ctx);
+            }
+        }
+
+        // ---- bulk import
+        if self.bulk.is_some() {
+            let mut go = false;
+            let mut cancel = false;
+            let tables: Vec<String> = self.objects.iter().filter(|o| o.kind == ObjectKind::Table).map(|o| o.qualified()).collect();
+            if let Some(d) = self.bulk.as_mut() {
+                egui::Window::new("Bulk import").collapsible(false).resizable(false).show(ctx, |ui| {
+                    egui::Grid::new("bulk").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                        ui.label("File");
+                        ui.horizontal(|ui| {
+                            let changed = ui.add(egui::TextEdit::singleline(&mut d.path).desired_width(340.0)).changed();
+                            let mut picked = false;
+                            if ui.button("Browse...").clicked() {
+                                if let Some(p) = rfd::FileDialog::new().add_filter("Delimited text", &["csv", "tsv", "txt", "tbl", "dat"]).pick_file() {
+                                    d.path = p.display().to_string();
+                                    d.table.clear();
+                                    picked = true;
+                                }
+                            }
+                            if changed || picked {
+                                Self::bulk_preview(d);
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("Table");
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut d.table).desired_width(240.0));
+                            egui::ComboBox::from_id_salt("bulk_table").selected_text("existing...").show_ui(ui, |ui| {
+                                for t in &tables {
+                                    if ui.selectable_label(false, t).clicked() {
+                                        d.table = t.clone();
+                                    }
+                                }
+                            });
+                        });
+                        ui.end_row();
+                        ui.label("Delimiter");
+                        let before = d.delimiter;
+                        egui::ComboBox::from_id_salt("bulk_delim").selected_text(DELIMITERS[d.delimiter].0).show_ui(ui, |ui| {
+                            for (i, (name, _)) in DELIMITERS.iter().enumerate() {
+                                ui.selectable_value(&mut d.delimiter, i, *name);
+                            }
+                        });
+                        if before != d.delimiter && !d.path.is_empty() {
+                            Self::bulk_preview(d);
+                        }
+                        ui.end_row();
+                        ui.label("");
+                        ui.checkbox(&mut d.header, "The first line names the columns");
+                        ui.end_row();
+                        ui.label("");
+                        ui.checkbox(&mut d.create, "Create the table when it does not exist (types are inferred from the first 1000 lines)");
+                        ui.end_row();
+                        ui.label("Rows per batch");
+                        ui.add(egui::TextEdit::singleline(&mut d.batch).desired_width(80.0));
+                        ui.end_row();
+                        ui.label("");
+                        ui.checkbox(&mut d.one_transaction, "All or nothing (one transaction); otherwise each batch commits by itself");
+                        ui.end_row();
+                    });
+                    if !d.preview.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("First lines").strong());
+                        for r in &d.preview {
+                            let line = r.iter().map(|c| c.chars().take(24).collect::<String>()).collect::<Vec<_>>().join("  |  ");
+                            ui.label(RichText::new(line.chars().take(110).collect::<String>()).monospace());
+                        }
+                    }
+                    if let Some(e) = &d.error {
+                        ui.colored_label(ERROR, e);
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Import").clicked() {
+                            go = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            }
+            if cancel {
+                self.bulk = None;
+            } else if go {
+                self.run_bulk(ctx);
+            }
+        }
+
+        // ---- connect to a server
+        if self.connect.is_some() {
+            let mut go = false;
+            let mut cancel = false;
+            if let Some(d) = self.connect.as_mut() {
+                egui::Window::new("Connect to server").collapsible(false).resizable(false).show(ctx, |ui| {
+                    egui::Grid::new("connect").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                        ui.label("Server");
+                        ui.text_edit_singleline(&mut d.target.host);
+                        ui.end_row();
+                        ui.label("Port");
+                        ui.text_edit_singleline(&mut d.port);
+                        ui.end_row();
+                        ui.label("Login");
+                        ui.text_edit_singleline(&mut d.target.login);
+                        ui.end_row();
+                        ui.label("Password");
+                        let pw = ui.add(egui::TextEdit::singleline(&mut d.target.password).password(true));
+                        ui.end_row();
+                        ui.label("Database");
+                        ui.text_edit_singleline(&mut d.target.database);
+                        ui.end_row();
+                        ui.label("");
+                        ui.checkbox(&mut d.target.encrypt, "Encrypt (TLS)");
+                        ui.end_row();
+                        if pw.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                            go = true;
+                        }
+                    });
+                    if let Some(e) = &d.error {
+                        ui.colored_label(ERROR, e);
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Connect").clicked() {
+                            go = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            }
+            if cancel {
+                self.connect = None;
+            } else if go {
+                let t = self.connect.as_mut().and_then(|d| match d.port.trim().parse::<u16>() {
+                    Ok(p) => {
+                        d.target.port = p;
+                        d.error = None;
+                        Some(d.target.clone())
+                    }
+                    Err(_) => {
+                        d.error = Some("The port must be a number".into());
+                        None
+                    }
+                });
+                if let Some(t) = t {
+                    self.start_connect(t);
+                }
             }
         }
 
@@ -682,6 +1197,9 @@ impl App {
                 if finished {
                     match next {
                         Deferred::Open(dir) => self.open_dir(dir),
+                        Deferred::Connect(t) => {
+                            self.connect_remote(t);
+                        }
                         Deferred::Exit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                     }
                 }
@@ -716,7 +1234,13 @@ impl App {
             }
         }
 
-        if self.storage_window {
+        if self.storage_window && self.remote.is_some() {
+            let mut open = true;
+            egui::Window::new("Storage statistics").open(&mut open).collapsible(false).show(ctx, |ui| {
+                ui.label(RichText::new("The storage engine of a server is not visible over the wire; its metrics are on the server's /metrics endpoint.").weak());
+            });
+            self.storage_window = open;
+        } else if self.storage_window {
             let (data, temp) = self.server.storage_stats();
             egui::Window::new("Storage statistics").open(&mut self.storage_window).collapsible(false).show(ctx, |ui| {
                 egui::Grid::new("storage").striped(true).spacing([20.0, 4.0]).show(ui, |ui| {
@@ -773,11 +1297,15 @@ impl App {
 
         // a script that was running on the worker thread has finished: hand the results to its tab
         if let Some(fin) = self.conn.poll() {
-            let mut fin = Some(fin);
-            for t in self.tabs.iter_mut() {
-                if let (Tab::Query(q), true) = (&mut *t, fin.is_some()) {
-                    if q.running {
-                        q.finish(fin.take().unwrap(), &mut ev);
+            if let Some(task) = self.task.take() {
+                self.finish_task(&fin.results, task);
+            } else {
+                let mut fin = Some(fin);
+                for t in self.tabs.iter_mut() {
+                    if let (Tab::Query(q), true) = (&mut *t, fin.is_some()) {
+                        if q.running {
+                            q.finish(fin.take().unwrap(), &mut ev);
+                        }
                     }
                 }
             }
@@ -790,6 +1318,7 @@ impl App {
                     q.running = false;
                 }
             }
+            self.task = None;
             self.error = Some("The running script crashed its session; a new session was started (an open transaction was lost).".into());
         }
         if self.conn.is_busy() {
@@ -826,8 +1355,8 @@ impl App {
                 Tab::Datasheet(_) | Tab::Design(_) if self.conn.is_busy() => {
                     ui.label("Waiting for the running script to finish...");
                 }
-                Tab::Datasheet(d) => d.ui(ui, &mut self.conn, &mut ev),
-                Tab::Design(d) => d.ui(ui, &mut self.conn, &mut ev),
+                Tab::Datasheet(d) => d.ui(ui, &mut *self.conn, &mut ev),
+                Tab::Design(d) => d.ui(ui, &mut *self.conn, &mut ev),
                 Tab::Query(q) => q.ui(ui, &mut self.conn, &mut ev),
             }
         });
@@ -978,7 +1507,7 @@ mod tests {
             b.open_dir(None);
             assert!(b.error.is_none());
         }
-        let a = App::with_context(&ctx, Some(dir.path().to_path_buf()), opts);
+        let mut a = App::with_context(&ctx, Some(dir.path().to_path_buf()), opts);
         assert_eq!(a.conn.table_info("keep").unwrap().approx_rows, 1);
     }
 
@@ -1005,8 +1534,132 @@ mod tests {
         let text = "id,name\n1,Ann\n2,Bob\n".to_string();
         a.import = Some(ImportDialog { file: "x.csv".into(), text: text.clone(), name: "people".into(), create: true, preview: tools::parse_csv(&text).unwrap(), error: None });
         frames(&ctx, &mut a, 2);
-        assert_eq!(tools::import_csv(&mut a.conn, "people", &text, true).unwrap(), 2);
+        assert_eq!(tools::import_csv(&mut *a.conn, "people", &text, true).unwrap(), 2);
         a.refresh_nav();
         assert!(a.objects.iter().any(|o| o.name == "people"));
+    }
+
+    /// Let the worker thread finish the job (a backup, a bulk import) while frames are drawn.
+    fn finish_task(ctx: &egui::Context, a: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while a.task.is_some() && std::time::Instant::now() < deadline {
+            frames(ctx, a, 1);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(a.task.is_none(), "the job did not finish");
+    }
+
+    #[test]
+    fn backups_are_exported_and_imported_in_both_formats() {
+        let (ctx, mut a) = app();
+        assert!(a.run_script("CREATE DATABASE shop
+GO
+USE shop
+GO
+CREATE TABLE dbo.t (id INT PRIMARY KEY, s NVARCHAR(20))
+GO
+INSERT dbo.t VALUES (1, N'one'), (2, N'it''s two')", "ok"));
+        let dir = tempfile::tempdir().unwrap();
+        for (sql_server, name, kind) in [(false, "native", "a tsql-server backup"), (true, "mssql", "a Microsoft SQL Server backup")] {
+            let path = dir.path().join(format!("{name}.bak"));
+            a.open_backup(false);
+            {
+                let d = a.backup.as_mut().unwrap();
+                d.database = "shop".into();
+                d.path = path.display().to_string();
+                d.sql_server_format = sql_server;
+            }
+            a.run_backup(&ctx);
+            assert!(a.backup.is_none() && a.task.is_some());
+            finish_task(&ctx, &mut a);
+            assert!(a.error.is_none(), "{:?}", a.error);
+            assert_eq!(App::detect_backup(&path.display().to_string()).as_deref(), Some(kind));
+            // import it as a new database; either kind of file is read
+            a.open_backup(true);
+            {
+                let d = a.backup.as_mut().unwrap();
+                d.path = path.display().to_string();
+                d.database = format!("copy_{name}");
+            }
+            a.run_backup(&ctx);
+            finish_task(&ctx, &mut a);
+            assert!(a.error.is_none(), "{:?}", a.error);
+            assert!(a.databases.iter().any(|d| d == &format!("copy_{name}")), "{:?}", a.databases);
+            let rows = a.conn.query(&format!("SELECT COUNT(*), MAX(s) FROM [copy_{name}].dbo.t")).unwrap();
+            assert_eq!(rows[0][0].to_string(), "2");
+            assert_eq!(rows[0][1].to_string(), "one");
+        }
+        // an import over an existing database needs REPLACE; a bad file is reported
+        a.open_backup(true);
+        {
+            let d = a.backup.as_mut().unwrap();
+            d.path = dir.path().join("native.bak").display().to_string();
+            d.database = "copy_native".into();
+        }
+        a.run_backup(&ctx);
+        finish_task(&ctx, &mut a);
+        assert!(a.error.as_deref().is_some_and(|e| e.contains("failed")), "{:?}", a.error);
+        a.open_backup(true);
+        {
+            let d = a.backup.as_mut().unwrap();
+            d.path = dir.path().join("native.bak").display().to_string();
+            d.database = "copy_native".into();
+            d.replace = true;
+        }
+        a.run_backup(&ctx);
+        finish_task(&ctx, &mut a);
+        assert!(a.error.is_none(), "{:?}", a.error);
+        a.open_backup(true);
+        a.backup.as_mut().unwrap().path.clear();
+        a.run_backup(&ctx);
+        assert!(a.backup.as_ref().unwrap().error.is_some(), "the dialog stays open and says what is missing");
+    }
+
+    #[test]
+    fn bulk_import_loads_a_big_file_on_the_worker_thread() {
+        let (ctx, mut a) = app();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.tsv");
+        let mut text = String::from("id	name
+");
+        for i in 1..=5000 {
+            text.push_str(&format!("{i}	row {i}
+"));
+        }
+        std::fs::write(&path, text).unwrap();
+        a.open_bulk();
+        {
+            let d = a.bulk.as_mut().unwrap();
+            d.path = path.display().to_string();
+            App::bulk_preview(d);
+            assert_eq!(d.table, "big", "the table is named after the file");
+            assert!(d.preview.iter().all(|r| r.len() == 1) && d.preview[0] == vec!["id	name"], "a comma file: one field per line");
+            d.delimiter = 1;
+            App::bulk_preview(d);
+            assert_eq!(d.preview[1], vec!["1", "row 1"]);
+            d.batch = "500".into();
+        }
+        a.run_bulk(&ctx);
+        assert!(a.bulk.is_none() && a.task.is_some());
+        finish_task(&ctx, &mut a);
+        assert!(a.error.is_none(), "{:?}", a.error);
+        assert!(a.status.contains("5000"), "{}", a.status);
+        assert_eq!(a.conn.query("SELECT COUNT(*), MAX(name) FROM big WHERE id > 4990").unwrap()[0][0].to_string(), "10");
+        // a bad value stops the import and takes it all back
+        std::fs::write(&path, "id	name
+9001	fine
+bad	oops
+").unwrap();
+        a.open_bulk();
+        {
+            let d = a.bulk.as_mut().unwrap();
+            d.path = path.display().to_string();
+            d.table = "big".into();
+            d.delimiter = 1;
+        }
+        a.run_bulk(&ctx);
+        finish_task(&ctx, &mut a);
+        assert!(a.error.as_deref().is_some_and(|e| e.contains("record 3")), "{:?}", a.error);
+        assert_eq!(a.conn.query("SELECT COUNT(*) FROM big").unwrap()[0][0].to_string(), "5000");
     }
 }

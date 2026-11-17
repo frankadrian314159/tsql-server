@@ -228,3 +228,86 @@ fn literals_read_back_as_the_same_values() {
         assert_eq!(a.to_string(), b.to_string());
     }
 }
+
+#[test]
+fn the_csv_reader_streams_records_with_any_delimiter() {
+    let text = "\u{feff}a;b;c\r\n1;\"x;y\";3\r\n\r\n\"multi\nline\";\"q\"\"t\";\n";
+    let mut r = tools::CsvReader::new(std::io::Cursor::new(text), ';');
+    assert_eq!(r.next_record().unwrap().unwrap(), vec!["a", "b", "c"]);
+    assert_eq!(r.next_record().unwrap().unwrap(), vec!["1", "x;y", "3"]);
+    assert_eq!(r.next_record().unwrap().unwrap(), vec!["multi\nline", "q\"t", ""]);
+    assert!(r.next_record().unwrap().is_none());
+    assert_eq!(r.records, 3);
+    let mut r = tools::CsvReader::new(std::io::Cursor::new("a\tb\n1\t2"), '\t');
+    assert_eq!(r.next_record().unwrap().unwrap(), vec!["a", "b"]);
+    assert_eq!(r.next_record().unwrap().unwrap(), vec!["1", "2"]);
+    assert!(tools::CsvReader::new(std::io::Cursor::new("\"open"), ',').next_record().is_err());
+}
+
+fn big_csv(rows: usize) -> String {
+    let mut s = String::from("id,name,amt\n");
+    for i in 1..=rows {
+        s.push_str(&format!("{},\"name {}\",{}.5\n", i, i, i % 100));
+    }
+    s
+}
+
+#[test]
+fn bulk_import_loads_many_rows_in_batches_and_reports_progress() {
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE big (id INT PRIMARY KEY, name NVARCHAR(40), amt DECIMAL(10,2))");
+    let opts = tools::BulkOptions { batch: 700, ..Default::default() };
+    let mut seen = vec![];
+    let n = tools::bulk_import(&mut c, "big", std::io::Cursor::new(big_csv(2500)), &opts, &mut |n| {
+        seen.push(n);
+        true
+    })
+    .unwrap();
+    assert_eq!(n, 2500);
+    assert_eq!(seen, vec![700, 1400, 2100, 2500]);
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM big"), "2500");
+    assert_eq!(scalar(&mut c, "SELECT name FROM big WHERE id = 1234"), "name 1234");
+    assert_eq!(c.transaction_count(), 0);
+}
+
+#[test]
+fn bulk_import_creates_the_table_and_takes_other_delimiters_and_no_header() {
+    let mut c = conn();
+    let opts = tools::BulkOptions { delimiter: '|', create: true, ..Default::default() };
+    assert_eq!(tools::bulk_import(&mut c, "made", std::io::Cursor::new("id|label|d\n1|a|2026-01-05\n2|b|2026-02-06\n"), &opts, &mut |_| true).unwrap(), 2);
+    assert_eq!(rows(&mut c, "SELECT id, label, d FROM made ORDER BY id"), vec![vec!["1", "a", "2026-01-05"], vec!["2", "b", "2026-02-06"]]);
+    // without a header the fields are the columns, in order
+    exec(&mut c, "CREATE TABLE plain (a INT, b VARCHAR(10))");
+    let opts = tools::BulkOptions { header: false, ..Default::default() };
+    assert_eq!(tools::bulk_import(&mut c, "plain", std::io::Cursor::new("1,x\n2,y\n"), &opts, &mut |_| true).unwrap(), 2);
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM plain"), "2");
+    // a table that is not there, and may not be created
+    let e = tools::bulk_import(&mut c, "nope", std::io::Cursor::new("a\n1\n"), &tools::BulkOptions::default(), &mut |_| true).unwrap_err();
+    assert_eq!(e.number, 208);
+}
+
+#[test]
+fn bulk_import_is_all_or_nothing_or_batch_by_batch_and_can_be_stopped() {
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    let mut text = String::from("id,v\n");
+    for i in 1..=30 {
+        text.push_str(&format!("{},{}\n", i, if i == 25 { "oops".to_string() } else { i.to_string() }));
+    }
+    // one transaction: the bad record 26 (line 26 of the file counting the header) takes everything back
+    let e = tools::bulk_import(&mut c, "t", std::io::Cursor::new(text.clone()), &tools::BulkOptions { batch: 10, ..Default::default() }, &mut |_| true).unwrap_err();
+    assert!(e.message.contains("record 26") && e.message.contains("column v"), "{}", e.message);
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM t"), "0");
+    assert_eq!(c.transaction_count(), 0);
+    // batch by batch: the two batches before the bad one stay
+    let e = tools::bulk_import(&mut c, "t", std::io::Cursor::new(text), &tools::BulkOptions { batch: 10, one_transaction: false, ..Default::default() }, &mut |_| true).unwrap_err();
+    assert!(e.message.contains("record 26"), "{}", e.message);
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM t"), "20");
+    // stopping rolls a single transaction back
+    exec(&mut c, "TRUNCATE TABLE t");
+    let e = tools::bulk_import(&mut c, "t", std::io::Cursor::new((1..=50).fold(String::from("id,v
+"), |s, i| s + &format!("{},{}
+", i, i))), &tools::BulkOptions { batch: 10, ..Default::default() }, &mut |n| n < 20);
+    assert_eq!(e.unwrap_err().number, 50001);
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM t"), "0");
+}

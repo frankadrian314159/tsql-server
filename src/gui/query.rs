@@ -2,7 +2,8 @@
 use std::path::PathBuf;
 
 use egui::{Key, RichText, TextEdit};
-use tsql_server::{tools, Connection, Event as SqlEvent, ResultSet, SqlError};
+use crate::backend::Backend;
+use tsql_server::{tools, Event as SqlEvent, ResultSet, SqlError};
 
 use crate::session::{Finished, Session};
 use crate::ui::{result_grid, Event, ERROR};
@@ -120,7 +121,7 @@ impl QueryTab {
     }
 
     /// Describe the plan of the selection (or everything) without running it.
-    pub fn explain(&mut self, conn: &mut Connection) {
+    pub fn explain(&mut self, conn: &mut dyn Backend) {
         let text = self.text_to_run();
         self.items.clear();
         match conn.explain(&text) {
@@ -237,7 +238,7 @@ impl QueryTab {
             self.selection = if a != b { Some((a.min(b), a.max(b))) } else { None };
         }
         if explain && !busy {
-            self.explain(conn);
+            self.explain(&mut **conn);
         } else if run {
             self.start(conn, ui.ctx());
         }
@@ -353,11 +354,11 @@ mod tests {
         let mut q = QueryTab::new(None, "CREATE TABLE t (id INT PRIMARY KEY, v INT)\nGO\nINSERT t VALUES (1, 1)".into());
         run(&mut q, &mut c, &mut ev);
         q.sql = "SELECT * FROM t WHERE id = 1".into();
-        q.explain(&mut c);
+        q.explain(&mut *c);
         assert_eq!(q.pane, Pane::Plan);
         assert!(q.plan.iter().any(|l| l.contains("index seek")), "{:?}", q.plan);
         q.sql = "SELECT * FROM missing".into();
-        q.explain(&mut c);
+        q.explain(&mut *c);
         assert_eq!(q.error_count(), 1);
         assert_eq!(q.pane, Pane::Messages);
     }

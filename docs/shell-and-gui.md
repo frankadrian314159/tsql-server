@@ -44,8 +44,29 @@ Built with [egui](https://github.com/emilk/egui) and compiled only with the `gui
 need no GUI toolkit:
 
 ```text
-cargo run --release --features gui --bin tsql-gui -- [DATA_DIR] [--pool-pages N]
+cargo run --release --features gui --bin tsql-gui -- [DATA_DIR] [--pool-pages N] [--embedded]
+cargo run --release --features gui --bin tsql-gui -- --connect HOST[:PORT] [-U LOGIN] [-P PASSWORD] [-d DATABASE] [--encrypt]
 ```
+
+### Which server it works on
+
+The app works on a server over TDS, like any client:
+
+* `--connect HOST[:PORT]` (with `-U`, `-P`, `-d`, `--encrypt`) names the server: a cluster's control node (`tsql-cluster --listen 1433`), `tsql-serve`,
+  or any server that speaks TDS. **File > Connect to server...** does the same from inside the app.
+* Without it, the app looks at `127.0.0.1:1433`. When something listens there it connects to it (the login is `sa` and the
+  password is in the environment variable `TSQL_PASSWORD`; `TSQL_LOGIN` names another login). If the login is refused, the connect window opens
+  with the reason so it can be tried again.
+* When nothing listens there, the app starts a single-node server **in its own process** on `127.0.0.1:1433` (a `DATA_DIR` keeps its data
+  on disk), gives its `sa` login a random password that only the process knows, and connects to it. Other tools (the shell, DBeaver, a
+  cluster driver) can use that port while the window is open; the server stops with the window.
+* `--embedded` keeps the engine inside the window with no network, the way the app worked before (and **File > Open data folder...**
+  and **New in-memory database** switch a window to an embedded engine).
+
+Over the wire the navigation pane, the designer and the scripts come from the `sys` catalog views, so everything a server shows there
+works; what the wire does not carry is left out: `PRINT` output and the row counts of statements, XML and spatial index details of a
+table, the buffer-pool statistics of **Database > Storage statistics...** (a server's are on its `/metrics` endpoint), and a data folder
+(a server has its own).
 
 * **Navigation pane** — database selector, a filter box, and tables, views, procedures, functions and sequences.
   Double-click to open; right-click for *Design*, *Script*, *Select top 100*, *Show definition*, *Delete…*.
@@ -59,10 +80,29 @@ cargo run --release --features gui --bin tsql-gui -- [DATA_DIR] [--pool-pages N]
 * **Query** — an editor with Run (Ctrl+Enter or F5; runs the selection if there is one, otherwise everything, with `GO`
   separators), *Explain* (the optimizer's plan), a result grid per result set, a messages pane (`PRINT`, row counts,
   errors, timing), open/save `.sql` files, export the shown result as CSV.
-* **File** — open a data folder (or start a new in-memory database), import CSV into a new or existing table, export
-  the current grid. **Database** — begin/commit/roll back, isolation level, checkpoint, storage statistics (buffer pool
+* **File** — open a data folder (or start a new in-memory database), connect to a server, import CSV into a new or existing
+  table, export the current grid, **bulk import**, and **import / export a backup**. **Database** — begin/commit/roll back, isolation level, checkpoint, storage statistics (buffer pool
   and page file, live), locks held, load the sample database. The status bar always shows an open transaction, and
   closing or switching databases with one open asks whether to commit or roll back.
+
+### Bulk import
+
+**File > Bulk import...** loads a delimited file of any size (comma, tab, semicolon or pipe separated) into a table. The file is read
+a line at a time, never whole, and loaded in batches of up to 1000 rows per `INSERT` on the session's worker thread, so the window stays
+responsive; a counter shows the rows so far and **Stop** ends the import. The first line names the columns (or, without it, the fields are the
+table's columns in order). The table can be an existing one or a new one (the table is created from the first 1000 lines, with
+inferred types). *All or nothing* puts the whole load in one transaction (an error, a bad value or **Stop** takes every row back; the
+message names the record and column); without it each batch commits by itself and an error leaves the earlier batches in. The same
+code is `tsql_server::tools::bulk_import`, which works on any `SqlSession` (an engine or a server over TDS).
+
+### Backups
+
+**File > Export backup (.bak)...** runs `BACKUP DATABASE` for the chosen database in one of two formats: this server's own
+(`TSQLBAK1`, checksummed logical frames) or a **Microsoft SQL Server `.bak`** (`WITH SQL_SERVER_FORMAT`). **File > Import backup
+(.bak)...** runs `RESTORE DATABASE` under the name given (optionally replacing an existing database); it reads either kind, which the server
+tells from the first bytes of the file (the dialog shows what it found), and a backup taken by a real SQL Server restores too
+([docs/backup.md](backup.md)). The file is read and written by the server: on a server over the network the path is the server's, and
+there is no **Browse...** button then. Both run on the worker thread.
 
 The app uses one session, so it shows the effect of isolation levels and locks held by its own open transaction but
 cannot demonstrate blocking between sessions; use two shells or the library for that. A script run from the Query tab

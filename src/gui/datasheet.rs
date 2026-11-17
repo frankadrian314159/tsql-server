@@ -2,7 +2,8 @@
 use egui::{Key, RichText, Sense, TextEdit};
 use egui_extras::{Column, TableBuilder};
 use tsql_server::inspect::TableInfo;
-use tsql_server::{tools, Connection, Value};
+use crate::backend::Backend;
+use tsql_server::{tools, Value};
 
 use crate::ui::{display, Event, ERROR};
 
@@ -49,7 +50,7 @@ impl Datasheet {
     }
 
     /// Read the rows again (and the table's structure, which may have changed).
-    pub fn load(&mut self, conn: &mut Connection) {
+    pub fn load(&mut self, conn: &mut dyn Backend) {
         self.dirty = false;
         self.error = None;
         self.editing = None;
@@ -95,7 +96,7 @@ impl Datasheet {
     }
 
     /// Change one cell. `text` is what the user typed; an empty value is NULL for a nullable column.
-    pub fn commit_edit(&mut self, conn: &mut Connection, row: usize, col: usize, text: &str) -> Result<(), String> {
+    pub fn commit_edit(&mut self, conn: &mut dyn Backend, row: usize, col: usize, text: &str) -> Result<(), String> {
         let info = self.info.as_ref().ok_or("this object cannot be edited")?;
         let ci = info.columns.iter().find(|c| c.name.eq_ignore_ascii_case(&self.columns[col])).ok_or("unknown column")?;
         if ci.computed || ci.identity.is_some() || ci.ty == "timestamp" {
@@ -108,7 +109,7 @@ impl Datasheet {
         Ok(())
     }
 
-    pub fn delete_row(&mut self, conn: &mut Connection, row: usize) -> Result<(), String> {
+    pub fn delete_row(&mut self, conn: &mut dyn Backend, row: usize) -> Result<(), String> {
         let info = self.info.as_ref().ok_or("this object cannot be edited")?;
         let wh = self.where_for_row(row).ok_or("this table has no primary key, so its rows cannot be deleted")?;
         conn.run(&format!("DELETE FROM {} WHERE {}", info.quoted(), wh)).map_err(|e| e.message)?;
@@ -116,7 +117,7 @@ impl Datasheet {
     }
 
     /// Insert the values typed in the new-row boxes; boxes left empty get the column's default.
-    pub fn insert_new_row(&mut self, conn: &mut Connection) -> Result<(), String> {
+    pub fn insert_new_row(&mut self, conn: &mut dyn Backend) -> Result<(), String> {
         let info = self.info.as_ref().ok_or("this object cannot be edited")?;
         let mut cols = vec![];
         let mut vals = vec![];
@@ -134,11 +135,11 @@ impl Datasheet {
         Ok(())
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, conn: &mut Connection, ev: &mut Vec<Event>) {
+    pub fn ui(&mut self, ui: &mut egui::Ui, conn: &mut dyn Backend, ev: &mut Vec<Event>) {
         ui.push_id(("datasheet", self.table.clone()), |ui| self.show(ui, conn, ev));
     }
 
-    fn show(&mut self, ui: &mut egui::Ui, conn: &mut Connection, ev: &mut Vec<Event>) {
+    fn show(&mut self, ui: &mut egui::Ui, conn: &mut dyn Backend, ev: &mut Vec<Event>) {
         if self.dirty {
             self.load(conn);
         }
@@ -353,7 +354,7 @@ impl Datasheet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tsql_server::Server;
+    use tsql_server::{Connection, Server};
 
     fn setup() -> (Connection, Datasheet) {
         let mut c = Server::new().connect();
