@@ -28,3 +28,4 @@ resources/*.bak
 data/*.db
 data/lock
 data/wal.log
+target-test/
