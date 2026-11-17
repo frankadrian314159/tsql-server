@@ -673,6 +673,12 @@ impl<'a> Engine<'a> {
                 }
             }
         }
+        // UPDATE(column) inside a trigger names a column of the trigger's table, not of the query's FROM
+        if let Expr::Func(fc) = e {
+            if fc.name == "UPDATE" && fc.args.len() == 1 && matches!(fc.args[0], Expr::Col(_)) {
+                return Ok(());
+            }
+        }
         let mut ch = vec![];
         children(e, &mut ch);
         for c in ch {

@@ -157,3 +157,20 @@ GO",
     exec(&mut c, "BEGIN TRAN; INSERT vb VALUES (3, 4); ROLLBACK");
     assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM b"), "2");
 }
+
+#[test]
+fn update_of_a_column_is_not_checked_against_the_from_of_its_query() {
+    // UPDATE(name) names a column of the trigger's table; `deleted` and `inserted` both have `name`, and joining them must not make it ambiguous
+    let mut c = conn();
+    script(
+        &mut c,
+        "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(20))
+CREATE TABLE lg (msg VARCHAR(100))
+INSERT t VALUES (1, 'ann')
+GO
+CREATE TRIGGER tg ON t AFTER UPDATE AS INSERT lg SELECT CONCAT('u ', d.id, CASE WHEN UPDATE(name) THEN ' name' ELSE '' END) FROM deleted d JOIN inserted i ON i.id = d.id
+GO",
+    );
+    exec(&mut c, "UPDATE t SET name = 'x'");
+    assert_eq!(scalar(&mut c, "SELECT msg FROM lg"), "u 1 name");
+}

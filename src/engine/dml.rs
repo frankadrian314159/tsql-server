@@ -1992,7 +1992,9 @@ impl<'a> Engine<'a> {
         }
         let loc = self.locate(name);
         if let Some(Object::View(v)) = self.object_ref(&loc) {
-            if v.triggers.is_empty() {
+            // (a view with INSTEAD OF triggers is written through only by the statements of its own trigger, which go to the base table)
+            let key = obj_key(&v.schema, &v.name);
+            if v.triggers.is_empty() || self.ses.trigger_stack.iter().any(|c| c.instead_of && c.table.key() == key) {
                 return simple_updatable(&v.query);
             }
         }
