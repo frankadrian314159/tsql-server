@@ -480,7 +480,7 @@ impl<'a> Engine<'a> {
         !schema.is_empty() && crate::rewrite::decorrelate::is_uncorrelated(q, schema)
     }
 
-    /// The query with its correlated subqueries of the `WHERE` rewritten into joins (`crate::rewrite::decorrelate`), or None when there is
+    /// The query with its correlated subqueries of the `WHERE` and the select list rewritten into joins (`crate::rewrite::decorrelate`), or None when there is
     /// nothing to rewrite or the rewrite cannot be trusted: a correlated subquery is run for every outer row (or for every distinct
     /// value of the outer columns it reads), which costs a pass over the subquery's tables for each; as a join with a grouped derived
     /// table (or a hashed `IN` list) the tables are read once.
@@ -488,15 +488,17 @@ impl<'a> Engine<'a> {
         if !q.ctes.is_empty() || !self.ses.cte_stack.is_empty() || !self.ses.trigger_stack.is_empty() || sel.from.is_empty() {
             return None;
         }
-        // only a subquery in a condition on its own is of any use; `SELECT *` would show the columns of the derived tables
-        let w = sel.where_.as_ref()?;
-        let has = crate::rewrite::astutil::has_subquery(w);
-        if !has || sel.items.iter().any(|i| matches!(i, SelectItem::Star(None))) {
+        // a subquery in the WHERE or the select list; `SELECT *` would show the columns of the derived tables
+        let in_where = sel.where_.as_ref().is_some_and(crate::rewrite::astutil::has_subquery);
+        let in_items = sel.items.iter().any(|i| matches!(i, SelectItem::Expr { e, .. } if crate::rewrite::astutil::has_subquery(e)));
+        if !(in_where || in_items) || sel.items.iter().any(|i| matches!(i, SelectItem::Star(None))) {
             return None;
         }
         // every table the query reads must be a known table (an unqualified column is told to be the subquery's or the query
         // around it by the columns of the tables)
         let mut schema: HashMap<String, Vec<String>> = HashMap::new();
+        // the columns that lead an index: a subquery correlated on one is a seek per outer row, and is not made an outer join
+        let mut leading: HashMap<String, Vec<String>> = HashMap::new();
         for id in crate::rewrite::astutil::referenced_tables(q) {
             let (sch, name) = id.split_once('.')?;
             if name.starts_with('@') {
@@ -505,11 +507,12 @@ impl<'a> Engine<'a> {
             // (a session temporary table is found by its bare name)
             let loc = if name.starts_with('#') { self.locate(&[name.to_string()]) } else { self.locate(&[sch.to_string(), name.to_string()]) };
             let t = self.table_ref(&loc)?;
+            leading.insert(id.clone(), t.data.specs.iter().filter_map(|sp| sp.cols.first()).filter_map(|&c| t.columns.get(c)).map(|c| c.name.to_lowercase()).collect());
             schema.insert(id, t.columns.iter().map(|c| c.name.to_lowercase()).collect());
         }
         let mut q2 = q.clone();
         let mut counter = self.ses.decorrelate_counter;
-        if !crate::rewrite::decorrelate::decorrelate(&mut q2, &mut counter, schema) {
+        if !crate::rewrite::decorrelate::decorrelate_all(&mut q2, &mut counter, schema, &leading) {
             return None;
         }
         self.ses.decorrelate_counter = counter;

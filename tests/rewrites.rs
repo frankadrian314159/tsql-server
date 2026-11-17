@@ -62,6 +62,90 @@ fn correlated_subqueries_give_the_same_rows_as_before() {
     assert_eq!(same(&mut c, "SELECT * FROM dept d WHERE EXISTS (SELECT * FROM emp e WHERE e.dept_id = d.id)").len(), 3);
 }
 
+/// Whether the plan of `sql` says a correlated subquery was rewritten as a join.
+fn rewritten(c: &mut tsql_server::Connection, sql: &str) -> bool {
+    exec(c, "SET OPTIMIZER ON");
+    exec(c, sql);
+    c.last_plan().iter().any(|l| l.contains("correlated subquery rewritten as a join"))
+}
+
+fn table(rows: &[&[&str]]) -> Vec<Vec<String>> {
+    rows.iter().map(|r| r.iter().map(|s| s.to_string()).collect()).collect()
+}
+
+#[test]
+fn correlated_subqueries_in_the_select_list_and_with_count_become_outer_joins() {
+    let mut c = data();
+    // (emp.dept_id leads no index: run per department, each subquery reads all of emp)
+    let counts = "SELECT d.id, (SELECT COUNT(*) FROM emp e WHERE e.dept_id = d.id) FROM dept d";
+    assert!(rewritten(&mut c, counts));
+    // a department without employees counts 0, not NULL
+    assert_eq!(same(&mut c, counts), table(&[&["1", "4"], &["2", "2"], &["3", "2"], &["4", "0"], &["5", "0"]]));
+    let sums = same(&mut c, "SELECT d.id, (SELECT SUM(sal) FROM emp e WHERE e.dept_id = d.id) AS total FROM dept d");
+    assert_eq!(sums[3], ["4", "NULL"], "the other aggregates are NULL over no rows");
+    for q in [
+        // inside other expressions, and an aggregate expression with COUNT in it
+        "SELECT d.id, ISNULL((SELECT MAX(sal) FROM emp e WHERE e.dept_id = d.id), -1), (SELECT COUNT(*) + 1 FROM emp e WHERE e.dept_id = d.id AND e.sal > 60) FROM dept d",
+        "SELECT d.id, CASE WHEN (SELECT COUNT(*) FROM emp e WHERE e.dept_id = d.id) > 2 THEN 'big' ELSE 'small' END FROM dept d",
+        // an outer join in the outer query, NULL and dangling keys, and two keys
+        "SELECT e.id, d.name, (SELECT COUNT(*) FROM emp x WHERE x.dept_id = e.dept_id) FROM emp e LEFT JOIN dept d ON d.id = e.dept_id",
+        "SELECT e.id, (SELECT COUNT(*) FROM emp x WHERE x.dept_id = e.dept_id AND x.grade = e.grade) FROM emp e",
+        // unqualified columns of the subquery, DISTINCT and TOP in the outer query
+        "SELECT d.id, (SELECT AVG(sal) FROM emp WHERE dept_id = d.id) FROM dept d",
+        "SELECT DISTINCT (SELECT COUNT(*) FROM emp e WHERE e.dept_id = d.id) FROM dept d",
+        "SELECT TOP 3 d.id, (SELECT COUNT(*) FROM emp e WHERE e.dept_id = d.id) AS n FROM dept d ORDER BY n DESC, d.id",
+        // two subqueries on different keys
+        "SELECT e.id, (SELECT COUNT(*) FROM emp x WHERE x.dept_id = e.dept_id), (SELECT COUNT(*) FROM emp y WHERE y.boss = e.id) FROM emp e",
+    ] {
+        assert!(rewritten(&mut c, q), "{q}");
+        same(&mut c, q);
+    }
+    // in the WHERE: COUNT compared, a subquery inside an OR, and other conditions on the outer table
+    let none = "SELECT id FROM dept d WHERE (SELECT COUNT(*) FROM emp e WHERE e.dept_id = d.id) = 0";
+    assert!(rewritten(&mut c, none));
+    assert_eq!(same(&mut c, none), table(&[&["4"], &["5"]]));
+    for q in [
+        "SELECT id FROM dept d WHERE d.region = 2 OR (SELECT SUM(sal) FROM emp e WHERE e.dept_id = d.id) > 300",
+        "SELECT id FROM dept d WHERE d.region = 1 AND (SELECT COUNT(*) FROM emp e WHERE e.dept_id = d.id) > 2",
+        "SELECT id FROM emp e WHERE (SELECT COUNT(*) FROM emp x WHERE x.boss = e.id) >= 1",
+    ] {
+        assert!(rewritten(&mut c, q), "{q}");
+        same(&mut c, q);
+    }
+}
+
+#[test]
+fn exists_on_several_keys_becomes_a_join_with_the_distinct_keys() {
+    let mut c = data();
+    let q = "SELECT id FROM emp e WHERE EXISTS (SELECT 1 FROM emp x WHERE x.dept_id = e.dept_id AND x.grade = e.grade AND x.sal > 100)";
+    assert!(rewritten(&mut c, q));
+    // (an employee matches itself; NULL departments and grades match nothing)
+    assert_eq!(same(&mut c, q), table(&[&["1"], &["10"], &["2"], &["6"], &["9"]]));
+    let q = "SELECT id FROM emp e WHERE NOT EXISTS (SELECT 1 FROM emp x WHERE x.dept_id = e.dept_id AND x.grade = e.grade AND x.sal > 100)";
+    assert!(rewritten(&mut c, q));
+    assert_eq!(same(&mut c, q), table(&[&["3"], &["4"], &["5"], &["7"], &["8"]]));
+    same(&mut c, "SELECT e.id, d.name FROM emp e JOIN dept d ON d.id = e.dept_id WHERE NOT EXISTS (SELECT * FROM emp x WHERE x.dept_id = e.dept_id AND x.grade = e.grade AND x.id > e.id)");
+}
+
+#[test]
+fn a_subquery_that_seeks_an_index_or_sits_in_a_grouped_query_is_left_alone() {
+    let mut c = data();
+    // dept.id is the primary key: per outer row the subquery is one seek
+    let q = "SELECT e.id, (SELECT MAX(name) FROM dept d WHERE d.id = e.dept_id) FROM emp e";
+    assert!(!rewritten(&mut c, q));
+    same(&mut c, q);
+    // (a grouped outer query: only that the rewrite keeps out of it is checked here)
+    let _ = c.run("SELECT d.region, COUNT(*), (SELECT COUNT(*) FROM emp e WHERE e.dept_id = d.region) FROM dept d GROUP BY d.region");
+    assert!(!c.last_plan().iter().any(|l| l.contains("correlated subquery rewritten as a join")));
+    // a subquery that is not an aggregate can give more than one row, which must stay error 512
+    for opt in ["ON", "OFF"] {
+        exec(&mut c, &format!("SET OPTIMIZER {opt}"));
+        let e = c.run("SELECT d.id, (SELECT e.sal FROM emp e WHERE e.dept_id = d.id) FROM dept d").unwrap_err();
+        assert_eq!(e.number, 512);
+    }
+    exec(&mut c, "SET OPTIMIZER ON");
+}
+
 #[test]
 fn a_subquery_that_stands_alone_is_a_constant_and_in_subqueries_are_hashed() {
     let mut c = data();

@@ -14,6 +14,9 @@
 //! Only equalities between a column of the subquery and a *qualified* column of the outer query are recognised; anything else
 //! is left alone (and the statement is gathered, which is always exact). A rewrite that turns out not to bind is undone by the
 //! caller, which runs the original.
+//!
+//! The single-node engine also uses the rewrites that need an outer join ([`decorrelate_all`], see the section near the end).
+use crate::types::Value;
 use serde_json::Value as J;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -486,4 +489,274 @@ fn exists(sq: &Query, negated: bool, outer: &[String], conj: &[Expr], me: usize)
     } else {
         Some(vec![Expr::InQuery(Box::new(outer_key), Box::new(list), false)])
     }
+}
+
+// ------------------------------------------------------------------------------------------------ rewrites with an outer join
+//
+// The rewrites above keep the shape of the statement (a comma join, conditions in the WHERE), which is what the cluster's control node
+// can take apart. The ones below put a LEFT JOIN around one item of the FROM, and only the single-node engine uses them
+// ([`decorrelate_all`]):
+//
+// * a scalar aggregate subquery anywhere in the select list or the WHERE (`(SELECT COUNT(*) FROM t WHERE t.k = o.k)`, inside
+//   `ISNULL(..)`, a `CASE`, an `OR`, ...) becomes the value of a grouped derived table outer-joined on its keys; an outer row that
+//   no group matches gets what the aggregate gives for no rows (`COUNT` 0, the others NULL), so `COUNT` is rewritten too;
+// * `EXISTS` correlated on more than one equality becomes a join with the distinct keys of the subquery, and `NOT EXISTS` an
+//   outer join with them that found no match.
+//
+// The derived table has one row per key (grouped, or DISTINCT), so the join never repeats an outer row, and the value it gives an
+// outer row is the one the subquery gave it. A subquery correlated on a column that leads an index of its table is left alone: run
+// per outer row it is an index seek, cheaper than aggregating the whole table when the outer rows are few. The rewrite is for the
+// subquery that, run per outer row, reads its table once for each.
+
+/// [`decorrelate`], then the rewrites that need an outer join. `leading`: the columns (lower case) that lead an index, by table id
+/// (as [`table_id`] makes it).
+pub fn decorrelate_all(q: &mut Query, counter: &mut u64, schema: HashMap<String, Vec<String>>, leading: &HashMap<String, Vec<String>>) -> bool {
+    let a = decorrelate(q, counter, schema);
+    let b = outer_join_rewrites(q, counter, leading);
+    a || b
+}
+
+fn outer_join_rewrites(q: &mut Query, counter: &mut u64, leading: &HashMap<String, Vec<String>>) -> bool {
+    let QueryBody::Select(sel) = &mut q.body else { return false };
+    if sel.from.is_empty() {
+        return false;
+    }
+    // (`decorrelate` set the outer columns and tables; set the columns again in case it returned before it did)
+    COLS.with(|c| c.borrow_mut().1 = columns_of(&sel.from));
+    let mut outer = vec![];
+    aliases(&sel.from, &mut outer);
+    let mut conj: Vec<Expr> = vec![];
+    if let Some(w) = &sel.where_ {
+        conjuncts(w, &mut conj);
+    }
+    let mut changed = false;
+    // the select list; not when the outer query groups (a column of the derived table is not one of its groups)
+    let grouped = sel.group.is_some() || sel.having.is_some() || sel.items.iter().any(|i| matches!(i, SelectItem::Expr { e, .. } if has_aggregate(e)));
+    if !grouped {
+        for i in 0..sel.items.len() {
+            let SelectItem::Expr { e, alias } = sel.items[i].clone() else { continue };
+            if !has_subquery(&e) {
+                continue;
+            }
+            let mut ch = false;
+            let e2 = replace_scalar(&e, &outer, &conj, usize::MAX, &mut sel.from, counter, leading, &mut ch);
+            if ch {
+                sel.items[i] = SelectItem::Expr { e: e2, alias };
+                changed = true;
+            }
+        }
+    }
+    // the WHERE
+    let mut out: Vec<Expr> = vec![];
+    let mut extra_from: Vec<TableRef> = vec![];
+    let mut touched = false;
+    for (i, c) in conj.iter().enumerate() {
+        if let Some(r) = exists_join(c, &outer, &conj, i, &mut sel.from, &mut extra_from, counter, leading) {
+            out.extend(r);
+            touched = true;
+            continue;
+        }
+        if has_subquery(c) {
+            let mut ch = false;
+            let r = replace_scalar(c, &outer, &conj, i, &mut sel.from, counter, leading, &mut ch);
+            if ch {
+                out.push(r);
+                touched = true;
+                continue;
+            }
+        }
+        out.push(c.clone());
+    }
+    if touched {
+        sel.where_ = and_all(out);
+        sel.from.extend(extra_from);
+        changed = true;
+    }
+    changed
+}
+
+/// Whether `e` calls an aggregate (outside subqueries).
+fn has_aggregate(e: &Expr) -> bool {
+    let mut found = false;
+    walk_expr(e, &mut |x| {
+        if is_aggregate_call(x).is_some() {
+            found = true;
+        }
+    });
+    found
+}
+
+fn col2(alias: &str, name: &str) -> Expr {
+    Expr::Col(vec![alias.to_string(), name.to_string()])
+}
+
+/// `e` with each correlated scalar aggregate subquery in it replaced by the value of an outer-joined derived table (see above).
+#[allow(clippy::too_many_arguments)]
+fn replace_scalar(e: &Expr, outer: &[String], conj: &[Expr], me: usize, from: &mut Vec<TableRef>, counter: &mut u64, leading: &HashMap<String, Vec<String>>, changed: &mut bool) -> Expr {
+    map_expr(e, &mut |x| {
+        let Expr::Subquery(sq) = x else { return None };
+        let v = scalar_join(sq, outer, conj, me, from, counter, leading)?;
+        *changed = true;
+        Some(v)
+    })
+}
+
+fn scalar_join(sq: &Query, outer: &[String], conj: &[Expr], me: usize, from: &mut [TableRef], counter: &mut u64, leading: &HashMap<String, Vec<String>>) -> Option<Expr> {
+    let parts = take_apart(sq, outer)?;
+    let item = parts.item.clone()?;
+    if !aggregate_only(&item) || key_indexed(&parts, leading) {
+        return None;
+    }
+    let empty = empty_value(&item)?;
+    let slot = owner_item(&parts.keys, from)?;
+    *counter += 1;
+    let alias = format!("__dc{}", counter);
+    let mut items: Vec<SelectItem> = parts.keys.iter().enumerate().map(|(i, (k, _))| SelectItem::Expr { e: k.clone(), alias: Some(format!("dk{}", i)) }).collect();
+    items.push(SelectItem::Expr { e: item, alias: Some("dv".into()) });
+    items.push(SelectItem::Expr { e: Expr::Lit(Value::Int(1)), alias: Some("dm".into()) });
+    let group: Vec<GroupItem> = parts.keys.iter().map(|(k, _)| GroupItem::Expr(k.clone())).collect();
+    let mut inner_where = parts.rest.clone();
+    if let Some(r) = reduction(&parts, conj, me) {
+        inner_where.push(r);
+    }
+    let derived = simple_query(Select { distinct: false, top: None, items, into: None, from: parts.from.clone(), where_: and_all(inner_where), group: Some(group), having: None });
+    outer_join(from, slot, derived, &alias, &parts.keys);
+    // (a CASE, not the bare column, also keeps the select-list item unnamed, as the subquery was)
+    Some(Expr::Case { operand: None, whens: vec![(Expr::IsNull(Box::new(col2(&alias, "dm")), false), empty)], els: Some(Box::new(col2(&alias, "dv"))) })
+}
+
+/// `[NOT] EXISTS` correlated on two or more equalities, as a join with the distinct keys (one equality is `IN`, above).
+#[allow(clippy::too_many_arguments)]
+fn exists_join(c: &Expr, outer: &[String], conj: &[Expr], me: usize, from: &mut [TableRef], extra_from: &mut Vec<TableRef>, counter: &mut u64, leading: &HashMap<String, Vec<String>>) -> Option<Vec<Expr>> {
+    let (sq, negated) = match c {
+        Expr::Exists(q) => (q, false),
+        Expr::Not(x) => match &**x {
+            Expr::Exists(q) => (q, true),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let parts = take_apart(sq, outer)?;
+    if parts.keys.len() < 2 || key_indexed(&parts, leading) {
+        return None;
+    }
+    let slot = if negated { Some(owner_item(&parts.keys, from)?) } else { None };
+    *counter += 1;
+    let alias = format!("__dc{}", counter);
+    let mut items: Vec<SelectItem> = parts.keys.iter().enumerate().map(|(i, (k, _))| SelectItem::Expr { e: k.clone(), alias: Some(format!("dk{}", i)) }).collect();
+    items.push(SelectItem::Expr { e: Expr::Lit(Value::Int(1)), alias: Some("dm".into()) });
+    let mut inner_where = parts.rest.clone();
+    if let Some(r) = reduction(&parts, conj, me) {
+        inner_where.push(r);
+    }
+    let derived = simple_query(Select { distinct: true, top: None, items, into: None, from: parts.from.clone(), where_: and_all(inner_where), group: None, having: None });
+    match slot {
+        // no match in the keys: a NULL outer key finds none either, as NOT EXISTS holds for it
+        Some(slot) => {
+            outer_join(from, slot, derived, &alias, &parts.keys);
+            Some(vec![Expr::IsNull(Box::new(col2(&alias, "dm")), false)])
+        }
+        None => {
+            extra_from.push(TableRef::Derived { query: Box::new(derived), alias: Some(alias.clone()), cols: None });
+            Some(parts.keys.iter().enumerate().map(|(i, (_, o))| Expr::Binary(BinOp::Eq, Box::new(col2(&alias, &format!("dk{}", i))), Box::new(o.clone()))).collect())
+        }
+    }
+}
+
+/// Replace `from[slot]` by `from[slot] LEFT JOIN (derived) alias ON alias.dk<i> = <outer key i> ...`.
+fn outer_join(from: &mut [TableRef], slot: usize, derived: Query, alias: &str, keys: &[(Expr, Expr)]) {
+    let on = and_all(keys.iter().enumerate().map(|(i, (_, o))| Expr::Binary(BinOp::Eq, Box::new(col2(alias, &format!("dk{}", i))), Box::new(o.clone()))).collect());
+    let left = std::mem::replace(&mut from[slot], TableRef::Values { rows: vec![], alias: None, cols: None });
+    from[slot] = TableRef::Join { kind: JoinKind::Left, left: Box::new(left), right: Box::new(TableRef::Derived { query: Box::new(derived), alias: Some(alias.to_string()), cols: None }), on };
+}
+
+/// The value of an aggregate expression over no rows: `COUNT` (and `COUNT_BIG`, `APPROX_COUNT_DISTINCT`) are 0, the others NULL.
+/// None for the aggregates whose empty value is something else.
+fn empty_value(e: &Expr) -> Option<Expr> {
+    let mut ok = true;
+    let v = map_expr(e, &mut |x| {
+        let fc = is_aggregate_call(x)?;
+        Some(match fc.name.as_str() {
+            "COUNT" => Expr::Lit(Value::Int(0)),
+            "COUNT_BIG" | "APPROX_COUNT_DISTINCT" => Expr::Lit(Value::BigInt(0)),
+            "SUM" | "AVG" | "MIN" | "MAX" | "STDEV" | "STDEVP" | "VAR" | "VARP" | "STRING_AGG" | "CHECKSUM_AGG" => Expr::Lit(Value::Null),
+            _ => {
+                ok = false;
+                Expr::Lit(Value::Null)
+            }
+        })
+    });
+    ok.then_some(v)
+}
+
+/// The item of the outer `FROM` that every column of the outer keys belongs to; None when they belong to several, or to one that
+/// cannot be told.
+fn owner_item(keys: &[(Expr, Expr)], from: &[TableRef]) -> Option<usize> {
+    let mut at: Option<usize> = None;
+    let mut ok = true;
+    for (_, o) in keys {
+        walk_expr(o, &mut |x| {
+            if let Expr::Col(p) = x {
+                match (item_of(p, from), at) {
+                    (None, _) => ok = false,
+                    (Some(i), None) => at = Some(i),
+                    (Some(i), Some(a)) if i != a => ok = false,
+                    _ => {}
+                }
+            }
+        });
+    }
+    if ok {
+        at
+    } else {
+        None
+    }
+}
+
+fn item_of(p: &[String], from: &[TableRef]) -> Option<usize> {
+    if p.len() >= 2 {
+        let q = p[p.len() - 2].to_lowercase();
+        return from.iter().position(|t| {
+            let mut a = vec![];
+            one(t, &mut a);
+            a.contains(&q)
+        });
+    }
+    let n = p.last()?.to_lowercase();
+    let hits: Vec<usize> = (0..from.len()).filter(|&i| columns_of(std::slice::from_ref(&from[i])).contains(&n)).collect();
+    if hits.len() == 1 {
+        Some(hits[0])
+    } else {
+        None
+    }
+}
+
+/// Whether one of the subquery's keys is a column that leads an index of its table (so the subquery, run per outer row, seeks).
+fn key_indexed(parts: &Parts, leading: &HashMap<String, Vec<String>>) -> bool {
+    fn tables(from: &[TableRef], out: &mut Vec<(String, String)>) {
+        for t in from {
+            match t {
+                TableRef::Table { name, alias, .. } => {
+                    if let Some(a) = alias.clone().or_else(|| name.last().cloned()) {
+                        out.push((a.to_lowercase(), table_id(name)));
+                    }
+                }
+                TableRef::Join { left, right, .. } => tables(&[(**left).clone(), (**right).clone()], out),
+                _ => {}
+            }
+        }
+    }
+    let mut ts = vec![];
+    tables(&parts.from, &mut ts);
+    parts.keys.iter().any(|(k, _)| {
+        let Expr::Col(p) = k else { return false };
+        let n = p.last().map(|s| s.to_lowercase()).unwrap_or_default();
+        let id = if p.len() >= 2 {
+            let q = p[p.len() - 2].to_lowercase();
+            ts.iter().find(|(a, _)| *a == q).map(|(_, id)| id.clone())
+        } else {
+            ts.iter().find(|(_, id)| SCHEMA.with(|s| s.borrow().get(id).is_some_and(|c| c.contains(&n)))).map(|(_, id)| id.clone())
+        };
+        id.is_some_and(|id| leading.get(&id).is_some_and(|c| c.contains(&n)))
+    })
 }
