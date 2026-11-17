@@ -24,6 +24,25 @@ pub fn foldable(fc: &FuncCall) -> bool {
         && !fc.args.iter().any(super::query::has_agg)
 }
 
+/// Whether the argument of an aggregate is made of exact numbers only (integers, decimals, bits: no `float`, `real`, string, or anything
+/// whose type is not known from the columns' declared types): a sum of them does not depend on the order of the additions, so
+/// partial sums can be added in any grouping.
+pub fn exact_number(e: &Expr, schema: &super::query::Schema) -> bool {
+    use crate::types::DataType as T;
+    match e {
+        Expr::Paren(x) | Expr::Neg(x) => exact_number(x, schema),
+        Expr::Lit(v) => matches!(v, Value::Int(_) | Value::BigInt(_) | Value::Dec(_) | Value::Bit(_)),
+        Expr::Col(p) => match schema.find_parts(p) {
+            super::query::Found::One(i) => matches!(schema.cols[i].ty, Some(T::Bit | T::TinyInt | T::SmallInt | T::Int | T::BigInt | T::Decimal(..) | T::Money | T::SmallMoney)),
+            _ => false,
+        },
+        Expr::Binary(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div, a, b) => exact_number(a, schema) && exact_number(b, schema),
+        // (what a cast gives for a row is the same whichever worker casts it: only the type of the result matters)
+        Expr::Cast { ty, .. } => ty.parts.len() == 1 && matches!(ty.parts[0].to_lowercase().as_str(), "int" | "integer" | "bigint" | "smallint" | "tinyint" | "bit" | "decimal" | "numeric" | "dec" | "money" | "smallmoney"),
+        _ => false,
+    }
+}
+
 /// Every aggregate call of the expression, or `false` if one of them cannot be folded.
 pub fn collect<'e>(e: &'e Expr, out: &mut Vec<&'e FuncCall>) -> bool {
     if let Expr::Func(fc) = e {
@@ -134,6 +153,66 @@ impl AggAcc {
                         }
                     }
                 });
+            }
+            _ => {}
+        }
+    }
+
+    /// Take in the state of the same aggregate over the rows that come *after* this one's (a worker's part of a parallel query: the parts
+    /// are merged in the order of the rows). What a serial fold keeps is kept: the first error, the first of equal `MIN`/`MAX` values.
+    /// For `SUM` and `AVG` the sums of the parts are added, which is the sum of the rows for exact numbers (integers, decimals) but not for
+    /// floats, whose sum depends on the order: the caller merges only aggregates over exact arguments (see `exact_number`).
+    pub fn merge(&mut self, o: AggAcc, fc: &FuncCall) {
+        if self.err.is_some() {
+            return;
+        }
+        if let Some(e) = o.err {
+            self.err = Some(e);
+            return;
+        }
+        if !self.started && o.started {
+            self.started = true;
+            self.coll = o.coll.clone();
+        }
+        self.count += o.count;
+        match fc.name.as_str() {
+            "SUM" | "AVG" => {
+                self.val = match (self.val.take(), o.val) {
+                    (None, v) => v,
+                    (Some(a), None) => Some(a),
+                    (Some(a), Some(b)) => match arith(BinOp::Add, &a, &b) {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            self.err = Some(e);
+                            return;
+                        }
+                    },
+                };
+            }
+            "MIN" | "MAX" => {
+                let min = fc.name == "MIN";
+                self.val = match (self.val.take(), o.val) {
+                    (None, v) => v,
+                    (Some(a), None) => Some(a),
+                    (Some(a), Some(b)) => {
+                        let ord = match (&self.coll, &b, &a) {
+                            (Some(c), Value::Str(x), Value::Str(y)) => c.compare(x, y),
+                            _ => match compare(&b, &a) {
+                                Ok(o) => o.unwrap_or(std::cmp::Ordering::Equal),
+                                Err(e) => {
+                                    self.err = Some(e);
+                                    return;
+                                }
+                            },
+                        };
+                        // (the later value replaces the earlier only when it is better: of equal ones the first stays)
+                        if (min && ord == std::cmp::Ordering::Less) || (!min && ord == std::cmp::Ordering::Greater) {
+                            Some(b)
+                        } else {
+                            Some(a)
+                        }
+                    }
+                };
             }
             _ => {}
         }

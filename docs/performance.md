@@ -411,10 +411,20 @@ TPC-H sf 0.1, the binaries of before and after one after the other: total 23.0 -
 Q3 0.95 -> 0.53, Q17 0.48 -> 0.27, Q1 1.9 -> 1.6; Q19 stays at 1.2); TPC-DS total unchanged (its queries read small tables or go through the general executor).
 On the cluster, TPC-C's consistency check 10 went from 3.0-3.6 s to 1.4 s and check 12 from 2.2 to 0.8 s (they no longer gather).
 
+5. **Workers fold the aggregates and the groups are merged** (`AggAcc::merge`, `aggacc::exact_number`, `src/engine/stream.rs`). In a parallel
+   streaming scan the workers used to evaluate the group key and the arguments of the aggregates and hand them back, and one thread added them
+   up, row by row. Each worker now folds its own part of a batch into groups of its own, and the parts are merged in the order of the rows
+   (the first row of a group, the first error and the first of equal `MIN`/`MAX` values are those of a serial run). It applies when every
+   aggregate is a count, a `MIN` or `MAX`, or a `SUM`/`AVG` of exact numbers: columns declared integer, decimal, money or bit, numeric
+   literals, `+ - * /` between them, a cast to one of those types. A float sum depends on the order of its additions, so those stay as they were
+   (the plan has no `workers fold the aggregates` line, and the sum is the serial one to the last digit). Not identical to a serial run in one case
+   only: a sum of integers that overflows `int` part of the way through the rows (values that cancel) may overflow in a serial run and not in a
+   parallel one, which adds partial sums. TPC-H Q1 (12 cores) 1.57 -> 0.9-1.07 s over repeated back to back runs; the other queries and TPC-DS
+   did not change.
+
 What is left in a row, measured as the extra time per row over a bare `COUNT(*)` (0.27 microseconds): one `SUM(column)` 0.2, `SUM(a * (1 - b))`
-0.5, a decimal operation 0.1-0.2. These are values cloned out of the row, walked through the expression tree, and the decimal arithmetic;
-folding the aggregates in each worker and merging them (exact for integers and decimals, not for floats, whose sum depends on its order)
-would use the cores for the accumulation as well, which today is serial after the parallel evaluation.
+0.5, a decimal operation 0.1-0.2. These are values cloned out of the row, walked through the expression tree, and the decimal arithmetic; a
+compiled form of an expression (column positions resolved once, no tree walk per row) is the next thing to try.
 
 ## Where the time goes now
 

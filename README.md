@@ -15,6 +15,8 @@ statement-terminating vs batch-aborting errors, blocking and deadlocks, permissi
 > is implemented (`tsql-serve`, see [docs/tds.md](docs/tds.md)) for SQL-authenticated connections (optionally encrypted with TLS), so
 > ADO.NET and tiberius can connect; so can the Rust API and the bundled shell.
 
+The [docs/](docs/README.md) folder has a guide and index to the documentation, one file per subject.
+
 ## What it has
 
 | Area | Summary | Details |
@@ -207,7 +209,7 @@ Tests are grouped by area: `datatypes`, `queries`, `dml`, `programmability`, `fu
 pool, eviction of uncommitted pages, crash during a checkpoint, overflow rows, space reuse), `security`, `optimizer`
 (results with the optimizer on and off must be identical, plus plan assertions). Unit tests in `src/storage` check the
 B+tree against a `BTreeMap` while the cache is forced to evict. `TSQL_TEST_PAGED=1 cargo test` runs the whole suite
-against a disk-backed server with an 8-page cache. `cargo test --features gui` also runs the GUI's headless tests
+against a disk-backed server with an 8-page cache, and `TSQL_TEST_SPILL=1 cargo test` makes every query that can use the streaming executor use it, with a tiny work-memory budget (see [docs/storage.md](docs/storage.md)). `cargo test --features gui` also runs the GUI's headless tests
 (views are driven without a window). Expected values encode real SQL Server behaviour.
 
 ## License

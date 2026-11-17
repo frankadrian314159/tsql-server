@@ -474,6 +474,8 @@ impl<'a> Engine<'a> {
             gk: Option<String>,
             args: Vec<Option<std::result::Result<Value, SqlError>>>,
             proj: Option<(Row, Vec<Value>)>,
+            /// a worker's groups for its part of a batch, and the number of rows of the part that passed the WHERE (see `partial` below)
+            partial: Option<(std::collections::HashMap<String, GroupAcc>, usize)>,
         }
         struct GroupAcc {
             rep: Row,
@@ -532,6 +534,32 @@ impl<'a> Engine<'a> {
             let (group_colls, order_colls) = (&group_colls, &order_colls);
             // what happens to each row of the source: filter, then group, or project and hand to the sink
             let mut handle = |eng: &mut Engine<'_>, row: Row, mut pre: Option<Prep>| -> Result<bool> {
+                // a worker's groups for a whole part: merged into the groups, the part's rows counted (in the order of the parts, so the
+                // first row of each group and the first error are those of a serial run)
+                if let Some((map, n)) = pre.as_mut().and_then(|p| p.partial.take()) {
+                    if let Some((groups, bytes)) = agg_groups_ref.as_mut() {
+                        for (k, mut g) in map {
+                            match groups.get_mut(&k) {
+                                Some(mine) => {
+                                    for ((a, b), fc) in mine.accs.iter_mut().zip(g.accs).zip(agg_calls_ref.iter()) {
+                                        a.merge(b, fc);
+                                    }
+                                }
+                                None => {
+                                    *bytes += super::spill::row_bytes(&g.rep) + k.len() + 96 * agg_calls_ref.len() + 64;
+                                    if *bytes > work_bytes {
+                                        *agg_restart_ref = true;
+                                        return Ok(false);
+                                    }
+                                    g.first_seq += *seq;
+                                    groups.insert(k, g);
+                                }
+                            }
+                        }
+                    }
+                    *seq += n as u64;
+                    return Ok(true);
+                }
                 let env = Env::new(schema, &row, outer);
                 if pre.is_none() {
                     if let Some(w) = where_ {
@@ -631,7 +659,7 @@ impl<'a> Engine<'a> {
                                 return Ok(None);
                             }
                         }
-                        let mut prep = Prep { gk: None, args: vec![], proj: None };
+                        let mut prep = Prep { gk: None, args: vec![], proj: None, partial: None };
                         if fold {
                             let mut kv = Vec::with_capacity(group_exprs.len());
                             for ge in group_exprs.iter() {
@@ -644,7 +672,47 @@ impl<'a> Engine<'a> {
                         }
                         Ok(Some((row, prep)))
                     };
+                    // aggregates that can be folded in any grouping (counts, minimums, maximums, sums of exact numbers) are folded by each
+                    // worker over its part of the batch, and the parts' groups are merged here in the order of the parts: the cores do the
+                    // accumulation as well as the evaluation. (A float sum depends on the order of its additions, so it stays serial.)
+                    let partial = foldable && !agg_calls.is_empty() && agg_calls.iter().all(|fc| fc.star || !matches!(fc.name.as_str(), "SUM" | "AVG") || fc.args.iter().all(|a| super::aggacc::exact_number(a, schema)));
+                    if partial {
+                        self.ses.plan.push(format!("{} workers fold the aggregates of their rows and the groups are merged", par_dop));
+                    }
                     let mut run = |eng: &mut Engine<'_>, rows: Vec<Row>, handle: &mut dyn FnMut(&mut Engine<'_>, Row, Option<Prep>) -> Result<bool>| -> Result<bool> {
+                        if partial {
+                            let parts = eng.par_map(rows, par_dop, &|w, part: Vec<Row>| -> Result<(std::collections::HashMap<String, GroupAcc>, usize)> {
+                                let mut map: std::collections::HashMap<String, GroupAcc> = std::collections::HashMap::new();
+                                let mut n = 0usize;
+                                for row in part {
+                                    let env = Env::new(schema, &row, None);
+                                    if let Some(wh) = where_ {
+                                        if !matches!(w.ev(wh, &env)?, Value::Bit(true)) {
+                                            continue;
+                                        }
+                                    }
+                                    n += 1;
+                                    let mut kv = Vec::with_capacity(group_exprs.len());
+                                    for ge in group_exprs.iter() {
+                                        kv.push(w.ev(ge, &env)?);
+                                    }
+                                    let gk = if group_colls.is_empty() { key_of(&kv) } else { key_of(&keyed(&kv, group_colls)) };
+                                    let g = map.entry(gk).or_insert_with(|| GroupAcc { rep: row.clone(), first_seq: n as u64, accs: agg_calls.iter().map(|_| AggAcc::new()).collect() });
+                                    for (a, fc) in g.accs.iter_mut().zip(agg_calls.iter()) {
+                                        a.update(w, fc, &env);
+                                    }
+                                }
+                                Ok((map, n))
+                            });
+                            for part in parts {
+                                let (map, n) = part?;
+                                let prep = Prep { gk: None, args: vec![], proj: None, partial: Some((map, n)) };
+                                if !handle(eng, vec![], Some(prep))? {
+                                    return Ok(false);
+                                }
+                            }
+                            return Ok(true);
+                        }
                         let parts = eng.par_map(rows, par_dop, &|w, part: Vec<Row>| part.into_iter().map(|row| prepare(w, row)).collect::<Vec<_>>());
                         for part in parts {
                             for r in part {

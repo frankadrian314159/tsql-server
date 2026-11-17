@@ -97,6 +97,49 @@ fn joins_are_probed_in_parallel_and_give_the_serial_rows_in_the_serial_order() {
 }
 
 #[test]
+fn aggregates_folded_by_the_workers_and_merged_give_the_serial_answer() {
+    let _one = one_at_a_time();
+    let mut c = big();
+    exec(&mut c, "CREATE TABLE ci (id INT PRIMARY KEY, g INT, s VARCHAR(10) COLLATE Latin1_General_CI_AS, v INT NULL, n DECIMAL(10,2))");
+    exec(&mut c, "WITH n AS (SELECT 1 AS i UNION ALL SELECT i + 1 FROM n WHERE i < 30000) INSERT ci SELECT i, i % 5, CASE WHEN i % 2 = 0 THEN 'abc' ELSE 'ABC' END, CASE WHEN i % 11 = 0 THEN NULL ELSE i % 1000 END, i / 4.0 FROM n OPTION (MAXRECURSION 0)");
+    let folded = |c: &mut tsql_server::Connection, sql: &str| c.last_plan().iter().any(|l| l.contains("fold the aggregates")) && { let _ = sql; true };
+    // counts, extremes, sums and averages of exact numbers, with groups, with one group, with NULLs, over expressions
+    for sql in [
+        "SELECT grp, COUNT(*), SUM(amount), MIN(name), MAX(name), MIN(d), MAX(d), AVG(id), AVG(amount) FROM big GROUP BY grp ORDER BY grp",
+        "SELECT COUNT(*), SUM(amount), MIN(id), MAX(d), AVG(grp), SUM(id * 3 - grp) FROM big WHERE grp > 3",
+        "SELECT g, COUNT(v), SUM(v), AVG(v), MIN(v), MAX(v), SUM(n), AVG(n) FROM ci GROUP BY g ORDER BY g",
+        "SELECT SUM(v), AVG(v), COUNT(*) FROM ci WHERE id % 11 = 0",
+        "SELECT g, SUM(CAST(id AS BIGINT) * 1000000), AVG(CAST(v AS DECIMAL(12,3))) FROM ci GROUP BY g ORDER BY g",
+    ] {
+        let before = parallel_batches();
+        let par = run(&mut c, sql);
+        assert!(parallel_batches() > before, "{}", sql);
+        assert!(folded(&mut c, sql), "the workers should fold: {}: {:?}", sql, c.last_plan());
+        assert_eq!(par, run(&mut c, &format!("{} OPTION (MAXDOP 1)", sql)), "{}", sql);
+    }
+    // MIN and MAX of strings that compare equal (the collation ignores case): the first of them, as a serial run gives
+    for sql in ["SELECT g, MIN(s), MAX(s) FROM ci GROUP BY g ORDER BY g", "SELECT MIN(s), MAX(s) FROM ci"] {
+        assert_eq!(run(&mut c, sql), run(&mut c, &format!("{} OPTION (MAXDOP 1)", sql)), "{}", sql);
+    }
+    // a float sum depends on the order of its additions: it is not folded by the workers, and is the serial one to the last digit
+    for sql in ["SELECT grp, SUM(f), AVG(f) FROM big GROUP BY grp ORDER BY grp", "SELECT SUM(f * 2), MIN(f) FROM big", "SELECT grp, SUM(amount + f) FROM big GROUP BY grp ORDER BY grp"] {
+        let par = run(&mut c, sql);
+        assert!(!c.last_plan().iter().any(|l| l.contains("fold the aggregates")), "{}: {:?}", sql, c.last_plan());
+        assert_eq!(par, run(&mut c, &format!("{} OPTION (MAXDOP 1)", sql)), "{}", sql);
+    }
+    // an error in an argument is raised, by a serial run and a parallel one alike (and not for a group that HAVING drops)
+    for sql in ["SELECT grp, SUM(CAST(name AS INT)) FROM big GROUP BY grp", "SELECT SUM(id * 1000000) FROM big"] {
+        let par = c.execute(sql).first_error().map(|e| e.number);
+        let ser = c.execute(&format!("{} OPTION (MAXDOP 1)", sql)).first_error().map(|e| e.number);
+        assert!(par.is_some() && par == ser, "{}: {:?} {:?}", sql, par, ser);
+    }
+    assert_eq!(run(&mut c, "SELECT grp, SUM(CAST(name AS INT)) FROM big GROUP BY grp HAVING 1 = 0"), run(&mut c, "SELECT grp, SUM(CAST(name AS INT)) FROM big GROUP BY grp HAVING 1 = 0 OPTION (MAXDOP 1)"));
+    // no rows: the one row of a query with no GROUP BY, none with one
+    assert_eq!(run(&mut c, "SELECT COUNT(*), SUM(amount), MAX(d) FROM big WHERE id < 0"), vec!["0|NULL|NULL".to_string()]);
+    assert!(run(&mut c, "SELECT grp, COUNT(*) FROM big WHERE id < 0 GROUP BY grp").is_empty());
+}
+
+#[test]
 fn what_cannot_be_shared_out_runs_on_one_thread() {
     let _one = one_at_a_time();
     let mut c = big();
