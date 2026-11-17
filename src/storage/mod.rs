@@ -318,6 +318,10 @@ pub struct TableData {
     heap: Arc<Tree>,
     pub specs: Vec<IndexSpec>,
     indexes: Vec<Arc<Tree>>,
+    /// Row versions written since the handle was made (inserts, updates and deletes; shared by clones). The optimizer's column
+    /// statistics compare it with the count they were sampled at, so an update that changes values but not the row count still
+    /// makes them stale. It is not persisted: it starts again at 0 when the table is decoded.
+    mods: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Serialize for TableData {
@@ -329,19 +333,19 @@ impl<'de> Deserialize<'de> for TableData {
     /// The result is not attached to a page store; call [`TableData::attach`].
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<TableData, D::Error> {
         let desc = TableDataDesc::deserialize(d)?;
-        Ok(TableData { heap: Arc::new(Tree::from_desc(desc.heap, None)), specs: desc.specs, indexes: desc.indexes.into_iter().map(|t| Arc::new(Tree::from_desc(t, None))).collect() })
+        Ok(TableData { heap: Arc::new(Tree::from_desc(desc.heap, None)), specs: desc.specs, indexes: desc.indexes.into_iter().map(|t| Arc::new(Tree::from_desc(t, None))).collect(), mods: Default::default() })
     }
 }
 
 impl TableData {
     pub fn new(store: &Arc<PageStore>) -> TableData {
-        TableData { heap: Arc::new(Tree::new(store)), specs: vec![], indexes: vec![] }
+        TableData { heap: Arc::new(Tree::new(store)), specs: vec![], indexes: vec![], mods: Default::default() }
     }
 
     /// An empty table with the same index layout.
     pub fn fresh(&self) -> TableData {
         let store = self.store().clone();
-        TableData { heap: Arc::new(Tree::new(&store)), specs: self.specs.clone(), indexes: self.specs.iter().map(|_| Arc::new(Tree::new(&store))).collect() }
+        TableData { heap: Arc::new(Tree::new(&store)), specs: self.specs.clone(), indexes: self.specs.iter().map(|_| Arc::new(Tree::new(&store))).collect(), mods: Default::default() }
     }
 
     pub fn store(&self) -> &Arc<PageStore> {
@@ -429,6 +433,11 @@ impl TableData {
         out
     }
 
+    /// Row versions written through this table's handles since it was created or decoded (see the `mods` field).
+    pub fn modifications(&self) -> u64 {
+        self.mods.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Slots in the heap (live rows plus deleted-but-not-yet-collected ones).
     pub fn slot_count(&self) -> usize {
         self.heap.entries() as usize
@@ -471,6 +480,7 @@ impl TableData {
 
     // ---- writes
     pub fn push_version(&self, rowid: RowId, row: Option<Row>, stamp: Stamp) {
+        self.mods.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // the index keys of the new version; an index already holding the key (an earlier version of the row has
         // it, as in an update that leaves the key alone) needs no entry
         let keys: Vec<Option<KeyVals>> = match &row {
@@ -504,6 +514,7 @@ impl TableData {
         if items.is_empty() {
             return;
         }
+        self.mods.fetch_add(items.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let rids: Vec<u64> = items.iter().map(|(r, _)| *r as u64).collect();
         let mut keys: Vec<Vec<Option<KeyVals>>> = items
             .iter()

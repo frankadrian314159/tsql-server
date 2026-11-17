@@ -8,6 +8,10 @@
 //! sample). A condition on one column then has a selectivity: equality is the share of a common value, or what is left of the rows
 //! divided by the other distinct values; a range is read off the histogram; `IN`, `BETWEEN`, `IS NULL`, `LIKE 'prefix%'`, `AND`, `OR`
 //! and `NOT` are built from those. A condition that is none of these keeps the old guess.
+//!
+//! The statistics are taken again when the table has changed in size by a fifth, or when more than `STALE_BASE` + a fifth of its
+//! rows have been written since the sample (`TableData::modifications`), so an `UPDATE` that changes the values of a column
+//! without changing the number of rows makes them stale too (as SQL Server's modification counter does).
 use super::*;
 use crate::catalog::Table;
 use crate::convert::compare;
@@ -21,6 +25,8 @@ const BLOCK: usize = 64;
 /// Slices of the histogram, and most common values kept.
 const BUCKETS: usize = 32;
 const MCV: usize = 12;
+/// Row versions written since the sample, beyond a fifth of the table, that make the statistics stale.
+const STALE_BASE: f64 = 500.0;
 
 pub struct ColStats {
     /// Share of rows that are NULL.
@@ -36,6 +42,8 @@ pub struct ColStats {
 pub struct TableStats {
     /// Slots of the heap when the sample was taken.
     pub slots: usize,
+    /// `TableData::modifications` when the sample was taken.
+    pub mods: u64,
     pub cols: Vec<ColStats>,
 }
 
@@ -44,7 +52,7 @@ fn key(v: &Value) -> String {
 }
 
 /// The statistics of a table taken from `rows` (a sample) of a heap with `slots` slots.
-fn build(rows: &[Vec<Value>], ncols: usize, slots: usize) -> TableStats {
+fn build(rows: &[Vec<Value>], ncols: usize, slots: usize, mods: u64) -> TableStats {
     let n = rows.len().max(1) as f64;
     let total = slots as f64;
     let mut cols = vec![];
@@ -75,7 +83,7 @@ fn build(rows: &[Vec<Value>], ncols: usize, slots: usize) -> TableStats {
         }
         cols.push(ColStats { nulls, ndv, mcv, bounds });
     }
-    TableStats { slots, cols }
+    TableStats { slots, mods, cols }
 }
 
 impl ColStats {
@@ -140,16 +148,18 @@ fn num(v: &Value) -> Option<f64> {
 use chrono::Datelike;
 
 impl<'a> Engine<'a> {
-    /// The statistics of `t`, sampled now when there are none or the table has changed in size by a fifth; None for a table that is small,
-    /// temporary or cannot be sampled.
+    /// The statistics of `t`, sampled now when there are none or they are stale (see the module comment); None for a table that is
+    /// small, temporary or cannot be sampled.
     fn table_stats(&mut self, t: &Table) -> Option<Arc<TableStats>> {
         let slots = t.data.slot_count();
         if slots < MIN_SLOTS || t.is_temp || !t.data.is_attached() {
             return None;
         }
         let id = t.data.heap_id();
+        // (read before the sample, so writes made while it is taken count towards the next one)
+        let mods = t.data.modifications();
         if let Some(s) = self.srv.stats.lock().unwrap_or_else(|e| e.into_inner()).get(&id) {
-            if (s.slots as f64 - slots as f64).abs() <= 0.2 * s.slots as f64 {
+            if fresh(s, slots, mods) {
                 return Some(s.clone());
             }
         }
@@ -165,7 +175,7 @@ impl<'a> Engine<'a> {
         if rows.is_empty() {
             return None;
         }
-        let st = Arc::new(build(&rows, t.columns.len(), slots));
+        let st = Arc::new(build(&rows, t.columns.len(), slots, mods));
         self.srv.stats.lock().unwrap_or_else(|e| e.into_inner()).insert(id, st.clone());
         Some(st)
     }
@@ -187,6 +197,26 @@ impl<'a> Engine<'a> {
 
     fn col_of(&self, t: &Table, alias: &str, e: &Expr) -> Option<usize> {
         Self::pred_col(t, alias, e)
+    }
+
+    /// The one column of `t` a condition is on (`col op x`, `col BETWEEN ..`, `col IN (..)`, `col IS NULL`, `col LIKE ..`, and
+    /// `AND` / `OR` / `NOT` of conditions on that same column); None when it is on no column or several. Used to tell which of a
+    /// table's conditions an index access already answers (`Engine::estimate_table`).
+    pub fn cond_col(t: &Table, alias: &str, e: &Expr) -> Option<usize> {
+        let one = |a: &Expr, b: &Expr| match (Self::pred_col(t, alias, a), Self::pred_col(t, alias, b)) {
+            (Some(c), None) | (None, Some(c)) => Some(c),
+            _ => None,
+        };
+        match e {
+            Expr::Paren(x) | Expr::Not(x) => Self::cond_col(t, alias, x),
+            Expr::And(a, b) | Expr::Or(a, b) => match (Self::cond_col(t, alias, a), Self::cond_col(t, alias, b)) {
+                (Some(x), Some(y)) if x == y => Some(x),
+                _ => None,
+            },
+            Expr::Binary(_, a, b) => one(a, b),
+            Expr::Between(a, ..) | Expr::InList(a, ..) | Expr::IsNull(a, _) | Expr::Like(a, ..) => Self::pred_col(t, alias, a),
+            _ => None,
+        }
     }
 
     fn cond_selectivity(&mut self, st: &TableStats, t: &Table, alias: &str, e: &Expr) -> Option<f64> {
@@ -260,6 +290,14 @@ impl<'a> Engine<'a> {
             _ => None,
         }
     }
+}
+
+/// Whether statistics sampled as `s` still describe a table that now has `slots` slots and `mods` versions written.
+fn fresh(s: &TableStats, slots: usize, mods: u64) -> bool {
+    let base = s.slots as f64;
+    // (a counter below the sampled one means the table was decoded again since: the statistics may be of other rows)
+    let Some(written) = mods.checked_sub(s.mods) else { return false };
+    (base - slots as f64).abs() <= 0.2 * base && (written as f64) <= STALE_BASE + 0.2 * base
 }
 
 fn flip(op: BinOp) -> BinOp {

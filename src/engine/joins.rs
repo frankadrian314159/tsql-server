@@ -58,23 +58,36 @@ impl<'a> Engine<'a> {
             return base.max(1.0);
         }
         let conj: Vec<&Expr> = pushed.iter().collect();
-        let est = match self.choose_access(t, alias, &conj) {
+        // the rows the access path reads, and the index columns whose conditions it answers
+        let (est, answered): (f64, &[usize]) = match self.choose_access(t, alias, &conj) {
             Access::Seek { idx, keys, .. } => {
                 let sp = &t.data.specs[idx];
                 let used = keys.first().map(|k| k.len()).unwrap_or(0);
-                if sp.unique && used == sp.cols.len() {
+                let est = if sp.unique && used == sp.cols.len() {
                     keys.len() as f64
                 } else {
                     let ndv = distinct_prefixes(t, idx, used).max(1) as f64;
                     base / ndv * keys.len() as f64
-                }
+                };
+                (est, &sp.cols[..used.min(sp.cols.len())])
             }
-            Access::Range { idx, lo, hi, .. } => base * t.data.range_fraction(idx, lo.as_ref().map(|(v, i)| (v.as_slice(), *i)), hi.as_ref().map(|(v, i)| (v.as_slice(), *i))),
-            Access::Full => match self.pushed_selectivity(t, alias, &conj) {
-                Some(sel) => base * sel,
-                None => base * 0.33f64.powi(pushed.len().min(4) as i32),
-            },
+            Access::Range { idx, lo, hi, .. } => {
+                let est = base * t.data.range_fraction(idx, lo.as_ref().map(|(v, i)| (v.as_slice(), *i)), hi.as_ref().map(|(v, i)| (v.as_slice(), *i)));
+                (est, &t.data.specs[idx].cols[..1.min(t.data.specs[idx].cols.len())])
+            }
+            Access::Full => {
+                let est = match self.pushed_selectivity(t, alias, &conj) {
+                    Some(sel) => base * sel,
+                    None => base * 0.33f64.powi(pushed.len().min(4) as i32),
+                };
+                return est.clamp(1.0, base.max(1.0));
+            }
         };
+        // The conditions the index does not answer still remove rows: take their share from the column statistics (assumed
+        // independent of the index columns). A condition on an answered column is left out so it is not counted twice; without
+        // statistics (a small table) the estimate is the index's alone, as before.
+        let residual: Vec<&Expr> = conj.iter().copied().filter(|e| !Self::cond_col(t, alias, e).is_some_and(|c| answered.contains(&c))).collect();
+        let est = if residual.is_empty() { est } else { est * self.pushed_selectivity(t, alias, &residual).unwrap_or(1.0) };
         est.clamp(1.0, base.max(1.0))
     }
 

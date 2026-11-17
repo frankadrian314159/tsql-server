@@ -117,6 +117,47 @@ fn estimates_come_from_the_statistics_of_the_columns() {
     assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM s WHERE g = 7"), "60");
 }
 
+fn est_of(c: &mut tsql_server::Connection, sql: &str) -> f64 {
+    let plan = c.explain(sql).unwrap().join("\n");
+    let at = plan.find("est ").unwrap_or_else(|| panic!("no estimate in {plan}"));
+    plan[at + 4..].split_whitespace().next().unwrap().parse().unwrap()
+}
+
+/// 6000 rows: `g` (indexed) takes 10 values, 600 rows each; `flag` (not indexed) is 1 for 1% of the rows, independently of `g`.
+fn flagged(c: &mut tsql_server::Connection) {
+    exec(c, "CREATE TABLE r (id INT PRIMARY KEY, g INT NOT NULL, flag INT NOT NULL); CREATE INDEX ix_r_g ON r (g)");
+    exec(c, "DECLARE @i INT = 1; WHILE @i <= 6000 BEGIN INSERT r VALUES (@i, @i % 10, CASE WHEN (@i / 10) % 100 = 0 THEN 1 ELSE 0 END); SET @i += 1 END");
+}
+
+#[test]
+fn conditions_an_index_seek_does_not_answer_still_count_in_its_estimate() {
+    let mut c = conn();
+    flagged(&mut c);
+    let seek = est_of(&mut c, "SELECT * FROM r WHERE g = 3");
+    assert!((400.0..=800.0).contains(&seek), "the index alone: about 600 rows: {seek}");
+    let p = c.explain("SELECT * FROM r WHERE g = 3 AND flag = 1").unwrap().join("\n");
+    assert!(p.contains("index seek via ix_r_g"), "{p}");
+    let both = est_of(&mut c, "SELECT * FROM r WHERE g = 3 AND flag = 1");
+    assert!(both < seek / 4.0, "the unindexed condition keeps about 1% of what the seek finds: {both} against {seek}");
+    // a second condition on the column the seek is on is not counted again
+    let same_col = est_of(&mut c, "SELECT * FROM r WHERE g = 3 AND g <> 4");
+    assert_eq!(same_col, seek, "a condition on the sought column");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM r WHERE g = 3 AND flag = 1"), "6");
+}
+
+#[test]
+fn statistics_are_taken_again_after_updates_that_keep_the_row_count() {
+    let mut c = conn();
+    flagged(&mut c);
+    let before = est_of(&mut c, "SELECT * FROM r WHERE flag = 1");
+    assert!(before < 200.0, "1% of the rows: {before}");
+    // half the rows change value, none are added or removed
+    exec(&mut c, "UPDATE r SET flag = 1 WHERE g < 5");
+    let after = est_of(&mut c, "SELECT * FROM r WHERE flag = 1");
+    assert!(after > 1500.0, "about 3000 rows now, from a new sample: {after}");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM r WHERE flag = 1"), "3030");
+}
+
 #[test]
 fn a_session_temporary_table_is_read_through_its_index() {
     let mut c = data();
