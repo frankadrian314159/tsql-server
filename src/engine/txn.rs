@@ -434,9 +434,12 @@ impl<'a> Engine<'a> {
     /// need not hold them all); `f` returns `false` to stop the scan early. Locking and visibility rules are
     /// those of a scan.
     pub fn scan_each(&mut self, loc: &Loc, t: &Table, ap: &optimizer::Access, flt: Option<(&Schema, &[Expr])>, f: &mut dyn FnMut(&mut Self, Vec<(RowId, Row)>) -> Result<bool>) -> Result<()> {
+        // (set for this scan alone by the caller that knows which columns the query reads)
+        let needed = self.ses.scan_needed.take();
         // row-level security: a filter predicate hides rows from every reader of the table
         if self.has_filter_policy(loc) {
-            return self.scan_each_inner(loc, t, ap, flt, &mut |eng, rows| {
+            // (a policy's predicate reads columns of its own: every column is read)
+            return self.scan_each_inner(loc, t, ap, flt, None, &mut |eng, rows| {
                 let rows = eng.rls_filter(loc, t, rows)?;
                 if rows.is_empty() {
                     return Ok(true);
@@ -444,16 +447,24 @@ impl<'a> Engine<'a> {
                 f(eng, rows)
             });
         }
-        self.scan_each_inner(loc, t, ap, flt, f)
+        self.scan_each_inner(loc, t, ap, flt, needed.as_deref(), f)
     }
 
-    fn scan_each_inner(&mut self, loc: &Loc, t: &Table, ap: &optimizer::Access, flt: Option<(&Schema, &[Expr])>, f: &mut dyn FnMut(&mut Self, Vec<(RowId, Row)>) -> Result<bool>) -> Result<()> {
+    fn scan_each_inner(&mut self, loc: &Loc, t: &Table, ap: &optimizer::Access, flt: Option<(&Schema, &[Expr])>, needed: Option<&[bool]>, f: &mut dyn FnMut(&mut Self, Vec<(RowId, Row)>) -> Result<bool>) -> Result<()> {
         let db = match loc {
             Loc::Db(d, _) => d.clone(),
             // global temporary tables are shared between sessions, so they are locked like any table
             Loc::GTemp(_) => "tempdb".to_string(),
             _ => {
-                let rows = t.rows_in(ReadView::dirty());
+                // (a session temporary table or a table variable: an index the condition can use is used, as for any table; reading every
+                // row to find a few made a correlated subquery over a temporary table a scan of it for each outer row)
+                let rows = match ap {
+                    optimizer::Access::Full => t.rows_in(ReadView::dirty()),
+                    _ => {
+                        let v = ReadView::dirty();
+                        ap.row_ids(t).into_iter().filter_map(|r| t.data.get(r, &v).map(|row| (r, row))).collect()
+                    }
+                };
                 let rows = match flt {
                     Some((sc, es)) => self.filter_pushed(sc, rows, es)?,
                     None => rows,
@@ -499,7 +510,7 @@ impl<'a> Engine<'a> {
             let (batch, dop) = if h.write_lock { (0, 1) } else { self.par_batch(t, flt) };
             let mut pending: Vec<(RowId, Row)> = Vec::new();
             loop {
-                let mut chunk = t.data.scan_chunk(&view, after, 512, !h.readpast);
+                let mut chunk = t.data.scan_chunk_cols(&view, after, 512, !h.readpast, needed);
                 if let Some(w) = chunk.blocked_by {
                     if self.waits_in_place(iso, h.write_lock) {
                         // wait for the writer here and read the chunk again, instead of running the whole statement again

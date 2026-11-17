@@ -116,3 +116,27 @@ fn estimates_come_from_the_statistics_of_the_columns() {
     // and the answers are the answers
     assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM s WHERE g = 7"), "60");
 }
+
+#[test]
+fn a_session_temporary_table_is_read_through_its_index() {
+    let mut c = data();
+    exec(&mut c, "SELECT * INTO #e FROM emp");
+    exec(&mut c, "CREATE INDEX ix_e ON #e (dept_id)");
+    // an equality on the indexed column seeks, for a constant and for each row of an outer query
+    let plan = |c: &mut tsql_server::Connection, sql: &str| {
+        exec(c, sql);
+        c.last_plan().to_vec()
+    };
+    let p = plan(&mut c, "SELECT id FROM #e WHERE dept_id = 1");
+    assert!(p.iter().any(|l| l.contains("index seek via ix_e")), "{p:?}");
+    let sql = "SELECT d.id, ISNULL((SELECT SUM(e.sal) FROM #e e WHERE e.dept_id = d.id), -1) FROM dept d";
+    let p = plan(&mut c, sql);
+    assert!(p.iter().any(|l| l.contains("index seek via ix_e")), "{p:?}");
+    // the same rows as the same query over the table, and as with the index out of the way
+    let over_table = sorted(&mut c, "SELECT d.id, ISNULL((SELECT SUM(e.sal) FROM emp e WHERE e.dept_id = d.id), -1) FROM dept d");
+    assert_eq!(sorted(&mut c, sql), over_table);
+    assert_eq!(sorted(&mut c, "SELECT id FROM #e WHERE dept_id IN (1, 3) AND sal > 100"), sorted(&mut c, "SELECT id FROM emp WHERE dept_id IN (1, 3) AND sal > 100"));
+    // a table variable too: the rows of its index are found by it
+    exec(&mut c, "DECLARE @v TABLE (k INT PRIMARY KEY, v INT); INSERT @v VALUES (1, 10), (2, 20), (3, 30)");
+    assert_eq!(rows(&mut c, "DECLARE @v TABLE (k INT PRIMARY KEY, v INT); INSERT @v VALUES (1, 10), (2, 20), (3, 30); SELECT v FROM @v WHERE k = 2"), vec![vec!["20".to_string()]]);
+}

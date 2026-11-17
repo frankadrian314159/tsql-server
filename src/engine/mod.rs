@@ -234,6 +234,8 @@ pub struct SessionState {
     pub push_plans: HashMap<(usize, usize), std::sync::Arc<optimizer::PushPlan>>,
     /// Set while a grouped query runs again without folding its aggregates as the rows arrive (see `aggacc`).
     pub no_fold_agg: bool,
+    /// For the next table scan only: the columns the query reads (see `Engine::needed_cols`); the others are read as NULL.
+    pub scan_needed: Option<Vec<bool>>,
     /// Per statement: for a correlated subquery, the names it mentions (`None`: its result must not be reused), and the
     /// rows it gave for each combination of the values of the outer columns with those names (see `Engine::sub_rows`).
     pub sub_names: HashMap<usize, Option<std::sync::Arc<Vec<(String, Option<String>)>>>>,
@@ -336,6 +338,7 @@ impl SessionState {
             in_sets: None,
             push_plans: HashMap::new(),
             no_fold_agg: false,
+            scan_needed: None,
             sub_names: HashMap::new(),
             sub_memo: HashMap::new(),
             leaf_seen: std::collections::HashSet::new(),

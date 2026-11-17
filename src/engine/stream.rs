@@ -166,14 +166,76 @@ impl Sinks {
 impl<'a> Engine<'a> {
     /// Run a single-table SELECT with the streaming executor if it is eligible (see the module docs);
     /// `Ok(None)` means the caller should use the general executor.
+    /// The columns of `t` that the query reads, for a scan that need not copy the others: None (read them all) when the table is small
+    /// (working it out costs more than it saves), has a computed column, or the query has a `*` anywhere. A column is read when its
+    /// name is used anywhere in the statement, in a subquery too (the match is by name alone, so more columns than needed are kept
+    /// when two tables share a name, never fewer).
+    pub(super) fn needed_cols(&mut self, sel: &Select, order: &[OrderItem], t: &Table) -> Option<Vec<bool>> {
+        // (`TSQL_NO_SCAN_PRUNE`: for the tests that compare an answer with and without the pruning)
+        if t.data.slot_count() < 2000 || t.columns.iter().any(|c| c.computed.is_some()) || std::env::var_os("TSQL_NO_SCAN_PRUNE").is_some() {
+            return None;
+        }
+        fn walk(v: &serde_json::Value, names: &mut std::collections::HashSet<String>) -> bool {
+            match v {
+                serde_json::Value::Object(m) => {
+                    if m.contains_key("Star") {
+                        return false;
+                    }
+                    if let Some(serde_json::Value::Array(p)) = m.get("Col") {
+                        if let Some(n) = p.last().and_then(|n| n.as_str()) {
+                            names.insert(n.to_lowercase());
+                        }
+                    }
+                    m.values().all(|c| walk(c, names))
+                }
+                serde_json::Value::Array(a) => a.iter().all(|c| walk(c, names)),
+                _ => true,
+            }
+        }
+        let mut names = std::collections::HashSet::new();
+        let ok = serde_json::to_value(sel).map(|j| walk(&j, &mut names)).unwrap_or(false) && order.iter().all(|o| serde_json::to_value(&o.e).map(|j| walk(&j, &mut names)).unwrap_or(false));
+        if !ok {
+            return None;
+        }
+        let needed: Vec<bool> = t.columns.iter().map(|c| names.contains(&c.name.to_lowercase())).collect();
+        if needed.iter().all(|n| *n) {
+            return None;
+        }
+        self.ses.plan.push(format!("scan of {} copies {} of its {} columns", t.name, needed.iter().filter(|n| **n).count(), needed.len()));
+        Some(needed)
+    }
+
     pub fn try_stream_select(&mut self, sel: &Select, order: &[OrderItem], offset: &Option<Expr>, fetch: &Option<Expr>, outer: Option<&Env<'_>>, may_stream: bool, to_buf: bool) -> Result<Option<Rowset>> {
         if self.ses.dry_run || sel.from.is_empty() {
             return Ok(None);
         }
         // GROUP BY over plain expressions is done by sorting on the group key; ROLLUP/CUBE/GROUPING SETS and
         // aggregates without GROUP BY (one group holding every row) stay with the general executor
-        let grouped = sel.group.is_some();
-        if grouped && !sel.group.as_ref().unwrap().iter().all(|g| matches!(g, GroupItem::Expr(_))) {
+        // (a query whose select list is nothing but aggregates the rows can be folded into, and has no GROUP BY, is one group: the same
+        // machinery runs it with no group key, and gives its one row for an empty input too)
+        // (one table only: a join with no GROUP BY keeps the general executor, which starts from the selective table and finds the rest by
+        // index, where the streaming join would read the big side whole)
+        let global_agg = sel.group.is_none()
+            && sel.from.len() == 1
+            && matches!(sel.from[0], TableRef::Table { .. })
+            && sel.having.is_none()
+            && !self.ses.no_fold_agg
+            && !sel.distinct
+            && sel.top.is_none()
+            && offset.is_none()
+            && fetch.is_none()
+            && order.is_empty()
+            && sel.into.is_none()
+            && !sel.items.is_empty()
+            && sel.items.iter().all(|i| match i {
+                SelectItem::Expr { e, .. } => {
+                    let mut calls = vec![];
+                    has_agg(e) && aggacc::collect(e, &mut calls)
+                }
+                _ => false,
+            });
+        let grouped = sel.group.is_some() || global_agg;
+        if grouped && !global_agg && !sel.group.as_ref().unwrap().iter().all(|g| matches!(g, GroupItem::Expr(_))) {
             return Ok(None);
         }
         if sel.having.is_some() && !grouped {
@@ -596,6 +658,7 @@ impl<'a> Engine<'a> {
                         Ok(true)
                     };
                     let mut stopped = false;
+                    self.ses.scan_needed = self.needed_cols(sel, order, &o.t);
                     self.scan_each(&o.loc, &o.t, &o.ap, Some((&o.schema, &o.pushed)), &mut |eng, chunk| {
                         *scanned += chunk.len();
                         buf.extend(chunk.into_iter().map(|(_, row)| row));
@@ -609,6 +672,7 @@ impl<'a> Engine<'a> {
                         run(self, std::mem::take(&mut buf), &mut handle)?;
                     }
                 } else {
+                    self.ses.scan_needed = self.needed_cols(sel, order, &o.t);
                     self.scan_each(&o.loc, &o.t, &o.ap, Some((&o.schema, &o.pushed)), &mut |eng, chunk| {
                         for (_, row) in chunk {
                             *scanned += 1;
@@ -630,6 +694,7 @@ impl<'a> Engine<'a> {
                     let leaf = &leaves[st.leaf];
                     names.push((leaf.alias.clone(), leaf.ap.describe()));
                     let mut hj = HashJoin::new(st.spec, budget, work.clone());
+                    self.ses.scan_needed = self.needed_cols(sel, order, &leaf.t);
                     self.scan_each(&leaf.loc, &leaf.t, &leaf.ap, Some((&leaf.schema, &leaf.pushed)), &mut |eng, chunk| {
                         for (_, row) in chunk {
                             hj.add_build(eng, row, outer)?;
@@ -684,6 +749,7 @@ impl<'a> Engine<'a> {
                             }
                             Ok(true)
                         };
+                        self.ses.scan_needed = self.needed_cols(sel, order, &probe.t);
                         self.scan_each(&probe.loc, &probe.t, &probe.ap, Some((&probe.schema, &probe.pushed)), &mut |eng, chunk| {
                             *scanned += chunk.len();
                             buf.extend(chunk.into_iter().map(|(_, row)| row));
@@ -697,6 +763,7 @@ impl<'a> Engine<'a> {
                             run(self, std::mem::take(&mut buf), joins)?;
                         }
                     } else {
+                        self.ses.scan_needed = self.needed_cols(sel, order, &probe.t);
                         self.scan_each(&probe.loc, &probe.t, &probe.ap, Some((&probe.schema, &probe.pushed)), &mut |eng, chunk| {
                             for (_, row) in chunk {
                                 *scanned += 1;
@@ -762,6 +829,9 @@ impl<'a> Engine<'a> {
         let mut hashed = false;
         if let Some((mut map, _)) = agg_groups.take() {
             // folded aggregates: each group is its first row and the finished aggregates, in the order of the keys
+            if global_agg && map.is_empty() {
+                map.insert(String::new(), GroupAcc { rep: vec![Value::Null; schema.cols.len()], first_seq: 0, accs: agg_calls.iter().map(|_| AggAcc::new()).collect() });
+            }
             grouper = None;
             hgroups = None;
             hashed = true;

@@ -124,7 +124,12 @@ tables sharded on the item), and its table shows how each query ran (`split`, `s
     query may join several tables when its sharded ones are co-located (TPC-H Q4 is this case; before it was gathered, 18 times
     slower than one node). When the outer query also reads tables that are not co-located with those (TPC-H Q21: `supplier` and `nation` next to
     `lineitem` and `orders`), the join planner copies them to every shard first (broadcast only, never a re-spread: the copy is a replicated
-    table for the check), and the query then runs shard by shard with the subqueries inside, when the shards can answer them against that;
+    table for the check), and the query then runs shard by shard with the subqueries inside, when the shards can answer them against that. A
+    subquery may join several sharded tables (TPC-C's consistency checks 10 and 12: `orders JOIN order_line` under `customer`) when each of
+    them is tied, by an equality of shard keys in its `WHERE` or `ON`, to another of them or to the outer query's table, all in one chain: the
+    rows that belong to an outer row then lie on its shard. A subquery that reads a table sharded on another key (`history`, by the customer's
+    id, next to `customer` by its warehouse) has that table copied to every shard when it is small (`set_broadcast_limit`), indexed on the
+    columns the subquery compares, and reads the copy;
   * *correlated subqueries* (`decorrelate.rs`): the common shapes are rewritten as joins first, so that their parts do not
     depend on the outer rows. A scalar aggregate subquery in a comparison of the `WHERE`
     (`x > (SELECT AVG(y) FROM t WHERE t.k = o.k)`, also under arithmetic) becomes a join with a grouped derived table (a row

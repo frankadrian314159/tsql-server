@@ -208,11 +208,11 @@ fn what_cannot_be_scattered_is_gathered_and_still_exact() {
     // a subquery that does not depend on the outer query is evaluated first and the outer query runs over the shards
     let plan = p.check("SELECT c.name FROM customers c WHERE c.id IN (SELECT customer_id FROM orders WHERE amount > 990)", false);
     assert!(!plan.iter().any(|l| l.starts_with("gather")), "{:?}", plan);
-    // a correlated one by equality is rewritten as a join, one that is not is gathered
+    // a correlated one by equality is rewritten as a join; one that is not has the small table it reads copied to every shard
     let plan = p.check("SELECT c.name FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.amount > 990)", false);
     assert!(!plan.iter().any(|l| l.starts_with("gather")), "{:?}", plan);
     let plan = p.check("SELECT c.name FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.amount > c.credit)", false);
-    assert!(plan.iter().any(|l| l.starts_with("gather")), "{:?}", plan);
+    assert!(plan.iter().any(|l| l.starts_with("join over shards: broadcast dbo.orders")) && !plan.iter().any(|l| l.starts_with("gather")), "{:?}", plan);
 }
 
 #[test]
@@ -698,10 +698,13 @@ fn subqueries_ctes_and_derived_tables_are_evaluated_around_the_shards() {
         assert!(plan.iter().any(|l| l.contains(expect)), "{}\nexpected {:?} in the plan, got {:?}", sql, expect, plan);
         assert!(!plan.iter().any(|l| l.starts_with("gather")), "{}\nthe tables should not be gathered: {:?}", sql, plan);
     }
-    // what cannot be evaluated alone is gathered, and still exact: a correlated subquery that is not an equality, ANY / ALL
+    // a correlated subquery over a small table of another key runs on the shards, with that table copied to every shard
+    let plan = p.check("SELECT c.id FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.amount > c.credit) ORDER BY c.id", true);
+    assert!(plan.iter().any(|l| l.starts_with("join over shards: broadcast dbo.orders")) && !plan.iter().any(|l| l.starts_with("gather")), "{:?}", plan);
+    let plan = p.check("SELECT c.id FROM customers c WHERE c.credit > (SELECT AVG(o.amount) FROM orders o WHERE o.customer_id < c.id) ORDER BY c.id", true);
+    assert!(plan.iter().any(|l| l.starts_with("join over shards: broadcast dbo.orders")) && !plan.iter().any(|l| l.starts_with("gather")), "{:?}", plan);
+    // what cannot be evaluated alone is gathered, and still exact: ANY / ALL
     for sql in [
-        "SELECT c.id FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.amount > c.credit) ORDER BY c.id",
-        "SELECT c.id FROM customers c WHERE c.credit > (SELECT AVG(o.amount) FROM orders o WHERE o.customer_id < c.id) ORDER BY c.id",
         "SELECT id FROM customers WHERE credit > ANY (SELECT amount FROM orders WHERE amount < 10) ORDER BY id",
     ] {
         let plan = p.check(sql, true);
@@ -1271,6 +1274,24 @@ fn subqueries_of_a_join_with_a_small_table_run_on_the_shards_after_it_is_broadca
     ] {
         let plan = p.check(sql, ordered);
         assert!(joined(&plan) && !plan.iter().any(|l| l.starts_with("gather")), "{}
+{:?}", sql, plan);
+    }
+}
+
+#[test]
+fn subqueries_that_join_co_located_tables_or_read_a_small_table_of_another_key_run_on_the_shards() {
+    let mut p = Pair::new(3);
+    p.load();
+    p.load_items();
+    // TPC-C's consistency check 10 in miniature: one subquery joins two tables that are co-located with the outer one (items and orders on
+    // the order key), the other reads customers, which are sharded on their own key; the small table is copied to every shard
+    for (sql, ordered) in [
+        ("SELECT COUNT(*) FROM orders o WHERE o.amount <> ISNULL((SELECT SUM(i.qty) FROM order_items i JOIN orders o2 ON o2.id = i.order_id WHERE o2.id = o.id AND o2.qty > 1), 0) - ISNULL((SELECT SUM(c.credit) FROM customers c WHERE c.id = o.customer_id), 0)", false),
+        ("SELECT COUNT(*) FROM orders o WHERE o.qty <> ISNULL((SELECT SUM(i.qty) FROM order_items i JOIN orders o2 ON o2.id = i.order_id WHERE o2.id = o.id), 0)", false),
+        ("SELECT o.id FROM orders o WHERE EXISTS (SELECT 1 FROM customers c WHERE c.id = o.customer_id AND c.credit > 500) AND o.amount > 90000 ORDER BY o.id", true),
+    ] {
+        let plan = p.check(sql, ordered);
+        assert!(!plan.iter().any(|l| l.starts_with("gather")), "{}
 {:?}", sql, plan);
     }
 }

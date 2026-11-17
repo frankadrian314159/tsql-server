@@ -42,6 +42,8 @@ pub struct PrepSpec {
     /// None: every shard gets every row (broadcast); Some((column, class)): a row goes to the shard that owns the hash of
     /// that column (repartition)
     pub repartition: Option<(usize, KeyClass)>,
+    /// columns to index the copy on once it is filled (a subquery that looks the copy up for each outer row needs them)
+    pub index_on: Vec<String>,
 }
 
 pub struct JoinPlan {
@@ -461,7 +463,7 @@ pub fn plan_join(q: &Query, tables: &HashMap<String, DistTable>, rows: &HashMap<
     for (l, rp) in &moves {
         let temp = next_temp();
         temps[*l] = Some(temp.clone());
-        preps.push(PrepSpec { table: leaves[*l].table.clone(), alias: leaves[*l].alias.clone(), temp, filter: filter_for(*l), repartition: *rp });
+        preps.push(PrepSpec { table: leaves[*l].table.clone(), alias: leaves[*l].alias.clone(), temp, filter: filter_for(*l), repartition: *rp, index_on: vec![] });
         desc.push(format!("{} {}", if rp.is_some() { "repartition" } else { "broadcast" }, leaves[*l].table.id));
     }
     let new_from = {

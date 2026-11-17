@@ -470,10 +470,10 @@ impl<'a> Engine<'a> {
         let mut schema: HashMap<String, Vec<String>> = HashMap::new();
         for id in crate::rewrite::astutil::referenced_tables(q) {
             let Some((sch, name)) = id.split_once('.') else { return false };
-            if name.starts_with('#') || name.starts_with('@') {
+            if name.starts_with('@') {
                 return false;
             }
-            let loc = self.locate(&[sch.to_string(), name.to_string()]);
+            let loc = if name.starts_with('#') { self.locate(&[name.to_string()]) } else { self.locate(&[sch.to_string(), name.to_string()]) };
             let Some(t) = self.table_ref(&loc) else { return false };
             schema.insert(id, t.columns.iter().map(|c| c.name.to_lowercase()).collect());
         }
@@ -499,10 +499,11 @@ impl<'a> Engine<'a> {
         let mut schema: HashMap<String, Vec<String>> = HashMap::new();
         for id in crate::rewrite::astutil::referenced_tables(q) {
             let (sch, name) = id.split_once('.')?;
-            if name.starts_with('#') || name.starts_with('@') {
+            if name.starts_with('@') {
                 return None;
             }
-            let loc = self.locate(&[sch.to_string(), name.to_string()]);
+            // (a session temporary table is found by its bare name)
+            let loc = if name.starts_with('#') { self.locate(&[name.to_string()]) } else { self.locate(&[sch.to_string(), name.to_string()]) };
             let t = self.table_ref(&loc)?;
             schema.insert(id, t.columns.iter().map(|c| c.name.to_lowercase()).collect());
         }

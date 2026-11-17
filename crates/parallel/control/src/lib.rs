@@ -2012,21 +2012,52 @@ impl ClusterSession {
             }
         };
         self.temp_counter = counter;
-        let Some(jp) = plan else { return Ok(None) };
+        let Some(mut jp) = plan else { return Ok(None) };
         let shape = if nested {
-            let copies: HashMap<String, DistTable> = jp
-                .preps
-                .iter()
-                .map(|p| {
-                    let mut t = p.table.clone();
-                    t.dist = Dist::Replicated;
-                    t.id = table_id(std::slice::from_ref(&p.temp));
-                    (t.id.clone(), t)
-                })
-                .collect();
-            let this = &*self;
-            let lookup = |id: &str| copies.get(id).cloned().or_else(|| this.table_by_id(id));
-            if !pushdown::pushdown_ok(&jp.query, &lookup, false) {
+            let replicated_copies = |preps: &[joins::PrepSpec]| -> HashMap<String, DistTable> {
+                preps
+                    .iter()
+                    .map(|p| {
+                        let mut t = p.table.clone();
+                        t.dist = Dist::Replicated;
+                        t.id = table_id(std::slice::from_ref(&p.temp));
+                        (t.id.clone(), t)
+                    })
+                    .collect()
+            };
+            let mut copies = replicated_copies(&jp.preps);
+            let mut ok = {
+                let this = &*self;
+                let lookup = |id: &str| copies.get(id).cloned().or_else(|| this.table_by_id(id));
+                pushdown::pushdown_ok(&jp.query, &lookup, false)
+            };
+            if !ok {
+                // a subquery over a table that is sharded on another key: when that table is small it is copied to every shard too
+                let mut sizes: HashMap<String, u64> = HashMap::new();
+                for t in tables.iter().filter(|t| matches!(t.dist, Dist::Sharded { .. })) {
+                    sizes.insert(t.id.clone(), self.table_rows(t).await?);
+                }
+                let mut counter = self.temp_counter;
+                let extra = {
+                    let this = &*self;
+                    let lookup = |id: &str| copies.get(id).cloned().or_else(|| this.table_by_id(id));
+                    pushdown::with_small_tables_copied(&jp.query, &lookup, &|id| sizes.get(id).copied(), limit, &mut || {
+                        counter += 1;
+                        format!("#dpj_{}_{}", sid, counter)
+                    })
+                };
+                self.temp_counter = counter;
+                if let Some((q2, more)) = extra {
+                    jp.query = q2;
+                    jp.preps.extend(more);
+                    jp.description = format!("{}", jp.preps.iter().map(|p| format!("{} {}", if p.repartition.is_some() { "repartition" } else { "broadcast" }, p.table.id)).collect::<Vec<_>>().join(", "));
+                    copies = replicated_copies(&jp.preps);
+                    let this = &*self;
+                    let lookup = |id: &str| copies.get(id).cloned().or_else(|| this.table_by_id(id));
+                    ok = pushdown::pushdown_ok(&jp.query, &lookup, false);
+                }
+            }
+            if !ok {
                 return Ok(None);
             }
             plan::plan_scatter_sub(&jp.query)
@@ -2179,6 +2210,12 @@ impl ClusterSession {
             r?;
         }
         let _ = n;
+        // a subquery that looks the copy up for each row of the outer query seeks it by an index instead of reading it each time
+        if !p.index_on.is_empty() {
+            let keys: Vec<(String, bool)> = p.index_on.iter().map(|c| (c.clone(), false)).collect();
+            let ix = Stmt::CreateIndex { name: format!("ix_{}", p.temp.trim_start_matches('#')), table: vec![p.temp.clone()], cols: keys, unique: false, include: vec![], filter: None, xml: None, spatial: None };
+            self.fan_run(&shards, |_| Work::Stmts(vec![ix.clone()])).await?;
+        }
         Ok(())
     }
 

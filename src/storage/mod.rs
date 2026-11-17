@@ -754,6 +754,12 @@ impl TableData {
     /// Visible rows of up to `max_slots` slots after `after`. With `check_writers`, stops at the first
     /// slot another uncommitted transaction is changing (when the view requires committed data).
     pub fn scan_chunk(&self, view: &ReadView, after: Option<RowId>, max_slots: usize, check_writers: bool) -> Chunk {
+        self.scan_chunk_cols(view, after, max_slots, check_writers, None)
+    }
+
+    /// [`TableData::scan_chunk`] that copies only the columns `needed` marks (the others read as NULL, which costs no copy of a string): for a
+    /// query that is known not to look at them.
+    pub fn scan_chunk_cols(&self, view: &ReadView, after: Option<RowId>, max_slots: usize, check_writers: bool, needed: Option<&[bool]>) -> Chunk {
         let mut rows = Vec::new();
         let mut last = None;
         let mut seen = 0usize;
@@ -776,7 +782,10 @@ impl TableData {
             seen += 1;
             last = Some(r as RowId);
             if let Some(row) = s.visible(view) {
-                rows.push((r as RowId, row.clone()));
+                match needed {
+                    Some(n) if n.len() == row.len() => rows.push((r as RowId, row.iter().zip(n).map(|(v, keep)| if *keep { v.clone() } else { Value::Null }).collect())),
+                    _ => rows.push((r as RowId, row.clone())),
+                }
             }
             true
         });

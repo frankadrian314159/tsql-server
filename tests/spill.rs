@@ -160,7 +160,7 @@ fn group_by_sorts_on_the_key_and_matches_the_general_executor() {
     exec(&mut c, "SELECT grp, COUNT(*) FROM big GROUP BY grp");
     let plan = c.last_plan().join("\n");
     assert!(plan.contains("group by sort (53 group(s)"), "{plan}");
-    assert!(!plan.contains("0 spilled run(s))"), "the group sort should have spilled: {plan}");
+    assert!(!plan.contains(", 0 spilled run(s))"), "the group sort should have spilled: {plan}");
     assert_eq!(spill_files(dir.path()), 0);
     // an error while aggregating cleans up too
     assert!(c.execute("SELECT grp, SUM(1/(id - 77)) FROM big GROUP BY grp").first_error().is_some());
@@ -173,13 +173,26 @@ fn unsupported_shapes_fall_back_to_the_general_executor() {
     s.set_work_mem(4096, 0, Some(dir.path().to_path_buf()));
     for q in [
         "SELECT grp, COUNT(*) FROM big GROUP BY ROLLUP(grp)",
-        "SELECT COUNT(*) FROM big",
         "SELECT grp, ROW_NUMBER() OVER (ORDER BY id), RANK() OVER (ORDER BY grp) FROM big ORDER BY id",
         "SELECT a.id FROM big a JOIN big b ON a.id = b.id ORDER BY a.id",
     ] {
         exec(&mut c, q);
         assert!(!c.last_plan().join("\n").contains("streaming scan"), "{q}: {:?}", c.last_plan());
     }
+}
+
+#[test]
+fn a_query_of_nothing_but_aggregates_streams_as_one_group() {
+    let (s, mut c, dir) = setup();
+    s.set_work_mem(4096, 0, Some(dir.path().to_path_buf()));
+    let n = scalar(&mut c, "SELECT COUNT(*) FROM big");
+    assert!(c.last_plan().join("
+").contains("streaming scan big") && c.last_plan().join("
+").contains("group by hash (1 group(s))"), "{:?}", c.last_plan());
+    assert_eq!(n, "6000");
+    // no rows in: one row out, as the general executor gives
+    assert_eq!(rows(&mut c, "SELECT COUNT(*), SUM(id), MAX(grp) FROM big WHERE id < 0"), vec![vec!["0".to_string(), "NULL".into(), "NULL".into()]]);
+    assert_eq!(spill_files(dir.path()), 0);
 }
 
 // ------------------------------------------------------------------------------------------------ joins
@@ -429,7 +442,7 @@ fn abandoning_a_streamed_result_stops_the_statement_and_cleans_up() {
 fn results_that_are_not_streamable_still_arrive_whole() {
     let (s, mut c, dir) = join_setup();
     s.set_work_mem(4096, 0, Some(dir.path().to_path_buf()));
-    for q in ["SELECT COUNT(*) AS n FROM fact", "SELECT id FROM fact UNION SELECT id FROM dim ORDER BY 1", "SELECT TOP 5 PERCENT id FROM fact ORDER BY id", "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS r, RANK() OVER (ORDER BY region) AS k FROM dim"] {
+    for q in ["SELECT id FROM fact UNION SELECT id FROM dim ORDER BY 1", "SELECT TOP 5 PERCENT id FROM fact ORDER BY id", "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS r, RANK() OVER (ORDER BY region) AS k FROM dim"] {
         let (got, whole, _) = streamed(&mut c, q);
         assert_eq!(whole, 1, "{q}");
         assert_eq!(got, rows(&mut c, q), "{q}");

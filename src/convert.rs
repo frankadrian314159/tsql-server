@@ -891,6 +891,25 @@ fn norm_str(s: &str) -> String {
     s.trim_end_matches(' ').to_lowercase()
 }
 
+/// A string of exactly the form `YYYY-MM-DD` that is a date (None for any other string, which the general parser reads).
+fn iso_date(s: &str) -> Option<NaiveDate> {
+    let b = s.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| -> Option<u32> {
+        let mut n = 0u32;
+        for &c in &b[r] {
+            if !c.is_ascii_digit() {
+                return None;
+            }
+            n = n * 10 + (c - b'0') as u32;
+        }
+        Some(n)
+    };
+    NaiveDate::from_ymd_opt(num(0..4)? as i32, num(5..7)?, num(8..10)?)
+}
+
 fn to_ndt(v: &Value) -> Result<NaiveDateTime> {
     Ok(match v {
         Value::Date(d) => d.and_hms_opt(0, 0, 0).unwrap(),
@@ -898,6 +917,10 @@ fn to_ndt(v: &Value) -> Result<NaiveDateTime> {
         Value::Dto(d) => d.naive_utc(),
         Value::Time(t) => NaiveDateTime::new(base_date(), *t),
         Value::Str(s) => {
+            // 'YYYY-MM-DD', what a date literal nearly always is (read for every row a condition compares a date column with it)
+            if let Some(d) = iso_date(s) {
+                return Ok(d.and_hms_opt(0, 0, 0).unwrap());
+            }
             let p = parse_datetime_str(s).ok_or_else(dt_fail)?;
             NaiveDateTime::new(p.date.unwrap_or_else(base_date), p.time.unwrap_or_default())
         }

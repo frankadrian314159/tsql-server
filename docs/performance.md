@@ -384,6 +384,38 @@ doing something else were twice these, which is why every comparison here is of 
 6. **A transaction that touched one shard already commits in one phase**, with the `BEGIN` travelling in front of its first statement (the
    sixth round); what is left in the OLTP round trips is one request per statement.
 
+## Eighth round: what a row costs
+
+A bare `SELECT COUNT(*) FROM lineitem` (600,000 rows, one thread) took 1.2 s, 2 microseconds a row, before any expression was evaluated. A
+profile (`--features prof`, `examples/tpc --sql "..."`) showed `scan_rows_flt` and the work of freeing the rows afterwards: every row was
+copied whole out of the heap, each of its sixteen values (the strings are heap allocations) and then dropped, to count it.
+
+1. **A scan copies only the columns the query names** (`Engine::needed_cols`, `TableData::scan_chunk_cols`). For a streaming scan of a table
+   of 2,000 slots or more the statement is searched for column names (select list, `WHERE`, `ON`, `GROUP BY`, `HAVING`, `ORDER BY`, and
+   inside subqueries, by name alone, so more are kept than needed, never fewer); the other columns read as NULL. A `*`, a computed column or a
+   row-level-security policy reads everything. The plan says `scan of t copies 7 of its 16 columns`. `TSQL_NO_SCAN_PRUNE` turns it off
+   (`tests/scan_columns.rs` compares 20 query shapes with and without it).
+2. **A query of nothing but aggregates over one table streams too.** `SELECT COUNT(*), SUM(x) FROM t WHERE ...` with no `GROUP BY` went to
+   the general executor, which collects the rows. It is now one group of the streaming executor (no key; the one row of an empty input is
+   made at the end), and the scan can then prune: `COUNT(*)` over `lineitem` 1.2 -> 0.16 s. A join with no `GROUP BY` keeps the general
+   executor: it starts from the selective table and finds the rest by index, where the streaming join reads the big side whole (a first
+   version streamed those too, TPC-H Q19 0.5 s against 1.2 s, and a test of join order caught that a selective join had lost its
+   index nested loop).
+3. **`date_column <= 'YYYY-MM-DD'`** read the string with the general date parser for every row (0.9 microseconds a row, more than the rest of
+   the condition); a string that is exactly `YYYY-MM-DD` is now read directly: 0.70 -> 0.33 s for `COUNT(*) ... WHERE l_shipdate <= '1998-09-02'`.
+4. **A temporary table's index is used.** A scan of a session temporary table or a table variable ignored the access path and read every row
+   (a correlated subquery over `#t` scanned it for each outer row: 9.9 s against 0.25 s over the same data in a table, 8,000 rows).
+   It seeks now, and the cluster uses that for the copies of small tables it makes for subqueries (see [distributed.md](distributed.md)).
+
+TPC-H sf 0.1, the binaries of before and after one after the other: total 23.0 -> 16.6 s (Q18 3.2 -> 1.8, Q6 0.64 -> 0.27,
+Q3 0.95 -> 0.53, Q17 0.48 -> 0.27, Q1 1.9 -> 1.6; Q19 stays at 1.2); TPC-DS total unchanged (its queries read small tables or go through the general executor).
+On the cluster, TPC-C's consistency check 10 went from 3.0-3.6 s to 1.4 s and check 12 from 2.2 to 0.8 s (they no longer gather).
+
+What is left in a row, measured as the extra time per row over a bare `COUNT(*)` (0.27 microseconds): one `SUM(column)` 0.2, `SUM(a * (1 - b))`
+0.5, a decimal operation 0.1-0.2. These are values cloned out of the row, walked through the expression tree, and the decimal arithmetic;
+folding the aggregates in each worker and merging them (exact for integers and decimals, not for floats, whose sum depends on its order)
+would use the cores for the accumulation as well, which today is serial after the parallel evaluation.
+
 ## Where the time goes now
 
 A point lookup by primary key costs about 20 microseconds from `Connection::execute`: parsing 5-10 (statements with
