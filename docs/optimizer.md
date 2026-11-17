@@ -33,7 +33,7 @@ big index in full. The design follows the optimizer in the sibling `accessor` pr
    of another (see [concurrency.md](concurrency.md)).
 
 Outer joins keep their written order; `OR` conditions, functions of columns and subqueries are not used to choose
-indexes; subqueries run per outer row.
+indexes; correlated subqueries are rewritten as joins where they can be (see the rewrites below) and otherwise run per outer row.
 
 ## Seeing the plan
 
@@ -110,13 +110,25 @@ after the other indexes. A real shredded index would be a change to the storage 
   rows that survive the outer query's conditions on that table. Only equalities between a column of the subquery and a qualified column of
   the outer query are recognised, only when every table is a known base table, and not for `SELECT *`; a rewritten query that does not run
   is run as it was written. `SET OPTIMIZER OFF` turns it off. The plan says `correlated subquery rewritten as a join`.
+* **Correlated aggregate subqueries in the select list, and those with `COUNT`, become outer joins** (`decorrelate_all`, the
+  single-node engine only). A scalar aggregate subquery anywhere in the select list or the `WHERE` (`(SELECT COUNT(*) FROM t WHERE
+  t.k = o.k)`, inside `ISNULL`, a `CASE` or an `OR`) becomes the value of a grouped derived table `LEFT JOIN`ed to the item of the
+  `FROM` its outer columns belong to; where no group matches, the value is what the aggregate gives over no rows (`COUNT` 0, the
+  others NULL), so the answer is the subquery's. `EXISTS` on two or more equalities becomes a join with the distinct keys of the
+  subquery, and `NOT EXISTS` an outer join with them that found no match. Left alone: a subquery whose key column leads an index of
+  its table (run per outer row it is a seek, which beats aggregating the whole table when the outer rows are few), one in the select
+  list of a grouped query, one that is not an aggregate (it may give more than one row, error 512), and one whose outer columns span
+  several items of the `FROM`.
 * **A scalar subquery that stands alone is a constant for the plan**: `d_month_seq = (SELECT MAX(..) ..)` is run once before the plan
   is made and its value put in the condition, which can then be pushed to the table, seek an index and count in the row estimate.
 * **Statistics of the columns** (`src/engine/stats.rs`) give the row estimates of the conditions that no index answers (the optimizer used
   to guess that each keeps a third of the rows). A table of 2000 slots or more is sampled once (64 blocks of 64 slots spread over its row
-  ids, `Server::stats`, kept until the table has changed in size by a fifth): per column the share of NULLs, the distinct values, the most
-  common values with their shares and an equi-depth histogram. `col = lit`, ranges, `BETWEEN`, `IN`, `IS NULL`, `LIKE 'prefix%'`, `AND`, `OR`
-  and `NOT` have a selectivity read off them. They order joins; they do not change an answer.
+  ids, `Server::stats`, kept until the table has changed in size by a fifth or more than 500 + a fifth of its rows have been written
+  since the sample, so an `UPDATE` that leaves the row count alone makes them stale too): per column the share of NULLs, the distinct
+  values, the most common values with their shares and an equi-depth histogram. `col = lit`, ranges, `BETWEEN`, `IN`, `IS NULL`,
+  `LIKE 'prefix%'`, `AND`, `OR` and `NOT` have a selectivity read off them. When a table is read through an index, the conditions the
+  index does not answer (on other columns) multiply its estimate by their selectivity, so `WHERE indexed = 1 AND other = 2` is estimated
+  as fewer rows than `WHERE indexed = 1`. They order joins; they do not change an answer.
 * **`IN (subquery)` of integers is tested with a hash**, and the rows of a subquery that does not use the outer row are shared, not copied,
   for each outer row. The keys of hash joins, groups and `DISTINCT` (`convert::key_into`) are written without a temporary string per value.
 * **Common conjuncts of an OR are factored out** when the statement is parsed: `(a AND b) OR (a AND c)` is

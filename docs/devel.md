@@ -37,7 +37,7 @@ The root crate is the single-node server (`src/`). The cluster is a workspace be
 | You are changing | Look in |
 | --- | --- |
 | the syntax of a statement or an expression | `src/lexer.rs`, `src/parser.rs`, `src/ast.rs` |
-| what a statement does | `src/engine/mod.rs` (`exec_inner`, the dispatcher) and the file for its kind: `ddl.rs`, `dml.rs`, `query.rs`, `txn.rs`, `admin.rs`, `backup.rs`, ... |
+| what a statement does | `src/engine/mod.rs` (`exec_inner`, the dispatcher) and the file for its kind: `ddl.rs`, `dml.rs`, `query.rs`, `txn.rs`, `admin.rs`, `backup.rs`, ...; DML triggers in `dml.rs` (`run_trigger`) and, on views, `viewtrig.rs` |
 | the value of an expression, a built-in function | `src/engine/expr.rs` (the evaluator, `Engine::ev`), `src/engine/funcs.rs` (`Engine::builtin`, the functions) |
 | a data type, a conversion, a comparison | `src/types.rs` (`DataType`, `Value`), `src/convert.rs` (`CAST`, `compare`, `arith`), `src/decimal.rs` |
 | how a query is answered | `src/engine/query.rs` (the general executor), `src/engine/stream.rs` (the streaming executor), `src/engine/optimizer.rs` (access paths, pushdown), `src/engine/joins.rs` and `hashjoin.rs` (joins), `src/engine/stats.rs` (column statistics), `src/engine/aggacc.rs` (folded aggregates), `src/engine/par.rs` (parallelism), `src/rewrite/` (subquery rewrites) |

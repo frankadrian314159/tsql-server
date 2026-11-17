@@ -41,7 +41,7 @@ which file to open for what, and in what order to read them.
 | [hierarchyid.md](hierarchyid.md) | The `hierarchyid` type and its methods; values from restored SQL Server databases are used as they are. |
 | [spatial.md](spatial.md) | `geometry` and `geography`: shapes, methods, the binary form, spatial indexes, what is not supported. |
 | [xml-schema.md](xml-schema.md) | `CREATE XML SCHEMA COLLECTION`, typed `xml`, the validator, and what happens to typed columns in a SQL Server backup. |
-| [triggers.md](triggers.md) | DDL triggers, `LOGON` triggers, `ENABLE`/`DISABLE TRIGGER`, the xml methods and `OPENXML`, full-text search. |
+| [triggers.md](triggers.md) | DML triggers (`AFTER`, `INSTEAD OF`, and `INSTEAD OF` triggers on views), DDL triggers, `LOGON` triggers, `ENABLE`/`DISABLE TRIGGER`, the xml methods and `OPENXML`, full-text search. |
 | [tsqlt.md](tsqlt.md) | A tSQLt-compatible unit-test framework written in T-SQL (the real one needs CLR), the suites that run on it, and where it differs. |
 
 ### How the engine works
@@ -50,7 +50,7 @@ which file to open for what, and in what order to read them.
 | --- | --- |
 | [concurrency.md](concurrency.md) | Transactions, locks (row, table and key-range), isolation levels including snapshot, waiting, timeouts and deadlocks, differences from SQL Server, intra-query parallelism, latching, the commit protocol. |
 | [storage.md](storage.md) | Pages, the buffer pool and the page file, shadow paging, the write-ahead log and recovery, the undo log, rows, versions and indexes, working memory and spilling to disk, prepared transactions, snapshots of the whole state, the layout of a data directory. |
-| [optimizer.md](optimizer.md) | How a query is planned: access paths, pushdown, join order and method, subquery rewrites (correlated subqueries become joins), column statistics, how to see a plan, filtered and XML indexes. |
+| [optimizer.md](optimizer.md) | How a query is planned: access paths, pushdown, join order and method, subquery rewrites (correlated subqueries become joins and outer joins), column statistics and when they are taken again, how to see a plan, filtered and XML indexes. |
 
 ### For people changing the code
 

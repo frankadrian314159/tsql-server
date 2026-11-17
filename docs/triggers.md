@@ -1,4 +1,4 @@
-# DDL triggers, LOGON triggers and the xml methods
+# DML, DDL and LOGON triggers, and the xml methods
 
 ```sql
 CREATE TRIGGER no_drops ON DATABASE FOR DROP_TABLE, ALTER_TABLE AS
@@ -16,6 +16,51 @@ CREATE TRIGGER gate ON ALL SERVER FOR LOGON AS
 DISABLE TRIGGER no_drops ON DATABASE;   ENABLE TRIGGER ALL ON ALL SERVER;   DROP TRIGGER gate ON ALL SERVER;
 DISABLE TRIGGER trg ON dbo.t;           -- DML triggers too
 ```
+
+## DML triggers
+
+`CREATE [OR ALTER] TRIGGER name ON table { AFTER | FOR | INSTEAD OF } { INSERT | UPDATE | DELETE } [, ...] AS ...` runs once per
+statement, in the statement's transaction, with the rows it changed as the `inserted` and `deleted` tables and `UPDATE(col)`
+true for the columns an `UPDATE` sets. An `AFTER` trigger runs after the rows are written (and the constraints checked); an
+`INSTEAD OF` trigger runs in place of the statement, which then changes nothing itself. A trigger runs with the rights of its
+schema's owner, so the ownership chain carries into the tables it writes. Inside an `INSTEAD OF` trigger the same statement on
+the same table goes to the table, not to the trigger again. `ROLLBACK` in a trigger ends the transaction and aborts the batch
+(3609).
+
+### INSTEAD OF triggers on views
+
+```sql
+CREATE VIEW dbo.order_lines AS
+    SELECT o.id, c.name, o.amount FROM dbo.orders o JOIN dbo.customers c ON c.id = o.customer_id;
+GO
+CREATE TRIGGER dbo.order_lines_ins ON dbo.order_lines INSTEAD OF INSERT AS
+    INSERT dbo.orders (id, customer_id, amount)
+    SELECT i.id, c.id, i.amount FROM inserted i JOIN dbo.customers c ON c.name = i.name;
+GO
+INSERT dbo.order_lines VALUES (13, 'bob', 4);      -- the trigger writes dbo.orders
+```
+
+A view takes `INSTEAD OF` triggers, one per statement (`INSERT`, `UPDATE`, `DELETE`): with one, a view that cannot be written
+through (a join, an aggregate, a `UNION`) can be, by a trigger that writes its base tables (`src/engine/viewtrig.rs`).
+
+* **What the trigger sees.** `inserted` and `deleted` have the view's columns, with the types the view gives them. For an
+  `INSERT`, `inserted` holds the source rows matched to the view's columns by the column list; a column the list leaves out, and
+  `DEFAULT`, is NULL (a view has no defaults). For a `DELETE`, `deleted` holds the rows of the view that the `WHERE` (and the
+  `FROM`, if any) select; for an `UPDATE`, `deleted` holds those rows and `inserted` the same rows with the `SET` applied
+  (`SET c += 1` too), and `UPDATE(col)` is true for the columns the `SET` names. A view row that a `FROM` joins to several rows is
+  in them once. `TOP` and `SET ROWCOUNT` limit the rows. The trigger runs even when no row matched.
+* **Permissions.** The statement needs `INSERT`, `UPDATE` or `DELETE` permission on the view; the view's rows are read with the
+  rights of its owner, as a `SELECT` through the view is.
+* **`OUTPUT`** returns the rows as if the statement had been carried out, as in SQL Server.
+* **A statement on the view inside its own trigger** goes to the view's base table when the view maps onto one table (as it does
+  without a trigger), and is an error otherwise.
+* **DDL.** An `AFTER` trigger on a view is error 8197, a second `INSTEAD OF` trigger for the same statement error 2111.
+  `ALTER VIEW` keeps the view's triggers and `DROP VIEW` drops them; `DISABLE` / `ENABLE TRIGGER ... ON view` and `DROP TRIGGER`
+  work as on tables; `sys.triggers` lists them with the view as `parent_id` and `is_instead_of_trigger` = 1.
+* **Not handled.** `WHERE CURRENT OF` and `SET @variable = ...` in an `UPDATE` of such a view run as if the view had no trigger;
+  `MERGE` into a view does not fire it. The rows an `UPDATE` or `DELETE` reaches are found by numbering the view's rows and running
+  the statement's `FROM` and `WHERE` over them, so a comparison in the `WHERE` uses the default collation even where a column of
+  the view has another one.
 
 ## DDL triggers
 

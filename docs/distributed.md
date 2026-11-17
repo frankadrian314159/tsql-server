@@ -130,7 +130,8 @@ tables sharded on the item), and its table shows how each query ran (`split`, `s
     rows that belong to an outer row then lie on its shard. A subquery that reads a table sharded on another key (`history`, by the customer's
     id, next to `customer` by its warehouse) has that table copied to every shard when it is small (`set_broadcast_limit`), indexed on the
     columns the subquery compares, and reads the copy;
-  * *correlated subqueries* (`decorrelate.rs`): the common shapes are rewritten as joins first, so that their parts do not
+  * *correlated subqueries* (`decorrelate.rs`, `decorrelate`; the single-node engine also uses the outer-join rewrites of `decorrelate_all`,
+    which the control node does not): the common shapes are rewritten as joins first, so that their parts do not
     depend on the outer rows. A scalar aggregate subquery in a comparison of the `WHERE`
     (`x > (SELECT AVG(y) FROM t WHERE t.k = o.k)`, also under arithmetic) becomes a join with a grouped derived table (a row
     with no match gets NULL, which fails the comparison, as the join dropping it does; `COUNT` is left alone, it gives 0 for no
