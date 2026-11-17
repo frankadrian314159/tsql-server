@@ -7,6 +7,9 @@
 //! * the table is still read by the session's thread (visibility, locks, waiting for writers and every other rule of a scan are
 //!   unchanged); only the evaluation of the rows it has read is shared out, a batch at a time: the workers start when a batch
 //!   is complete and the session's thread waits for them, so nothing else is going on while they read the catalog;
+//! * the probe side of a hash join is shared out the same way: when the stages of a join are in memory (none spilled, no right or full
+//!   join) and every expression they evaluate is safe, batches of probe rows go through all the stages on the workers and the joined
+//!   rows reach the rest of the query in the order the probe rows were read;
 //! * a worker is a [`Engine`] of its own: it borrows the catalog the session holds (shared, read-only) and has a copy of the few
 //!   things an expression reads of the session (the variables, the date and language settings);
 //! * only expressions that read nothing but the row, the variables and the settings are shared out (see [`par_safe`]): no

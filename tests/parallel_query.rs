@@ -43,6 +43,17 @@ fn same(c: &mut tsql_server::Connection, sql: &str, expect_parallel: bool) {
     assert_eq!(used, expect_parallel, "{}: ran in parallel: {}", sql, used);
 }
 
+/// Like [`same`] for a join: when the tests run with a work memory so small that every hash join spills to files
+/// (`TSQL_TEST_SPILL`), a join is not probed by several threads, and only the rows are compared.
+fn same_join(c: &mut tsql_server::Connection, sql: &str) {
+    if std::env::var("TSQL_TEST_SPILL").is_ok() {
+        let par = run(c, sql);
+        assert_eq!(par, run(c, &format!("{} OPTION (MAXDOP 1)", sql)), "{}", sql);
+    } else {
+        same(c, sql, true);
+    }
+}
+
 #[test]
 fn scans_with_conditions_are_shared_out() {
     let _one = one_at_a_time();
@@ -65,6 +76,24 @@ fn grouped_aggregates_and_sorted_queries_are_shared_out() {
     same(&mut c, "SELECT TOP 10 id, amount FROM big WHERE grp = 7 ORDER BY amount DESC, id", true);
     same(&mut c, "SELECT id, name, amount * 2 FROM big WHERE grp < 3 ORDER BY name, id", true);
     same(&mut c, "SELECT DISTINCT grp FROM big WHERE id % 2 = 0 ORDER BY grp", true);
+}
+
+#[test]
+fn joins_are_probed_in_parallel_and_give_the_serial_rows_in_the_serial_order() {
+    let _one = one_at_a_time();
+    let mut c = big();
+    exec(&mut c, "CREATE TABLE dim (g INT, label VARCHAR(10))");
+    exec(&mut c, "INSERT dim SELECT n, 'g' + CAST(n AS VARCHAR(5)) FROM (SELECT TOP 60 ROW_NUMBER() OVER (ORDER BY id) AS n FROM big) x");
+    exec(&mut c, "CREATE TABLE dim2 (label VARCHAR(10), w INT)");
+    exec(&mut c, "INSERT dim2 SELECT label, g * 3 FROM dim WHERE g % 2 = 0");
+    // inner, left, two stages, a residual condition, a probe row that matches nothing (grp 60..96) and a NULL key
+    same_join(&mut c, "SELECT big.id, dim.label FROM big JOIN dim ON dim.g = big.grp");
+    same_join(&mut c, "SELECT big.id, dim.label FROM big LEFT JOIN dim ON dim.g = big.grp");
+    same_join(&mut c, "SELECT big.id, dim.label, dim2.w FROM big JOIN dim ON dim.g = big.grp JOIN dim2 ON dim2.label = dim.label");
+    same_join(&mut c, "SELECT big.id, dim.label FROM big LEFT JOIN dim ON dim.g = big.grp AND big.id % 3 = 0");
+    same_join(&mut c, "SELECT big.id, dim.label FROM big JOIN dim ON dim.g = big.grp WHERE big.amount > 100 AND dim.g <> 7");
+    same_join(&mut c, "SELECT TOP 25 big.id, dim.label FROM big JOIN dim ON dim.g = big.grp");
+    same_join(&mut c, "SELECT dim.label, COUNT(*), SUM(big.amount) FROM big JOIN dim ON dim.g = big.grp GROUP BY dim.label ORDER BY dim.label");
 }
 
 #[test]

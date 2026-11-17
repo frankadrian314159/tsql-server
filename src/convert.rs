@@ -1018,14 +1018,46 @@ pub fn sort_cmp(a: &Value, b: &Value) -> Ordering {
     }
 }
 
+/// `i` in decimal, appended to `out` (no formatting machinery, no temporary string).
+fn push_int(out: &mut String, i: i64) {
+    let mut buf = [0u8; 20];
+    let mut n = i.unsigned_abs();
+    let mut at = buf.len();
+    loop {
+        at -= 1;
+        buf[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    if i < 0 {
+        out.push('-');
+    }
+    // (digits only)
+    out.push_str(std::str::from_utf8(&buf[at..]).unwrap_or("0"));
+}
+
 /// Append a canonical, collation-aware key for grouping/hashing to `out`.
 pub fn key_into(v: &Value, out: &mut String) {
     match v {
         Value::Null => out.push_str("\u{1}N"),
-        Value::Bit(b) => out.push_str(&format!("n{}", *b as i32)),
-        Value::Int(i) => out.push_str(&format!("n{}", i)),
-        Value::BigInt(i) => out.push_str(&format!("n{}", i)),
-        Value::Dec(d) => out.push_str(&format!("n{}", d.normalized())),
+        Value::Bit(b) => {
+            out.push('n');
+            push_int(out, *b as i64);
+        }
+        Value::Int(i) => {
+            out.push('n');
+            push_int(out, *i as i64);
+        }
+        Value::BigInt(i) => {
+            out.push('n');
+            push_int(out, *i);
+        }
+        Value::Dec(d) => {
+            use std::fmt::Write;
+            let _ = write!(out, "n{}", d.normalized());
+        }
         Value::Float(f) => {
             if f.is_finite() && *f == f.trunc() && f.abs() < 9e18 {
                 out.push_str(&format!("n{}", *f as i64));
@@ -1037,7 +1069,12 @@ pub fn key_into(v: &Value, out: &mut String) {
         }
         Value::Str(s) => {
             out.push('s');
-            out.push_str(&norm_str(s));
+            if s.is_ascii() {
+                // (what `norm_str` gives for ASCII, without the two strings it builds on the way)
+                out.extend(s.trim_end_matches(' ').chars().map(|c| c.to_ascii_lowercase()));
+            } else {
+                out.push_str(&norm_str(s));
+            }
         }
         Value::Bin(b) => out.push_str(&format!("b{}", hex(b))),
         Value::Date(d) => out.push_str(&format!("d{}", d.and_hms_opt(0, 0, 0).unwrap())),

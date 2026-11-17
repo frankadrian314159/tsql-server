@@ -57,7 +57,13 @@ tables sharded on the item), and its table shows how each query ran (`split`, `s
 * **Distribution.** A table is *sharded* by default, on the first column of its primary key (else its first column), by an
   integer, character or `uniqueidentifier` key. `DISTRIBUTE TABLE t BY column` picks another column and `DISTRIBUTE TABLE t
   REPLICATED` puts the same rows on every shard (small reference tables); both need an empty table. A key belongs to one of
-  1024 hash *slots* and each slot to one shard (the slot map).
+  1024 hash *slots* and each slot to one shard (the slot map). **`ADVISE DISTRIBUTION`** (`advisor.rs`) says which tables to
+  distribute differently: the control node counts, per table, the times it was copied to every shard (broadcast), re-spread by a
+  column (repartition) or read into the control node (gather) for a query, and the statement lists them with the advice that would
+  have spared the move: `DISTRIBUTE TABLE t REPLICATED` for a small table broadcast three times or more, `DISTRIBUTE TABLE t BY c` for a
+  table re-spread by `c` (or compared with other tables on `c` in a gathered query) more often than by its key. The advice is not
+  carried out (a table that has rows cannot be re-distributed in place: create it again, distribute it, load it), and nothing about how a
+  query runs depends on it. `ADVISE DISTRIBUTION RESET` clears the counts.
 * **`INSERT`** is split by the key of each row; every shard gets its rows in one statement.
 * **`UPDATE` / `DELETE`** of one table go to the shards that can hold the rows (one when the `WHERE` fixes the key); counts
   are added. A condition may have subqueries that do not depend on the row (they are evaluated first, as for `SELECT`). An
@@ -115,8 +121,10 @@ tables sharded on the item), and its table shows how each query ran (`split`, `s
     *co-located* with the outer table: it reads one sharded table and an equality in its `WHERE` ties that table's shard key to the
     outer table's (`EXISTS (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey AND ...)` from `orders`, both sharded on the order
     key; rows that agree on the key are on one shard, so anything else the subquery asks of them can be asked there). The outer
-    query may join several tables when its sharded ones are co-located (TPC-H Q4 and Q21 are this case; before they were gathered,
-    18 times slower than one node in the Q4 case);
+    query may join several tables when its sharded ones are co-located (TPC-H Q4 is this case; before it was gathered, 18 times
+    slower than one node). When the outer query also reads tables that are not co-located with those (TPC-H Q21: `supplier` and `nation` next to
+    `lineitem` and `orders`), the join planner copies them to every shard first (broadcast only, never a re-spread: the copy is a replicated
+    table for the check), and the query then runs shard by shard with the subqueries inside, when the shards can answer them against that;
   * *correlated subqueries* (`decorrelate.rs`): the common shapes are rewritten as joins first, so that their parts do not
     depend on the outer rows. A scalar aggregate subquery in a comparison of the `WHERE`
     (`x > (SELECT AVG(y) FROM t WHERE t.k = o.k)`, also under arithmetic) becomes a join with a grouped derived table (a row
@@ -190,11 +198,14 @@ tables sharded on the item), and its table shows how each query ran (`split`, `s
     table or one whose key the condition fixes) are routed without walking the query in its serialized form: that took a routed
     SELECT from 0.78 ms to 0.59 ms (a bare round trip to a shard is 0.33 ms, a statement through the shard client 0.5 ms).
     `TSQL_PLAN_TRACE=1` prints one line per statement with how the cluster ran it.
-* **Transactions.** `BEGIN TRANSACTION` begins on a shard when a statement first uses it, on that shard's session for this
+* **Transactions.** `BEGIN TRANSACTION` begins on a shard when a statement first uses it (the `BEGIN` travels in the same request as that
+  statement), on that shard's session for this
   control session, so locks and uncommitted changes are held there and the session reads its own writes. `COMMIT`: one shard,
   committed there; several shards, **two-phase commit** (see `txn.rs`): every participant makes its part durable (a `Prepare`
   record in its log, or its Raft group's log) and keeps the transaction open, the decision is persisted in the control state,
-  then each participant commits, from its open transaction or, if it restarted since it voted, from its durable record.
+  then each participant commits (all at once), from its open transaction or, if it restarted since it voted, from its durable record. When only one participant
+  changed anything there is nothing to decide between shards, and the decision is not written (a control node that stops after that vote leaves a prepared
+  transaction, which rolls back, as nothing has committed anywhere).
   Isolation is the shard engines'. A statement that fails on several shards, or because a shard failed, dooms the transaction (error 3930; only
   `ROLLBACK` works), as the shards cannot be told apart from half done. Nested `BEGIN`/`COMMIT` count as in SQL Server. `SAVE TRANSACTION name` makes a savepoint on the shards that have begun the
   transaction; `ROLLBACK TRANSACTION name` takes them back to it, undoes everything on a shard that joined later, and clears a

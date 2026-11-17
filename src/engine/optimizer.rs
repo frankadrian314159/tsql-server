@@ -152,7 +152,7 @@ fn coerce_const(col: &Column, v: Value) -> Option<Value> {
 }
 
 impl<'a> Engine<'a> {
-    fn const_value(&mut self, e: &Expr) -> Option<Value> {
+    pub(super) fn const_value(&mut self, e: &Expr) -> Option<Value> {
         if !is_constant(e) {
             return None;
         }
@@ -586,8 +586,34 @@ fn pd_leaves(eng: &Engine, tr: &TableRef, preserved: bool, out: &mut Vec<PdLeaf>
             pd_leaves(eng, left, lp, out, opaque);
             pd_leaves(eng, right, rp, out, opaque);
         }
+        // a derived table (what a rewritten subquery becomes) reads whatever its query gives: its columns are known when the query names
+        // them, which keeps an unqualified column of another table attributable to that table; no condition is pushed into it
+        TableRef::Derived { query, alias: Some(a), cols } => match derived_names(query, cols) {
+            Some(c) => out.push(PdLeaf { alias: a.to_lowercase(), cols: c, preserved: false }),
+            None => *opaque = true,
+        },
         _ => *opaque = true,
     }
+}
+
+/// The output column names (lower case) of a derived table, when its query names them all.
+fn derived_names(q: &Query, cols: &Option<Vec<String>>) -> Option<Vec<String>> {
+    if let Some(c) = cols {
+        return Some(c.iter().map(|n| n.to_lowercase()).collect());
+    }
+    let mut body = &q.body;
+    while let QueryBody::SetOp { left, .. } = body {
+        body = left;
+    }
+    let QueryBody::Select(s) = body else { return None };
+    s.items
+        .iter()
+        .map(|i| match i {
+            SelectItem::Expr { alias: Some(a), .. } => Some(a.to_lowercase()),
+            SelectItem::Expr { e: Expr::Col(p), alias: None } => p.last().map(|n| n.to_lowercase()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The table (index into `ls`) whose rows alone decide the condition `c`, when `c` can be applied while that table

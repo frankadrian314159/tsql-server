@@ -67,6 +67,14 @@ fn simple_cols(keys: &[Expr], schema: &Schema) -> Option<Vec<usize>> {
 
 fn key_for(eng: &mut Engine<'_>, keys: &[Expr], idx: Option<&[usize]>, colls: &super::query::Colls, schema: &Schema, row: &[Value], outer: Option<&Env<'_>>) -> Result<Option<String>> {
     if let Some(ix) = idx {
+        // one key column (nearly every join): its value is hashed where it lies
+        if let [i] = ix {
+            let v = &row[*i];
+            if v.is_null() {
+                return Ok(None);
+            }
+            return Ok(Some(if colls.is_empty() { key_of(std::slice::from_ref(v)) } else { key_of(&super::query::keyed(std::slice::from_ref(v), colls)) }));
+        }
         let mut kv = Vec::with_capacity(ix.len());
         for &i in ix {
             let v = &row[i];
@@ -287,6 +295,48 @@ impl HashJoin {
         Ok(true)
     }
 
+    /// Whether probe rows can be pushed through this stage by several threads at once: the table is in memory, nothing is
+    /// recorded per probe row (no right/full join) and every expression it evaluates is safe to share out.
+    pub fn par_ok(&self) -> bool {
+        self.grace.is_none()
+            && !self.spec.right
+            && self.spec.residual.iter().all(super::par::par_safe)
+            && self.spec.left_keys.iter().all(super::par::par_safe)
+    }
+
+    /// [`HashJoin::probe`] for a stage that is [`par_ok`](HashJoin::par_ok): the joined rows are collected, nothing is changed.
+    fn probe_ro(&self, eng: &mut Engine<'_>, lrow: Row, out: &mut Vec<Row>) -> Result<()> {
+        let Some(k) = key_for(eng, &self.spec.left_keys, self.left_idx.as_deref(), &self.spec.colls, &self.spec.left_schema, &lrow, None)? else {
+            if self.spec.left {
+                out.push(self.null_extended(&lrow));
+            }
+            return Ok(());
+        };
+        let mut matched = false;
+        if let Some(cands) = self.map.get(&k) {
+            let n = lrow.len();
+            let mut keep = Some(lrow);
+            for (i, r) in cands.iter().enumerate() {
+                let last = i + 1 == cands.len();
+                let mut row = if last { keep.take().unwrap() } else { keep.as_ref().unwrap().clone() };
+                row.extend(r.iter().cloned());
+                if self.residual_ok(eng, &row, None)? {
+                    matched = true;
+                    out.push(row);
+                } else if last {
+                    row.truncate(n);
+                    keep = Some(row);
+                }
+            }
+            if !matched && self.spec.left {
+                out.push(self.null_extended(&keep.expect("an unmatched probe row is kept")));
+            }
+        } else if self.spec.left {
+            out.push(self.null_extended(&lrow));
+        }
+        Ok(())
+    }
+
     /// The probe input is exhausted: join the spilled partitions. Returns false when the consumer wants no more rows.
     pub fn finish(&mut self, eng: &mut Engine<'_>, outer: Option<&Env<'_>>, emit: Emit<'_>) -> Result<bool> {
         let Some(g) = self.grace.take() else {
@@ -458,6 +508,22 @@ pub fn push_through(eng: &mut Engine<'_>, stages: &mut [HashJoin], row: Row, out
         None => sink(eng, row),
         Some((first, rest)) => first.probe(eng, row, outer, &mut |eng, joined| push_through(eng, rest, joined, outer, sink)),
     }
+}
+
+/// Push `row` through `stages` (all [`HashJoin::par_ok`]) and collect the rows that come out, in the order the serial
+/// [`push_through`] would give them.
+pub fn collect_through(eng: &mut Engine<'_>, stages: &[HashJoin], row: Row, out: &mut Vec<Row>) -> Result<()> {
+    match stages.split_first() {
+        None => out.push(row),
+        Some((first, rest)) => {
+            let mut mid = Vec::new();
+            first.probe_ro(eng, row, &mut mid)?;
+            for r in mid {
+                collect_through(eng, rest, r, out)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The probe input is exhausted: finish every stage in order (a stage's spilled partitions feed the later stages).

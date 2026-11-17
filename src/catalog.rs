@@ -764,6 +764,8 @@ pub struct ServerState {
     pub replicator: std::sync::Mutex<Option<Arc<dyn crate::persist::Replicator>>>,
     /// Transactions that voted in a distributed commit and wait for its outcome (see `persist::LogOp::Prepare`), by id.
     pub prepared: std::sync::Mutex<BTreeMap<u64, crate::persist::PreparedTxn>>,
+    /// Column statistics the optimizer took from samples of tables, by heap id (see `engine/stats.rs`).
+    pub stats: std::sync::Mutex<HashMap<u32, Arc<crate::engine::stats::TableStats>>>,
 }
 
 /// Foreign-key facts about one table, valid for one catalog epoch.
@@ -793,6 +795,7 @@ impl ServerState {
             fk_cache: std::sync::Mutex::new(FkCache::default()),
             replicator: std::sync::Mutex::new(None),
             prepared: std::sync::Mutex::new(BTreeMap::new()),
+            stats: std::sync::Mutex::new(HashMap::new()),
         };
         for (i, n) in ["master", "tempdb", "model", "msdb"].iter().enumerate() {
             s.databases.insert(n.to_string(), Database::new(n, i as i32 + 1));

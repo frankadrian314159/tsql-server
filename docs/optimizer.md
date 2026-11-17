@@ -103,6 +103,22 @@ after the other indexes. A real shredded index would be a change to the storage 
   found by running it once without the outer row: if that works, no outer column was needed and its rows are kept for
   the rest of the statement; if it fails because a column is unknown, it runs per row as before. The cache is dropped
   at the end of each statement and is off while an `IF` or `WHILE` condition is evaluated.
+* **Correlated subqueries of the `WHERE` become joins** (`src/rewrite/decorrelate.rs`, shared with the cluster's control node, applied by
+  `Engine::decorrelated`). A scalar aggregate compared with a column (`x > (SELECT AVG(y) FROM t WHERE t.k = o.k)`) becomes a join with a
+  grouped derived table (a `COUNT` is left alone: it gives 0, not NULL, for no rows), and `EXISTS` / `NOT EXISTS` on one equality become `IN` /
+  `NOT IN` over the subquery's keys, written so that a NULL key behaves as it did. The derived table is restricted to the keys of the outer
+  rows that survive the outer query's conditions on that table. Only equalities between a column of the subquery and a qualified column of
+  the outer query are recognised, only when every table is a known base table, and not for `SELECT *`; a rewritten query that does not run
+  is run as it was written. `SET OPTIMIZER OFF` turns it off. The plan says `correlated subquery rewritten as a join`.
+* **A scalar subquery that stands alone is a constant for the plan**: `d_month_seq = (SELECT MAX(..) ..)` is run once before the plan
+  is made and its value put in the condition, which can then be pushed to the table, seek an index and count in the row estimate.
+* **Statistics of the columns** (`src/engine/stats.rs`) give the row estimates of the conditions that no index answers (the optimizer used
+  to guess that each keeps a third of the rows). A table of 2000 slots or more is sampled once (64 blocks of 64 slots spread over its row
+  ids, `Server::stats`, kept until the table has changed in size by a fifth): per column the share of NULLs, the distinct values, the most
+  common values with their shares and an equi-depth histogram. `col = lit`, ranges, `BETWEEN`, `IN`, `IS NULL`, `LIKE 'prefix%'`, `AND`, `OR`
+  and `NOT` have a selectivity read off them. They order joins; they do not change an answer.
+* **`IN (subquery)` of integers is tested with a hash**, and the rows of a subquery that does not use the outer row are shared, not copied,
+  for each outer row. The keys of hash joins, groups and `DISTINCT` (`convert::key_into`) are written without a temporary string per value.
 * **Common conjuncts of an OR are factored out** when the statement is parsed: `(a AND b) OR (a AND c)` is
   `a AND (b OR c)`, so a join condition repeated in each branch (TPC-H Q19) is a join condition.
 * **A condition on a CTE, derived table or view reference is applied to its rows before they are joined.**

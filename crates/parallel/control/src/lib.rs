@@ -21,11 +21,12 @@
 //! subqueries, OUTPUT or TOP. A statement that fails on some shards after succeeding on others (a multi-shard
 //! `UPDATE`) leaves the shards that succeeded changed: atomic cross-shard transactions need the two-phase commit of a later
 //! phase.
-pub mod astutil;
+pub use tsql_server::rewrite::astutil;
+pub mod advisor;
 pub mod autoscale;
 pub mod client;
 pub mod deadlock;
-pub mod decorrelate;
+pub use tsql_server::rewrite::decorrelate;
 pub mod fk;
 pub mod flatten;
 pub mod gather;
@@ -131,6 +132,8 @@ pub struct Cluster {
     tables: Mutex<HashMap<String, DistTable>>,
     /// held while the mirror's copies of tables are loaded and queried
     gather: Mutex<()>,
+    /// what the queries had to move between shards or gather (see `advisor.rs`)
+    advisor: advisor::Log,
     next_session: AtomicU64,
     /// the largest table (in rows) a join broadcasts to every shard
     broadcast_limit: AtomicU64,
@@ -201,6 +204,7 @@ impl Cluster {
             mirror: Server::new(),
             tables: Mutex::new(HashMap::new()),
             gather: Mutex::new(()),
+            advisor: Default::default(),
             next_session: AtomicU64::new(fresh_session_base()),
             broadcast_limit: AtomicU64::new(100_000),
             in_list_limit: AtomicU64::new(20_000),
@@ -635,9 +639,22 @@ impl ClusterSession {
 
     /// Run a batch; the result has the events of the engine (result sets, row counts, an error that stops the batch).
     pub fn execute(&mut self, sql: &str) -> BatchResult {
+        tsql_server::span!("ctl_execute");
         self.plan.clear();
         let cl = self.cluster.clone();
         let mut events = vec![];
+        // ADVISE DISTRIBUTION [RESET]: what the queries had to move or gather so far, and the distribution that would have spared it
+        {
+            let words: Vec<String> = sql.trim().trim_end_matches(';').split_whitespace().map(|w| w.to_lowercase()).collect();
+            if words.len() >= 2 && words[0] == "advise" && words[1] == "distribution" {
+                if words.len() == 3 && words[2] == "reset" {
+                    cl.advisor.clear();
+                    return BatchResult { events: vec![Event::Message("The record of moved tables is cleared.".into())] };
+                }
+                let rs = advisor::advise(&cl.advisor, &cl.tables(), cl.broadcast_limit.load(Ordering::Relaxed));
+                return BatchResult { events: vec![Event::Rows(rs)] };
+            }
+        }
         if let Some(cmd) = parse_distribute(sql) {
             let _migration = cl.migration.read().unwrap_or_else(|e| e.into_inner());
             let r = match cmd {
@@ -649,7 +666,11 @@ impl ClusterSession {
             }
             return BatchResult { events };
         }
-        match tsql_server::parser::parse(sql) {
+        let parsed = {
+            tsql_server::span!("ctl_parse");
+            tsql_server::parser::parse(sql)
+        };
+        match parsed {
             Ok(stmts) => {
                 let r = self.run_stmts(&stmts);
                 // TSQL_PLAN_TRACE=1: one line per statement with its first words and how the cluster ran it (to see which statements
@@ -719,6 +740,7 @@ impl ClusterSession {
     /// `SELECT @a = e1, @b = e2 FROM ...`: run the query for its values and assign the last row's to the variables (no row:
     /// they keep their values), as the engine does.
     async fn select_assign(&mut self, q: &Query, targets: Vec<(String, Option<BinOp>)>) -> Result<(), SqlError> {
+        tsql_server::span!("ctl_select_assign");
         let mut plain = q.clone();
         if let QueryBody::Select(s) = &mut plain.body {
             s.items = s.items.iter().map(|i| if let SelectItem::Assign { e, .. } = i { SelectItem::Expr { e: e.clone(), alias: None } } else { i.clone() }).collect();
@@ -779,6 +801,7 @@ impl ClusterSession {
 
     /// In a transaction, begin it on each shard the statement is about to use for the first time.
     async fn ensure_begun(&self, shards: &[usize]) -> Result<(), SqlError> {
+        tsql_server::span!("ctl_ensure_begun");
         self.stmt_shards.set(self.stmt_shards.get().max(shards.len()));
         let need: Vec<usize> = match self.txn.borrow().as_ref() {
             None => return Ok(()),
@@ -802,10 +825,44 @@ impl ClusterSession {
         Ok(())
     }
 
+    /// `work` for `shard`, with the start of the transaction in front of it when the transaction has not been there yet: the shard
+    /// begins and runs the statement in one request (a request of its own for the `BEGIN` costs a round trip to every shard a
+    /// transaction touches). Work that is text goes behind a `BEGIN` of its own, as it may be a statement that must start its batch.
+    async fn prepared(&self, shard: usize, work: Work) -> Result<Work, SqlError> {
+        self.stmt_shards.set(self.stmt_shards.get().max(1));
+        let begins = match self.txn.borrow().as_ref() {
+            None => false,
+            Some(t) => !t.shards.contains(&shard),
+        };
+        if !begins {
+            return Ok(work);
+        }
+        match work {
+            Work::Stmts(mut v) => {
+                let ms = self.cluster.lock_timeout_ms.load(Ordering::Relaxed);
+                let mut pre = tsql_server::parser::parse(&format!("SET LOCK_TIMEOUT {}; BEGIN TRANSACTION", ms)).map_err(|e| SqlError::new(50000, e.to_string()))?;
+                if let Some(t) = self.txn.borrow_mut().as_mut() {
+                    t.shards.insert(shard);
+                }
+                pre.append(&mut v);
+                Ok(Work::Stmts(pre))
+            }
+            other => {
+                self.ensure_begun(&[shard]).await?;
+                Ok(other)
+            }
+        }
+    }
+
     async fn fan_run(&self, shards: &[usize], work: impl Fn(usize) -> Work) -> Result<Vec<RunReply>, SqlError> {
-        self.ensure_begun(shards).await?;
+        tsql_server::span!("ctl_fan_run");
+        self.stmt_shards.set(self.stmt_shards.get().max(shards.len()));
+        let mut works = vec![];
+        for &i in shards {
+            works.push(self.prepared(i, work(i)).await?);
+        }
         let clients: Vec<ShardClient> = shards.iter().map(|&i| self.cluster.shard(i)).collect();
-        let futs: Vec<_> = clients.iter().zip(shards).map(|(c, &i)| c.run(self.id, work(i))).collect();
+        let futs: Vec<_> = clients.iter().zip(works).map(|(c, w)| c.run(self.id, w)).collect();
         let mut out = vec![];
         for r in join_all(futs).await {
             let reply = r?;
@@ -818,9 +875,14 @@ impl ClusterSession {
     }
 
     async fn fan_query(&self, shards: &[usize], work: impl Fn(usize) -> Work) -> Result<Vec<ResultSet>, SqlError> {
-        self.ensure_begun(shards).await?;
+        tsql_server::span!("ctl_fan_query");
+        self.stmt_shards.set(self.stmt_shards.get().max(shards.len()));
+        let mut works = vec![];
+        for &i in shards {
+            works.push(self.prepared(i, work(i)).await?);
+        }
         let clients: Vec<ShardClient> = shards.iter().map(|&i| self.cluster.shard(i)).collect();
-        let futs: Vec<_> = clients.iter().zip(shards).map(|(c, &i)| c.query(self.id, work(i))).collect();
+        let futs: Vec<_> = clients.iter().zip(works).map(|(c, w)| c.query(self.id, w)).collect();
         join_all(futs).await.into_iter().collect()
     }
 
@@ -837,6 +899,7 @@ impl ClusterSession {
     // ------------------------------------------------------------------ statements
 
     async fn exec_stmt(&mut self, st: &Stmt, events: &mut Vec<Event>) -> Result<(), SqlError> {
+        tsql_server::span!("ctl_exec_stmt");
         match st {
             Stmt::BeginTran(_) => {
                 let mut t = self.txn.borrow_mut();
@@ -1223,6 +1286,7 @@ impl ClusterSession {
     /// An EXEC of a procedure that runs on one shard: the arguments are evaluated, and the call is sent to the shard that owns the
     /// value of the key parameter (inside the session transaction, when there is one). False when the procedure is not one of those.
     async fn exec_routed_proc(&mut self, ex: &ExecStmt, events: &mut Vec<Event>) -> Result<bool, SqlError> {
+        tsql_server::span!("ctl_exec_routed_proc");
         if ex.name_is_var {
             return Ok(false);
         }
@@ -1258,15 +1322,15 @@ impl ClusterSession {
         let shard = self.cluster.shard_of_hash(h);
         let st = Stmt::Exec(Box::new(ExecStmt { name: ex.name.clone(), name_is_var: false, args, retvar: None }));
         self.plan.push(format!("procedure {} runs on shard {}", ex.name.join("."), shard));
-        self.ensure_begun(&[shard]).await?;
+        let work = self.prepared(shard, Work::Stmts(vec![st])).await?;
         if route.rows {
             // (every result set the procedure returns; there may be none, when it ends before it returns any, as New-Order does when it
             // rolls back)
-            for rs in self.cluster.shard(shard).run_sets(self.id, Work::Stmts(vec![st])).await? {
+            for rs in self.cluster.shard(shard).run_sets(self.id, work).await? {
                 events.push(Event::Rows(rs));
             }
         } else {
-            let reply = self.cluster.shard(shard).run(self.id, Work::Stmts(vec![st])).await?;
+            let reply = self.cluster.shard(shard).run(self.id, work).await?;
             if let Some(e) = reply.first_error() {
                 return Err(e.to_sql());
             }
@@ -1357,6 +1421,7 @@ impl ClusterSession {
     }
 
     async fn eval_scalar(&mut self, e: &Expr) -> Result<Value, SqlError> {
+        tsql_server::span!("ctl_eval_scalar");
         if let Expr::Lit(v) = e {
             return Ok(v.clone());
         }
@@ -1400,6 +1465,7 @@ impl ClusterSession {
     }
 
     async fn insert_values(&mut self, ins: &Insert, events: &mut Vec<Event>) -> Result<(), SqlError> {
+        tsql_server::span!("ctl_insert_values");
         let name = match &ins.target {
             Target::Table(name) => name,
             Target::Var(v) if self.tvars.contains_key(&v.to_lowercase()) => {
@@ -1635,6 +1701,7 @@ impl ClusterSession {
 
     /// The common checks of a single-table UPDATE or DELETE; the shards to send it to.
     async fn dml_shards(&mut self, t: &DistTable, where_: Option<&Expr>) -> Result<Vec<usize>, SqlError> {
+        tsql_server::span!("ctl_dml_shards");
         match t.dist {
             Dist::Replicated => Ok(self.all_shards()),
             Dist::Sharded { .. } => self.pruned_shards(t, where_).await,
@@ -1642,6 +1709,7 @@ impl ClusterSession {
     }
 
     async fn run_dml(&mut self, t: &DistTable, st: Stmt, shards: Vec<usize>, events: &mut Vec<Event>) -> Result<(), SqlError> {
+        tsql_server::span!("ctl_run_dml");
         let replies = self.fan_run(&shards, |_| Work::Stmts(vec![st.clone()])).await?;
         let count = match t.dist {
             Dist::Replicated => replies.first().map(|r| r.row_count()).unwrap_or(0),
@@ -1654,6 +1722,7 @@ impl ClusterSession {
     }
 
     async fn update(&mut self, u: &Update, events: &mut Vec<Event>) -> Result<(), SqlError> {
+        tsql_server::span!("ctl_update");
         let Target::Table(name) = &u.target else { return Err(unsupported("UPDATE of a table variable")) };
         let t = self.table(name)?;
         if !u.from.is_empty() || u.output.is_some() || u.top.is_some() || u.current_of.is_some() || !u.ctes.is_empty() {
@@ -1766,6 +1835,7 @@ impl ClusterSession {
     }
 
     async fn delete(&mut self, d: &Delete, events: &mut Vec<Event>) -> Result<(), SqlError> {
+        tsql_server::span!("ctl_delete");
         let Target::Table(name) = &d.target else { return Err(unsupported("DELETE from a table variable")) };
         let t = self.table(name)?;
         if !d.from.is_empty() || d.output.is_some() || d.top.is_some() || d.current_of.is_some() || !d.ctes.is_empty() {
@@ -1790,6 +1860,7 @@ impl ClusterSession {
     // ------------------------------------------------------------------ queries
 
     async fn run_query_flat(&mut self, q: &Query) -> Result<ResultSet, SqlError> {
+        tsql_server::span!("ctl_run_query_flat");
         let ids = referenced_tables(q);
         let tables: Vec<DistTable> = ids.iter().filter_map(|i| self.table_by_id(i)).collect();
         if tables.is_empty() {
@@ -1807,6 +1878,10 @@ impl ClusterSession {
         // query runs shard by shard with them inside
         if has_nested_query(q) && tables.iter().any(|t| matches!(t.dist, Dist::Sharded { .. })) {
             if let Some(rs) = self.try_pushdown(q, false).await? {
+                return Ok(rs);
+            }
+            // (the rest of the tables broadcast to the shards that hold the co-located ones, TPC-H Q21)
+            if let Some(rs) = self.try_join(q, &tables, true).await? {
                 return Ok(rs);
             }
         }
@@ -1829,7 +1904,7 @@ impl ClusterSession {
                 self.plan.push(format!("route: every table's key fixes the shard ({})", shard));
                 return self.direct(shard, q).await;
             }
-            if let Some(rs) = self.try_join(q, &tables).await? {
+            if let Some(rs) = self.try_join(q, &tables, false).await? {
                 return Ok(rs);
             }
             if let Some(rs) = self.try_mpp(q, &tables).await? {
@@ -1902,7 +1977,11 @@ impl ClusterSession {
     }
 
     /// A join of several tables run shard by shard (co-located, broadcast or repartitioned); None when it cannot be.
-    async fn try_join(&mut self, q: &Query, tables: &[DistTable]) -> Result<Option<ResultSet>, SqlError> {
+    /// `nested`: the query has subqueries in its `WHERE`; the tables moved are then broadcast (never repartitioned), and the query goes
+    /// on only when the shards can evaluate the subqueries against what they hold once those copies are in place (the tables that
+    /// stay where they are are co-located with each other, and each subquery is co-located with them or reads replicated tables).
+    async fn try_join(&mut self, q: &Query, tables: &[DistTable], nested: bool) -> Result<Option<ResultSet>, SqlError> {
+        tsql_server::span!("ctl_try_join");
         let map: HashMap<String, DistTable> = tables.iter().map(|t| (t.id.clone(), t.clone())).collect();
         let limit = self.cluster.broadcast_limit.load(Ordering::Relaxed);
         let n = self.cluster.shard_count();
@@ -1912,7 +1991,7 @@ impl ClusterSession {
         // taken as too big to move, and only when that moves something are the tables counted, which costs a round trip to every shard
         // each time a table has changed)
         let unknown: HashMap<String, u64> = tables.iter().filter(|t| !matches!(t.dist, Dist::Replicated)).map(|t| (t.id.clone(), u64::MAX / 4)).collect();
-        let first = joins::plan_join(q, &map, &unknown, limit, n, &mut || {
+        let first = joins::plan_join(q, &map, &unknown, limit, n, nested, &mut || {
             counter += 1;
             format!("#dpj_{}_{}", sid, counter)
         });
@@ -1926,7 +2005,7 @@ impl ClusterSession {
                         rows.insert(t.id.clone(), n);
                     }
                 }
-                joins::plan_join(q, &map, &rows, limit, n, &mut || {
+                joins::plan_join(q, &map, &rows, limit, n, nested, &mut || {
                     counter += 1;
                     format!("#dpj_{}_{}", sid, counter)
                 })
@@ -1934,7 +2013,27 @@ impl ClusterSession {
         };
         self.temp_counter = counter;
         let Some(jp) = plan else { return Ok(None) };
-        let Some(shape) = plan::plan_scatter_multi(&jp.query) else { return Ok(None) };
+        let shape = if nested {
+            let copies: HashMap<String, DistTable> = jp
+                .preps
+                .iter()
+                .map(|p| {
+                    let mut t = p.table.clone();
+                    t.dist = Dist::Replicated;
+                    t.id = table_id(std::slice::from_ref(&p.temp));
+                    (t.id.clone(), t)
+                })
+                .collect();
+            let this = &*self;
+            let lookup = |id: &str| copies.get(id).cloned().or_else(|| this.table_by_id(id));
+            if !pushdown::pushdown_ok(&jp.query, &lookup, false) {
+                return Ok(None);
+            }
+            plan::plan_scatter_sub(&jp.query)
+        } else {
+            plan::plan_scatter_multi(&jp.query)
+        };
+        let Some(shape) = shape else { return Ok(None) };
         let mut shards = self.all_shards();
         // (a condition `col = literal` on a column with a global index limits a co-located join to the shards that hold such rows: the
         // other sharded tables' partners of a row are on its shard; a column that another table of the query has too is not used)
@@ -1954,6 +2053,9 @@ impl ClusterSession {
         let mut made = vec![];
         let mut result = Ok(());
         for p in &jp.preps {
+            let rows = self.table_by_id(&p.table.id).and_then(|t| t.rows.map(|r| r.1)).unwrap_or(0);
+            let col: Vec<String> = p.repartition.as_ref().map(|(c, _)| p.table.cols[*c].name.clone()).into_iter().collect();
+            self.cluster.advisor.record(&p.table.id, if p.repartition.is_some() { "repartition" } else { "broadcast" }, rows, &col);
             made.push(p.temp.clone());
             if let Err(e) = self.prepare_copy(p).await {
                 result = Err(e);
@@ -1978,6 +2080,7 @@ impl ClusterSession {
     /// A join that needs the shuffle between its joins (`mpp.rs`): the stages move rows from shard to shard into session
     /// temporary tables, then the rewritten query runs shard by shard. None when the query is not of that kind.
     async fn try_mpp(&mut self, q: &Query, tables: &[DistTable]) -> Result<Option<ResultSet>, SqlError> {
+        tsql_server::span!("ctl_try_mpp");
         if tables.len() < 2 {
             return Ok(None);
         }
@@ -2086,11 +2189,13 @@ impl ClusterSession {
     }
 
     async fn direct(&mut self, shard: usize, q: &Query) -> Result<ResultSet, SqlError> {
-        self.ensure_begun(&[shard]).await?;
-        self.cluster.shard(shard).query(self.id, Work::Stmts(vec![Stmt::Query(Box::new(q.clone()))])).await
+        tsql_server::span!("ctl_direct");
+        let work = self.prepared(shard, Work::Stmts(vec![Stmt::Query(Box::new(q.clone()))])).await?;
+        self.cluster.shard(shard).query(self.id, work).await
     }
 
     async fn scatter(&mut self, shape: Shape, shards: &[usize]) -> Result<ResultSet, SqlError> {
+        tsql_server::span!("ctl_scatter");
         let (sq, kind) = match &shape {
             Shape::Row(p) => (p.shard_query.clone(), "rows"),
             Shape::Agg(p) => (p.shard_query.clone(), "two-phase aggregate"),

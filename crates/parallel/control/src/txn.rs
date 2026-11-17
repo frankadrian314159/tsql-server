@@ -44,6 +44,7 @@ impl ClusterSession {
     /// Roll the transaction back on every shard that began it (best effort: a shard that cannot be reached rolls it back
     /// when its session ends).
     pub(crate) async fn finish_rollback(&self, tx: &TxnState) {
+        tsql_server::span!("ctl_finish_rollback");
         let shards: Vec<usize> = tx.shards.iter().copied().collect();
         let clients: Vec<ShardClient> = shards.iter().map(|&i| self.cluster.shard(i)).collect();
         let futs: Vec<_> = clients.iter().map(|c| c.run(self.id, Work::Sql("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION".into()))).collect();
@@ -132,6 +133,7 @@ impl ClusterSession {
     }
 
     pub(crate) async fn commit_txn(&mut self, events: &mut Vec<Event>) -> Result<(), SqlError> {
+        tsql_server::span!("ctl_commit_txn");
         {
             let mut t = self.txn.borrow_mut();
             match t.as_mut() {
@@ -171,6 +173,7 @@ impl ClusterSession {
     }
 
     async fn two_phase_commit(&mut self, tx: TxnState, shards: Vec<usize>, events: &mut Vec<Event>) -> Result<(), SqlError> {
+        tsql_server::span!("ctl_two_phase_commit");
         let sid = self.id;
         let cl = self.cluster.clone();
         let gid = cl.next_gid.fetch_add(1, Ordering::Relaxed);
@@ -197,8 +200,12 @@ impl ClusterSession {
         if cl.fault("after_prepare") {
             return Err(SqlError::new(50220, "The control node stopped before deciding the transaction (a test fault)."));
         }
-        // the decision: recorded before anything is committed, so that a control node that stops now finishes the commit
-        if !prepared.is_empty() {
+        // the decision: recorded before anything is committed, so that a control node that stops now finishes the commit. With one shard
+        // that changed anything there is nothing to decide between shards: it commits by itself (atomically), and the others only read, so
+        // a control node that stops first leaves a prepared transaction that is rolled back (nothing has committed anywhere), which is as
+        // good as the transaction never having been committed; no write of the state file is needed
+        let record = prepared.len() > 1;
+        if record {
             cl.pending.lock().unwrap_or_else(|e| e.into_inner()).push((gid, prepared.clone()));
             cl.save_state();
         }
@@ -208,38 +215,42 @@ impl ClusterSession {
         }
         // phase 2: a prepared shard commits from its durable record (so it commits even if it lost the open transaction
         // since it voted); a shard that changed nothing just ends its transaction
-        let mut waiting: Vec<usize> = vec![];
-        for (c, s) in clients.iter().zip(&shards) {
-            if prepared.contains(s) {
-                let mut done = false;
-                for attempt in 0..3 {
-                    match c.settle(gid, true).await {
-                        Ok(_) => {
-                            done = true;
-                            break;
+        // (all at once: the shards are independent of each other now)
+        let settled = join_all(clients.iter().zip(&shards).map(|(c, s)| {
+            let prepared_here = prepared.contains(s);
+            async move {
+                if prepared_here {
+                    for attempt in 0..3 {
+                        match c.settle(gid, true).await {
+                            Ok(_) => return (*s, true),
+                            Err(_) if attempt < 2 => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
+                            Err(_) => {}
                         }
-                        Err(_) if attempt < 2 => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
-                        Err(_) => {}
                     }
+                    (*s, false)
+                } else {
+                    let _ = c.run(sid, Work::Sql("IF @@TRANCOUNT > 0 COMMIT TRANSACTION".into())).await;
+                    (*s, true)
                 }
-                if !done {
-                    waiting.push(*s);
-                }
-            } else {
-                let _ = c.run(sid, Work::Sql("IF @@TRANCOUNT > 0 COMMIT TRANSACTION".into())).await;
             }
-        }
+        }))
+        .await;
+        let waiting: Vec<usize> = settled.into_iter().filter(|(_, ok)| !ok).map(|(s, _)| s).collect();
         {
             let mut p = cl.pending.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(i) = p.iter().position(|(g, _)| *g == gid) {
-                if waiting.is_empty() {
+            match p.iter().position(|(g, _)| *g == gid) {
+                Some(i) if waiting.is_empty() => {
                     p.remove(i);
-                } else {
-                    p[i].1 = waiting.clone();
                 }
+                Some(i) => p[i].1 = waiting.clone(),
+                // (the one shard that changed something did not confirm: the decision is recorded now, for it to be finished later)
+                None if !waiting.is_empty() => p.push((gid, waiting.clone())),
+                None => {}
             }
         }
-        cl.save_state();
+        if record || !waiting.is_empty() {
+            cl.save_state();
+        }
         self.bump_written(&tx);
         if !waiting.is_empty() {
             events.push(Event::Message(format!("The transaction is committed; shard(s) {:?} have not confirmed yet and will finish it when they are reachable (Cluster::resolve_pending).", waiting)));

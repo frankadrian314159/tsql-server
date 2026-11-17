@@ -7,7 +7,7 @@
 //! (`ORDER BY`, `DISTINCT`). Results are the same as the materialising executor's, which still handles everything
 //! else (windows, set operations, outer joins other than LEFT, derived tables, small tables); only the working set
 //! differs.
-use super::hashjoin::{finish_all, push_through, HashJoin, JoinPlan};
+use super::hashjoin::{collect_through, finish_all, push_through, HashJoin, JoinPlan};
 use super::query::{any_coll, cmp_keys, collect_windows, has_agg, keyed, Colls, Env, OutCol, Rowset};
 use super::aggacc::{self, AggAcc};
 use super::spill::{Cmp, Entry, RowsWriter, Sorter, WorkMem};
@@ -647,16 +647,67 @@ impl<'a> Engine<'a> {
                 let mut stopped = false;
                 {
                     let (joins, scanned, stopped) = (&mut joins, &mut scanned, &mut stopped);
-                    self.scan_each(&probe.loc, &probe.t, &probe.ap, Some((&probe.schema, &probe.pushed)), &mut |eng, chunk| {
-                        for (_, row) in chunk {
-                            *scanned += 1;
-                            if !push_through(eng, &mut joins[..], row, outer, &mut sink)? {
+                    // a big probe table whose stages are all in memory: batches of probe rows are pushed through the stages by
+                    // several threads, and the joined rows reach the sink in the order the rows were read
+                    let jdop = if outer.is_none()
+                        && probe.t.data.slot_count() >= super::par::min_slots()
+                        && probe.schema.cols.iter().all(|c| c.denied.is_none())
+                        && joins.iter().all(|j| j.par_ok())
+                    {
+                        self.dop()
+                    } else {
+                        1
+                    };
+                    if jdop > 1 {
+                        let mut buf: Vec<Row> = Vec::new();
+                        let batch = jdop * 1024;
+                        let mut run = |eng: &mut Engine<'_>, rows: Vec<Row>, joins: &mut Vec<HashJoin>| -> Result<bool> {
+                            let n = rows.len();
+                            let stages: &[HashJoin] = &joins[..];
+                            let parts = eng.par_map(rows, jdop, &|w, part: Vec<Row>| {
+                                part.into_iter()
+                                    .map(|row| {
+                                        let mut out = Vec::new();
+                                        collect_through(w, stages, row, &mut out).map(|_| out)
+                                    })
+                                    .collect::<Vec<_>>()
+                            });
+                            joins[0].probed += n;
+                            for part in parts {
+                                for r in part {
+                                    for joined in r? {
+                                        if !sink(eng, joined)? {
+                                            return Ok(false);
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(true)
+                        };
+                        self.scan_each(&probe.loc, &probe.t, &probe.ap, Some((&probe.schema, &probe.pushed)), &mut |eng, chunk| {
+                            *scanned += chunk.len();
+                            buf.extend(chunk.into_iter().map(|(_, row)| row));
+                            if buf.len() >= batch && !run(eng, std::mem::take(&mut buf), joins)? {
                                 *stopped = true;
                                 return Ok(false);
                             }
+                            Ok(true)
+                        })?;
+                        if !*stopped && !buf.is_empty() {
+                            run(self, std::mem::take(&mut buf), joins)?;
                         }
-                        Ok(true)
-                    })?;
+                    } else {
+                        self.scan_each(&probe.loc, &probe.t, &probe.ap, Some((&probe.schema, &probe.pushed)), &mut |eng, chunk| {
+                            for (_, row) in chunk {
+                                *scanned += 1;
+                                if !push_through(eng, &mut joins[..], row, outer, &mut sink)? {
+                                    *stopped = true;
+                                    return Ok(false);
+                                }
+                            }
+                            Ok(true)
+                        })?;
+                    }
                 }
                 if !stopped {
                     finish_all(self, &mut joins[..], outer, &mut sink)?;

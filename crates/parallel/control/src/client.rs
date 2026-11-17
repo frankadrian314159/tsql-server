@@ -167,11 +167,16 @@ impl ShardClient {
 
     /// Run work on the shard's session; the reply says what happened (errors are inside the reply).
     pub async fn run(&self, session: u64, work: Work) -> Result<RunReply, SqlError> {
-        let body = postcard::to_allocvec(&Fragment { session, work }).map_err(|e| SqlError::new(50000, e.to_string()))?;
+        tsql_server::span!("ctl_shard_run");
+        let body = {
+            tsql_server::span!("ctl_encode");
+            postcard::to_allocvec(&Fragment { session, work }).map_err(|e| SqlError::new(50000, e.to_string()))?
+        };
         let reply = match self.action(ACTION_RUN, body.clone()).await {
             Err(e) if self.after_in_doubt(&e).await => self.action(ACTION_RUN, body).await?,
             r => r?,
         };
+        tsql_server::span!("ctl_decode");
         postcard::from_bytes(&reply).map_err(|e| SqlError::new(50000, format!("bad reply from shard {}: {}", self.id, e)))
     }
 

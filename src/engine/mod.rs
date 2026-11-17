@@ -23,6 +23,7 @@ pub mod query;
 pub mod secexec;
 pub mod setops;
 pub mod spill;
+pub mod stats;
 pub mod admin;
 pub mod backup;
 pub mod bakexport;
@@ -200,6 +201,8 @@ pub struct SessionState {
     pub dry_run: bool,
     pub showplan: bool,
     pub optimizer: bool,
+    /// Numbers the derived tables of the queries whose correlated subqueries were rewritten (`Engine::decorrelated`).
+    pub decorrelate_counter: u64,
     pub module_owner: Vec<String>,
     /// The SET options as `@@OPTIONS` reports them (a bit mask).
     pub options: i32,
@@ -223,7 +226,7 @@ pub struct SessionState {
     pub preeval: Option<(usize, query::Rowset)>,
     /// Results of subqueries that do not depend on the enclosing row, for the statement being run (see `Engine::sub_rows`).
     /// `None` where caching is not safe: outside a statement, and while an IF or WHILE condition is evaluated.
-    pub sub_cache: Option<HashMap<usize, Option<query::Rowset>>>,
+    pub sub_cache: Option<HashMap<usize, Option<Arc<query::Rowset>>>>,
     /// The literal integers of the long `IN` lists of the statement being run, as hash sets (by the address of the list; see
     /// `Engine::int_set`). Scoped like `sub_cache`: None where no statement is being run.
     pub in_sets: Option<HashMap<usize, Option<std::sync::Arc<expr::IntSet>>>>,
@@ -234,7 +237,7 @@ pub struct SessionState {
     /// Per statement: for a correlated subquery, the names it mentions (`None`: its result must not be reused), and the
     /// rows it gave for each combination of the values of the outer columns with those names (see `Engine::sub_rows`).
     pub sub_names: HashMap<usize, Option<std::sync::Arc<Vec<(String, Option<String>)>>>>,
-    pub sub_memo: HashMap<usize, HashMap<String, query::Rowset>>,
+    pub sub_memo: HashMap<usize, HashMap<String, Arc<query::Rowset>>>,
     /// Per statement, for a statement that only reads (a SELECT): the rows a table scan with some conditions gave, kept the
     /// second time the same scan is asked for (a correlated subquery reads the tables of its FROM again for every outer row).
     pub leaf_seen: std::collections::HashSet<String>,
@@ -315,6 +318,7 @@ impl SessionState {
             dry_run: false,
             showplan: false,
             optimizer: true,
+            decorrelate_counter: 0,
             module_owner: vec![],
             options: 5496,
             sys_tables: vec![],

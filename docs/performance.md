@@ -313,6 +313,77 @@ index on their status (about 4 ms), and what is left of the lock waiting is the 
 of TPC-C), whose holders keep them to the end of a transaction by design. Not done: resuming a blocked *write* statement
 in place (an `UPDATE` that meets a locked row still runs again after the wait, and must when the row has changed).
 
+## Sixth round: subqueries, statistics and the cluster's round trips
+
+Measured on one machine, release build, the same binaries run back to back on an otherwise idle machine (the numbers of a machine that was
+doing something else were twice these, which is why every comparison here is of runs made one after the other): TPC-H at scale 0.1 and TPC-DS at 0.2
+(`examples/tpc`), TPC-C with 10 warehouses and 8 terminals for 20 seconds.
+
+| | Before | After |
+| --- | ---: | ---: |
+| TPC-H, 22 queries, total | 26.1 s | 22.8 s |
+| TPC-DS subset, 24 queries, total | 23.9 s | 20.3 s |
+| TPC-H Q2 | 0.98 s | 0.24 s |
+| TPC-DS Q6 | 2.02 s | 0.62 s |
+| TPC-DS Q69 | 1.26 s | 0.19 s |
+| TPC-H Q20 / Q17 / Q8 | 1.28 / 0.61 / 1.33 s | 0.88 / 0.45 / 0.68 s |
+| TPC-C, New-Order mean (about 12,000 done) | 10.1 ms | 10.1 ms |
+
+1. **Correlated subqueries are joins** (see [optimizer.md](optimizer.md)). The first version made things worse where it helped: a query with
+   a derived table in its `FROM` lost the pushdown of its other conditions, because any leaf the optimizer could not name the columns of
+   made every unqualified column ambiguous (TPC-H Q2 went from 2.0 s only to 1.6 s until a derived table with named columns was given a
+   place of its own in the pushdown plan: 0.45 s).
+2. **Scalar subqueries that stand alone are constants** (TPC-DS Q6: 3.2 s with the rewrite alone, 0.62 s with the constant, the date
+   filter being then known before the join order is chosen).
+3. **Column statistics.** A first version never ran: the sample was taken from `max_rowid`, which walked back from the wrong end of the
+   tree and found nothing, so the old guess stayed in force and the tests of the estimates caught it. With them TPC-H Q8 is 40% faster; most
+   other queries do not change. The first plan of a query over a big table pays for the sample (about 40 ms: TPC-DS Q12, which takes 20 ms
+   without it, takes 58 ms the first time), and a try at a scalar subquery that turned out to use the outer row read a whole table to find out
+   (TPC-H Q17 was slower than before the change, until the subquery was looked at before it was run).
+4. **What did not help.** Fat LTO with one code-generation unit (`lto = "fat"`, `codegen-units = 1`) gave -4% on TPC-H, +3% on TPC-DS and -4% on TPC-C,
+   within the noise of a run to run difference, for a build twice as long: it is not on. The span profiler does not look inside a
+   streaming scan or a hash join, so what a row costs there (a few microseconds, mostly values cloned out of the heap and evaluated by
+   walking an expression tree) is not measured by it.
+5. **The cluster's round trips.** A transaction began on each shard with a request of its own before the statement that used the shard;
+   the `BEGIN` now travels in front of that statement (`ClusterSession::prepared`), which saves a round trip per shard per transaction. A
+   two-phase commit with one shard that changed anything no longer writes the state file (the decision is only recorded when more than one shard must
+   be told), and the shards are told to commit all at once instead of one after the other.
+   TPC-C on 3 local shards with 8 terminals (`oltp_cluster c`, the old and the new binary run in turn, twice each): 16,000 New-Orders per minute
+   before (16,278 and 15,816), 17,450 after (17,481 and 17,430); Payment's mean latency 21.9 ms before, 18.5 ms after.
+
+## Seventh round: the probe side of a hash join, and what the other suspects turned out to be
+
+1. **Hash joins probe on several threads** (`HashJoin::par_ok`, `collect_through`, see `src/engine/par.rs`). When every stage of a join
+   is in memory, the probe table has at least `min_slots` rows and no expression is unsafe to share (the rules of a parallel scan), batches
+   of probe rows go through all the stages on the workers and reach the rest of the query in the order they were read, so rows and order are
+   those of `OPTION (MAXDOP 1)` (`tests/parallel_query.rs`). Back to back on an idle machine (TPC-H sf 0.1, TPC-DS sf 0.2, 12 cores): TPC-H Q5
+   1.03 -> 0.68 s, TPC-DS Q50 0.55 -> 0.31 s, Q3 1.01 -> 0.87 s, totals 23.0 -> 22.6 s and 20.2 -> 19.9 s. Most of a join query's time is
+   in the scan, the grouping and the sort, which the totals show, so the gain is large for a few queries and small for the rest.
+2. **OLTP lock contention is not what limits TPC-C here.** With 8 terminals and 10 warehouses a 15 s run had 7 lock waits (0.02 s in all);
+   with 36 terminals, 2,753 waits and 8.5 s waited, out of about 540 s of terminal time (1.6%), nearly all on the district rows that every
+   New-Order updates (`d_next_o_id`), which a transaction holds until it commits, as the benchmark's rules and SQL Server both require. New-Order
+   goes from 10 ms to 50 ms between 8 and 36 terminals on 12 cores because the terminals queue for the processors, not for locks. Locks are
+   already per row; nothing was changed.
+3. **The control node is not the ceiling.** The control node's own work per statement (the profile above `ctl_*` spans, TPC-C on 3 shards, 36
+   terminals) is about 20 microseconds to parse, 20 to route and 4 to encode a request; the round trip to a shard is 0.15 ms bare, 0.2 ms with
+   a statement and 0.245 ms through a cluster session (`examples/rtt_probe.rs`). The time of a statement under load (1.6 to 2.3 ms) is the
+   shards' and the machine's, all three shards, the control node and the terminals sharing the cores. A point select through a single unary reply
+   instead of a `do_get` stream is 12% faster on an idle machine (0.195 against 0.221 ms), too little to be worth a second path for results
+   whose size is not known. To see the control node's profile build with `--features tsql-server/prof` (`ctl_exec_stmt`, `ctl_direct`,
+   `ctl_fan_run`, `ctl_shard_run`, `ctl_commit_txn`, `ctl_two_phase_commit` and others; the report is of the first terminal's thread).
+4. **TPC-H Q21 no longer gathers on the cluster.** Its `lineitem` and `orders` meet on the order key, its correlated `EXISTS` / `NOT EXISTS`
+   (with a `<>` that no join rewrite can express) are on that same key, but `supplier` and `nation`, sharded on keys of their own, made the
+   check for subqueries on the shards fail, so all four tables were read into the control node (11 s of the 14.6 s was copying). The join
+   planner now copies such tables to every shard first (broadcast only) and the query then runs shard by shard with the subqueries inside.
+   TPC-H sf 0.1 on 3 local shards, the old and the new binary one after the other: Q21 14.6 -> 1.76 s (the single node: 2.6 s), the other 21
+   queries unchanged within noise, every answer the same as the single node's, the 22 queries' total 15.9 s against 24.5 s on one node.
+5. **A distribution advisor** (`ADVISE DISTRIBUTION`, `src/advisor.rs` of the control crate, see [distributed.md](distributed.md)) counts which tables
+   the queries had to broadcast, re-spread or gather and says which `DISTRIBUTE TABLE` would have spared the move. It advises and changes
+   nothing: a table with rows cannot be re-distributed in place, and choosing keys for the user from a sample of queries could make
+   another workload slower.
+6. **A transaction that touched one shard already commits in one phase**, with the `BEGIN` travelling in front of its first statement (the
+   sixth round); what is left in the OLTP round trips is one request per statement.
+
 ## Where the time goes now
 
 A point lookup by primary key costs about 20 microseconds from `Connection::execute`: parsing 5-10 (statements with

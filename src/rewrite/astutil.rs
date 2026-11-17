@@ -1,6 +1,6 @@
 //! Helpers over the engine's syntax tree: rebuilding an expression with some parts replaced, comparing expressions
 //! structurally, and finding the tables a statement reads.
-use tsql_server::ast::*;
+use crate::ast::*;
 
 /// Rebuild `e`, replacing every sub-expression for which `f` returns a replacement (the replacement is not searched
 /// again). Subqueries are kept as they are; callers that cannot handle them check [`has_subquery`] first.

@@ -289,8 +289,9 @@ impl Union {
 
 /// Plan the joins of `q` (a plain SELECT over base tables, no nested queries). `rows` are the row counts of the tables,
 /// `limit` the largest table (in rows) that is broadcast, `shards` the number of shards, `next_temp` hands out names for
-/// the temporary copies. None: not a join this planner can run shard by shard.
-pub fn plan_join(q: &Query, tables: &HashMap<String, DistTable>, rows: &HashMap<String, u64>, limit: u64, shards: usize, next_temp: &mut dyn FnMut() -> String) -> Option<JoinPlan> {
+/// the temporary copies. None: not a join this planner can run shard by shard. With `allow_sub` the `WHERE` may have subqueries: they are
+/// left as they are, only broadcast copies are made (the caller checks that the shards can evaluate them, see `pushdown.rs`).
+pub fn plan_join(q: &Query, tables: &HashMap<String, DistTable>, rows: &HashMap<String, u64>, limit: u64, shards: usize, allow_sub: bool, next_temp: &mut dyn FnMut() -> String) -> Option<JoinPlan> {
     let QueryBody::Select(sel) = &q.body else { return None };
     if sel.from.is_empty() {
         return None;
@@ -308,7 +309,7 @@ pub fn plan_join(q: &Query, tables: &HashMap<String, DistTable>, rows: &HashMap<
     }
     let mut where_conjuncts: Vec<&Expr> = vec![];
     if let Some(w) = &sel.where_ {
-        if has_subquery(w) || has_window_or_session(w) {
+        if (has_subquery(w) && !allow_sub) || has_window_or_session(w) {
             return None;
         }
         conjuncts(w, &mut where_conjuncts);
@@ -416,6 +417,9 @@ pub fn plan_join(q: &Query, tables: &HashMap<String, DistTable>, rows: &HashMap<
         }
     }
     let (_, anchor, moves) = best?;
+    if allow_sub && moves.iter().any(|(_, rp)| rp.is_some()) {
+        return None;
+    }
     let mut part = vec![false; leaves.len()];
     for &l in &classes[anchor] {
         part[l] = true;
@@ -432,6 +436,9 @@ pub fn plan_join(q: &Query, tables: &HashMap<String, DistTable>, rows: &HashMap<
     let filter_for = |l: usize| -> Option<Expr> {
         let mut fs: Vec<Expr> = vec![];
         for w in &where_conjuncts {
+            if has_subquery(w) {
+                continue;
+            }
             let mut only = true;
             let mut any = false;
             walk_expr(w, &mut |x| match x {

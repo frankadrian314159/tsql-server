@@ -1257,6 +1257,45 @@ fn subqueries_that_the_shards_can_answer_run_on_the_shards() {
 }
 
 #[test]
+fn subqueries_of_a_join_with_a_small_table_run_on_the_shards_after_it_is_broadcast() {
+    let mut p = Pair::new(3);
+    p.load();
+    p.load_items();
+    // TPC-H Q21's shape: the items and orders meet in place on the order key, the customers (sharded on their own key) are copied
+    // to every shard, and the correlated subqueries (on the order key, with a `<>` that no join rewrite could express) stay inside
+    let joined = |plan: &[String]| plan.iter().any(|l| l.starts_with("join over shards"));
+    for (sql, ordered) in [
+        ("SELECT c.region, COUNT(*) AS n FROM customers c, orders o, order_items i WHERE c.id = o.customer_id AND o.id = i.order_id AND c.credit > 100 AND EXISTS (SELECT * FROM order_items j WHERE j.order_id = i.order_id AND j.qty <> i.qty) GROUP BY c.region ORDER BY c.region", true),
+        ("SELECT c.region, COUNT(*) AS n FROM customers c, orders o, order_items i WHERE c.id = o.customer_id AND o.id = i.order_id AND NOT EXISTS (SELECT * FROM order_items j WHERE j.order_id = i.order_id AND j.qty <> i.qty AND j.qty > 3) GROUP BY c.region ORDER BY c.region", true),
+        ("SELECT TOP 5 o.id, c.name FROM orders o, customers c WHERE c.id = o.customer_id AND EXISTS (SELECT * FROM order_items j WHERE j.order_id = o.id AND j.qty > 5) ORDER BY o.id", true),
+    ] {
+        let plan = p.check(sql, ordered);
+        assert!(joined(&plan) && !plan.iter().any(|l| l.starts_with("gather")), "{}
+{:?}", sql, plan);
+    }
+}
+
+#[test]
+fn the_advisor_says_which_tables_to_replicate_after_they_were_broadcast_again_and_again() {
+    let mut p = Pair::new(3);
+    p.load();
+    assert!(rows_of(&p.cl.execute("ADVISE DISTRIBUTION")).is_empty(), "nothing has been moved yet");
+    // customers are sharded on their own key and joined by the orders' customer column: a copy to every shard for each run
+    for _ in 0..3 {
+        p.check("SELECT c.region, COUNT(*) AS n FROM orders o, customers c WHERE c.id = o.customer_id GROUP BY c.region ORDER BY c.region", true);
+    }
+    let advice = rows_of(&p.cl.execute("ADVISE DISTRIBUTION"));
+    let mine: Vec<&Vec<String>> = advice.iter().filter(|r| r[0].eq_ignore_ascii_case("customers")).collect();
+    assert_eq!(mine.len(), 1, "{:?}", advice);
+    assert_eq!(mine[0][2], "broadcast");
+    assert_eq!(mine[0][3], "3", "{:?}", advice);
+    assert!(mine[0][5].contains("DISTRIBUTE TABLE customers REPLICATED"), "{:?}", advice);
+    // what it says to do makes the copy go away
+    p.cl.execute("ADVISE DISTRIBUTION RESET");
+    assert!(rows_of(&p.cl.execute("ADVISE DISTRIBUTION")).is_empty());
+}
+
+#[test]
 fn a_long_in_list_becomes_a_replicated_table_and_the_shards_do_the_rest() {
     let mut p = Pair::new(3);
     p.load();

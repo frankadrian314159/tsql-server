@@ -17,9 +17,9 @@
 use serde_json::Value as J;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use tsql_server::ast::*;
+use crate::ast::*;
 
-use crate::astutil::*;
+use super::astutil::*;
 
 thread_local! {
     /// the columns (lower case) of the tables the query reads, by table id: how an unqualified column name is told to belong to
@@ -270,6 +270,12 @@ pub fn decorrelate(q: &mut Query, counter: &mut u64, schema: HashMap<String, Vec
         sel.from.extend(extra_from);
     }
     changed
+}
+
+/// Whether `q` refers to nothing but its own tables (`schema`: the columns of every table it reads, by table id; see [`decorrelate`]).
+pub fn is_uncorrelated(q: &Query, schema: HashMap<String, Vec<String>>) -> bool {
+    SCHEMA.with(|s| *s.borrow_mut() = schema);
+    uncorrelated(q)
 }
 
 /// Whether a subquery refers to nothing but its own tables (it does not depend on the query around it): every column it names is a

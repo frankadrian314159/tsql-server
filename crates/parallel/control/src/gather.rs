@@ -116,6 +116,11 @@ impl ClusterSession {
         let star = !used_columns(&qj, &mut used);
         let mut eq_cols = HashSet::new();
         equated_columns(&qj, &mut eq_cols);
+        for t in tables.iter().filter(|t| matches!(t.dist, Dist::Sharded { .. })) {
+            let mine: Vec<String> = t.cols.iter().filter(|c| eq_cols.contains(&c.name.to_lowercase())).map(|c| c.name.clone()).collect();
+            let rows = self.table_by_id(&t.id).and_then(|x| x.rows.map(|r| r.1)).unwrap_or(0);
+            cl.advisor.record(&t.id, "gather", rows, &mine);
+        }
         // the tables as a plain join, for the conditions that can be applied while copying (None: not a plain join)
         let map: HashMap<String, DistTable> = tables.iter().map(|t| (t.id.clone(), t.clone())).collect();
         let join = match &q.body {

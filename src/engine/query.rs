@@ -360,12 +360,160 @@ impl<'a> Engine<'a> {
 
     fn exec_query_inner(&mut self, q: &Query, outer: Option<&Env<'_>>) -> Result<Rowset> {
         match &q.body {
-            QueryBody::Select(sel) => self.exec_select(sel, &q.order, &q.offset, &q.fetch, outer),
+            QueryBody::Select(sel) => {
+                // a scalar subquery that stands alone, compared with a column, is a constant for the plan (it is run once, here)
+                let folded = if outer.is_none() && self.ses.optimizer { self.fold_scalar_subqueries(q, sel) } else { None };
+                let (q, sel) = match &folded {
+                    Some(f) => match &f.body {
+                        QueryBody::Select(s) => (f, s),
+                        _ => (q, sel),
+                    },
+                    None => (q, sel),
+                };
+                if outer.is_none() && self.ses.optimizer {
+                    if let Some(q2) = self.decorrelated(q, sel) {
+                        if let QueryBody::Select(s2) = &q2.body {
+                            // (the rewritten query is run buffered; when it does not run, the original does)
+                            let flags = (self.ses.stream_ok, self.ses.stream_to_buf);
+                            self.ses.stream_ok = false;
+                            let plan_len = self.ses.plan.len();
+                            match self.exec_select(s2, &q2.order, &q2.offset, &q2.fetch, None) {
+                                Ok(rs) => return Ok(rs),
+                                Err(_) => {
+                                    self.ses.plan.truncate(plan_len);
+                                    (self.ses.stream_ok, self.ses.stream_to_buf) = flags;
+                                }
+                            }
+                        }
+                    }
+                }
+                self.exec_select(sel, &q.order, &q.offset, &q.fetch, outer)
+            }
             _ => {
                 let rs = self.exec_body(&q.body, outer)?;
                 self.order_output(rs, &q.order, &q.offset, &q.fetch, outer)
             }
         }
+    }
+
+    /// The query with the scalar subqueries of its `WHERE` that do not depend on the query around them replaced by the values they give:
+    /// `d_month_seq = (SELECT MAX(..) ..)` becomes `d_month_seq = 1200`, which a plan can use (an index seek, a pushed-down condition, the
+    /// estimate of how many rows the table gives) where a subquery it can only run for each row. Only a subquery in a comparison with
+    /// something that is not a subquery, at the top of the `WHERE`. A subquery that fails (it is correlated, or an error of its own) is
+    /// left for the statement to meet as before.
+    fn fold_scalar_subqueries(&mut self, q: &Query, sel: &Select) -> Option<Query> {
+        fn candidate(e: &Expr) -> bool {
+            match e {
+                Expr::And(a, b) => candidate(a) || candidate(b),
+                Expr::Paren(a) => candidate(a),
+                Expr::Binary(op, a, b) if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) => {
+                    let sq = |x: &Expr| matches!(x, Expr::Subquery(_)) || matches!(x, Expr::Paren(i) if matches!(**i, Expr::Subquery(_)));
+                    sq(a) != sq(b)
+                }
+                _ => false,
+            }
+        }
+        if sel.from.is_empty() || !candidate(sel.where_.as_ref()?) || !self.ses.cte_stack.is_empty() {
+            return None;
+        }
+        let mut q2 = q.clone();
+        let QueryBody::Select(s2) = &mut q2.body else { return None };
+        let mut changed = false;
+        fn walk(eng: &mut Engine<'_>, e: &mut Expr, changed: &mut bool) {
+            match e {
+                Expr::And(a, b) => {
+                    walk(eng, a, changed);
+                    walk(eng, b, changed);
+                }
+                Expr::Paren(a) => walk(eng, a, changed),
+                Expr::Binary(op, a, b) if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) => {
+                    for side in [a, b] {
+                        let inner = match &**side {
+                            Expr::Subquery(sq) => Some(sq.clone()),
+                            Expr::Paren(i) => match &**i {
+                                Expr::Subquery(sq) => Some(sq.clone()),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some(sq) = inner {
+                            // (a subquery that uses the query around it would be read through once, to its end, only to fail)
+                            if !eng.standalone(&sq) {
+                                continue;
+                            }
+                            if let Ok(rs) = eng.exec_query(&sq, None) {
+                                if rs.schema.cols.len() == 1 && rs.rows.len() <= 1 {
+                                    let v = rs.rows.first().map(|r| r[0].clone()).unwrap_or(Value::Null);
+                                    **side = Expr::Lit(v);
+                                    *changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // (the subqueries are not the outermost SELECT: the statement's own flags for streaming are theirs to keep)
+        let flags = (self.ses.stream_ok, self.ses.stream_to_buf);
+        self.ses.stream_ok = false;
+        self.ses.stream_to_buf = false;
+        if let Some(w) = s2.where_.as_mut() {
+            walk(self, w, &mut changed);
+        }
+        (self.ses.stream_ok, self.ses.stream_to_buf) = flags;
+        changed.then_some(q2)
+    }
+
+    /// Whether the subquery names nothing but the columns of its own tables (and every one of them is a known table).
+    fn standalone(&mut self, q: &Query) -> bool {
+        let mut schema: HashMap<String, Vec<String>> = HashMap::new();
+        for id in crate::rewrite::astutil::referenced_tables(q) {
+            let Some((sch, name)) = id.split_once('.') else { return false };
+            if name.starts_with('#') || name.starts_with('@') {
+                return false;
+            }
+            let loc = self.locate(&[sch.to_string(), name.to_string()]);
+            let Some(t) = self.table_ref(&loc) else { return false };
+            schema.insert(id, t.columns.iter().map(|c| c.name.to_lowercase()).collect());
+        }
+        !schema.is_empty() && crate::rewrite::decorrelate::is_uncorrelated(q, schema)
+    }
+
+    /// The query with its correlated subqueries of the `WHERE` rewritten into joins (`crate::rewrite::decorrelate`), or None when there is
+    /// nothing to rewrite or the rewrite cannot be trusted: a correlated subquery is run for every outer row (or for every distinct
+    /// value of the outer columns it reads), which costs a pass over the subquery's tables for each; as a join with a grouped derived
+    /// table (or a hashed `IN` list) the tables are read once.
+    fn decorrelated(&mut self, q: &Query, sel: &Select) -> Option<Query> {
+        if !q.ctes.is_empty() || !self.ses.cte_stack.is_empty() || !self.ses.trigger_stack.is_empty() || sel.from.is_empty() {
+            return None;
+        }
+        // only a subquery in a condition on its own is of any use; `SELECT *` would show the columns of the derived tables
+        let w = sel.where_.as_ref()?;
+        let has = crate::rewrite::astutil::has_subquery(w);
+        if !has || sel.items.iter().any(|i| matches!(i, SelectItem::Star(None))) {
+            return None;
+        }
+        // every table the query reads must be a known table (an unqualified column is told to be the subquery's or the query
+        // around it by the columns of the tables)
+        let mut schema: HashMap<String, Vec<String>> = HashMap::new();
+        for id in crate::rewrite::astutil::referenced_tables(q) {
+            let (sch, name) = id.split_once('.')?;
+            if name.starts_with('#') || name.starts_with('@') {
+                return None;
+            }
+            let loc = self.locate(&[sch.to_string(), name.to_string()]);
+            let t = self.table_ref(&loc)?;
+            schema.insert(id, t.columns.iter().map(|c| c.name.to_lowercase()).collect());
+        }
+        let mut q2 = q.clone();
+        let mut counter = self.ses.decorrelate_counter;
+        if !crate::rewrite::decorrelate::decorrelate(&mut q2, &mut counter, schema) {
+            return None;
+        }
+        self.ses.decorrelate_counter = counter;
+        self.ses.plan.push("correlated subquery rewritten as a join".into());
+        Some(q2)
     }
 
     pub fn exec_body(&mut self, b: &QueryBody, outer: Option<&Env<'_>>) -> Result<Rowset> {

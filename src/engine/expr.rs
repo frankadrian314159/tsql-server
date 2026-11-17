@@ -31,6 +31,8 @@ pub struct IntSet {
     first: i64,
     last: i64,
     set: std::collections::HashSet<i64>,
+    /// (the rows of a subquery) one of them was NULL
+    nulls: bool,
 }
 
 impl<'a> Engine<'a> {
@@ -247,6 +249,22 @@ impl<'a> Engine<'a> {
                 if l.is_null() {
                     return Ok(Value::Null);
                 }
+                // a long result of integers, tested against an integer: one hash lookup instead of a comparison with every row
+                if rs.rows.len() >= IN_SET_MIN {
+                    if let Value::Int(_) | Value::BigInt(_) = l {
+                        if let Some(set) = self.rows_int_set(&rs) {
+                            let k = match l {
+                                Value::Int(i) => i as i64,
+                                Value::BigInt(i) => i,
+                                _ => 0,
+                            };
+                            if set.set.contains(&k) {
+                                return Ok(Value::Bit(!*neg));
+                            }
+                            return Ok(if set.nulls { Value::Null } else { Value::Bit(*neg) });
+                        }
+                    }
+                }
                 let mut saw_null = false;
                 for r in rs.rows.iter() {
                     match compare(&l, &r[0])? {
@@ -460,22 +478,56 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        let s = std::sync::Arc::new(IntSet { len: items.len(), first: int_of(&items[0])?, last: int_of(&items[items.len() - 1])?, set });
+        let s = std::sync::Arc::new(IntSet { len: items.len(), first: int_of(&items[0])?, last: int_of(&items[items.len() - 1])?, set, nulls: false });
         cache.insert(key, Some(s.clone()));
         Some(s)
     }
 
-    fn sub_rows(&mut self, q: &Query, env: &Env<'_>) -> Result<super::query::Rowset> {
+    /// The integers of the one column of a subquery's rows kept for the statement (see `sub_rows`), as a hash set; None when a value is
+    /// not an integer. Found by the address of the rowset (checked against its length, first and last row), in the statement's `in_sets`.
+    fn rows_int_set(&mut self, rs: &Arc<super::query::Rowset>) -> Option<Arc<IntSet>> {
+        let kept = self.ses.sub_cache.as_ref()?.values().any(|v| v.as_ref().is_some_and(|k| Arc::ptr_eq(k, rs)));
+        if !kept {
+            return None;
+        }
+        let int_of = |r: &Vec<Value>| match r.first() {
+            Some(Value::Int(i)) => Some(*i as i64),
+            Some(Value::BigInt(i)) => Some(*i),
+            _ => None,
+        };
+        let key = Arc::as_ptr(rs) as usize;
+        let (first, last) = (rs.rows.first().and_then(int_of), rs.rows.last().and_then(int_of));
+        if let Some(Some(e)) = self.ses.in_sets.as_ref()?.get(&key) {
+            if e.len == rs.rows.len() && first.map_or(true, |f| f == e.first) && last.map_or(true, |l| l == e.last) {
+                return Some(e.clone());
+            }
+        }
+        let mut set = std::collections::HashSet::with_capacity(rs.rows.len());
+        let mut nulls = false;
+        for r in rs.rows.iter() {
+            match r.first() {
+                Some(Value::Null) => nulls = true,
+                _ => {
+                    set.insert(int_of(r)?);
+                }
+            };
+        }
+        let e = Arc::new(IntSet { len: rs.rows.len(), first: first.unwrap_or(0), last: last.unwrap_or(0), set, nulls });
+        self.ses.in_sets.as_mut()?.insert(key, Some(e.clone()));
+        Some(e)
+    }
+
+    fn sub_rows(&mut self, q: &Query, env: &Env<'_>) -> Result<Arc<super::query::Rowset>> {
         let key = q as *const Query as usize;
         if self.ses.sub_cache.is_none() {
-            return self.exec_query(q, Some(env));
+            return self.exec_query(q, Some(env)).map(Arc::new);
         }
         match self.ses.sub_cache.as_ref().and_then(|c| c.get(&key)) {
             Some(Some(rs)) => return Ok(rs.clone()),
             Some(None) => return self.correlated_rows(q, env, key),
             None => {}
         }
-        match self.exec_query(q, None) {
+        match self.exec_query(q, None).map(Arc::new) {
             Ok(rs) => {
                 if let Some(c) = self.ses.sub_cache.as_mut() {
                     c.insert(key, Some(rs.clone()));
@@ -497,7 +549,7 @@ impl<'a> Engine<'a> {
     /// outer column nothing refers to cannot matter, and one that is only named like a reference of the subquery (an
     /// unqualified name, or the same name under another qualifier) can only make the key longer. A subquery whose result does not depend on its text and the outer values alone
     /// (variables, sequences, `NEWID`, `RAND`, functions of the user) is always run.
-    fn correlated_rows(&mut self, q: &Query, env: &Env<'_>, qkey: usize) -> Result<super::query::Rowset> {
+    fn correlated_rows(&mut self, q: &Query, env: &Env<'_>, qkey: usize) -> Result<Arc<super::query::Rowset>> {
         let names: Option<std::sync::Arc<Vec<(String, Option<String>)>>> = match self.ses.sub_names.get(&qkey) {
             Some(n) => n.clone(),
             None => {
@@ -525,7 +577,7 @@ impl<'a> Engine<'a> {
                 n
             }
         };
-        let Some(names) = names else { return self.exec_query(q, Some(env)) };
+        let Some(names) = names else { return self.exec_query(q, Some(env)).map(Arc::new) };
         // the values of the outer columns the subquery names, through every enclosing row
         let mut vals: Vec<Value> = vec![];
         let mut cur = Some(env);
@@ -558,7 +610,7 @@ impl<'a> Engine<'a> {
         if let Some(rs) = self.ses.sub_memo.get(&qkey).and_then(|m| m.get(&key)) {
             return Ok(rs.clone());
         }
-        let rs = self.exec_query(q, Some(env))?;
+        let rs = Arc::new(self.exec_query(q, Some(env))?);
         let memo = self.ses.sub_memo.entry(qkey).or_default();
         if memo.len() < 50_000 {
             memo.insert(key, rs.clone());

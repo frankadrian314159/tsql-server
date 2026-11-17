@@ -104,6 +104,7 @@ impl Cluster {
             mirror,
             tables: Mutex::new(tables),
             gather: Mutex::new(()),
+            advisor: Default::default(),
             next_session: AtomicU64::new(crate::fresh_session_base()),
             broadcast_limit: AtomicU64::new(100_000),
             in_list_limit: AtomicU64::new(20_000),

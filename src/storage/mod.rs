@@ -418,6 +418,17 @@ impl TableData {
         self.heap.reserve_id(rowid as u64);
     }
 
+    /// The highest row id in the heap.
+    pub fn max_rowid(&self) -> Option<RowId> {
+        let mut out = None;
+        // (nothing is `first_true`, so the walk back starts after the last entry)
+        self.heap.scan(&|_, _| false, false, &mut |_, r, _| {
+            out = Some(r as RowId);
+            false
+        });
+        out
+    }
+
     /// Slots in the heap (live rows plus deleted-but-not-yet-collected ones).
     pub fn slot_count(&self) -> usize {
         self.heap.entries() as usize

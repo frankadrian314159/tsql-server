@@ -70,7 +70,10 @@ impl<'a> Engine<'a> {
                 }
             }
             Access::Range { idx, lo, hi, .. } => base * t.data.range_fraction(idx, lo.as_ref().map(|(v, i)| (v.as_slice(), *i)), hi.as_ref().map(|(v, i)| (v.as_slice(), *i))),
-            Access::Full => base * 0.33f64.powi(pushed.len().min(4) as i32),
+            Access::Full => match self.pushed_selectivity(t, alias, &conj) {
+                Some(sel) => base * sel,
+                None => base * 0.33f64.powi(pushed.len().min(4) as i32),
+            },
         };
         est.clamp(1.0, base.max(1.0))
     }
