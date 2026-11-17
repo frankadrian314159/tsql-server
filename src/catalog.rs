@@ -302,6 +302,15 @@ impl SharedCounter {
 
 impl Table {
     pub fn new(db: &str, schema: &str, name: &str, columns: Vec<Column>, store: &Arc<PageStore>) -> Table {
+        Table::with_data(db, schema, name, columns, TableData::new(store))
+    }
+
+    /// A table with no storage (see [`TableData::detached`]): only its columns mean anything.
+    pub fn detached(db: &str, schema: &str, name: &str, columns: Vec<Column>) -> Table {
+        Table::with_data(db, schema, name, columns, TableData::detached())
+    }
+
+    fn with_data(db: &str, schema: &str, name: &str, columns: Vec<Column>, data: TableData) -> Table {
         let identity_next = columns.iter().find_map(|c| c.identity.map(|(s, _)| s));
         Table {
             db: db.to_string(),
@@ -309,7 +318,7 @@ impl Table {
             name: name.to_string(),
             object_id: 0,
             columns: columns.into(),
-            data: Arc::new(TableData::new(store)),
+            data: Arc::new(data),
             pk: None,
             uniques: Shared::default(),
             checks: Shared::default(),

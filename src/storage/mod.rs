@@ -342,6 +342,13 @@ impl TableData {
         TableData { heap: Arc::new(Tree::new(store)), specs: vec![], indexes: vec![], mods: Default::default() }
     }
 
+    /// Storage that holds nothing and is attached to no page store (dropping it frees nothing): the shape of rows that are not a
+    /// table's, such as the `inserted` and `deleted` rows of a trigger on a view.
+    pub fn detached() -> TableData {
+        let tree = || Arc::new(Tree::from_desc(page::TreeDesc { root: 0, entries: 0, has_ovf: false, next_id: 0 }, None));
+        TableData { heap: tree(), specs: vec![], indexes: vec![], mods: Default::default() }
+    }
+
     /// An empty table with the same index layout.
     pub fn fresh(&self) -> TableData {
         let store = self.store().clone();

@@ -73,7 +73,7 @@ impl<'a> Engine<'a> {
         }
     }
 
-    fn with_ctes<T>(&mut self, ctes: &[Cte], f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+    pub(super) fn with_ctes<T>(&mut self, ctes: &[Cte], f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         if ctes.is_empty() {
             return f(self);
         }
@@ -90,6 +90,10 @@ impl<'a> Engine<'a> {
     // ------------------------------------------------------------ INSERT
     pub fn exec_insert(&mut self, ins: &Insert) -> Result<()> {
         crate::span!("exec_insert");
+        // a view with an INSTEAD OF INSERT trigger: the trigger does the work (see viewtrig.rs)
+        if self.insert_view_instead(ins)? {
+            return Ok(());
+        }
         // an INSERT through a view is run as an INSERT into its base table, on a copy of the statement (the copy of a big
         // VALUES list is not free, so a plain table is not given one)
         let through_view = matches!(&ins.target, Target::Table(name) if self.updatable_source(name, &ins.ctes).is_some());
@@ -104,11 +108,9 @@ impl<'a> Engine<'a> {
         self.with_ctes(&ins.ctes, |s| s.exec_insert_inner(ins))
     }
 
-    fn exec_insert_inner(&mut self, ins: &Insert) -> Result<()> {
-        let (loc, name) = self.dml_target(&ins.target, &[], "")?;
-        let allowed = self.check_insert_permission(&loc, &name, ins);
-        self.audit_access("INSERT", &loc, allowed.is_ok());
-        allowed?;
+    /// The rows an `INSERT` writes, before they are matched to the target's columns (None: `DEFAULT`), and how many values each has;
+    /// `TOP` and `SET ROWCOUNT` are applied.
+    pub(super) fn insert_source(&mut self, ins: &Insert) -> Result<(Vec<Vec<Option<Value>>>, usize)> {
         let mut src_rows: Vec<Vec<Option<Value>>> = vec![];
         let mut src_ncols = 0usize;
         match &ins.src {
@@ -157,6 +159,15 @@ impl<'a> Engine<'a> {
         if self.ses.rowcount_limit > 0 {
             src_rows.truncate(self.ses.rowcount_limit as usize);
         }
+        Ok((src_rows, src_ncols))
+    }
+
+    fn exec_insert_inner(&mut self, ins: &Insert) -> Result<()> {
+        let (loc, name) = self.dml_target(&ins.target, &[], "")?;
+        let allowed = self.check_insert_permission(&loc, &name, ins);
+        self.audit_access("INSERT", &loc, allowed.is_ok());
+        allowed?;
+        let (src_rows, src_ncols) = self.insert_source(ins)?;
         let done = self.insert_into_table(&loc, &ins.cols, src_rows, src_ncols, matches!(ins.src, InsertSrc::DefaultValues))?;
         let Some((applied, nrows, tcopy)) = done else {
             self.ses.rowcount = 0;
@@ -1220,7 +1231,7 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    fn emit_output(&mut self, o: &Output, t: &Table, ins: &[Row], del: &[Row], action: Option<&[String]>) -> Result<()> {
+    pub(super) fn emit_output(&mut self, o: &Output, t: &Table, ins: &[Row], del: &[Row], action: Option<&[String]>) -> Result<()> {
         let ncols = t.columns.len();
         let mut cols: Vec<ColMeta> = t.columns.iter().map(|c| ColMeta { qual: Some("inserted".into()), name: c.name.clone(), ty: Some(c.ty.clone()), denied: None, hidden: false, coll: c.collation.as_deref().and_then(crate::collation::get), mask: None }).collect();
         cols.extend(t.columns.iter().map(|c| ColMeta { qual: Some("deleted".into()), name: c.name.clone(), ty: Some(c.ty.clone()), denied: None, hidden: false, coll: c.collation.as_deref().and_then(crate::collation::get), mask: None }));
@@ -1307,6 +1318,9 @@ impl<'a> Engine<'a> {
     // ------------------------------------------------------------ UPDATE
     pub fn exec_update(&mut self, u: &Update) -> Result<()> {
         crate::span!("exec_update");
+        if self.update_view_instead(u)? {
+            return Ok(());
+        }
         let mut u = u.clone();
         let mut check: Option<(Vec<String>, Expr)> = None;
         if let (Target::Table(name), true) = (&u.target, u.from.is_empty()) {
@@ -1648,6 +1662,9 @@ impl<'a> Engine<'a> {
     // ------------------------------------------------------------ DELETE
     pub fn exec_delete(&mut self, d: &Delete) -> Result<()> {
         crate::span!("exec_delete");
+        if self.delete_view_instead(d)? {
+            return Ok(());
+        }
         let mut d = d.clone();
         if let (Target::Table(name), true) = (&d.target, d.from.is_empty()) {
             if let Some((base, filter, _)) = self.updatable_source(name, &d.ctes) {
@@ -2017,7 +2034,7 @@ fn and_filter(w: &Option<Expr>, f: Option<Expr>) -> Option<Expr> {
     }
 }
 
-fn find_alias(from: &[TableRef], alias: &str) -> Option<Vec<String>> {
+pub(super) fn find_alias(from: &[TableRef], alias: &str) -> Option<Vec<String>> {
     fn walk(t: &TableRef, alias: &str) -> Option<Vec<String>> {
         match t {
             TableRef::Table { name, alias: a, .. } => {

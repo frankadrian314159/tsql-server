@@ -763,6 +763,7 @@ impl<'a> Engine<'a> {
                     for (tk, trg) in db.triggers.values() {
                         let pid = match db.objects.get(tk) {
                             Some(Object::Table(t)) => t.object_id,
+                            Some(Object::View(v)) => v.object_id,
                             _ => 0,
                         };
                         rows.push(vec![sv(&trg.name), Value::Int(trg.object_id), Value::Int(1), sv("OBJECT_OR_COLUMN"), Value::Int(pid), sv("TR"), Value::Bit(trg.disabled), Value::Bit(trg.instead)]);

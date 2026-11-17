@@ -43,6 +43,7 @@ pub mod sysprocs;
 pub mod sysviews;
 pub mod temporal;
 pub mod txn;
+pub mod viewtrig;
 
 use crate::ast::*;
 use crate::catalog::*;

@@ -271,6 +271,9 @@ impl<'a> Engine<'a> {
     /// `ENABLE | DISABLE TRIGGER names | ALL ON table`
     pub fn set_dml_triggers_enabled(&mut self, table: &Name, names: &[String], all: bool, enable: bool) -> Result<()> {
         let tloc = self.locate(table);
+        if matches!(self.object_ref(&tloc), Some(Object::View(_))) {
+            return self.set_view_triggers_enabled(&tloc, table, names, all, enable);
+        }
         let Some(tt) = self.table_ref(&tloc).cloned() else {
             return Err(SqlError::new(4902, format!("Cannot find the object \"{}\" because it does not exist or you do not have permissions.", table.join("."))));
         };
@@ -317,7 +320,7 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    fn object_exists_err(&self, name: &str) -> SqlError {
+    pub(super) fn object_exists_err(&self, name: &str) -> SqlError {
         SqlError::new(2714, format!("There is already an object named '{}' in the database.", name))
     }
 
@@ -437,7 +440,12 @@ impl<'a> Engine<'a> {
                 }
                 let dbname = self.srv.databases[&db].name.clone();
                 let oid = if exists { self.srv.databases[&db].objects[&key].object_id() } else { self.srv.new_object_id() };
-                let v = ViewDef { db: dbname, schema, name: n, query: query.clone(), cols: cols.clone(), text: text.clone(), object_id: oid, triggers: vec![], check_option: *check_option };
+                // (ALTER VIEW keeps the view's INSTEAD OF triggers)
+                let triggers = match self.srv.databases[&db].objects.get(&key) {
+                    Some(Object::View(old)) if exists => old.triggers.clone(),
+                    _ => vec![],
+                };
+                let v = ViewDef { db: dbname, schema, name: n, query: query.clone(), cols: cols.clone(), text: text.clone(), object_id: oid, triggers, check_option: *check_option };
                 self.ensure_tx()?;
                 self.undo_object(&db, &key);
                 self.srv.cat_mut().databases.get_mut(&db).unwrap().objects.insert(key, Object::View(v));
@@ -487,7 +495,18 @@ impl<'a> Engine<'a> {
                         self.ddl_lock(&tloc, &tt)?;
                         self.undo_table(&tloc, &tt);
                     }
-                    None => return Err(SqlError::new(8197, format!("The object '{}' does not exist or is invalid for this operation.", table.join(".")))),
+                    None => {
+                        // a view takes INSTEAD OF triggers only (see viewtrig.rs)
+                        if !self.create_view_trigger(&tloc, table, trg.clone(), *or_alter)? {
+                            return Err(SqlError::new(8197, format!("The object '{}' does not exist or is invalid for this operation.", table.join("."))));
+                        }
+                        let vk = match &tloc {
+                            Loc::Db(_, k) => k.clone(),
+                            _ => String::new(),
+                        };
+                        self.srv.cat_mut().databases.get_mut(&db).unwrap().triggers.insert(tkey, (vk, trg));
+                        return Ok(());
+                    }
                 }
                 let mut t = self.take_table(&tloc).unwrap();
                 let exists = t.triggers.iter().any(|x| x.name.eq_ignore_ascii_case(&n));
@@ -870,6 +889,8 @@ impl<'a> Engine<'a> {
                     self.undo_object(&db, &key);
                     let d = self.srv.cat_mut().databases.get_mut(&db).unwrap();
                     d.objects.remove(&key);
+                    // (the triggers of a view go with it)
+                    d.triggers.retain(|_, (tk, _)| *tk != key);
                 } else if !if_exists {
                     return Err(SqlError::new(3701, format!("Cannot drop the {} '{}', because it does not exist or you do not have permission.", kind_desc, n)));
                 }
@@ -878,10 +899,16 @@ impl<'a> Engine<'a> {
                 let found = self.srv.cat_mut().databases.get_mut(&db).and_then(|d| d.triggers.remove(&key));
                 match found {
                     Some((tk, _)) => {
-                        let loc = Loc::Db(db.clone(), tk);
+                        let loc = Loc::Db(db.clone(), tk.clone());
                         if let Some(mut t) = self.take_table(&loc) {
                             t.triggers.retain(|x| !x.name.eq_ignore_ascii_case(&n));
                             self.put_table(&loc, t);
+                        } else if matches!(self.object_ref(&loc), Some(Object::View(_))) {
+                            self.ensure_tx()?;
+                            self.undo_object(&db, &tk);
+                            if let Some(Object::View(v)) = self.srv.cat_mut().databases.get_mut(&db).and_then(|d| d.objects.get_mut(&tk)) {
+                                v.triggers.retain(|x| !x.name.eq_ignore_ascii_case(&n));
+                            }
                         }
                     }
                     None => {
