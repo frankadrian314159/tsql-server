@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use tonic::{Request, Response, Status, Streaming};
 use tsql_server::{Connection, Event, ResultSet, Server};
 use tsql_shared_ces::arrowconv;
-use tsql_shared_ces::wire::{self, status_for, Fragment, PrepareReq, RunReply, SettleReq, WireError, WireEvent, Work, ACTION_CLOSE_SESSION, ACTION_PREPARE, ACTION_KILL, ACTION_MEMBERS, ACTION_PREPARED, ACTION_RAFT, ACTION_RUN, ACTION_SETTLE, ACTION_STATUS, ACTION_WAITS, IN_DOUBT, MEMBERSHIP, NOT_LEADER};
+use tsql_shared_ces::wire::{self, status_for, Fragment, PrepareReq, RunReply, SettleReq, WireError, WireEvent, Work, ACTION_CLOSE_SESSION, ACTION_PREPARE, ACTION_KILL, ACTION_MEMBERS, ACTION_PREPARED, ACTION_RAFT, ACTION_RUN, ACTION_RUN_SETS, ACTION_SETTLE, ACTION_STATUS, ACTION_WAITS, IN_DOUBT, MEMBERSHIP, NOT_LEADER};
 use tsql_shared_ces::wire::MemberReq;
 use tsql_shared_ces::wire::{LoadReq, ShuffleReq, ACTION_LOAD, ACTION_METRICS, ACTION_SHUFFLE, SHUTTING_DOWN};
 use tsql_shared_ces::metrics::{NodeMetrics, Sampler};
@@ -440,6 +440,32 @@ impl FlightService for ShardNode {
                 .map_err(|e| Status::internal(format!("the statement panicked: {}", e)))?;
                 postcard::to_allocvec(&reply).map_err(|e| Status::internal(e.to_string()))?
             }
+            ACTION_RUN_SETS => {
+                self.check_serving()?;
+                let frag: Fragment = postcard::from_bytes(&action.body).map_err(|e| Status::invalid_argument(format!("bad request: {}", e)))?;
+                let _busy = self.admit(frag.session)?;
+                let conn = self.session(frag.session);
+                let reply = tokio::task::spawn_blocking(move || {
+                    let mut c = conn.lock().unwrap_or_else(|e| e.into_inner());
+                    let res = run_work(&mut c, &frag.work);
+                    let mut sets = vec![];
+                    let mut error = None;
+                    for ev in res.events {
+                        match ev {
+                            Event::Rows(rs) => sets.push(wire::WireSet { columns: rs.columns, types: rs.types, rows: rs.rows }),
+                            Event::Error(err) => {
+                                error = Some(WireError::from_sql(&err));
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    wire::SetsReply { sets, error }
+                })
+                .await
+                .map_err(|e| Status::internal(format!("the statement panicked: {}", e)))?;
+                postcard::to_allocvec(&reply).map_err(|e| Status::internal(e.to_string()))?
+            }
             ACTION_METRICS => postcard::to_allocvec(&self.metrics()).map_err(|e| Status::internal(e.to_string()))?,
             ACTION_LOAD => {
                 self.check_serving()?;
@@ -608,7 +634,7 @@ impl FlightService for ShardNode {
         Err(Status::unimplemented("do_exchange"))
     }
     async fn list_actions(&self, _r: Request<Empty>) -> Result<Response<Self::ListActionsStream>, Status> {
-        let acts = [ACTION_RUN, ACTION_CLOSE_SESSION, ACTION_STATUS, ACTION_PREPARE, ACTION_SETTLE, ACTION_PREPARED, ACTION_WAITS, ACTION_KILL, ACTION_MEMBERS, ACTION_SHUFFLE, ACTION_LOAD, ACTION_METRICS].iter().map(|n| Ok(ActionType { r#type: n.to_string(), description: String::new() })).collect::<Vec<_>>();
+        let acts = [ACTION_RUN, ACTION_RUN_SETS, ACTION_CLOSE_SESSION, ACTION_STATUS, ACTION_PREPARE, ACTION_SETTLE, ACTION_PREPARED, ACTION_WAITS, ACTION_KILL, ACTION_MEMBERS, ACTION_SHUFFLE, ACTION_LOAD, ACTION_METRICS].iter().map(|n| Ok(ActionType { r#type: n.to_string(), description: String::new() })).collect::<Vec<_>>();
         Ok(Response::new(stream::iter(acts).boxed()))
     }
 }

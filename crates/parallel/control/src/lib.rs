@@ -17,7 +17,7 @@
 //!   correctness baseline: it is slow for big tables but exact.
 //!
 //! What is not supported yet (an error says so): transactions that span statements, IDENTITY columns, foreign keys and
-//! UNIQUE constraints that do not contain the shard key, views, procedures, triggers, ALTER TABLE, and DML with joins,
+//! UNIQUE constraints that do not contain the shard key, views, functions, triggers, ALTER TABLE, and DML with joins,
 //! subqueries, OUTPUT or TOP. A statement that fails on some shards after succeeding on others (a multi-shard
 //! `UPDATE`) leaves the shards that succeeded changed: atomic cross-shard transactions need the two-phase commit of a later
 //! phase.
@@ -37,6 +37,7 @@ pub mod nested;
 pub mod ops;
 pub mod pushdown;
 pub mod plan;
+pub mod procs;
 pub mod rebalance;
 pub mod split;
 pub mod replicas;
@@ -87,6 +88,23 @@ pub struct DistTable {
     pub rows: Option<(u64, u64)>,
     /// the IDENTITY column the control node numbers (the shards' copies of the table have no identity of their own)
     pub identity: Option<Identity>,
+    /// global secondary indexes (`DISTRIBUTE TABLE t INDEX BY col`): see `GlobalIndex`
+    #[serde(default)]
+    pub indexes: Vec<GlobalIndex>,
+}
+
+/// A global secondary index of a sharded table: a table of its own, `(gv, gk)`, sharded by `gv` (the indexed value), whose rows say
+/// "a row with this value has this shard key". A lookup by the indexed column reads it (one shard) and asks only the shards that own
+/// the keys it lists. It only ever grows: a row deleted or moved leaves its entry behind, which costs a visit to a shard that has no
+/// such row and never gives a wrong answer; every row inserted gets its entry, in the same transaction.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GlobalIndex {
+    /// the position of the indexed column in the table
+    pub col: usize,
+    /// the index table's name
+    pub table: Name,
+    /// how the indexed value is hashed (the index table's own shard key class)
+    pub class: KeyClass,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -124,6 +142,8 @@ pub struct Cluster {
     /// the views (by table id) as their `CREATE VIEW` statements: a query that reads one is rewritten around its definition
     /// (see `nested.rs`), since the shards hold no views
     views: Mutex<HashMap<String, Stmt>>,
+    /// the procedures that run on one shard (by `dbo.name`): see `procs.rs`
+    proc_routes: Mutex<HashMap<String, procs::ProcRoute>>,
     /// the foreign keys, which the shards do not enforce (see `fk.rs`)
     fks: Mutex<Vec<FkDef>>,
     /// transactions whose commit was decided but not yet confirmed by every shard: (transaction id, shards still to finish)
@@ -162,7 +182,7 @@ fn make_verdict(pending: &Arc<Mutex<Vec<(u64, Vec<usize>)>>>, preparing: &Arc<Mu
 impl Cluster {
     pub fn connect(config: &ClusterConfig) -> Result<Arc<Cluster>, SqlError> {
         config.validate().map_err(|e| SqlError::new(50000, e))?;
-        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().map_err(|e| SqlError::new(50000, e.to_string()))?;
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(2, 8)).enable_all().build().map_err(|e| SqlError::new(50000, e.to_string()))?;
         let pending = Arc::new(Mutex::new(vec![]));
         let preparing = Arc::new(Mutex::new(std::collections::HashSet::new()));
         let verdict = make_verdict(&pending, &preparing);
@@ -187,6 +207,7 @@ impl Cluster {
             in_join_min: AtomicU64::new(100),
             lock_timeout_ms: AtomicU64::new(5000),
             views: Mutex::new(HashMap::new()),
+            proc_routes: Mutex::new(HashMap::new()),
             fks: Mutex::new(vec![]),
             pending,
             preparing,
@@ -381,7 +402,7 @@ fn unsupported(what: &str) -> SqlError {
     SqlError::new(50100, format!("{} is not supported by the distributed engine yet.", what))
 }
 
-fn stmt_kind(st: &Stmt) -> String {
+pub(crate) fn stmt_kind(st: &Stmt) -> String {
     let d = format!("{:?}", st);
     d.chars().take_while(|c| c.is_alphanumeric()).collect()
 }
@@ -450,14 +471,32 @@ fn prune_shards(where_: Option<&Expr>, t: &DistTable, cluster: &Cluster) -> Vec<
 /// conjunct of the `WHERE` (a table's key column must be unambiguous: qualified by the table's name or alias, or not a column of
 /// any other table in the `FROM`) and the literals all hash to the same shard. Only for plain `FROM a, b, ...` lists; the
 /// replicated tables are on every shard.
-fn pin_shard(q: &Query, tables: &HashMap<String, DistTable>, cluster: &Cluster) -> Option<usize> {
+pub(crate) fn pin_shard(q: &Query, tables: &HashMap<String, DistTable>, cluster: &Cluster) -> Option<usize> {
     let QueryBody::Select(sel) = &q.body else { return None };
     let w = sel.where_.as_ref()?;
     let mut refs: Vec<(String, DistTable)> = vec![];
+    // (the conditions of inner joins count as conditions of the WHERE; an outer join is not looked into)
+    let mut conds: Vec<&Expr> = vec![w];
+    fn collect<'a>(t: &'a TableRef, tables: &HashMap<String, DistTable>, refs: &mut Vec<(String, DistTable)>, conds: &mut Vec<&'a Expr>) -> Option<()> {
+        match t {
+            TableRef::Table { name, alias, .. } => {
+                let dt = tables.get(&table_id(name))?;
+                refs.push((alias.clone().or_else(|| name.last().cloned())?.to_lowercase(), dt.clone()));
+                Some(())
+            }
+            TableRef::Join { kind: JoinKind::Inner | JoinKind::Cross, left, right, on } => {
+                collect(left, tables, refs, conds)?;
+                collect(right, tables, refs, conds)?;
+                if let Some(c) = on {
+                    conds.push(c);
+                }
+                Some(())
+            }
+            _ => None,
+        }
+    }
     for t in &sel.from {
-        let TableRef::Table { name, alias, .. } = t else { return None };
-        let dt = tables.get(&table_id(name))?;
-        refs.push((alias.clone().or_else(|| name.last().cloned())?.to_lowercase(), dt.clone()));
+        collect(t, tables, &mut refs, &mut conds)?;
     }
     fn conjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
         match e {
@@ -470,35 +509,69 @@ fn pin_shard(q: &Query, tables: &HashMap<String, DistTable>, cluster: &Cluster) 
         }
     }
     let mut cs = vec![];
-    conjuncts(w, &mut cs);
-    let mut pinned: Option<usize> = None;
-    for (alias, dt) in &refs {
-        let Dist::Sharded { key, class } = &dt.dist else { continue };
+    for c in conds {
+        conjuncts(c, &mut cs);
+    }
+    // does `e` name the shard key column of table `i` (unambiguously)?
+    let names_key = |e: &Expr, i: usize| -> bool {
+        let (alias, dt) = &refs[i];
+        let Dist::Sharded { key, .. } = &dt.dist else { return false };
         let key_name = dt.cols[*key].name.to_lowercase();
-        // the key column named only by this table
         let others = refs.iter().filter(|(a, _)| a != alias).any(|(_, o)| o.cols.iter().any(|c| c.name.eq_ignore_ascii_case(&key_name)));
-        let names_key = |e: &Expr| match e {
+        match e {
             Expr::Col(p) if p.last().map(|s| s.to_lowercase()) == Some(key_name.clone()) => match p.len() {
                 1 => !others,
                 n => p[n - 2].to_lowercase() == *alias,
             },
             _ => false,
-        };
-        let mut shard: Option<usize> = None;
+        }
+    };
+    // the shard each sharded table is fixed to: by a literal on its key, then by an equality of its key with that of a table that is
+    let mut shard: Vec<Option<usize>> = vec![None; refs.len()];
+    for (i, (_, dt)) in refs.iter().enumerate() {
+        let Dist::Sharded { class, .. } = &dt.dist else { continue };
         for c in &cs {
             if let Expr::Binary(BinOp::Eq, a, b) = c {
                 let lit = match (&**a, &**b) {
-                    (x, Expr::Lit(v)) if names_key(x) => Some(v),
-                    (Expr::Lit(v), x) if names_key(x) => Some(v),
+                    (x, Expr::Lit(v)) if names_key(x, i) => Some(v),
+                    (Expr::Lit(v), x) if names_key(x, i) => Some(v),
                     _ => None,
                 };
                 if let Some(h) = lit.and_then(|v| key_hash(v, *class)) {
-                    shard = Some(cluster.shard_of_hash(h));
+                    shard[i] = Some(cluster.shard_of_hash(h));
                     break;
                 }
             }
         }
-        let s = shard?;
+    }
+    for _ in 0..refs.len() {
+        let mut changed = false;
+        for i in 0..refs.len() {
+            if shard[i].is_some() || !matches!(refs[i].1.dist, Dist::Sharded { .. }) {
+                continue;
+            }
+            for c in &cs {
+                if let Expr::Binary(BinOp::Eq, a, b) = c {
+                    for j in 0..refs.len() {
+                        let (Dist::Sharded { class: ci, .. }, Dist::Sharded { class: cj, .. }) = (&refs[i].1.dist, &refs[j].1.dist) else { continue };
+                        if j != i && shard[j].is_some() && ci == cj && ((names_key(a, i) && names_key(b, j)) || (names_key(b, i) && names_key(a, j))) {
+                            shard[i] = shard[j];
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut pinned: Option<usize> = None;
+    for (i, (_, dt)) in refs.iter().enumerate() {
+        if !matches!(dt.dist, Dist::Sharded { .. }) {
+            continue;
+        }
+        let s = shard[i]?;
         if pinned.map(|p| p != s).unwrap_or(false) {
             return None;
         }
@@ -518,22 +591,35 @@ fn query_where(q: &Query) -> Option<&Expr> {
 enum DistCmd {
     By(Name, String),
     Replicated(Name),
+    /// `DISTRIBUTE TABLE name INDEX BY column`: a global secondary index
+    Index(Name, String),
+    /// `DISTRIBUTE PROCEDURE name BY @parameter`: the procedure runs on the shard of the parameter's value (see `procs.rs`)
+    Proc(Name, String),
 }
 
 fn parse_distribute(sql: &str) -> Option<Result<DistCmd, SqlError>> {
     let t = sql.trim().trim_end_matches(';').trim();
     let words: Vec<&str> = t.split_whitespace().collect();
-    if words.len() < 3 || !words[0].eq_ignore_ascii_case("DISTRIBUTE") || !words[1].eq_ignore_ascii_case("TABLE") {
+    if words.len() < 3 || !words[0].eq_ignore_ascii_case("DISTRIBUTE") || !(words[1].eq_ignore_ascii_case("TABLE") || words[1].eq_ignore_ascii_case("PROCEDURE") || words[1].eq_ignore_ascii_case("PROC")) {
         return None;
     }
     let clean = |s: &str| s.trim_matches(|c| c == '[' || c == ']' || c == '"').to_string();
     let name: Name = words[2].split('.').map(clean).collect();
+    if !words[1].eq_ignore_ascii_case("TABLE") {
+        return Some(if words.len() == 5 && words[3].eq_ignore_ascii_case("BY") && words[4].starts_with('@') {
+            Ok(DistCmd::Proc(name, words[4].to_string()))
+        } else {
+            Err(SqlError::new(102, "Incorrect syntax near DISTRIBUTE. Expected: DISTRIBUTE PROCEDURE name BY @parameter"))
+        });
+    }
     Some(if words.len() == 4 && words[3].eq_ignore_ascii_case("REPLICATED") {
         Ok(DistCmd::Replicated(name))
     } else if words.len() == 5 && words[3].eq_ignore_ascii_case("BY") {
         Ok(DistCmd::By(name, clean(words[4])))
+    } else if words.len() == 6 && words[3].eq_ignore_ascii_case("INDEX") && words[4].eq_ignore_ascii_case("BY") {
+        Ok(DistCmd::Index(name, clean(words[5])))
     } else {
-        Err(SqlError::new(102, "Incorrect syntax near DISTRIBUTE. Expected: DISTRIBUTE TABLE name BY column | DISTRIBUTE TABLE name REPLICATED"))
+        Err(SqlError::new(102, "Incorrect syntax near DISTRIBUTE. Expected: DISTRIBUTE TABLE name BY column | DISTRIBUTE TABLE name REPLICATED | DISTRIBUTE TABLE name INDEX BY column"))
     })
 }
 
@@ -778,6 +864,9 @@ impl ClusterSession {
             if self.exec_executesql(ex, events).await? {
                 return Ok(());
             }
+            if !self.cluster.proc_routes.lock().unwrap_or_else(|e| e.into_inner()).is_empty() && self.exec_routed_proc(ex, events).await? {
+                return Ok(());
+            }
         }
         if self.exec_variable_stmt(st).await? {
             return Ok(());
@@ -787,6 +876,21 @@ impl ClusterSession {
         match st {
             Stmt::CreateTable { name, defs, versioning } => self.create_table(st, name, defs, versioning.is_some()).await,
             Stmt::AlterTable { name, action } => self.alter_table(st, name, action).await,
+            Stmt::CreateProc { name, .. } => {
+                // (a procedure is made on every shard, which runs it; a changed one must be declared again)
+                self.broadcast(st).await?;
+                self.cluster.proc_routes.lock().unwrap_or_else(|e| e.into_inner()).remove(&table_id(name));
+                self.cluster.log_schema(st);
+                Ok(())
+            }
+            Stmt::Drop { what, names, .. } if what.eq_ignore_ascii_case("PROCEDURE") || what.eq_ignore_ascii_case("PROC") => {
+                self.broadcast(st).await?;
+                for n in names {
+                    self.cluster.proc_routes.lock().unwrap_or_else(|e| e.into_inner()).remove(&table_id(n));
+                }
+                self.cluster.log_schema(st);
+                Ok(())
+            }
             Stmt::CreateView { name, alter, or_alter, .. } => {
                 let id = table_id(name);
                 let known = self.cluster.views.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&id);
@@ -827,9 +931,17 @@ impl ClusterSession {
                         return Err(SqlError::new(3726, format!("Could not drop object '{}' because it is referenced by a FOREIGN KEY constraint.", n.join("."))));
                     }
                 }
+                // (the index tables of a table that is dropped go with it)
+                let mut dropped: Vec<Name> = names.clone();
+                for n in names {
+                    if let Some(t) = self.table_by_id(&table_id(n)) {
+                        dropped.extend(t.indexes.iter().map(|i| i.table.clone()));
+                    }
+                }
+                let st = &Stmt::Drop { what: "TABLE".into(), names: dropped.clone(), if_exists: matches!(st, Stmt::Drop { if_exists: true, .. }) };
                 self.broadcast(st).await?;
                 let mut t = self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner());
-                for n in names {
+                for n in &dropped {
                     t.remove(&table_id(n));
                 }
                 drop(t);
@@ -965,7 +1077,7 @@ impl ClusterSession {
             return Err(e);
         }
         let id = table_id(name);
-        self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), DistTable { id, name: name.clone(), cols, dist: Dist::Sharded { key, class }, version: 0, loaded: None, rows: None, identity: identity.map(|(col, next, inc)| Identity { col, next, inc }) });
+        self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), DistTable { id, name: name.clone(), cols, dist: Dist::Sharded { key, class }, version: 0, loaded: None, rows: None, identity: identity.map(|(col, next, inc)| Identity { col, next, inc }), indexes: vec![] });
         self.cluster.fks.lock().unwrap_or_else(|e| e.into_inner()).extend(fks);
         self.cluster.log_schema(st);
         Ok(())
@@ -1089,10 +1201,139 @@ impl ClusterSession {
         Ok(())
     }
 
+    /// `DISTRIBUTE PROCEDURE p BY @param`: check the procedure body against the declaration (see `procs.rs`) and route its calls.
+    fn distribute_proc(&mut self, name: Name, param: String) -> Result<(), SqlError> {
+        let id = table_id(&name);
+        let created = {
+            let log = self.cluster.schema_log.lock().unwrap_or_else(|e| e.into_inner());
+            log.iter().rev().find_map(|st| match st {
+                Stmt::CreateProc { name: n, params, body, .. } if table_id(n) == id => Some((params.clone(), body.clone())),
+                _ => None,
+            })
+        };
+        let Some((params, body)) = created else { return Err(SqlError::new(2812, format!("Could not find stored procedure '{}'.", name.join(".")))) };
+        let tables = self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let lookup = |i: &str| tables.get(i).cloned();
+        let route = procs::validate(&params, &param, &body, &lookup, &self.cluster).map_err(|why| SqlError::new(50104, format!("The procedure {} cannot run on one shard: {}.", name.join("."), why)))?;
+        self.cluster.proc_routes.lock().unwrap_or_else(|e| e.into_inner()).insert(id, route);
+        self.cluster.save_state();
+        Ok(())
+    }
+
+    /// An EXEC of a procedure that runs on one shard: the arguments are evaluated, and the call is sent to the shard that owns the
+    /// value of the key parameter (inside the session transaction, when there is one). False when the procedure is not one of those.
+    async fn exec_routed_proc(&mut self, ex: &ExecStmt, events: &mut Vec<Event>) -> Result<bool, SqlError> {
+        if ex.name_is_var {
+            return Ok(false);
+        }
+        let id = table_id(&ex.name);
+        let Some(route) = self.cluster.proc_routes.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned() else { return Ok(false) };
+        if ex.retvar.is_some() || ex.args.iter().any(|a| a.out) {
+            return Err(unsupported("a procedure call that takes a return value or an OUTPUT parameter"));
+        }
+        let params = {
+            let log = self.cluster.schema_log.lock().unwrap_or_else(|e| e.into_inner());
+            log.iter().rev().find_map(|st| match st {
+                Stmt::CreateProc { name: n, params, .. } if table_id(n) == id => Some(params.clone()),
+                _ => None,
+            })
+        };
+        let Some(params) = params else { return Ok(false) };
+        // the arguments as values: by name, or by position
+        let mut args = ex.args.clone();
+        let mut key: Option<Value> = None;
+        for (i, a) in args.iter_mut().enumerate() {
+            let v = self.eval_scalar(&a.e).await?;
+            let is_key = match &a.name {
+                Some(n) => n.trim_start_matches('@').eq_ignore_ascii_case(params[route.param].name.trim_start_matches('@')),
+                None => i == route.param,
+            };
+            if is_key {
+                key = Some(v.clone());
+            }
+            a.e = Expr::Lit(v);
+        }
+        let Some(key) = key else { return Err(SqlError::new(201, format!("Procedure '{}' expects parameter '{}', which was not supplied.", ex.name.join("."), params[route.param].name))) };
+        let h = key_hash(&key, route.class).ok_or_else(|| SqlError::new(245, format!("The value {} cannot be used as the shard key of {}.", tsql_server::convert::display(&key), ex.name.join("."))))?;
+        let shard = self.cluster.shard_of_hash(h);
+        let st = Stmt::Exec(Box::new(ExecStmt { name: ex.name.clone(), name_is_var: false, args, retvar: None }));
+        self.plan.push(format!("procedure {} runs on shard {}", ex.name.join("."), shard));
+        self.ensure_begun(&[shard]).await?;
+        if route.rows {
+            // (every result set the procedure returns; there may be none, when it ends before it returns any, as New-Order does when it
+            // rolls back)
+            for rs in self.cluster.shard(shard).run_sets(self.id, Work::Stmts(vec![st])).await? {
+                events.push(Event::Rows(rs));
+            }
+        } else {
+            let reply = self.cluster.shard(shard).run(self.id, Work::Stmts(vec![st])).await?;
+            if let Some(e) = reply.first_error() {
+                return Err(e.to_sql());
+            }
+        }
+        for t in &route.writes {
+            self.bump(t);
+        }
+        Ok(true)
+    }
+
+    /// `DISTRIBUTE TABLE t INDEX BY col`: make the global index table (sharded by the value, indexed on it) and register it.
+    async fn distribute_index(&mut self, name: Name, column: String) -> Result<(), SqlError> {
+        let mut t = self.table(&name)?;
+        let Dist::Sharded { key, class: key_class } = t.dist.clone() else { return Err(unsupported("a global index on a replicated table")) };
+        let pos = t.cols.iter().position(|x| x.name.eq_ignore_ascii_case(&column)).ok_or_else(|| SqlError::new(207, format!("Invalid column name '{}'.", column)))?;
+        if pos == key {
+            return Err(SqlError::new(50103, "The shard key needs no global index: a condition on it already routes."));
+        }
+        let class = KeyClass::of_type_name(&t.cols[pos].type_name).ok_or_else(|| unsupported(&format!("a global index on a column of type {}", t.cols[pos].type_name)))?;
+        if t.indexes.iter().any(|i| i.col == pos) {
+            return Err(SqlError::new(1913, format!("The operation failed because an index or statistics with name '{}' already exists.", column)));
+        }
+        // an index can only be started on an empty table (it would have to be built from the rows otherwise)
+        let count = simple_query(Select { distinct: false, top: None, items: vec![SelectItem::Expr { e: Expr::Func(Box::new(FuncCall { name: "COUNT".into(), schema: None, parts: vec![], args: vec![], distinct: false, star: true, over: None, within: None })), alias: None }], into: None, from: vec![TableRef::Table { name: t.name.clone(), alias: None, hints: vec![] }], where_: None, group: None, having: None });
+        let shards = self.all_shards();
+        let counts = self.fan_query(&shards, |_| Work::Stmts(vec![Stmt::Query(Box::new(count.clone()))])).await?;
+        if counts.iter().any(|r| r.rows.first().map(|x| !matches!(x[0], Value::Int(0))).unwrap_or(false)) {
+            return Err(SqlError::new(50101, format!("DISTRIBUTE TABLE ... INDEX needs an empty table; {} has rows.", name.join("."))));
+        }
+        // the column types are the base table's own
+        let find = |c: &str| -> Option<ColumnDef> {
+            let log = self.cluster.schema_log.lock().unwrap_or_else(|e| e.into_inner());
+            log.iter().find_map(|st| match st {
+                Stmt::CreateTable { name: n, defs, .. } if table_id(n) == t.id => defs.iter().find_map(|d| match d {
+                    TableDef::Column(cd) if cd.name.eq_ignore_ascii_case(c) => Some(cd.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+        };
+        let (Some(vcol), Some(kcol)) = (find(&t.cols[pos].name), find(&t.cols[key].name)) else { return Err(unsupported("a global index on a table whose definition is not known")) };
+        let plain = |name: &str, from: &ColumnDef| TableDef::Column(ColumnDef { name: name.to_string(), ty: from.ty.clone(), nullable: Some(true), identity: None, default: None, default_text: None, default_name: None, computed: None, computed_text: None, pk: None, unique: None, checks: vec![], fk: None, collation: from.collation.clone(), mask: None, generated: None });
+        let idx_name = format!("gsi_{}_{}", t.name.last().cloned().unwrap_or_default(), t.cols[pos].name);
+        let idx_table: Name = vec![idx_name.clone()];
+        let mut none = vec![];
+        let create = Stmt::CreateTable { name: idx_table.clone(), defs: vec![plain("gv", &vcol), plain("gk", &kcol)], versioning: None };
+        self.exec_stmt(&create, &mut none).await?;
+        let ix = Stmt::CreateIndex { name: format!("ix_{}", idx_name), table: idx_table.clone(), cols: vec![("gv".to_string(), false)], unique: false, include: vec![], filter: None, xml: None, spatial: None };
+        self.exec_stmt(&ix, &mut none).await?;
+        let _ = key_class;
+        t.indexes.push(GlobalIndex { col: pos, table: idx_table, class });
+        self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner()).insert(t.id.clone(), t);
+        self.cluster.save_state();
+        Ok(())
+    }
+
     async fn distribute(&mut self, cmd: DistCmd) -> Result<(), SqlError> {
+        if let DistCmd::Index(n, c) = cmd {
+            return self.distribute_index(n, c).await;
+        }
+        if let DistCmd::Proc(n, p) = cmd {
+            return self.distribute_proc(n, p);
+        }
         let (name, by) = match &cmd {
             DistCmd::By(n, c) => (n.clone(), Some(c.clone())),
             DistCmd::Replicated(n) => (n.clone(), None),
+            DistCmd::Index(..) | DistCmd::Proc(..) => unreachable!(),
         };
         let mut t = self.table(&name)?;
         // only an empty table can change how it is spread
@@ -1130,7 +1371,35 @@ impl ClusterSession {
         res.resultsets().first().and_then(|r| r.rows.first()).and_then(|r| r.first()).cloned().ok_or_else(|| SqlError::new(50000, "an expression returned no value"))
     }
 
+    /// An INSERT. A table with global indexes gets its entries in the same transaction as its rows (one of its own when the session
+    /// has none), since they are on other shards.
     async fn insert(&mut self, ins: &Insert, events: &mut Vec<Event>) -> Result<(), SqlError> {
+        let indexed = match &ins.target {
+            Target::Table(name) => self.table(name).map(|t| !t.indexes.is_empty()).unwrap_or(false),
+            _ => false,
+        };
+        if !indexed {
+            return self.insert_values(ins, events).await;
+        }
+        let own_txn = self.txn.borrow().is_none();
+        if own_txn {
+            *self.txn.borrow_mut() = Some(TxnState { shards: Default::default(), depth: 1, doomed: false, wrote: Default::default(), savepoints: vec![] });
+        }
+        let out = self.insert_values(ins, events).await;
+        if own_txn {
+            match out {
+                Ok(()) => self.commit_txn(events).await,
+                Err(e) => {
+                    let _ = self.rollback_txn().await;
+                    Err(e)
+                }
+            }
+        } else {
+            out
+        }
+    }
+
+    async fn insert_values(&mut self, ins: &Insert, events: &mut Vec<Event>) -> Result<(), SqlError> {
         let name = match &ins.target {
             Target::Table(name) => name,
             Target::Var(v) if self.tvars.contains_key(&v.to_lowercase()) => {
@@ -1246,9 +1515,21 @@ impl ClusterSession {
             Dist::Sharded { key, class } => {
                 let key_pos = names.iter().position(|c| c.eq_ignore_ascii_case(&t.cols[*key].name)).ok_or_else(|| SqlError::new(50102, format!("The shard key column {} must be given a value.", t.cols[*key].name)))?;
                 let mut per_shard: Vec<Vec<Vec<Expr>>> = vec![vec![]; n];
+                // (the entries of the global indexes: per index, the (value, key) pairs)
+                let slots: Vec<Option<usize>> = t.indexes.iter().map(|ix| names.iter().position(|c| c.eq_ignore_ascii_case(&t.cols[ix.col].name))).collect();
+                let mut entries: Vec<Vec<(Value, Value)>> = vec![vec![]; t.indexes.len()];
                 for r in rows {
                     let v = self.eval_scalar(&r[key_pos]).await?;
                     let h = key_hash(&v, *class).ok_or_else(|| SqlError::new(245, format!("The value {} cannot be used as the shard key {}.", tsql_server::convert::display(&v), t.cols[*key].name)))?;
+                    for (i, slot) in slots.iter().enumerate() {
+                        if let Some(p) = slot {
+                            let gv = self.eval_scalar(&r[*p]).await?;
+                            // (a NULL is never found by an equality, so it needs no entry)
+                            if !gv.is_null() {
+                                entries[i].push((gv, v.clone()));
+                            }
+                        }
+                    }
                     per_shard[self.cluster.shard_of_hash(h)].push(r);
                 }
                 let used: Vec<usize> = (0..n).filter(|i| !per_shard[*i].is_empty()).collect();
@@ -1256,6 +1537,11 @@ impl ClusterSession {
                 let replies = self.fan_run(&used, |i| Work::Stmts(vec![stmts[i].clone()])).await?;
                 count = replies.iter().map(|r| r.row_count()).sum();
                 self.plan.push(format!("insert split over shards {:?}", used));
+                for (i, e) in entries.into_iter().enumerate() {
+                    if !e.is_empty() {
+                        self.index_insert(&t.indexes[i], e).await?;
+                    }
+                }
             }
         }
         self.bump(&t.id);
@@ -1263,11 +1549,95 @@ impl ClusterSession {
         Ok(())
     }
 
+    /// Add entries `(value, key)` to a global index: each goes to the shard that owns the hash of its value.
+    async fn index_insert(&mut self, ix: &GlobalIndex, mut entries: Vec<(Value, Value)>) -> Result<(), SqlError> {
+        let n = self.cluster.shard_count();
+        entries.sort_by(|a, b| format!("{:?}{:?}", a.0, a.1).cmp(&format!("{:?}{:?}", b.0, b.1)));
+        entries.dedup_by(|a, b| format!("{:?}{:?}", a.0, a.1) == format!("{:?}{:?}", b.0, b.1));
+        let mut per_shard: Vec<Vec<Vec<Expr>>> = vec![vec![]; n];
+        for (gv, gk) in entries {
+            let h = key_hash(&gv, ix.class).ok_or_else(|| SqlError::new(245, format!("The value {} cannot be used in a global index.", tsql_server::convert::display(&gv))))?;
+            per_shard[self.cluster.shard_of_hash(h)].push(vec![Expr::Lit(gv), Expr::Lit(gk)]);
+        }
+        let used: Vec<usize> = (0..n).filter(|i| !per_shard[*i].is_empty()).collect();
+        let stmts: Vec<Stmt> = per_shard.into_iter().map(|rows| Stmt::Insert(Box::new(Insert { ctes: vec![], target: Target::Table(ix.table.clone()), cols: Some(vec!["gv".into(), "gk".into()]), output: None, src: InsertSrc::Values(rows), top: None }))).collect();
+        self.fan_run(&used, |i| Work::Stmts(vec![stmts[i].clone()])).await?;
+        Ok(())
+    }
+
+    /// The shards that can hold rows matching `where_`: those the shard key fixes, else (when a global index of the table has its
+    /// column fixed by `col = literal` or `col IN (literals)`) the shards that own the keys the index lists for those values, else all.
+    pub(crate) async fn pruned_shards(&mut self, t: &DistTable, where_: Option<&Expr>) -> Result<Vec<usize>, SqlError> {
+        let by_key = prune_shards(where_, t, &self.cluster);
+        if by_key.len() < self.cluster.shard_count() || t.indexes.is_empty() {
+            return Ok(by_key);
+        }
+        let Some(w) = where_ else { return Ok(by_key) };
+        let Dist::Sharded { class: key_class, .. } = &t.dist else { return Ok(by_key) };
+        let mut cs = vec![];
+        fn conjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+            match e {
+                Expr::And(a, b) => {
+                    conjuncts(a, out);
+                    conjuncts(b, out);
+                }
+                Expr::Paren(a) => conjuncts(a, out),
+                other => out.push(other),
+            }
+        }
+        conjuncts(w, &mut cs);
+        for ix in &t.indexes {
+            let cname = &t.cols[ix.col].name;
+            let is_col = |e: &Expr| matches!(e, Expr::Col(p) if p.last().map(|s| s.eq_ignore_ascii_case(cname)).unwrap_or(false));
+            let mut values: Option<Vec<Value>> = None;
+            for c in &cs {
+                match c {
+                    Expr::Binary(BinOp::Eq, a, b) => match (&**a, &**b) {
+                        (x, Expr::Lit(v)) | (Expr::Lit(v), x) if is_col(x) && !v.is_null() => values = Some(vec![v.clone()]),
+                        _ => {}
+                    },
+                    Expr::InList(x, list, false) if is_col(x) && list.iter().all(|i| matches!(i, Expr::Lit(v) if !v.is_null())) => {
+                        values = Some(list.iter().filter_map(|i| if let Expr::Lit(v) = i { Some(v.clone()) } else { None }).collect());
+                    }
+                    _ => {}
+                }
+                if values.is_some() {
+                    break;
+                }
+            }
+            let Some(values) = values else { continue };
+            // the keys the index lists for these values (one shard of the index table when there is one value)
+            let cond = if values.len() == 1 {
+                Expr::Binary(BinOp::Eq, Box::new(col("gv")), Box::new(Expr::Lit(values[0].clone())))
+            } else {
+                Expr::InList(Box::new(col("gv")), values.iter().cloned().map(Expr::Lit).collect(), false)
+            };
+            let q = simple_query(Select { distinct: true, top: None, items: vec![SelectItem::Expr { e: col("gk"), alias: None }], into: None, from: vec![TableRef::Table { name: ix.table.clone(), alias: None, hints: vec![] }], where_: Some(cond), group: None, having: None });
+            let rs = Box::pin(self.run_query(&q)).await?;
+            let mut shards: Vec<usize> = vec![];
+            for r in &rs.rows {
+                match key_hash(&r[0], *key_class) {
+                    Some(h) => shards.push(self.cluster.shard_of_hash(h)),
+                    None => return Ok(by_key),
+                }
+            }
+            shards.sort();
+            shards.dedup();
+            if shards.is_empty() {
+                // (nothing has the value: any shard gives the empty answer with the right columns)
+                shards.push(0);
+            }
+            self.plan.push(format!("global index on {}: shards {:?}", cname, shards));
+            return Ok(shards);
+        }
+        Ok(by_key)
+    }
+
     /// The common checks of a single-table UPDATE or DELETE; the shards to send it to.
-    fn dml_shards(&self, t: &DistTable, where_: Option<&Expr>) -> Vec<usize> {
+    async fn dml_shards(&mut self, t: &DistTable, where_: Option<&Expr>) -> Result<Vec<usize>, SqlError> {
         match t.dist {
-            Dist::Replicated => self.all_shards(),
-            Dist::Sharded { .. } => prune_shards(where_, t, &self.cluster),
+            Dist::Replicated => Ok(self.all_shards()),
+            Dist::Sharded { .. } => self.pruned_shards(t, where_).await,
         }
     }
 
@@ -1305,6 +1675,10 @@ impl ClusterSession {
                             moves_key = true;
                         }
                     }
+                    // (the entry for the new value would be missing, and a lookup by it would not find the row)
+                    if t.indexes.iter().any(|ix| t.cols[ix.col].name.eq_ignore_ascii_case(&col)) {
+                        return Err(unsupported(&format!("UPDATE of the globally indexed column {} (delete and insert the row instead)", col)));
+                    }
                     exprs.push(e);
                 }
                 SetItem::Var { .. } => return Err(unsupported("UPDATE that assigns variables")),
@@ -1324,7 +1698,7 @@ impl ClusterSession {
         if moves_key {
             return self.update_moving_key(&t, u, events).await;
         }
-        let shards = self.dml_shards(&t, u.where_.as_ref());
+        let shards = self.dml_shards(&t, u.where_.as_ref()).await?;
         self.run_dml(&t, Stmt::Update(Box::new(u.clone())), shards, events).await
     }
 
@@ -1370,7 +1744,7 @@ impl ClusterSession {
         let rs = self.run_query(&read).await?;
         let del = Delete { ctes: vec![], target: u.target.clone(), from: vec![], where_: u.where_.clone(), output: None, top: None, current_of: None };
         let mut none = vec![];
-        let shards = self.dml_shards(t, u.where_.as_ref());
+        let shards = self.dml_shards(t, u.where_.as_ref()).await?;
         self.run_dml(t, Stmt::Delete(Box::new(del)), shards, &mut none).await?;
         let moved = rs.rows.len() as i64;
         if moved > 0 {
@@ -1409,7 +1783,7 @@ impl ClusterSession {
             }
         }
         self.fk_before_delete(&t, d.where_.as_ref(), events).await?;
-        let shards = self.dml_shards(&t, d.where_.as_ref());
+        let shards = self.dml_shards(&t, d.where_.as_ref()).await?;
         self.run_dml(&t, Stmt::Delete(Box::new(d.clone())), shards, events).await
     }
 
@@ -1440,7 +1814,7 @@ impl ClusterSession {
         // about the other)
         if tables.len() == 1 && !has_nested_query(q) && matches!(&q.body, QueryBody::Select(s) if matches!(s.from.as_slice(), [TableRef::Table { .. }])) {
             let t = &tables[0];
-            let shards = prune_shards(query_where(q), t, &self.cluster);
+            let shards = self.pruned_shards(t, query_where(q)).await?;
             if shards.len() == 1 {
                 self.plan.push(format!("route: the key fixes the shard ({})", shards[0]));
                 return self.direct(shards[0], q).await;
@@ -1530,25 +1904,53 @@ impl ClusterSession {
     /// A join of several tables run shard by shard (co-located, broadcast or repartitioned); None when it cannot be.
     async fn try_join(&mut self, q: &Query, tables: &[DistTable]) -> Result<Option<ResultSet>, SqlError> {
         let map: HashMap<String, DistTable> = tables.iter().map(|t| (t.id.clone(), t.clone())).collect();
-        let mut rows = HashMap::new();
-        for t in tables {
-            if !matches!(t.dist, Dist::Replicated) {
-                let n = self.table_rows(t).await?;
-                rows.insert(t.id.clone(), n);
-            }
-        }
         let limit = self.cluster.broadcast_limit.load(Ordering::Relaxed);
         let n = self.cluster.shard_count();
         let sid = self.id;
         let mut counter = self.temp_counter;
-        let plan = joins::plan_join(q, &map, &rows, limit, n, &mut || {
+        // (the row counts only decide between moving tables; a join that is co-located needs none: planned first with every table
+        // taken as too big to move, and only when that moves something are the tables counted, which costs a round trip to every shard
+        // each time a table has changed)
+        let unknown: HashMap<String, u64> = tables.iter().filter(|t| !matches!(t.dist, Dist::Replicated)).map(|t| (t.id.clone(), u64::MAX / 4)).collect();
+        let first = joins::plan_join(q, &map, &unknown, limit, n, &mut || {
             counter += 1;
             format!("#dpj_{}_{}", sid, counter)
         });
+        let plan = match first {
+            Some(jp) if jp.preps.is_empty() => Some(jp),
+            _ => {
+                let mut rows = HashMap::new();
+                for t in tables {
+                    if !matches!(t.dist, Dist::Replicated) {
+                        let n = self.table_rows(t).await?;
+                        rows.insert(t.id.clone(), n);
+                    }
+                }
+                joins::plan_join(q, &map, &rows, limit, n, &mut || {
+                    counter += 1;
+                    format!("#dpj_{}_{}", sid, counter)
+                })
+            }
+        };
         self.temp_counter = counter;
         let Some(jp) = plan else { return Ok(None) };
         let Some(shape) = plan::plan_scatter_multi(&jp.query) else { return Ok(None) };
-        let shards = self.all_shards();
+        let mut shards = self.all_shards();
+        // (a condition `col = literal` on a column with a global index limits a co-located join to the shards that hold such rows: the
+        // other sharded tables' partners of a row are on its shard; a column that another table of the query has too is not used)
+        if jp.preps.is_empty() {
+            for t in tables {
+                let ambiguous = t.indexes.iter().any(|ix| tables.iter().any(|o| o.id != t.id && o.cols.iter().any(|c| c.name.eq_ignore_ascii_case(&t.cols[ix.col].name))));
+                if t.indexes.is_empty() || ambiguous {
+                    continue;
+                }
+                let found = self.pruned_shards(t, query_where(q)).await?;
+                if found.len() < shards.len() {
+                    shards = found;
+                    break;
+                }
+            }
+        }
         let mut made = vec![];
         let mut result = Ok(());
         for p in &jp.preps {
@@ -1700,6 +2102,19 @@ impl ClusterSession {
         let types = (0..ncols).map(|i| results.iter().find(|r| r.rows.iter().any(|row| !row[i].is_null())).unwrap_or(&results[0]).types[i].clone()).collect::<Vec<_>>();
         let columns = results[0].columns.clone();
         let rows: Vec<Vec<Value>> = results.into_iter().flat_map(|r| r.rows).collect();
+        // (a plain ordering and TOP is merged here; the rest, and whatever might order differently from the engine, goes through it)
+        let rows = match &shape {
+            Shape::Row(p) => match p.merge_rows(&columns, rows) {
+                Ok(done) => {
+                    let n = done.first().map(|r| r.len()).unwrap_or(columns.len().min(types.len()));
+                    let nvisible = if done.is_empty() { p.visible_columns(columns.len()) } else { n };
+                    let types = merge::widen(&types[..nvisible], &done);
+                    return Ok(ResultSet { columns: columns[..nvisible].to_vec(), types, rows: done });
+                }
+                Err(rows) => rows,
+            },
+            Shape::Agg(_) => rows,
+        };
         merge::run_final(&mut self.mirror, &columns, &types, rows, |cols, tys| match &shape {
             Shape::Row(p) => Some(p.final_query(merge::tmp_name(), cols)),
             Shape::Agg(p) => p.final_query(merge::tmp_name(), tys),

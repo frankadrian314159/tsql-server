@@ -157,6 +157,35 @@ tables sharded on the item), and its table shows how each query ran (`split`, `s
     table of the mirror under a name of its own (`dpg_...`) that is dropped afterwards, not a `#temporary` table: the engine does not
     seek into the indexes of a temporary table from a correlated subquery, and without the index TPC-C's consistency condition 10 (a
     correlated subquery joining `orders` and `order_line`) scanned the 180,000-row copy once per customer and did not finish.
+  * *global secondary indexes* (`DISTRIBUTE TABLE t INDEX BY col`, on an empty sharded table): a lookup by a column that is not the shard
+    key (`col = literal`, `col IN (literals)`, in a SELECT, UPDATE or DELETE, or in a co-located join when no other table of the query has a
+    column of that name) asks only the shards that can hold such rows. The index is a table of its own, `gsi_<table>_<col>(gv, gk)`, sharded
+    by the value and indexed on it; the control node reads it (one shard) and sends the query to the shards that own the keys it lists
+    (plan line `global index on col: shards [..]`). It only grows: every inserted row gets its entry in the same transaction (one of its own
+    when the session has none); a deleted or moved row leaves its entry, which costs a visit to a shard with no such row and never a wrong
+    answer. It prunes only when the value is selective: the trades of one account are spread over every shard when the table is sharded
+    by trade id, so an index on the account cannot help there (shard the table by account instead), while an index on the trade id
+    finds one shard. Dropping the table drops its index tables. An UPDATE that sets the indexed column is refused (the entry for the
+    new value would be missing): delete and insert the row instead, or do not index a column that is updated.
+  * *a join whose sharded tables are all fixed to one shard* (by literals on their keys, or by equalities between their keys, in `WHERE`
+    or the `ON` of inner joins) runs on that shard as a whole.
+  * *procedures that run on one shard* (`CREATE PROCEDURE` is made on every shard; `DISTRIBUTE PROCEDURE name BY @param` declares that
+    the parameter's value is the shard key of everything the procedure reads and writes): a call `EXEC name ...` is one request to the
+    shard that owns that value, inside the session's transaction when there is one (so a transaction can call several, on several
+    shards, and commit them together by two-phase commit). The declaration is *checked* against the body and refused (error 50104,
+    naming the statement) unless every statement is of a kind the check understands (declarations, `SET`, `IF`, `WHILE`, blocks,
+    `SELECT`, `INSERT ... VALUES`, `UPDATE`, `DELETE`, transaction control, `RETURN`, `PRINT`), no expression has a subquery, every
+    sharded table a statement touches is fixed to the parameter by an equality on its shard key (the test that pins a join to a
+    shard; a derived table in a `FROM` is a query of its own that has to be fixed too), every `INSERT` gives the key the parameter, a replicated table is only read, the parameter is never assigned, and no
+    table written has an IDENTITY column, a foreign key or a global index (the control node does those, and a shard would skip
+    them). A call returns every result set of the procedure, in order (none when it ends before returning one); OUTPUT parameters and
+    return values are not carried. Changing the
+    procedure drops the declaration.
+  * *joins are planned without counting rows when they are co-located*: the planner first tries every table as too big to move, and
+    only a join that then has to move something counts the tables (a round trip to every shard each time a table has changed).
+    A scatter-gather that only orders and takes `TOP n` is merged in the control node itself (no `DISTINCT`, percent or ties, a literal
+    count, sort keys that are not character strings, whose order the engine takes from the collation); the rest goes through the
+    control node's engine.
   * *plain point statements* (`SELECT ... FROM t WHERE ...` with no subquery, view, CTE, grouping or long literal list, on a replicated
     table or one whose key the condition fixes) are routed without walking the query in its serialized form: that took a routed
     SELECT from 0.78 ms to 0.59 ms (a bare round trip to a shard is 0.33 ms, a statement through the shard client 0.5 ms).
@@ -274,12 +303,13 @@ The drivers of the single-node examples run against a cluster too, through a clu
 `Connection` and for `ClusterSession`); with `--config cluster.json` the control node connects to shard nodes that are already
 running (`tsql-shard` on other machines), otherwise `--shards N` starts them in the process.
 
-* `oltp_cluster [c|e]`: TPC-C and the reduced TPC-E. A cluster has no stored procedures or sequences, so the transactions are
+* `oltp_cluster [c|e]`: TPC-C and the reduced TPC-E. The drivers use no cluster procedures or sequences, so the transactions are
   **client-side**: the terminal sends `BEGIN`, each statement and `COMMIT` itself (`c.rs` / `e.rs` with `client = true`; the single-node
-  `tpc_oltp --client` runs the same code on one engine, and without `--client` it still calls the procedures). TPC-C is sharded on
-  the warehouse (the item table is replicated), TPC-E on each table's first key column (`security` replicated); transactions that
-  touch two shards (history rows, remote warehouses) commit by two-phase commit; a deadlock victim is retried. The consistency
-  conditions are checked before and after the run. `tests/oltp.rs` runs both for a moment.
+  `tpc_oltp --client` runs the same code on one engine, and without `--client` it still calls the procedures). The cluster is used as it
+  is, with no tuning of the schema or the statements for it: TPC-C is sharded on the warehouse (the item table is replicated), TPC-E on
+  each table's first key column (`security` replicated); transactions that touch two shards (history rows, remote warehouses) commit
+  by two-phase commit; a deadlock victim is retried. The consistency conditions are checked before and after the run. `tests/oltp.rs`
+  runs both for a moment.
 * `bench_cluster`: the micro-benchmark's workloads (loops, procedures and `sp_executesql` left out) on one engine and the cluster,
   with both times, the plan and whether the answers agree, and concurrent sessions of the cluster.
 * `sqlsmith_cluster`: the fuzzer's random queries on one engine and the cluster; answers, error numbers and the effect of data changes
@@ -362,7 +392,8 @@ generated rows.
 * **Snapshots are in memory and fuzzy** (see Replication); a replicated shard's transactions in flight at a failover are lost
   (the client sees an error and retries). Membership changes go through the shard's leader one voter at a time.
 * **Refused** (error 50100 says so): `UNIQUE` constraints or unique indexes that do not contain the shard key, stored
-  procedures, functions and triggers (they would need an interpreter next to the data), `CREATE DATABASE`/`USE`, temporal
+  functions and triggers (they would need an interpreter next to the data; a procedure is made on every shard and can be
+  declared to run on one, see *Procedures that run on one shard*), `CREATE DATABASE`/`USE`, temporal
   tables, DML with joins (`UPDATE ... FROM`), `OUTPUT` or `TOP` in DML, `INSERT ... DEFAULT VALUES`/`EXEC`, correlated
   subqueries in DML, and schema changes inside a transaction. Views cannot be written through.
 * **Foreign keys and identity values are the control node's**: the checks are not atomic across sessions (see Foreign keys),

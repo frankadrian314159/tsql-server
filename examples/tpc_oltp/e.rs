@@ -158,7 +158,7 @@ fn symb(i: i64) -> String {
 }
 
 /// Create and fill the tables. `client`: no stored procedures and no sequence (the transactions are statements sent by the
-/// terminals); `replicated`: also `DISTRIBUTE TABLE .. REPLICATED` for `security`, `last_trade` and `broker` (a cluster: the small, mostly read tables live on every shard).
+/// terminals); `replicated`: also `DISTRIBUTE TABLE security REPLICATED` (a cluster: the read-only table lives on every shard).
 pub fn load<D: Sql + ?Sized>(c: &mut D, cfg: &Cfg, client: bool, replicated: bool) {
     if client {
         must(c, &SCHEMA.lines().filter(|l| !l.contains("CREATE SEQUENCE")).collect::<Vec<_>>().join("\n"));
@@ -166,11 +166,7 @@ pub fn load<D: Sql + ?Sized>(c: &mut D, cfg: &Cfg, client: bool, replicated: boo
         must(c, SCHEMA);
     }
     if replicated {
-        // the small tables that the transactions read and join with (only Market-Feed writes the prices): on every shard, so that
-        // a join with them runs where the rows are instead of copying the table to the shards for each query
-        for t in ["security", "last_trade", "broker"] {
-            must(c, &format!("DISTRIBUTE TABLE {} REPLICATED", t));
-        }
+        must(c, "DISTRIBUTE TABLE security REPLICATED");
     }
     if !client {
         for p in PROCS {

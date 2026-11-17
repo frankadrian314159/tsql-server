@@ -10,6 +10,24 @@ use tsql_server::{SqlError, Value};
 
 /// Flight action names.
 pub const ACTION_RUN: &str = "run";
+/// Like `run`, but the reply carries every result set the work produced (`SetsReply`), not just the counts: for a procedure that returns
+/// several.
+pub const ACTION_RUN_SETS: &str = "run_sets";
+
+/// A result set on the wire.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WireSet {
+    pub columns: Vec<String>,
+    pub types: Vec<tsql_server::DataType>,
+    pub rows: Vec<Vec<Value>>,
+}
+
+/// The reply to `run_sets`: the result sets in order, and the first error if the work failed (the sets before it are kept).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SetsReply {
+    pub sets: Vec<WireSet>,
+    pub error: Option<WireError>,
+}
 pub const ACTION_CLOSE_SESSION: &str = "close_session";
 pub const ACTION_STATUS: &str = "status";
 /// A Raft message between the replicas of a shard.

@@ -77,16 +77,7 @@ fn main() {
             tables.push(name.to_string());
         }
     }
-    // the small dimension tables are replicated on every shard; orders and lineitem are sharded on the order key, so they
-    // are co-located, and partsupp on the part key
-    if !args.iter().any(|a| a == "--all-sharded") {
-        for t in ["region", "nation", "supplier", "customer", "part"] {
-            let r = cs.execute(&format!("DISTRIBUTE TABLE {} REPLICATED", t));
-            if let Some(e) = r.first_error() {
-                panic!("{}", e);
-            }
-        }
-    }
+    // every table is sharded on the first column of its primary key (nothing is replicated or placed for the benchmark)
     for stmt in schema_const("INDEXES").split(';').map(str::trim).filter(|s| !s.is_empty()) {
         let r = cs.execute(stmt);
         if let Some(e) = r.first_error() {

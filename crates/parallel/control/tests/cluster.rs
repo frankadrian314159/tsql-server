@@ -265,7 +265,7 @@ fn errors_come_back_as_the_engine_gives_them() {
     let a = p.cl.execute("SELECT * FROM nothing_here");
     assert_eq!(a.first_error().map(|e| e.number), Some(208));
     // what is not supported says so
-    for sql in ["CREATE PROCEDURE p AS SELECT 1", "CREATE DATABASE other", "UPDATE TOP (1) t SET v = 'x'", "DELETE FROM t OUTPUT deleted.id WHERE id = 1"] {
+    for sql in ["CREATE DATABASE other", "UPDATE TOP (1) t SET v = 'x'", "DELETE FROM t OUTPUT deleted.id WHERE id = 1"] {
         let a = p.cl.execute(sql);
         assert_eq!(a.first_error().map(|e| e.number), Some(50100), "{}: {:?}", sql, a.first_error());
     }
@@ -1192,6 +1192,9 @@ fn joins_whose_keys_all_name_one_shard_run_there() {
     for sql in [
         "SELECT o.id, i.sku FROM orders o, order_items i WHERE o.id = 7 AND i.order_id = 7 AND i.order_id = o.id",
         "SELECT COUNT(*) FROM orders o, order_items i, regions r WHERE o.id = 12 AND i.order_id = 12 AND r.code = 'north'",
+        // (a key tied by equality to the key of a table that is pinned is pinned with it, also through JOIN ... ON)
+        "SELECT COUNT(*) FROM orders o, order_items i WHERE o.id = 7 AND i.order_id = o.id",
+        "SELECT o.id, i.sku FROM orders o JOIN order_items i ON i.order_id = o.id WHERE o.id = 9",
     ] {
         let plan = p.check(sql, false);
         assert!(routed(&plan), "{}
@@ -1199,7 +1202,7 @@ fn joins_whose_keys_all_name_one_shard_run_there() {
     }
     // not every table is pinned, or the key names are ambiguous, or the shards differ: not routed (and still exact)
     for sql in [
-        "SELECT COUNT(*) FROM orders o, order_items i WHERE o.id = 7 AND i.order_id = o.id",
+        "SELECT COUNT(*) FROM orders o, order_items i WHERE o.id = 7 AND i.qty = o.id",
         "SELECT COUNT(*) FROM orders a, orders b WHERE a.id = 7 AND b.customer_id = a.customer_id",
         "SELECT COUNT(*) FROM orders o, order_items i WHERE o.id = 7 AND i.order_id = 8",
         "SELECT COUNT(*) FROM orders a, orders b WHERE id = 7",
@@ -1483,4 +1486,173 @@ fn a_long_list_of_literals_is_joined_as_a_replicated_table() {
     p.check("SELECT COUNT(*) FROM orders WHERE id IN (1, 2, 3)", true);
     // a star select is left as it is (the joined table's column must not show)
     p.check(&format!("SELECT * FROM orders WHERE id IN ({}) ORDER BY id", dup), true);
+}
+
+#[test]
+fn a_global_index_routes_lookups_by_a_column_that_is_not_the_shard_key() {
+    let mut p = Pair::new(3);
+    p.both("CREATE TABLE trades (id INT PRIMARY KEY, acct INT, sym VARCHAR(8), qty INT)");
+    let r = p.cl.execute("DISTRIBUTE TABLE trades INDEX BY acct");
+    assert!(r.first_error().is_none(), "{:?}", r.first_error());
+    // a unique-ish column: each account has one or two trades, so a lookup meets one or two shards of three
+    let rows: Vec<String> = (1..=300).map(|i| format!("({}, {}, 'S{}', {})", i, 1000 + i / 2, i % 7, i % 13)).collect();
+    p.both(&format!("INSERT INTO trades VALUES {}", rows.join(", ")));
+    let plan = p.check("SELECT id, qty FROM trades WHERE acct = 1010 ORDER BY id", true);
+    assert!(plan.iter().any(|l| l.contains("global index on acct")), "{:?}", plan);
+    assert!(!plan.iter().any(|l| l.contains("[0, 1, 2]")), "{:?}", plan);
+    p.check("SELECT id FROM trades WHERE acct IN (1001, 1002, 1150) ORDER BY id", true);
+    // a value nothing has: an empty answer with the right columns
+    p.check("SELECT id, sym FROM trades WHERE acct = 999999", true);
+    // rows added later are found; a key that moves is found where it went; a deleted row leaves nothing to find
+    p.both("INSERT INTO trades VALUES (1001, 1010, 'NEW', 1), (1002, 5000, 'NEW', 2)");
+    p.check("SELECT id, sym FROM trades WHERE acct = 1010 ORDER BY id", true);
+    p.check("SELECT id FROM trades WHERE acct = 5000", true);
+    p.both("UPDATE trades SET id = 2001 WHERE id = 1001");
+    p.check("SELECT id, sym FROM trades WHERE acct = 1010 ORDER BY id", true);
+    p.both("DELETE FROM trades WHERE acct = 1010");
+    p.check("SELECT COUNT(*) FROM trades WHERE acct = 1010", true);
+    // setting the indexed column is refused (its new value would have no entry), the row can be replaced instead
+    let r = p.cl.execute("UPDATE trades SET acct = 7777 WHERE id = 5");
+    assert!(r.first_error().is_some());
+    // updates and deletes by the indexed column go to the shards it names
+    p.both("UPDATE trades SET qty = 99 WHERE acct = 1020");
+    p.check("SELECT id, qty FROM trades WHERE acct = 1020 ORDER BY id", true);
+    // an insert that fails leaves no entry behind that matters (entries are only a hint), and the table is still right
+    let bad = p.cl.execute("INSERT INTO trades VALUES (7, 4242, 'DUP', 1)");
+    assert!(bad.first_error().is_some());
+    p.check("SELECT COUNT(*) FROM trades WHERE acct = 4242", true);
+    p.check("SELECT COUNT(*), SUM(qty) FROM trades", true);
+    // the index table goes with the table
+    p.both("DROP TABLE trades");
+    let again = p.cl.execute("SELECT COUNT(*) FROM gsi_trades_acct");
+    assert!(again.first_error().is_some());
+}
+
+#[test]
+fn a_procedure_that_stays_on_one_shard_is_sent_whole() {
+    let mut p = Pair::new(3);
+    p.both("CREATE TABLE acct (w INT PRIMARY KEY, bal INT)");
+    p.both("CREATE TABLE ledger (w INT, n INT, amt INT)");
+    p.both("CREATE TABLE rates (code INT PRIMARY KEY, pct INT)");
+    assert!(p.cl.execute("DISTRIBUTE TABLE rates REPLICATED").first_error().is_none());
+    assert!(p.cl.execute("DISTRIBUTE TABLE ledger BY w").first_error().is_none());
+    p.both("INSERT INTO rates VALUES (1, 5), (2, 7)");
+    p.both(&format!("INSERT INTO acct VALUES {}", (1..=30).map(|w| format!("({}, {})", w, w * 100)).collect::<Vec<_>>().join(",")));
+    let create = "CREATE PROCEDURE bump @w INT, @amt INT AS
+BEGIN
+  SET NOCOUNT ON;
+  DECLARE @n INT;
+  SELECT @n = COUNT(*) FROM ledger WHERE w = @w;
+  UPDATE acct SET bal = bal + @amt WHERE w = @w;
+  INSERT ledger (w, n, amt) VALUES (@w, @n + 1, @amt);
+  SELECT bal, @n + 1 AS entry, (SELECT 1) AS one FROM acct WHERE w = @w;
+END";
+    // a subquery in the select list is not understood: the declaration is refused, and says why
+    p.both(create);
+    let r = p.cl.execute("DISTRIBUTE PROCEDURE bump BY @w");
+    assert_eq!(r.first_error().map(|e| e.number), Some(50104), "{:?}", r.first_error());
+    let create = create.replace("CREATE PROCEDURE", "CREATE OR ALTER PROCEDURE").replace(", (SELECT 1) AS one", "");
+    p.both(&create);
+    let r = p.cl.execute("DISTRIBUTE PROCEDURE bump BY @w");
+    assert!(r.first_error().is_none(), "{:?}", r.first_error());
+    // a call runs on the shard of its key, and answers as the single engine does
+    for (w, amt) in [(3, 10), (3, 5), (17, -20), (30, 1)] {
+        let sql = format!("EXEC bump {}, {}", w, amt);
+        let plan = p.check(&sql, true);
+        assert!(plan.iter().any(|l| l.starts_with("procedure dbo.bump runs on shard") || l.contains("runs on shard")), "{:?}", plan);
+    }
+    p.check("SELECT w, bal FROM acct WHERE w IN (3, 17, 30) ORDER BY w", true);
+    p.check("SELECT w, n, amt FROM ledger ORDER BY w, n", true);
+    // named arguments, and inside a transaction that is rolled back, then one that is committed (two shards at once)
+    p.check("EXEC bump @amt = 7, @w = 9", true);
+    p.both("BEGIN TRANSACTION");
+    p.check("EXEC bump 4, 100", true);
+    p.check("EXEC bump 5, 100", true);
+    p.both("ROLLBACK TRANSACTION");
+    p.check("SELECT w, bal FROM acct WHERE w IN (4, 5) ORDER BY w", true);
+    p.both("BEGIN TRANSACTION");
+    p.check("EXEC bump 4, 100", true);
+    p.check("EXEC bump 5, 100", true);
+    p.both("COMMIT TRANSACTION");
+    p.check("SELECT w, bal FROM acct WHERE w IN (4, 5) ORDER BY w", true);
+    p.check("SELECT COUNT(*), SUM(amt) FROM ledger", true);
+    // declarations that are refused: a write to a replicated table, a statement that is not fixed to the key, a missing parameter
+    p.both("CREATE PROCEDURE bad1 @w INT AS UPDATE rates SET pct = pct + 1 WHERE code = @w");
+    p.both("CREATE PROCEDURE bad2 @w INT AS UPDATE acct SET bal = 0 WHERE bal > @w");
+    p.both("CREATE PROCEDURE bad3 @w INT AS SELECT bal FROM acct WHERE w = @w + 1");
+    p.both("CREATE PROCEDURE bad4 @w INT AS BEGIN SET @w = @w + 1; SELECT bal FROM acct WHERE w = @w; END");
+    // what the control node does around a write (global index entries, identity numbers, foreign keys) a shard would skip
+    p.both("CREATE TABLE ixed (w INT PRIMARY KEY, g INT)");
+    assert!(p.cl.execute("DISTRIBUTE TABLE ixed INDEX BY g").first_error().is_none());
+    p.both("CREATE TABLE ided (w INT IDENTITY(1,1) PRIMARY KEY, g INT)");
+    p.both("CREATE PROCEDURE bad5 @w INT AS INSERT ixed (w, g) VALUES (@w, 1)");
+    p.both("CREATE PROCEDURE bad6 @w INT AS UPDATE ided SET g = 1 WHERE w = @w");
+    for (name, param) in [("bad5", "@w"), ("bad6", "@w")] {
+        let r = p.cl.execute(&format!("DISTRIBUTE PROCEDURE {} BY {}", name, param));
+        assert_eq!(r.first_error().map(|e| e.number), Some(50104), "{} {:?}", name, r.first_error());
+    }
+    for (name, param) in [("bad1", "@w"), ("bad2", "@w"), ("bad3", "@w"), ("bad4", "@w"), ("bump", "@nothing")] {
+        let r = p.cl.execute(&format!("DISTRIBUTE PROCEDURE {} BY {}", name, param));
+        assert_eq!(r.first_error().map(|e| e.number), Some(50104), "{} {:?}", name, r.first_error());
+    }
+}
+
+#[test]
+fn a_routed_procedure_may_use_a_derived_table_and_return_several_result_sets() {
+    let mut p = Pair::new(3);
+    p.both("CREATE TABLE acct (w INT PRIMARY KEY, bal INT)");
+    p.both("CREATE TABLE ledger (w INT, n INT, amt INT)");
+    assert!(p.cl.execute("DISTRIBUTE TABLE ledger BY w").first_error().is_none());
+    p.both(&format!("INSERT INTO acct VALUES {}", (1..=20).map(|w| format!("({}, {})", w, w * 10)).collect::<Vec<_>>().join(",")));
+    p.both(&format!("INSERT INTO ledger VALUES {}", (1..=20).flat_map(|w| (1..=5).map(move |n| format!("({}, {}, {})", w, n, (w * n) % 7))).collect::<Vec<_>>().join(",")));
+    p.both("CREATE PROCEDURE report @w INT AS
+BEGIN
+  DECLARE @best INT;
+  SELECT @best = n FROM (SELECT n, ROW_NUMBER() OVER (ORDER BY amt DESC, n) rk FROM ledger WHERE w = @w) x WHERE rk = 1;
+  SELECT bal FROM acct WHERE w = @w;
+  SELECT n, amt FROM ledger WHERE w = @w AND n = @best;
+  SELECT COUNT(*) AS entries FROM ledger WHERE w = @w;
+END");
+    let r = p.cl.execute("DISTRIBUTE PROCEDURE report BY @w");
+    assert!(r.first_error().is_none(), "{:?}", r.first_error());
+    for w in [2, 7, 13] {
+        let a = p.cl.execute(&format!("EXEC report {}", w));
+        let b = p.oracle.execute(&format!("EXEC report {}", w));
+        assert!(a.first_error().is_none(), "{:?}", a.first_error());
+        let (x, y): (Vec<_>, Vec<_>) = (a.resultsets(), b.resultsets());
+        assert_eq!(x.len(), 3, "three result sets");
+        assert_eq!(x.len(), y.len());
+        for (u, v) in x.iter().zip(&y) {
+            assert_eq!(u.columns, v.columns);
+            assert_eq!(u.rows.iter().map(|r| r.iter().map(|c| c.to_string()).collect::<Vec<_>>()).collect::<Vec<_>>(), v.rows.iter().map(|r| r.iter().map(|c| c.to_string()).collect::<Vec<_>>()).collect::<Vec<_>>());
+        }
+        assert!(p.cl.last_plan().iter().any(|l| l.contains("runs on shard")));
+    }
+    // a derived table that is not fixed to the parameter is refused
+    p.both("CREATE PROCEDURE bad7 @w INT AS SELECT n FROM (SELECT n FROM ledger WHERE amt > 3) x");
+    let r = p.cl.execute("DISTRIBUTE PROCEDURE bad7 BY @w");
+    assert_eq!(r.first_error().map(|e| e.number), Some(50104), "{:?}", r.first_error());
+}
+
+#[test]
+fn an_ordering_with_top_over_the_shards_is_merged_as_the_engine_would() {
+    let mut p = Pair::new(3);
+    p.both("CREATE TABLE m (id INT PRIMARY KEY, a INT NULL, b DATETIME NULL, s VARCHAR(8) NULL)");
+    let rows: Vec<String> = (1..=300).map(|i| format!("({}, {}, {}, {})", i, if i % 11 == 0 { "NULL".to_string() } else { ((i * 7) % 23).to_string() }, if i % 13 == 0 { "NULL".to_string() } else { format!("DATEADD(DAY, {}, '2024-01-01')", (i * 5) % 40) }, if i % 9 == 0 { "NULL".to_string() } else { format!("'s{}'", (i * 3) % 17) })).collect();
+    p.both(&format!("INSERT INTO m VALUES {}", rows.join(", ")));
+    for sql in [
+        "SELECT TOP 5 id, a FROM m ORDER BY a DESC, id",
+        "SELECT TOP 7 id, a FROM m ORDER BY a, id DESC",
+        "SELECT TOP 10 id, b FROM m ORDER BY b DESC, id",
+        "SELECT TOP 10 id FROM m ORDER BY b, a DESC, id",
+        "SELECT id, a FROM m WHERE id < 40 ORDER BY a, id",
+        "SELECT TOP 6 id, s FROM m ORDER BY s, id",
+        "SELECT TOP 6 id FROM m ORDER BY a DESC, id DESC",
+        "SELECT TOP 0 id FROM m ORDER BY id",
+        "SELECT TOP 3 WITH TIES a FROM m ORDER BY a",
+        "SELECT TOP 20 PERCENT id FROM m ORDER BY id",
+        "SELECT DISTINCT TOP 5 a FROM m ORDER BY a",
+    ] {
+        p.check(sql, true);
+    }
 }

@@ -175,6 +175,17 @@ impl ShardClient {
         postcard::from_bytes(&reply).map_err(|e| SqlError::new(50000, format!("bad reply from shard {}: {}", self.id, e)))
     }
 
+    /// Run work and return every result set it produces, in order (the error of the work, if it failed, is returned as the error).
+    pub async fn run_sets(&self, session: u64, work: Work) -> Result<Vec<ResultSet>, SqlError> {
+        let body = postcard::to_allocvec(&Fragment { session, work }).map_err(|e| SqlError::new(50000, e.to_string()))?;
+        let reply = self.action(tsql_shared_ces::wire::ACTION_RUN_SETS, body).await?;
+        let r: tsql_shared_ces::wire::SetsReply = postcard::from_bytes(&reply).map_err(|e| SqlError::new(50000, format!("bad reply from shard {}: {}", self.id, e)))?;
+        if let Some(e) = r.error {
+            return Err(e.to_sql());
+        }
+        Ok(r.sets.into_iter().map(|s| ResultSet { columns: s.columns, types: s.types, rows: s.rows }).collect())
+    }
+
     /// Run work and return its first result set (an error of the statement is returned as the error).
     pub async fn query(&self, session: u64, work: Work) -> Result<ResultSet, SqlError> {
         let ticket = postcard::to_allocvec(&Fragment { session, work }).map_err(|e| SqlError::new(50000, e.to_string()))?;

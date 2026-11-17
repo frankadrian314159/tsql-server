@@ -77,15 +77,7 @@ fn main() {
             tables.push(name.to_string());
         }
     }
-    // the small dimension tables are replicated on every shard; the fact tables are sharded on the first column of their primary key (the item)
-    if !args.iter().any(|a| a == "--all-sharded") {
-        for t in ["date_dim", "time_dim", "item", "customer_demographics", "household_demographics", "customer_address", "customer", "store", "promotion", "warehouse"] {
-            let r = cs.execute(&format!("DISTRIBUTE TABLE {} REPLICATED", t));
-            if let Some(e) = r.first_error() {
-                panic!("{}", e);
-            }
-        }
-    }
+    // every table is sharded on the first column of its primary key (nothing is replicated or placed for the benchmark)
     for stmt in schema_const("INDEXES").split(';').map(str::trim).filter(|s| !s.is_empty()) {
         let r = cs.execute(stmt);
         if let Some(e) = r.first_error() {

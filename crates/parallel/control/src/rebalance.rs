@@ -33,6 +33,7 @@ struct State {
     schema_log: Vec<Stmt>,
     views: Vec<(String, Stmt)>,
     fks: Vec<crate::fk::FkDef>,
+    proc_routes: Vec<(String, crate::procs::ProcRoute)>,
 }
 
 impl Cluster {
@@ -55,18 +56,18 @@ impl Cluster {
     }
 
     fn open_inner(path: PathBuf, config: &ClusterConfig, attach: bool) -> Result<Arc<Cluster>, SqlError> {
-        let (addrs, slots, tables, log, pending, views, fks) = match std::fs::read(&path) {
+        let (addrs, slots, tables, log, pending, views, fks, routes) = match std::fs::read(&path) {
             Ok(bytes) => {
                 let st: State = postcard::from_bytes(&bytes).map_err(|e| SqlError::new(50000, format!("{}: bad cluster state: {}", path.display(), e)))?;
-                (st.shard_addrs, Some(st.slots), st.tables, st.schema_log, st.pending, st.views, st.fks)
+                (st.shard_addrs, Some(st.slots), st.tables, st.schema_log, st.pending, st.views, st.fks, st.proc_routes)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && !attach => {
                 config.validate().map_err(|e| SqlError::new(50000, e))?;
-                (config.shards.iter().map(|s| s.addr.clone()).collect(), None, vec![], vec![], vec![], vec![], vec![])
+                (config.shards.iter().map(|s| s.addr.clone()).collect(), None, vec![], vec![], vec![], vec![], vec![], vec![])
             }
             Err(e) => return Err(SqlError::new(50000, format!("{}: {}", path.display(), e))),
         };
-        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().map_err(|e| SqlError::new(50000, e.to_string()))?;
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(2, 8)).enable_all().build().map_err(|e| SqlError::new(50000, e.to_string()))?;
         // (transactions decided by the control node that owns the state are its to finish)
         let pending = Arc::new(Mutex::new(if attach { vec![] } else { pending }));
         let preparing = Arc::new(Mutex::new(std::collections::HashSet::new()));
@@ -110,6 +111,7 @@ impl Cluster {
             lock_timeout_ms: AtomicU64::new(5000),
             views: Mutex::new(views.into_iter().collect()),
             fks: Mutex::new(fks),
+            proc_routes: Mutex::new(routes.into_iter().collect()),
             pending,
             preparing,
             next_gid: AtomicU64::new(crate::fresh_session_base()),
@@ -147,6 +149,7 @@ impl Cluster {
             schema_log: self.schema_log.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             views: self.views.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             fks: self.fks.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            proc_routes: self.proc_routes.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         };
         if let Ok(bytes) = postcard::to_allocvec(&st) {
             let tmp = path.with_extension("tmp");

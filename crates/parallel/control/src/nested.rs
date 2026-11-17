@@ -263,7 +263,7 @@ impl ClusterSession {
                 Ok(Some(self.direct(0, q).await?))
             }
             Dist::Sharded { .. } => {
-                let shards = prune_shards(sel.where_.as_ref(), &t, &self.cluster);
+                let shards = self.pruned_shards(&t, sel.where_.as_ref()).await?;
                 if shards.len() != 1 {
                     return Ok(None);
                 }
@@ -650,6 +650,7 @@ impl ClusterSession {
         let table = DistTable {
             id: table_id(std::slice::from_ref(&temp)),
             name: vec![temp.clone()],
+            indexes: vec![],
             cols: names.iter().zip(&types).map(|(n, t)| ColInfo { name: n.clone(), computed: false, type_name: t.to_string().to_lowercase().split('(').next().unwrap_or("").to_string() }).collect(),
             dist: Dist::Replicated,
             version: 0,
@@ -717,6 +718,7 @@ impl ClusterSession {
         let table = DistTable {
             id: table_id(std::slice::from_ref(&temp)),
             name: vec![temp.clone()],
+            indexes: vec![],
             cols: names.iter().zip(&types).map(|(n, t)| ColInfo { name: n.clone(), computed: false, type_name: base(t) }).collect(),
             dist: Dist::Sharded { key, class },
             version: 0,

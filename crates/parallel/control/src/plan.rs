@@ -236,6 +236,74 @@ fn plan_row(q: &Query, sel: &Select) -> Option<RowPlan> {
 
 impl RowPlan {
     /// The final query over the temporary table `tmp` of shard results whose columns are `header`.
+    /// The final step done here, without the control node's engine: the rows of the shards ordered, cut to `TOP n` and stripped of the
+    /// hidden sort columns. Only for what is certain to come out as the engine would give it (no DISTINCT, no percent or ties, a literal
+    /// count, and sort keys that are not character strings, which the engine orders by collation); otherwise the rows are handed back.
+    /// How many of the `n` columns the shards send are the query's own (the rest sort the rows).
+    pub fn visible_columns(&self, n: usize) -> usize {
+        n.saturating_sub(self.n_hidden)
+    }
+
+    pub fn merge_rows(&self, header: &[String], mut rows: Vec<Vec<tsql_server::Value>>) -> Result<Vec<Vec<tsql_server::Value>>, Vec<Vec<tsql_server::Value>>> {
+        if self.distinct {
+            return Err(rows);
+        }
+        let limit: Option<usize> = match &self.top {
+            None => None,
+            Some(Top { e: Expr::Lit(v), percent: false, ties: false }) => match v.as_i64() {
+                Some(n) if n >= 0 => Some(n as usize),
+                _ => return Err(rows),
+            },
+            Some(_) => return Err(rows),
+        };
+        let nvisible = header.len().saturating_sub(self.n_hidden);
+        let keys: Vec<(usize, bool)> = self
+            .order
+            .iter()
+            .map(|o| match o {
+                RowOrder::Visible(i, desc) => (*i, *desc),
+                RowOrder::Hidden(j, desc) => (nvisible + *j, *desc),
+            })
+            .collect();
+        if keys.iter().any(|(i, _)| *i >= header.len() || rows.iter().any(|r| matches!(r[*i], tsql_server::Value::Str(_)))) {
+            return Err(rows);
+        }
+        if !keys.is_empty() {
+            let mut failed = false;
+            rows.sort_by(|a, b| {
+                for (i, desc) in &keys {
+                    let o = match (a[*i].is_null(), b[*i].is_null()) {
+                        (true, true) => std::cmp::Ordering::Equal,
+                        (true, false) => std::cmp::Ordering::Less,
+                        (false, true) => std::cmp::Ordering::Greater,
+                        _ => match tsql_server::convert::compare(&a[*i], &b[*i]) {
+                            Ok(Some(o)) => o,
+                            _ => {
+                                failed = true;
+                                std::cmp::Ordering::Equal
+                            }
+                        },
+                    };
+                    let o = if *desc { o.reverse() } else { o };
+                    if o != std::cmp::Ordering::Equal {
+                        return o;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+            if failed {
+                return Err(rows);
+            }
+        }
+        if let Some(n) = limit {
+            rows.truncate(n);
+        }
+        for r in rows.iter_mut() {
+            r.truncate(nvisible);
+        }
+        Ok(rows)
+    }
+
     pub fn final_query(&self, tmp: &str, header: &[String]) -> Query {
         let nvisible = header.len().saturating_sub(self.n_hidden);
         let items = (0..nvisible)
