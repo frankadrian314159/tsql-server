@@ -18,6 +18,7 @@ pub mod ddl;
 pub mod dml;
 pub mod expr;
 pub mod funcs;
+pub mod graph;
 pub mod hooks;
 pub mod joins;
 pub mod optimizer;

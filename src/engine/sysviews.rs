@@ -175,7 +175,20 @@ impl<'a> Engine<'a> {
                             rows.push(vec![sv(&trg.name), Value::Int(trg.object_id), Value::Int(sid(&trg.schema)), Value::Int(pid), sv("TR"), sv("SQL_TRIGGER"), date(db.created), date(db.created), Value::Bit(false), Value::Null]);
                         }
                     }
-                    Some(rs(&[("name", nv()), ("object_id", DataType::Int), ("schema_id", DataType::Int), ("parent_object_id", DataType::Int), ("type", DataType::Char(2)), ("type_desc", nv()), ("create_date", DataType::DateTime), ("modify_date", DataType::DateTime), ("is_ms_shipped", DataType::Bit), ("principal_id", DataType::Int)], rows))
+                    { let mut cols: Vec<(&str, DataType)> = vec![("name", nv()), ("object_id", DataType::Int), ("schema_id", DataType::Int), ("parent_object_id", DataType::Int), ("type", DataType::Char(2)), ("type_desc", nv()), ("create_date", DataType::DateTime), ("modify_date", DataType::DateTime), ("is_ms_shipped", DataType::Bit), ("principal_id", DataType::Int)];
+                    if lname == "tables" {
+                        for r in rows.iter_mut() {
+                            let (node, edge) = match r.get(1) {
+                                Some(Value::Int(oid)) => db.objects.values().find_map(|o| match o { Object::Table(t) if t.object_id == *oid => Some((t.graph == Some(crate::catalog::GraphKind::Node), t.graph == Some(crate::catalog::GraphKind::Edge))), _ => None }).unwrap_or((false, false)),
+                                _ => (false, false),
+                            };
+                            r.push(Value::Bit(node));
+                            r.push(Value::Bit(edge));
+                        }
+                        cols.push(("is_node", DataType::Bit));
+                        cols.push(("is_edge", DataType::Bit));
+                    }
+                    Some(rs(&cols, rows)) }
                 }
                 "columns" | "all_columns" => {
                     let mut rows = vec![];
@@ -183,11 +196,19 @@ impl<'a> Engine<'a> {
                         if let Object::Table(t) = o {
                             for (i, c) in t.columns.iter().enumerate() {
                                 let (st, ml, p, s) = type_info(&c.ty);
-                                rows.push(vec![Value::Int(t.object_id), sv(&c.name), Value::Int(i as i32 + 1), Value::Int(if matches!(c.ty, DataType::HierarchyId | DataType::Geometry | DataType::Geography) { 240 } else { st }), Value::Int(st), Value::Int(ml), Value::Int(p), Value::Int(s), Value::Bit(c.nullable), Value::Bit(c.identity.is_some()), Value::Bit(c.computed.is_some()), if c.ty.is_string() { sv(c.collation.as_deref().unwrap_or(&db.collation_or_default())) } else { Value::Null }, Value::Int(if c.default_name.is_some() { t.object_id * 1000 + 500 + i as i32 } else { 0 })]);
+                                let (gt, gd) = match (t.graph, c.name.as_str()) {
+                                    (Some(_), "$graph_id") => (Value::Int(1), sv("GRAPH_ID")),
+                                    (Some(_), "$node_id") | (Some(_), "$edge_id") => (Value::Int(2), sv("GRAPH_ID_COMPUTED")),
+                                    (Some(_), "$from_id") => (Value::Int(5), sv("GRAPH_FROM_ID_COMPUTED")),
+                                    (Some(_), "$to_id") => (Value::Int(8), sv("GRAPH_TO_ID_COMPUTED")),
+                                    _ => (Value::Null, Value::Null),
+                                };
+                                rows.push(vec![Value::Int(t.object_id), sv(&c.name), Value::Int(i as i32 + 1), Value::Int(if matches!(c.ty, DataType::HierarchyId | DataType::Geometry | DataType::Geography) { 240 } else { st }), Value::Int(st), Value::Int(ml), Value::Int(p), Value::Int(s), Value::Bit(c.nullable), Value::Bit(c.identity.is_some()), Value::Bit(c.computed.is_some()), if c.ty.is_string() { sv(c.collation.as_deref().unwrap_or(&db.collation_or_default())) } else { Value::Null }, Value::Int(if c.default_name.is_some() { t.object_id * 1000 + 500 + i as i32 } else { 0 }), gt, gd]);
                             }
                         }
                     }
-                    Some(rs(&[("object_id", DataType::Int), ("name", nv()), ("column_id", DataType::Int), ("system_type_id", DataType::Int), ("user_type_id", DataType::Int), ("max_length", DataType::SmallInt), ("precision", DataType::TinyInt), ("scale", DataType::TinyInt), ("is_nullable", DataType::Bit), ("is_identity", DataType::Bit), ("is_computed", DataType::Bit), ("collation_name", nv()), ("default_object_id", DataType::Int)], rows))
+                    { let cols: Vec<(&str, DataType)> = vec![("object_id", DataType::Int), ("name", nv()), ("column_id", DataType::Int), ("system_type_id", DataType::Int), ("user_type_id", DataType::Int), ("max_length", DataType::SmallInt), ("precision", DataType::TinyInt), ("scale", DataType::TinyInt), ("is_nullable", DataType::Bit), ("is_identity", DataType::Bit), ("is_computed", DataType::Bit), ("collation_name", nv()), ("default_object_id", DataType::Int), ("graph_type", DataType::TinyInt), ("graph_type_desc", nv())];
+                    Some(rs(&cols, rows)) }
                 }
                 "parameters" | "all_parameters" => {
                     // the parameters of procedures and functions (the return value of a function is not listed)
@@ -591,6 +612,30 @@ impl<'a> Engine<'a> {
                         }
                     }
                     Some(rs(&[("name", nv()), ("object_id", DataType::Int), ("parent_object_id", DataType::Int), ("referenced_object_id", DataType::Int), ("delete_referential_action_desc", nv()), ("update_referential_action_desc", nv())], rows))
+                }
+                "edge_constraints" | "edge_constraint_clauses" => {
+                    let clauses = lname == "edge_constraint_clauses";
+                    let mut rows = vec![];
+                    for o in db.objects.values() {
+                        if let Object::Table(t) = o {
+                            for (k, c) in t.edge_constraints.iter().enumerate() {
+                                let oid = t.object_id * 100 + 50 + k as i32;
+                                let object_of = |key: &(String, String)| db.objects.values().find_map(|o| match o { Object::Table(x) if x.schema.to_lowercase() == key.0 && x.name.to_lowercase() == key.1 => Some(x.object_id), _ => None }).unwrap_or(0);
+                                if clauses {
+                                    for (n, (f, to)) in c.pairs.iter().enumerate() {
+                                        rows.push(vec![Value::Int(oid), Value::Int(n as i32 + 1), Value::Int(object_of(f)), Value::Int(object_of(to))]);
+                                    }
+                                } else {
+                                    rows.push(vec![sv(&c.name), Value::Int(oid), Value::Int(sid(&t.schema)), Value::Int(t.object_id), sv("EC"), sv("EDGE_CONSTRAINT"), date(db.created), date(db.created), Value::Bit(false), Value::Bit(false), Value::Int(if c.cascade { 1 } else { 0 }), sv(if c.cascade { "CASCADE" } else { "NO_ACTION" })]);
+                                }
+                            }
+                        }
+                    }
+                    Some(if clauses {
+                        rs(&[("object_id", DataType::Int), ("clause_number", DataType::Int), ("from_object_id", DataType::Int), ("to_object_id", DataType::Int)], rows)
+                    } else {
+                        rs(&[("name", nv()), ("object_id", DataType::Int), ("schema_id", DataType::Int), ("parent_object_id", DataType::Int), ("type", DataType::Char(2)), ("type_desc", nv()), ("create_date", DataType::DateTime), ("modify_date", DataType::DateTime), ("is_ms_shipped", DataType::Bit), ("is_disabled", DataType::Bit), ("delete_referential_action", DataType::TinyInt), ("delete_referential_action_desc", nv())], rows)
+                    })
                 }
                 "column_store_row_groups" | "dm_db_column_store_row_group_physical_stats" => {
                     // the row groups of each columnstore index: the compressed ones, and the delta store (the rows not in them yet)

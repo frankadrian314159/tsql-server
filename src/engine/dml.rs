@@ -340,8 +340,11 @@ impl<'a> Engine<'a> {
             if let Some((_, inc)) = col.identity {
                 // take the value and advance the counter in one step, so sessions never get the same one
                 let ty = col.ty.clone();
-                let cur = t.identity_next.update(|cur| {
-                    let cur = cur.unwrap_or(1);
+                // (the `$graph_id` of a graph table has a counter of its own: a column of the table that is an IDENTITY is not disturbed)
+                let graph_id = t.graph.is_some() && col.name == "$graph_id";
+                let counter = if graph_id { t.graph_next.clone() } else { t.identity_next.clone() };
+                let cur = counter.update(|cur| {
+                    let cur = cur.unwrap_or(if graph_id { 0 } else { 1 });
                     let max_ok = match ty {
                         DataType::TinyInt => cur <= 255,
                         DataType::SmallInt => cur <= 32767 && cur >= -32768,
@@ -354,7 +357,9 @@ impl<'a> Engine<'a> {
                     Ok((Some(cur + inc), cur))
                 })?;
                 row[ci] = convert::cast(&Value::BigInt(cur), &col.ty, None)?;
-                self.ses.last_identity = Some(cur);
+                if !graph_id {
+                    self.ses.last_identity = Some(cur);
+                }
                 continue;
             }
             if matches!(col.ty, DataType::Timestamp) {
@@ -395,6 +400,7 @@ impl<'a> Engine<'a> {
                 return Err(SqlError::new(515, format!("Cannot insert the value NULL into column '{}', table '{}'; column does not allow nulls. {} fails.", c.name, t.display_name(), verb)));
             }
         }
+        self.check_edge_row(t, row, verb)?;
         Ok(())
     }
 
@@ -606,6 +612,10 @@ impl<'a> Engine<'a> {
                     return Err(self.blocked(vec![]));
                 }
             }
+        }
+        // the edges at a node that is deleted (see graph.rs)
+        if !ch.deletes.is_empty() && t.graph.is_some() {
+            self.graph_parent_delete(loc, t, &ch)?;
         }
         // parent-side foreign keys (may add cascaded changes to this table)
         if !ch.deletes.is_empty() {
@@ -967,7 +977,7 @@ impl<'a> Engine<'a> {
         Ok(out)
     }
 
-    fn apply_child(&mut self, cloc: &Loc, ch: Changes, verb: &str) -> Result<()> {
+    pub(super) fn apply_child(&mut self, cloc: &Loc, ch: Changes, verb: &str) -> Result<()> {
         let mut c = match self.checkout_table(cloc) {
             Some(c) => c,
             None => return Ok(()), // cycle: already being modified further up

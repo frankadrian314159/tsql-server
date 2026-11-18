@@ -1111,6 +1111,8 @@ impl ClusterSession {
                 TableDef::Unique { cols: c, .. } => uniques.push(c.iter().map(|(n, _)| n.clone()).collect()),
                 TableDef::Index { cols: c, unique: true, .. } => uniques.push(c.iter().map(|(n, _)| n.clone()).collect()),
                 TableDef::Period { .. } => return Err(unsupported("system-versioned tables")),
+                // (the shards would each number a node table's rows from 0: two nodes of a table could have the one id)
+                TableDef::Graph { .. } | TableDef::EdgeConstraint { .. } => return Err(unsupported("graph (node and edge) tables")),
                 _ => {}
             }
         }

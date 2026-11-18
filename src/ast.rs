@@ -366,6 +366,10 @@ pub enum TableDef {
     ForeignKey(ForeignKeyDef),
     DefaultFor { name: String, e: Expr, col: String, text: String },
     Index { name: String, cols: Vec<(String, bool)>, unique: bool },
+    /// `AS NODE` or `AS EDGE` after the columns of a `CREATE TABLE`: a graph table
+    Graph { edge: bool },
+    /// `CONSTRAINT name CONNECTION (a TO b, ...) [ON DELETE CASCADE | NO ACTION]`: the node tables an edge table may connect
+    EdgeConstraint { name: Option<String>, pairs: Vec<(Name, Name)>, cascade: bool },
     /// `INDEX name [NONCLUSTERED | CLUSTERED] COLUMNSTORE [(columns)]` in a table definition
     Columnstore { name: String, clustered: bool, cols: Vec<String> },
     /// `PERIOD FOR SYSTEM_TIME (start, end)`

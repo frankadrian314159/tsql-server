@@ -16,8 +16,19 @@ impl<'a> Engine<'a> {
     pub fn build_table(&mut self, db: &str, schema: &str, name: &str, defs: &[TableDef], is_temp: bool) -> Result<Table> {
         let oid = self.srv.new_object_id();
         let mut cols: Vec<Column> = vec![];
+        // AS NODE / AS EDGE: the columns of a graph table come before its own (see graph.rs)
+        let graph = defs.iter().find_map(|d| if let TableDef::Graph { edge } = d { Some(if *edge { GraphKind::Edge } else { GraphKind::Node }) } else { None });
+        if let Some(kind) = graph {
+            if is_temp {
+                return Err(SqlError::new(13918, "A graph table cannot be a temporary table."));
+            }
+            cols.extend(super::graph::graph_columns(kind, schema, name));
+        }
         for d in defs {
             if let TableDef::Column(c) = d {
+                if graph.is_some() && c.name.starts_with('$') {
+                    return Err(SqlError::new(13920, format!("A column of a graph table cannot be named '{}': names that begin with $ are the graph's.", c.name)));
+                }
                 if cols.iter().any(|x| x.name.eq_ignore_ascii_case(&c.name)) {
                     return Err(SqlError::new(2705, format!("Column names in each table must be unique. Column name '{}' in table '{}' is specified more than once.", c.name, name)));
                 }
@@ -88,6 +99,7 @@ impl<'a> Engine<'a> {
         let mut t = Table::new(db, schema, name, cols, &store);
         t.object_id = oid;
         t.is_temp = is_temp;
+        t.graph = graph;
         self.define_period(&mut t, defs)?;
         let idx_of = |t: &Table, n: &str| -> Result<usize> { t.col_index(n).ok_or_else(|| SqlError::new(1911, format!("Column name '{}' does not exist in the target table or view.", n))) };
         // constraints
@@ -131,7 +143,8 @@ impl<'a> Engine<'a> {
                     t.indexes.push(IndexDef { name: n.clone(), cols: idx, unique: *unique, include: vec![], filter: None });
                 }
                 TableDef::Columnstore { name: n, clustered, cols } => Self::make_columnstore(&mut t, n, *clustered, cols)?,
-                TableDef::ForeignKey(_) | TableDef::Period { .. } => {}
+                TableDef::EdgeConstraint { name: n, pairs, cascade } => self.add_edge_constraint(&mut t, n, pairs, *cascade)?,
+                TableDef::Graph { .. } | TableDef::ForeignKey(_) | TableDef::Period { .. } => {}
             }
         }
         // foreign keys last (self references need the PK)
@@ -752,6 +765,37 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    /// `CONSTRAINT name CONNECTION (a TO b, ...) [ON DELETE CASCADE]` of an edge table (see graph.rs).
+    pub(super) fn add_edge_constraint(&mut self, t: &mut Table, name: &Option<String>, pairs: &[(Vec<String>, Vec<String>)], cascade: bool) -> Result<()> {
+        if t.graph != Some(GraphKind::Edge) {
+            return Err(SqlError::new(13923, format!("An edge constraint can be added only to an edge table; '{}' is not one.", t.name)));
+        }
+        let cn = name.clone().unwrap_or_else(|| format!("EC__{}__{:08X}", t.name, self.srv.new_object_id()));
+        if t.edge_constraints.iter().any(|c| c.name.eq_ignore_ascii_case(&cn)) {
+            return Err(SqlError::new(2714, format!("There is already an object named '{}' in the database.", cn)));
+        }
+        let mut out = vec![];
+        for (f, to) in pairs {
+            let key = |n: &Vec<String>, me: &Table| -> Result<(String, String)> {
+                let (_, schema, nm) = self.ddl_names(n);
+                if schema.eq_ignore_ascii_case(&me.schema) && nm.eq_ignore_ascii_case(&me.name) {
+                    return Err(SqlError::new(13924, "An edge table cannot connect itself."));
+                }
+                Ok((schema.to_lowercase(), nm.to_lowercase()))
+            };
+            let (fk, tk) = (key(f, t)?, key(to, t)?);
+            for (k, n) in [(&fk, f), (&tk, to)] {
+                let found = self.srv.databases.get(&self.ses.db.to_lowercase()).is_some_and(|d| d.objects.values().any(|o| matches!(o, Object::Table(x) if x.graph == Some(GraphKind::Node) && x.schema.to_lowercase() == k.0 && x.name.to_lowercase() == k.1)));
+                if !found {
+                    return Err(SqlError::new(13925, format!("'{}' is not a node table, so an edge constraint cannot connect it.", n.join("."))));
+                }
+            }
+            out.push((fk, tk));
+        }
+        t.edge_constraints.push(crate::catalog::EdgeConstraintDef { name: cn, pairs: out, cascade });
+        Ok(())
+    }
+
     /// `CREATE [NONCLUSTERED | CLUSTERED] COLUMNSTORE INDEX` (also inside a table definition): checked, then recorded (see
     /// `ColumnstoreDef`). A table has one; the numbers of the errors are SQL Server's where it has one for the case.
     pub(super) fn make_columnstore(t: &mut Table, name: &str, clustered: bool, cols: &[String]) -> Result<()> {
@@ -968,6 +1012,19 @@ impl<'a> Engine<'a> {
                         if let Object::Table(c) = o {
                             if c.key() != tk && c.fks.iter().any(|f| f.ref_key == tk && f.ref_db.eq_ignore_ascii_case(&t.db)) {
                                 return Err(SqlError::new(3726, format!("Could not drop object '{}' because it is referenced by a FOREIGN KEY constraint.", n)));
+                            }
+                        }
+                    }
+                }
+                // a node table that an edge constraint names
+                if t.graph == Some(GraphKind::Node) {
+                    let me = (t.schema.to_lowercase(), t.name.to_lowercase());
+                    if let Some(d) = self.srv.databases.get(&t.db.to_lowercase()) {
+                        for o in d.objects.values() {
+                            if let Object::Table(c) = o {
+                                if c.edge_constraints.iter().any(|ec| ec.pairs.iter().any(|(f, to)| *f == me || *to == me)) {
+                                    return Err(SqlError::new(3726, format!("Could not drop object '{}' because it is referenced by an EDGE constraint.", n)));
+                                }
                             }
                         }
                     }
@@ -1190,6 +1247,8 @@ impl<'a> Engine<'a> {
                             t.indexes.push(IndexDef { name: name.clone(), cols: idx, unique: *unique, include: vec![], filter: None });
                         }
                         TableDef::Columnstore { name, clustered, cols } => Self::make_columnstore(t, name, *clustered, cols)?,
+                        TableDef::EdgeConstraint { name, pairs, cascade } => self.add_edge_constraint(t, name, pairs, *cascade)?,
+                        TableDef::Graph { .. } => return Err(SqlError::new(13921, "A table cannot be made a node or edge table after it is created.")),
                         TableDef::Column(_) => {}
                         TableDef::Period { .. } => {}
                     }
@@ -1227,6 +1286,9 @@ impl<'a> Engine<'a> {
                     if before != (t.uniques.len(), t.checks.len(), t.fks.len()) {
                         found = true;
                     }
+                    let ecs = t.edge_constraints.len();
+                    t.edge_constraints.retain(|k| !k.name.eq_ignore_ascii_case(n));
+                    found |= ecs != t.edge_constraints.len();
                     for c in t.columns.iter_mut() {
                         if c.default_name.as_deref().map(|d| d.eq_ignore_ascii_case(n)).unwrap_or(false) {
                             c.default = None;
@@ -1252,6 +1314,9 @@ impl<'a> Engine<'a> {
                         }
                     };
                     let in_key = t.all_keys().iter().any(|k| k.cols.contains(&ci)) || t.fks.iter().any(|f| f.cols.contains(&ci)) || t.checks.iter().any(|c| c.col.as_deref() == Some(n.as_str())) || t.indexes.iter().any(|i| i.cols.iter().any(|(c, _)| *c == ci));
+                    if t.graph.is_some() && n.starts_with('$') {
+                        return Err(SqlError::new(13922, format!("The column '{}' is part of the graph table and cannot be dropped.", n)));
+                    }
                     let in_key = in_key || t.xml_indexes.iter().any(|x| x.col == ci) || t.spatial_indexes.iter().any(|x| x.col == ci) || t.fulltext.as_ref().is_some_and(|f| f.cols.iter().any(|c| c.0 == ci)) || t.columnstore.as_ref().is_some_and(|c| c.cols.contains(&ci));
                     if in_key {
                         return Err(SqlError::new(5074, format!("The object depends on column '{}'. ALTER TABLE DROP COLUMN failed because one or more objects access this column.", n)));

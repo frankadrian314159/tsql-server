@@ -694,6 +694,12 @@ impl<'a> Engine<'a> {
 
     // ------------------------------------------------------------- SELECT
     fn exec_select(&mut self, sel: &Select, order: &[OrderItem], offset: &Option<Expr>, fetch: &Option<Expr>, outer: Option<&Env<'_>>) -> Result<Rowset> {
+        // MATCH(SHORTEST_PATH(...)): worked out as the steps of the paths, which the select then reads (see graph.rs)
+        if crate::parser::GRAPH_USED.load(std::sync::atomic::Ordering::Relaxed) && sel.where_.is_some() {
+            if let Some((nsel, norder)) = self.graph_rewrite(sel, order)? {
+                return self.exec_select(&nsel, &norder, offset, fetch, outer);
+            }
+        }
         // (once a table has a columnstore index, what each SELECT names is kept for the scans that read it)
         if !crate::storage::colstore::USED.load(std::sync::atomic::Ordering::Relaxed) {
             return self.exec_select_inner(sel, order, offset, fetch, outer);

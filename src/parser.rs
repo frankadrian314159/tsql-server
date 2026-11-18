@@ -28,6 +28,10 @@ VALUES VARYING VIEW WAITFOR WHEN WHERE WHILE WITH WITHIN WRITETEXT THROW OUTPUT 
     })
 }
 
+/// Set when a statement that uses graph syntax that needs the engine's attention (a shortest path) has been parsed: until then the engine
+/// does not look for it.
+pub static GRAPH_USED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 const STMT_START: &[&str] = &[
     "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "ALTER", "DROP", "TRUNCATE", "DECLARE", "SET", "IF", "WHILE", "BEGIN", "RETURN", "BREAK", "CONTINUE", "PRINT",
     "EXEC", "EXECUTE", "USE", "COMMIT", "ROLLBACK", "SAVE", "THROW", "RAISERROR", "OPEN", "CLOSE", "FETCH", "DEALLOCATE", "WAITFOR", "GOTO", "GRANT", "REVOKE", "DENY",
@@ -744,6 +748,7 @@ impl Parser {
                         return Ok(Expr::Lit(Value::Null));
                     }
                     "CASE" => return self.case_expr(),
+                    "MATCH" if self.peek_is_op(1, "(") => return self.match_expr(),
                     "CAST" | "TRY_CAST" if self.peek_is_op(1, "(") => {
                         self.i += 2;
                         let e = self.expr()?;
@@ -1155,9 +1160,16 @@ impl Parser {
         if self.is_kw("WITHIN") && self.peek_kw(1, &["GROUP"]) {
             self.i += 2;
             self.expect_op("(")?;
-            self.expect_kw("ORDER")?;
-            self.expect_kw("BY")?;
-            within = Some(self.order_items()?);
+            if self.is_kw("GRAPH") && self.peek_kw(1, &["PATH"]) {
+                // an aggregate over the steps of a shortest path (see graph.rs)
+                self.i += 2;
+                GRAPH_USED.store(true, std::sync::atomic::Ordering::Relaxed);
+                within = Some(vec![OrderItem { e: Expr::SysVar("GRAPH PATH".to_string()), desc: false }]);
+            } else {
+                self.expect_kw("ORDER")?;
+                self.expect_kw("BY")?;
+                within = Some(self.order_items()?);
+            }
             self.expect_op(")")?;
         }
         self.skip_nulls_opt();
@@ -1167,6 +1179,117 @@ impl Parser {
             over = Some(self.over_clause()?);
         }
         Ok(Expr::Func(Box::new(FuncCall { name, schema, parts, args, distinct, star, over, within })))
+    }
+
+    /// `MATCH(pattern [AND pattern]...)`: a graph pattern, as the equalities of the edges' `$from_id` and `$to_id` with the nodes'
+    /// `$node_id`; `a-(e)->b` is `e.$from_id = a.$node_id AND e.$to_id = b.$node_id`, `a<-(e)-b` the other way, and a chain of them is the
+    /// conditions of each of its steps. `SHORTEST_PATH(...)` becomes a call that the engine takes out of the `WHERE` (see graph.rs).
+    fn match_expr(&mut self) -> R<Expr> {
+        self.i += 2;
+        let mut parts: Vec<Expr> = vec![];
+        loop {
+            if self.is_kw("SHORTEST_PATH") && self.peek_is_op(1, "(") {
+                parts.push(self.shortest_path()?);
+            } else {
+                self.match_chain(&mut parts)?;
+            }
+            if !self.accept_kw("AND") {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        let mut it = parts.into_iter();
+        let first = it.next().ok_or_else(|| self.err())?;
+        Ok(it.fold(first, |a, b| Expr::And(Box::new(a), Box::new(b))))
+    }
+
+    /// One step of a pattern from `left`: `-(edge)->node` or `<-(edge)-node` (false: neither follows). Gives the edge, the node, and
+    /// whether the edge points away from `left`.
+    fn match_step(&mut self) -> R<Option<(String, String, bool)>> {
+        if self.is_op("-") && self.peek_is_op(1, "(") {
+            self.i += 2;
+            let e = self.ident()?;
+            self.expect_op(")")?;
+            self.expect_op("-")?;
+            self.expect_op(">")?;
+            let n = self.ident()?;
+            return Ok(Some((e, n, true)));
+        }
+        if self.is_op("<") && self.peek_is_op(1, "-") && self.peek_is_op(2, "(") {
+            self.i += 3;
+            let e = self.ident()?;
+            self.expect_op(")")?;
+            self.expect_op("-")?;
+            let n = self.ident()?;
+            return Ok(Some((e, n, false)));
+        }
+        Ok(None)
+    }
+
+    fn match_chain(&mut self, out: &mut Vec<Expr>) -> R<()> {
+        let paren = self.accept_op("(");
+        let mut left = self.ident()?;
+        let mut steps = 0;
+        while let Some((e, right, forward)) = self.match_step()? {
+            let (from, to) = if forward { (left.clone(), right.clone()) } else { (right.clone(), left.clone()) };
+            let col = |a: &str, c: &str| Expr::Col(vec![a.to_string(), c.to_string()]);
+            let eq = |a: Expr, b: Expr| Expr::Binary(BinOp::Eq, Box::new(a), Box::new(b));
+            out.push(Expr::And(Box::new(eq(col(&e, "$from_id"), col(&from, "$node_id"))), Box::new(eq(col(&e, "$to_id"), col(&to, "$node_id")))));
+            left = right;
+            steps += 1;
+        }
+        if steps == 0 {
+            return Err(self.err());
+        }
+        if paren {
+            self.expect_op(")")?;
+        }
+        Ok(())
+    }
+
+    /// `SHORTEST_PATH(start(-(edge)->node)+)`, `(...){1,3}`, and with `<-(edge)-`: the call `__SHORTEST_PATH(start, edge, node, 'out' | 'in',
+    /// min, max)`.
+    fn shortest_path(&mut self) -> R<Expr> {
+        self.i += 2;
+        let start = self.ident()?;
+        self.expect_op("(")?;
+        let Some((edge, node, forward)) = self.match_step()? else { return Err(self.err()) };
+        if self.is_op("-") || self.is_op("<") {
+            return Err(SqlError::new(13904, "A SHORTEST_PATH pattern of more than one step is not supported."));
+        }
+        self.expect_op(")")?;
+        let (min, max) = if self.accept_op("+") {
+            (1, i32::MAX)
+        } else if self.accept_op("{") {
+            let lo = match self.tok().tok {
+                Tok::Int(v) => v as i32,
+                _ => return Err(self.err()),
+            };
+            self.i += 1;
+            self.expect_op(",")?;
+            let hi = match self.tok().tok {
+                Tok::Int(v) => v as i32,
+                _ => return Err(self.err()),
+            };
+            self.i += 1;
+            self.expect_op("}")?;
+            (lo, hi)
+        } else {
+            return Err(self.err());
+        };
+        self.expect_op(")")?;
+        GRAPH_USED.store(true, std::sync::atomic::Ordering::Relaxed);
+        let s = |x: String| Expr::Lit(Value::Str(x));
+        Ok(Expr::Func(Box::new(FuncCall {
+            name: "__SHORTEST_PATH".to_string(),
+            schema: None,
+            parts: vec![],
+            args: vec![s(start), s(edge), s(node), s(if forward { "out" } else { "in" }.to_string()), Expr::Lit(Value::Int(min)), Expr::Lit(Value::Int(max))],
+            distinct: false,
+            star: false,
+            over: None,
+            within: None,
+        })))
     }
 
     fn skip_nulls_opt(&mut self) {
@@ -1796,6 +1919,11 @@ impl Parser {
                 let (alias, cols) = self.opt_alias()?;
                 node = TableRef::Func { name, args, alias, cols, with };
             } else {
+                // `Person FOR PATH AS p`: the table is a step of a shortest path (see graph.rs)
+                if self.is_kw("FOR") && self.peek_kw(1, &["PATH"]) {
+                    self.i += 2;
+                    GRAPH_USED.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 let mut clause = None;
                 if self.is_kw("FOR") && self.peek_kw(1, &["SYSTEM_TIME"]) {
                     clause = Some(self.temporal_clause()?);
@@ -3637,7 +3765,14 @@ impl Parser {
         match what.as_str() {
             "TABLE" => {
                 let name = self.name_parts()?;
-                let defs = self.table_body()?;
+                // (an edge table may have no columns of its own: `CREATE TABLE LivesIn AS EDGE`)
+                let mut defs = if self.is_kw("AS") && self.peek_kw(1, &["NODE", "EDGE"]) { vec![] } else { self.table_body()? };
+                if self.is_kw("AS") && self.peek_kw(1, &["NODE", "EDGE"]) {
+                    self.i += 1;
+                    let edge = self.advance_up() == "EDGE";
+                    defs.push(TableDef::Graph { edge });
+                    GRAPH_USED.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 let mut versioning = None;
                 while self.is_kw_any(&["ON", "WITH", "TEXTIMAGE_ON"]) {
                     let with = self.advance_up() == "WITH";
@@ -4054,6 +4189,32 @@ impl Parser {
         let mut cname = None;
         if self.accept_kw("CONSTRAINT") {
             cname = Some(self.ident()?);
+        }
+        if self.is_kw("CONNECTION") && self.peek_is_op(1, "(") {
+            self.i += 2;
+            let mut pairs = vec![];
+            loop {
+                let from = self.name_parts()?;
+                self.expect_kw("TO")?;
+                let to = self.name_parts()?;
+                pairs.push((from, to));
+                if !self.accept_op(",") {
+                    break;
+                }
+            }
+            self.expect_op(")")?;
+            let mut cascade = false;
+            if self.is_kw("ON") && self.peek_kw(1, &["DELETE"]) {
+                self.i += 2;
+                if self.accept_kw("CASCADE") {
+                    cascade = true;
+                } else {
+                    self.expect_kw("NO")?;
+                    self.expect_kw("ACTION")?;
+                }
+            }
+            GRAPH_USED.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Ok(TableDef::EdgeConstraint { name: cname, pairs, cascade });
         }
         if self.is_kw("PERIOD") && self.peek_kw(1, &["FOR"]) {
             self.i += 2;

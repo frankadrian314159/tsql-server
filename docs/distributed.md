@@ -411,7 +411,7 @@ generated rows.
 * **Refused** (error 50100 says so): `UNIQUE` constraints or unique indexes that do not contain the shard key, stored
   functions and triggers (they would need an interpreter next to the data; a procedure is made on every shard and can be
   declared to run on one, see *Procedures that run on one shard*), `CREATE DATABASE`/`USE`, temporal
-  tables, DML with joins (`UPDATE ... FROM`), `OUTPUT` or `TOP` in DML, `INSERT ... DEFAULT VALUES`/`EXEC`, correlated
+  tables, graph (node and edge) tables, DML with joins (`UPDATE ... FROM`), `OUTPUT` or `TOP` in DML, `INSERT ... DEFAULT VALUES`/`EXEC`, correlated
   subqueries in DML, and schema changes inside a transaction. Views cannot be written through.
 * **Foreign keys and identity values are the control node's**: the checks are not atomic across sessions (see Foreign keys),
   and a control node that loses its state file loses the identity counters and the foreign keys with it.

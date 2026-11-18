@@ -1739,6 +1739,14 @@ impl<'a> Engine<'a> {
                     }
                 }
             }
+            "NODE_ID_FROM_PARTS" | "EDGE_ID_FROM_PARTS" => {
+                need(name, &a, 2)?;
+                self.graph_function(name, &a)?
+            }
+            "OBJECT_ID_FROM_NODE_ID" | "GRAPH_ID_FROM_NODE_ID" | "OBJECT_ID_FROM_EDGE_ID" | "GRAPH_ID_FROM_EDGE_ID" => {
+                need(name, &a, 1)?;
+                self.graph_function(name, &a)?
+            }
             "OBJECT_ID" => {
                 need_range(name, &a, 1, 2)?;
                 if a[0].is_null() { Value::Null } else {

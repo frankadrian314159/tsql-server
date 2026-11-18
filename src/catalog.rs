@@ -97,6 +97,23 @@ pub struct IndexDef {
     pub filter: Option<crate::storage::FilterPred>,
 }
 
+/// What a graph table is: `AS NODE` or `AS EDGE` (see docs/graph.md).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GraphKind {
+    Node,
+    Edge,
+}
+
+/// `CONSTRAINT name CONNECTION (a TO b, ...)` of an edge table: the pairs of node tables, as (schema, table) in lower case, that its edges
+/// may join.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EdgeConstraintDef {
+    pub name: String,
+    pub pairs: Vec<((String, String), (String, String))>,
+    /// `ON DELETE CASCADE`: deleting a node deletes the edges at it
+    pub cascade: bool,
+}
+
 /// A columnstore index: the table's columns (all of them for a clustered one) kept as compressed column segments in row groups, a copy
 /// of the heap's rows that scans and aggregates read when they can (see `storage/colstore.rs` and docs/columnstore.md). The heap stays
 /// the table's storage and its source of truth; the copy is built from it, brought up to date as rows are written, and rebuilt when it
@@ -278,6 +295,14 @@ pub struct Table {
     pub spatial_indexes: Vec<SpatialIndexDef>,
     #[serde(default)]
     pub columnstore: Option<ColumnstoreDef>,
+    /// `AS NODE` / `AS EDGE`
+    #[serde(default)]
+    pub graph: Option<GraphKind>,
+    #[serde(default)]
+    pub edge_constraints: Vec<EdgeConstraintDef>,
+    /// the next `$graph_id` of a graph table (a counter of its own, so that a table's `IDENTITY` column is not disturbed by it)
+    #[serde(default)]
+    pub graph_next: SharedCounter,
 }
 
 /// A counter that clones share: the next identity value of a table, the current value of a sequence. A statement
@@ -327,7 +352,8 @@ impl Table {
     }
 
     fn with_data(db: &str, schema: &str, name: &str, columns: Vec<Column>, data: TableData) -> Table {
-        let identity_next = columns.iter().find_map(|c| c.identity.map(|(s, _)| s));
+        // (the hidden `$graph_id` of a graph table has a counter of its own)
+        let identity_next = columns.iter().filter(|c| c.name != "$graph_id").find_map(|c| c.identity.map(|(s, _)| s));
         Table {
             db: db.to_string(),
             schema: schema.to_string(),
@@ -348,6 +374,9 @@ impl Table {
             fulltext: None,
             spatial_indexes: vec![],
             columnstore: None,
+            graph: None,
+            edge_constraints: vec![],
+            graph_next: SharedCounter::default(),
         }
     }
     pub fn col_index(&self, name: &str) -> Option<usize> {
