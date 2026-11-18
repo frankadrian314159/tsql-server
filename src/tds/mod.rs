@@ -24,6 +24,11 @@ mod tls;
 pub mod wire;
 
 pub use auth::{AadConfig, AuthConfig, JwksSource, KerberosConfig};
+
+/// A value as a T-SQL literal that converts back to the same value (what a statement that carries rows, built by a program, needs).
+pub fn literal(v: &crate::types::Value) -> String {
+    rpc::literal(v)
+}
 pub use tls::{Encryption, TlsConfig};
 
 use crate::{Connection, Event, Server, SqlError, Streamed};

@@ -398,6 +398,23 @@ to this server's format in a temporary file, as a single-node restore does).
 * **`BACKUP DATABASE` of the cluster's database is refused** (error 50100): the control node's engine holds none of its rows, so the
   backup would be empty.
 
+## Temporary tables of a client
+
+A `CREATE TABLE #t` that a client sends to the control node (and `SELECT ... INTO #t`) makes the table in the **control node's own engine**, as
+in a single server: it can have any column types and indexes (a unique index over columns that are not a shard key, `IGNORE_DUP_KEY`, `sysname`
+columns), and a batch that reads it with the catalog views (SSMS scripts a table and discovers dependencies that way) runs in that engine.
+
+A statement that needs the temporary table together with a table of the cluster is another matter: the shards cannot read the control
+node's tables. When such a batch arrives, the control node **hands the temporary table over** first: it reads its `CREATE TABLE` and its rows from
+the client's session, drops it there, makes it in the cluster as a *replicated* table (up to the broadcast limit, on every shard) and loads the
+rows. From then on it is the cluster's, as a table made with `CREATE TABLE` while a cluster table was in the batch always was (see
+`temps_wanted` and `adopt_temp` of the `Interceptor`, `crates/parallel/control/src/front.rs`). The temporary tables the cluster has made for a
+session are dropped when the session ends.
+
+Not done: a table that the engine made inside a procedure or `EXEC(...)` (the control node does not see the statement), and a temporary table
+with a feature the cluster does not take (it is refused when it is handed over, with the cluster's message). `CREATE UNIQUE INDEX ... WITH
+IGNORE_DUP_KEY` is accepted by the engine and does not skip duplicate rows: it raises the duplicate key error, as `CREATE UNIQUE INDEX` does.
+
 ## Foreign keys
 
 The shards cannot see each other's rows, so they are not given foreign keys; the control node keeps the definitions (in its

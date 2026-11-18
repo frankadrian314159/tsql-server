@@ -15,12 +15,29 @@ use crate::*;
 use std::collections::HashMap;
 use tsql_server::{Interceptor, Streamed};
 
-/// The words of a batch that can name a table: not those of comments, and not variables (`@ErrorLog` is not the table `ErrorLog`).
-fn identifiers(sql: &str) -> Vec<String> {
+/// The words of a batch that can name a table: not those of comments, and not variables (`@ErrorLog` is not the table `ErrorLog`). The
+/// contents of string literals are left out when `literals` is false: in a batch that runs no dynamic SQL a table's name in a string
+/// (`WHERE name = 'orders'`) is a value.
+fn identifiers(sql: &str, literals: bool) -> Vec<String> {
     let c: Vec<char> = sql.chars().collect();
     let mut out = vec![];
     let mut i = 0;
     while i < c.len() {
+        if !literals && c[i] == '\'' {
+            i += 1;
+            while i < c.len() {
+                if c[i] == '\'' {
+                    if c.get(i + 1) == Some(&'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
         if c[i] == '-' && c.get(i + 1) == Some(&'-') {
             while i < c.len() && c[i] != '\n' {
                 i += 1;
@@ -53,10 +70,22 @@ fn identifiers(sql: &str) -> Vec<String> {
 impl ClusterSession {
     /// Whether a batch needs the cluster (else the engine runs it itself).
     pub fn wants(&self, sql: &str) -> bool {
-        let understood = match tsql_server::parser::parse(sql) {
-            Ok(stmts) => stmts.iter().any(|s| self.stmt_wants(s)),
-            Err(_) => false,
-        };
+        let parsed = tsql_server::parser::parse(sql).ok();
+        let understood = parsed.as_ref().is_some_and(|stmts| stmts.iter().any(|s| self.stmt_wants(s)));
+        // a parameterized call (what drivers send, and SSMS): `DECLARE @rc; EXEC @rc = sp_executesql N'text', N'declaration', @p = N'value'; SELECT @rc`.
+        // Only its text can name a table: a parameter value that is the name of one (SSMS passes the name of the table it is asking about) is
+        // not a mention of it
+        if let Some(stmts) = &parsed {
+            let wrapper = stmts.iter().all(|s| match s {
+                Stmt::Declare(_) => true,
+                Stmt::Exec(ex) => self.executesql_text(ex).is_some(),
+                Stmt::Query(q) => referenced_tables(q).is_empty(),
+                _ => false,
+            });
+            if wrapper && stmts.iter().any(|s| matches!(s, Stmt::Exec(_))) {
+                return understood || stmts.iter().any(|s| matches!(s, Stmt::Exec(ex) if self.executesql_text(ex).is_some_and(|t| self.mentions_distributed_table(&t))));
+            }
+        }
         // The control node's own engine holds the schema of the distributed tables but none of their rows, so a batch that
         // mentions one must not be run there by mistake: if it is not understood, the cluster session says it is not
         // supported (an error) instead of the engine answering from an empty table.
@@ -69,7 +98,9 @@ impl ClusterSession {
         if tables.is_empty() && views.is_empty() {
             return false;
         }
-        identifiers(sql).iter().any(|w| tables.iter().any(|t| t.name.last().map(|n| n.eq_ignore_ascii_case(w)).unwrap_or(false)) || views.iter().any(|v| v.eq_ignore_ascii_case(w)))
+        // (a batch that has EXEC may run a string as SQL: then the strings count)
+        let runs_strings = words(sql).iter().any(|w| w == "exec" || w == "execute");
+        identifiers(sql, runs_strings).iter().any(|w| tables.iter().any(|t| t.name.last().map(|n| n.eq_ignore_ascii_case(w)).unwrap_or(false)) || views.iter().any(|v| v.eq_ignore_ascii_case(w)))
     }
 
     fn is_view(&self, id: &str) -> bool {
@@ -79,11 +110,17 @@ impl ClusterSession {
     fn stmt_wants(&self, st: &Stmt) -> bool {
         match st {
             Stmt::CreateTable { .. } | Stmt::AlterTable { .. } | Stmt::CreateIndex { .. } | Stmt::DropIndex { .. } | Stmt::AlterIndex { .. } | Stmt::Truncate(_) | Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::BeginTran(_) | Stmt::Commit(_) | Stmt::Rollback(_) | Stmt::SaveTran(_) => {
-                self.touches_distributed(st) || matches!(st, Stmt::CreateTable { .. } | Stmt::BeginTran(_) | Stmt::Commit(_) | Stmt::Rollback(_) | Stmt::SaveTran(_))
+                // (a temporary table that a batch makes is the engine's own, until a statement needs it with the cluster's tables: see `temps_wanted`)
+                self.touches_distributed(st)
+                    || match st {
+                        Stmt::CreateTable { name, .. } => !is_temp_name(name),
+                        Stmt::BeginTran(_) | Stmt::Commit(_) | Stmt::Rollback(_) | Stmt::SaveTran(_) => true,
+                        _ => false,
+                    }
             }
             Stmt::Drop { what, .. } if what.eq_ignore_ascii_case("VIEW") => true,
             Stmt::CreateView { .. } => true,
-            Stmt::Drop { what, .. } => what.eq_ignore_ascii_case("TABLE"),
+            Stmt::Drop { what, names, .. } => what.eq_ignore_ascii_case("TABLE") && names.iter().any(|n| !is_temp_name(n) || self.table_by_id(&table_id(n)).is_some()),
             Stmt::Query(q) => referenced_tables(q).iter().any(|t| self.table_by_id(t).is_some() || self.is_view(t)),
             Stmt::Exec(ex) => match self.executesql_text(ex) {
                 Some(inner) => self.wants(&inner),
@@ -342,12 +379,106 @@ fn lit_str(e: &Expr) -> Option<String> {
     }
 }
 
+/// Whether a name is that of a temporary table (`#t`).
+fn is_temp_name(n: &Name) -> bool {
+    n.last().is_some_and(|x| x.starts_with('#'))
+}
+
+/// The words of a batch, in lower case, with the names of temporary tables (`#t`) as one word each; comments are left out and
+/// variables (`@x`) are not words. For finding the temporary tables a batch makes, drops and mentions.
+fn words(sql: &str) -> Vec<String> {
+    let c: Vec<char> = sql.chars().collect();
+    let mut out = vec![];
+    let mut i = 0;
+    while i < c.len() {
+        if c[i] == '-' && c.get(i + 1) == Some(&'-') {
+            while i < c.len() && c[i] != '\n' {
+                i += 1;
+            }
+        } else if c[i] == '/' && c.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i < c.len() && !(c[i] == '*' && c.get(i + 1) == Some(&'/')) {
+                i += 1;
+            }
+            i += 2;
+        } else if c[i] == '@' {
+            i += 1;
+            while i < c.len() && (c[i].is_alphanumeric() || c[i] == '_' || c[i] == '@') {
+                i += 1;
+            }
+        } else if c[i].is_alphanumeric() || c[i] == '_' || c[i] == '#' {
+            let start = i;
+            while i < c.len() && (c[i].is_alphanumeric() || c[i] == '_' || c[i] == '#') {
+                i += 1;
+            }
+            out.push(c[start..i].iter().collect::<String>().to_lowercase());
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 /// The interceptor of a connection of the control node's TDS listener.
 struct ControlInterceptor {
     session: ClusterSession,
+    /// The temporary tables (`#t`, lower case) that the connection's own engine has: made by a batch the cluster did not take. They stay
+    /// the engine's (a batch that reads them with the catalog, as SSMS's scripts do, runs there); one that a batch needs with the cluster's
+    /// tables is handed over (see `temps_wanted`).
+    locals: std::collections::HashSet<String>,
+}
+
+impl ControlInterceptor {
+    /// Note the temporary tables a batch that the engine runs makes (`CREATE TABLE #t`, `SELECT ... INTO #t`) and drops.
+    fn note_locals(&mut self, sql: &str) {
+        let w = words(sql);
+        for (i, x) in w.iter().enumerate() {
+            if !x.starts_with('#') {
+                continue;
+            }
+            let before = |k: usize| if i >= k { w[i - k].as_str() } else { "" };
+            if (before(2) == "create" && before(1) == "table") || (before(1) == "into" && before(2) != "insert" && before(2) != "merge") {
+                self.locals.insert(x.clone());
+            } else if (before(2) == "drop" && before(1) == "table") || (before(4) == "drop" && before(3) == "table" && before(2) == "if" && before(1) == "exists") {
+                self.locals.remove(x);
+            }
+        }
+    }
 }
 
 impl Interceptor for ControlInterceptor {
+    fn temps_wanted(&mut self, sql: &str) -> Vec<String> {
+        if self.locals.is_empty() || !self.session.wants(sql) {
+            return vec![];
+        }
+        let mentioned: std::collections::HashSet<String> = words(sql).into_iter().filter(|x| x.starts_with('#')).collect();
+        let mut names: Vec<String> = self.locals.iter().filter(|n| mentioned.contains(*n)).cloned().collect();
+        names.sort();
+        for n in &names {
+            self.locals.remove(n);
+        }
+        names
+    }
+
+    fn adopt_temp(&mut self, name: &str, create: &str, rows: Vec<Vec<Value>>) -> Result<(), SqlError> {
+        // a replicated table: small, and one that a client made for its own use, with the keys and indexes it likes
+        self.session.create_dist = Some(restore::DistChoice::Replicated);
+        let r = self.session.execute(create);
+        self.session.create_dist = None;
+        if let Some(e) = r.first_error() {
+            return Err(e.clone());
+        }
+        let target = format!("[{}]", name);
+        for chunk in rows.chunks(200) {
+            let values: Vec<String> = chunk.iter().map(|r| format!("({})", r.iter().map(tsql_server::tds::literal).collect::<Vec<_>>().join(", "))).collect();
+            let r = self.session.execute(&format!("INSERT {} VALUES {}", target, values.join(", ")));
+            if let Some(e) = r.first_error() {
+                return Err(e.clone());
+            }
+        }
+        Ok(())
+    }
+
     fn handle_stmts(&mut self, stmts: &[Stmt], sink: &mut dyn FnMut(Streamed) -> bool) -> bool {
         if !stmts.iter().any(|s| self.session.stmt_wants(s)) {
             return false;
@@ -363,6 +494,7 @@ impl Interceptor for ControlInterceptor {
 
     fn handle(&mut self, sql: &str, sink: &mut dyn FnMut(Streamed) -> bool) -> bool {
         if !self.session.wants(sql) {
+            self.note_locals(sql);
             return false;
         }
         let res = self.session.execute(sql);
@@ -385,6 +517,6 @@ impl Cluster {
     /// Make the batches of the connections made to the mirror from now on run on the cluster (see this module).
     pub fn enable_tds(self: &Arc<Self>) {
         let cluster = self.clone();
-        self.mirror.set_interceptor(Some(Arc::new(move || Box::new(ControlInterceptor { session: cluster.session() }) as Box<dyn Interceptor>)));
+        self.mirror.set_interceptor(Some(Arc::new(move || Box::new(ControlInterceptor { session: cluster.session(), locals: Default::default() }) as Box<dyn Interceptor>)));
     }
 }

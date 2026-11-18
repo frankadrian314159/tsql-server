@@ -390,7 +390,7 @@ impl Cluster {
     }
 
     pub fn session(self: &Arc<Self>) -> ClusterSession {
-        ClusterSession { cluster: self.clone(), id: self.next_session.fetch_add(1, Ordering::Relaxed), mirror: self.mirror.connect_internal(), plan: vec![], temp_counter: 0, txn: std::cell::RefCell::new(None), stmt_shards: std::cell::Cell::new(0), commit_seq: 0, vars: HashMap::new(), local_tables: HashMap::new(), tvars: HashMap::new(), identity_insert: Default::default(), last_identity: None, create_dist: None }
+        ClusterSession { cluster: self.clone(), id: self.next_session.fetch_add(1, Ordering::Relaxed), mirror: self.mirror.connect_internal(), plan: vec![], temp_counter: 0, own_temps: vec![], txn: std::cell::RefCell::new(None), stmt_shards: std::cell::Cell::new(0), commit_seq: 0, vars: HashMap::new(), local_tables: HashMap::new(), tvars: HashMap::new(), identity_insert: Default::default(), last_identity: None, create_dist: None }
     }
 
     pub fn shard_status(&self) -> Vec<Result<ShardStatus, SqlError>> {
@@ -411,6 +411,8 @@ pub struct ClusterSession {
     mirror: Connection,
     plan: Vec<String>,
     temp_counter: u64,
+    /// The temporary tables (`#t`) this session made in the cluster: dropped when it ends.
+    own_temps: Vec<String>,
     /// the open transaction, if any
     txn: std::cell::RefCell<Option<TxnState>>,
     /// the most shards one statement has used (a failed statement on several shards leaves a transaction half done)
@@ -1004,7 +1006,14 @@ impl ClusterSession {
         let bound = self.bind_vars(st)?;
         let st = &bound;
         match st {
-            Stmt::CreateTable { name, defs, versioning } => self.create_table(st, name, defs, versioning.is_some()).await,
+            Stmt::CreateTable { name, defs, versioning } => {
+                let r = self.create_table(st, name, defs, versioning.is_some()).await;
+                // (a temporary table is the session's: it is dropped when the session ends)
+                if let (Ok(()), Some(n)) = (&r, name.last().filter(|n| n.starts_with('#'))) {
+                    self.own_temps.push(n.clone());
+                }
+                r
+            }
             Stmt::AlterTable { name, action } => self.alter_table(st, name, action).await,
             Stmt::CreateProc { name, .. } => {
                 // (a procedure is made on every shard, which runs it; a changed one must be declared again)
@@ -2569,6 +2578,13 @@ impl Drop for ClusterSession {
         // (not from inside a runtime: the session is dropped by the thread that used it)
         if tokio::runtime::Handle::try_current().is_err() {
             cl.rt.block_on(join_all(cl.shard_list().iter().map(|s| s.close_session(id))));
+            // the temporary tables of the session (made in the cluster by a statement that needed them there) go with it
+            if !self.own_temps.is_empty() {
+                let mut s = cl.session();
+                for t in std::mem::take(&mut self.own_temps) {
+                    let _ = s.execute(&format!("DROP TABLE IF EXISTS [{}]", t));
+                }
+            }
         }
     }
 }

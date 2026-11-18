@@ -70,6 +70,16 @@ pub trait Interceptor: Send {
     fn handle_stmts(&mut self, _stmts: &[crate::ast::Stmt], _sink: &mut dyn FnMut(Streamed) -> bool) -> bool {
         false
     }
+    /// Before a batch is handled: the session's temporary tables (`#name`, lower case) that it needs the interceptor to take over,
+    /// because the batch is one it will run itself. The connection reads each (its `CREATE TABLE` and its rows), drops it and gives it
+    /// to [`Interceptor::adopt_temp`]. None by default.
+    fn temps_wanted(&mut self, _sql: &str) -> Vec<String> {
+        vec![]
+    }
+    /// A temporary table of the session handed over (see [`Interceptor::temps_wanted`]): `create` is its `CREATE TABLE`, `rows` its rows.
+    fn adopt_temp(&mut self, _name: &str, _create: &str, _rows: Vec<Vec<Value>>) -> Result<(), SqlError> {
+        Ok(())
+    }
 }
 
 /// Makes the interceptor of a new connection.
@@ -492,9 +502,37 @@ impl Connection {
         Some(Connection { server: self.server.clone(), session: self.session.fork(), interceptor: None })
     }
 
+    /// Give the interceptor the temporary tables of this session that the batch needs it to take over (see [`Interceptor::temps_wanted`]):
+    /// the table is read, dropped here, and made by the interceptor from what was read. An error is returned for the batch.
+    fn hand_over_temps(&mut self, sql: &str) -> Option<SqlError> {
+        let names = self.interceptor.as_mut()?.temps_wanted(sql);
+        for n in names {
+            let (create, rows) = {
+                let shared = &self.server.shared;
+                let guard = SrvGuard::new(&shared.state);
+                let mut eng = Engine::new(guard, &mut self.session);
+                let Some(create) = eng.temp_table_create_sql(&n) else { continue };
+                eng.run_batch(&format!("SELECT * FROM {}", n));
+                let rows = eng.out.iter().find_map(|e| if let Event::Rows(rs) = e { Some(rs.rows.clone()) } else { None }).unwrap_or_default();
+                (create, rows)
+            };
+            if let Err(e) = self.interceptor.as_mut()?.adopt_temp(&n, &create, rows) {
+                return Some(e);
+            }
+            let shared = &self.server.shared;
+            let guard = SrvGuard::new(&shared.state);
+            let mut eng = Engine::new(guard, &mut self.session);
+            eng.run_batch(&format!("DROP TABLE {}", n));
+        }
+        None
+    }
+
     /// Execute a single batch (no `GO` handling).
     pub fn execute(&mut self, sql: &str) -> BatchResult {
         crate::span!("execute");
+        if let Some(e) = self.hand_over_temps(sql) {
+            return BatchResult { events: vec![Event::Error(e)] };
+        }
         if let Some(i) = self.interceptor.as_mut() {
             let mut events = vec![];
             let mut rows: Option<ResultSet> = None;
@@ -579,6 +617,10 @@ impl Connection {
     /// consumer has gone away; the statement is then abandoned. Small results and every other kind of result set
     /// arrive whole, as `Event::Rows`.
     pub fn execute_streaming(&mut self, sql: &str, sink: &mut dyn FnMut(Streamed) -> bool) {
+        if let Some(e) = self.hand_over_temps(sql) {
+            sink(Streamed::Event(Event::Error(e)));
+            return;
+        }
         if let Some(i) = self.interceptor.as_mut() {
             if i.handle(sql, sink) {
                 return;

@@ -733,6 +733,17 @@ impl<'a> Engine<'a> {
     }
 
     // ----------------------------------------------------------- statements
+    /// The `CREATE TABLE` that makes a copy of a temporary table of the session (None when it is not there or cannot be scripted): what
+    /// a cluster's control node needs to take it over (see `Interceptor::temps_wanted`).
+    pub fn temp_table_create_sql(&self, name: &str) -> Option<String> {
+        let t = self.ses.temp.get(&name.to_lowercase())?;
+        if crate::script::not_scriptable(t).is_some() {
+            return None;
+        }
+        let s = crate::script::table(t);
+        Some(s.create.replacen(&crate::script::table_name(t), &format!("[{}]", t.name), 1))
+    }
+
     /// A variable is declared for the whole batch (or procedure) wherever its DECLARE is: one in a branch that is not taken, or in a
     /// block that has ended, can still be used after it (as NULL, until its DECLARE runs). The variables declared in the blocks of
     /// `stmts` are made here, with their types, so that the batch that discovers dependencies in SSMS (it declares a cursor's variables

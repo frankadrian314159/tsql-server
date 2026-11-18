@@ -153,3 +153,34 @@ fn bulk_load_spreads_rows_over_the_shards_and_a_failed_load_leaves_nothing() {
     assert_eq!(total, 3000);
     f.listener.shutdown();
 }
+
+#[test]
+fn a_temporary_table_is_the_engines_own_until_a_statement_needs_it_with_the_clusters_tables() {
+    // (SSMS's scripts make temporary tables, fill them from the catalog, index them uniquely and read them with the catalog: none of that is the
+    // cluster's. One that a statement needs together with a table of the cluster is handed to the cluster, rows and all.)
+    let f = start(3);
+    f.rt.block_on(async {
+        let mut c = login(&f.listener).await;
+        run(&mut c, "CREATE TABLE orders (id INT PRIMARY KEY, amount INT)").await;
+        run(&mut c, "INSERT INTO orders VALUES (1, 10), (2, 20), (3, 30)").await;
+        // a temporary table with a column the cluster could not shard on, and a unique index it could not check: the engine's own
+        run(&mut c, "CREATE TABLE #dep (nm sysname COLLATE database_default NOT NULL, kind smallint NOT NULL, grp int NULL)").await;
+        run(&mut c, "CREATE UNIQUE CLUSTERED INDEX i1 ON #dep (nm, kind) WITH IGNORE_DUP_KEY").await;
+        run(&mut c, "INSERT #dep SELECT name, 3, object_id FROM sys.tables WHERE name = 'orders' UNION ALL SELECT 'x', 4, 7").await;
+        let r = strings(&mut c, "SELECT d.nm, d.kind FROM #dep d JOIN sys.tables t ON t.name = d.nm ORDER BY 1").await;
+        assert!(r.len() == 1 && r[0][0].contains("orders"), "{:?}", r);
+        // the control node does not know it as a table of the cluster
+        assert!(!f.cluster.tables().iter().any(|t| t.name.last().is_some_and(|n| n == "#dep")));
+        // a statement that needs it with the cluster's tables: it is handed over, with its rows
+        let r = strings(&mut c, "SELECT o.id, d.kind FROM orders o JOIN #dep d ON d.grp = o.id + 4 ORDER BY o.id").await;
+        assert!(r.len() == 1 && r[0][0].contains("3") && r[0][1].contains("4"), "{:?}", r);
+        assert!(f.cluster.tables().iter().any(|t| t.name.last().is_some_and(|n| n == "#dep")));
+        // and is the cluster's from then on
+        run(&mut c, "INSERT #dep VALUES ('y', 5, 1)").await;
+        let r = strings(&mut c, "SELECT COUNT(*) FROM #dep").await;
+        assert!(r[0][0].contains("3"), "{:?}", r);
+        run(&mut c, "DROP TABLE #dep").await;
+    });
+    // the session's temporary tables are not left behind when it ends
+    drop(f.rt);
+}
