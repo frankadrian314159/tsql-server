@@ -25,7 +25,6 @@ rustc-ice-*.txt
 
 # sample SQL Server backups used by the .bak reader tests (large, not part of the repository)
 resources/*.bak
-data/*.db
-data/lock
-data/wal.log
+# the data directory a server started here makes (database, log, snapshot, lock)
+data/
 target-test/
