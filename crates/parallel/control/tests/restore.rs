@@ -170,6 +170,40 @@ fn what_a_cluster_cannot_hold_is_refused_unless_the_rest_is_wanted() {
 }
 
 #[test]
+fn a_unique_key_without_the_shard_key_and_a_computed_column_that_calls_a_function_are_left_out_with_a_note() {
+    let h = start(2);
+    let path = backup_path("weak");
+    let src_server = Server::new();
+    let extra = "GO
+CREATE FUNCTION dbo.acct (@x INT) RETURNS NVARCHAR(12) AS BEGIN RETURN N'AW' + CAST(@x AS NVARCHAR(10)) END
+GO
+        CREATE TABLE people (id INT PRIMARY KEY, email VARCHAR(40) NOT NULL, acct AS dbo.acct(id));
+        INSERT people (id, email) VALUES (1, 'a@x'), (2, 'b@x'), (3, 'c@x'), (4, 'd@x');
+        CREATE UNIQUE INDEX ux_email ON people (email);
+        CREATE INDEX ix_acct ON people (acct);
+GO";
+    let _src = source(&src_server, &path, extra);
+    let mut s = h.cluster.session();
+    let restore = format!("RESTORE DATABASE shop FROM DISK = '{}' WITH DISTRIBUTION = N'dbo.people BY id'", path);
+    // the unique index does not contain the shard key: refused with the rest, and nothing is made
+    let e = s.execute(&restore).first_error().cloned().expect("refused");
+    assert_eq!(e.number, 50100);
+    assert_eq!(count(&mut h.cluster.mirror_server().connect_internal(), "SELECT COUNT(*) FROM sys.tables"), 0);
+    let r = s.execute(&format!("{}, CONTINUE_AFTER_ERROR", restore));
+    ok(&r, "the restore");
+    let said = messages(&r).join("
+");
+    assert!(said.contains("the uniqueness of the unique index ux_email of [dbo].[people]"), "{}", said);
+    assert!(said.contains("the computed column [acct] of [dbo].[people]"), "{}", said);
+    assert!(said.contains("the index ix_acct of [dbo].[people]"), "{}", said);
+    // the rows are there, spread, without the computed column; the index on the e-mail is an ordinary one
+    assert_eq!(rows_of(&s.execute("SELECT id, email FROM people ORDER BY id")).len(), 4);
+    assert_eq!(shard_counts(&h, "people").iter().sum::<i64>(), 4);
+    assert!(s.execute("SELECT acct FROM people").first_error().is_some(), "the computed column is not there");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn options_a_cluster_cannot_honour_are_errors() {
     let h = start(2);
     let path = backup_path("options");

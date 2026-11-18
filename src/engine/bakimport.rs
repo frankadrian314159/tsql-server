@@ -35,6 +35,7 @@ pub struct Report {
     pub procedures: usize,
     pub functions: usize,
     pub triggers: usize,
+    pub alias_types: usize,
     /// what could not be created, and why
     pub problems: Vec<String>,
 }
@@ -152,11 +153,25 @@ pub fn convert(src: &str, out: &str) -> Result<Report, String> {
     let mut conn = scratch.connect();
     run(&mut conn, &format!("CREATE DATABASE {}", quote(&db)))?;
     run(&mut conn, &format!("USE {}", quote(&db)))?;
-    let mut schemas: Vec<&str> = tables.iter().map(|t| t.schema.as_str()).filter(|s| !s.eq_ignore_ascii_case("dbo")).collect();
+    let alias_types = bak.alias_types()?;
+    let mut schemas: Vec<&str> = tables.iter().map(|t| t.schema.as_str()).chain(alias_types.iter().map(|a| a.schema.as_str())).filter(|s| !s.eq_ignore_ascii_case("dbo")).collect();
     schemas.sort_unstable();
     schemas.dedup();
     for s in schemas {
         run(&mut conn, &format!("CREATE SCHEMA {}", quote(s)))?;
+    }
+    // alias types, which the columns of the tables use (a column keeps the type's name; its values are those of the base type)
+    let mut alias_names: HashMap<u32, String> = HashMap::new();
+    for a in &alias_types {
+        let qn = format!("{}.{}", quote(&a.schema), quote(&a.name));
+        let sql = format!("CREATE TYPE {} FROM {} {}", qn, type_sql(&a.ty), if a.not_null { "NOT NULL" } else { "NULL" });
+        match run(&mut conn, &sql) {
+            Ok(()) => {
+                report.alias_types += 1;
+                alias_names.insert(a.id, qn);
+            }
+            Err(e) => report.problems.push(format!("the type {} was not created: {}", qn, e)),
+        }
     }
     // functions first: computed columns, defaults and checks may call them. Those that cannot be created yet (they read
     // tables that are not there) are tried again when the rows are in.
@@ -182,12 +197,12 @@ pub fn convert(src: &str, out: &str) -> Result<Report, String> {
         // this server cannot evaluate, found out when the rows go in) it is built again without them.
         let wants_computed = t.cols.iter().any(|c| c.computed && c.definition.is_some());
         let mut with_computed = wants_computed;
-        let mut loaded = load_table(&mut conn, t, &data, with_computed);
+        let mut loaded = load_table(&mut conn, t, &data, with_computed, &alias_names);
         if let (Err(e), true) = (&loaded, wants_computed) {
             report.problems.push(format!("the computed columns of {} were not created: {}", tn, e));
             let _ = conn.execute(&format!("DROP TABLE {}", qname(t)));
             with_computed = false;
-            loaded = load_table(&mut conn, t, &data, false);
+            loaded = load_table(&mut conn, t, &data, false, &alias_names);
         }
         loaded?;
         for c in t.cols.iter().filter(|c| c.computed) {
@@ -397,7 +412,7 @@ fn create_keys(conn: &mut crate::Connection, tables: &[TableMeta], computed: &st
 }
 
 /// Create a table and put its rows in.
-fn load_table(conn: &mut crate::Connection, t: &TableMeta, data: &crate::sqlbak::Rows, with_computed: bool) -> Result<(), String> {
+fn load_table(conn: &mut crate::Connection, t: &TableMeta, data: &crate::sqlbak::Rows, with_computed: bool, alias_names: &HashMap<u32, String>) -> Result<(), String> {
     // a column with values that could not be read must be able to hold NULL
     let defs: Vec<String> = t
         .cols
@@ -409,7 +424,7 @@ fn load_table(conn: &mut crate::Connection, t: &TableMeta, data: &crate::sqlbak:
             }
             let nullable = c.nullable || data.skipped.contains_key(&c.name);
             let identity = c.identity.map(|(seed, inc, _)| format!(" IDENTITY({},{})", seed, inc)).unwrap_or_default();
-            Some(format!("{} {}{}{}", quote(&c.name), type_sql(&c.ty), identity, if nullable { " NULL" } else { " NOT NULL" }))
+            Some(format!("{} {}{}{}", quote(&c.name), alias_names.get(&c.utype).cloned().unwrap_or_else(|| type_sql(&c.ty)), identity, if nullable { " NULL" } else { " NOT NULL" }))
         })
         .collect();
     run(conn, &format!("CREATE TABLE {} ({})", qname(t), defs.join(", ")))?;
@@ -521,7 +536,7 @@ mod tests {
         let data = Rows { rows, skipped: Default::default() };
         let server = Server::new();
         let mut c = server.connect();
-        load_table(&mut c, &table, &data, false).unwrap();
+        load_table(&mut c, &table, &data, false, &HashMap::new()).unwrap();
         let q = |c: &mut crate::Connection, sql: &str| -> Vec<String> { c.execute(sql).resultsets()[0].rows.iter().map(|r| r.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("|")).collect() };
         assert_eq!(q(&mut c, "SELECT t, n FROM t WHERE id = 1"), vec!["it's text|ünïcode \u{4e2d}"]);
         assert_eq!(q(&mut c, "SELECT DATALENGTH(t) FROM t WHERE id = 2"), vec!["20000"]);

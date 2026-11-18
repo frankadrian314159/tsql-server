@@ -99,7 +99,8 @@ The sample (760,167 rows in 71 tables) restores in about 15 seconds in a release
 
 What comes over:
 
-* schemas, tables with their column types, nullability and identity properties, and all rows, including large values
+* schemas; alias types (`CREATE TYPE ... FROM`, read from `sysscalartypes`: the columns of such a type keep it; the sample's six types, used
+  by 42 columns); tables with their column types, nullability and identity properties, and all rows, including large values
   (`varbinary(max)`, `nvarchar(max)`, long `xml`, images) and `xml` of the forms below;
 * computed columns, with their expressions (`PERSISTED` where the backup stores the value in the row);
 * views, procedures, functions (scalar, inline and multi-statement) and triggers, from the text of their `CREATE` statement,
@@ -126,7 +127,9 @@ What comes over:
 
 What does not:
 
-* user-defined types (columns of an alias type get the base type), sequences, users and permissions, and CLR objects;
+* sequences, synonyms, users and permissions, row-level security policies, temporal and graph table properties, and CLR objects (none of
+  them is in the sample; the readers for them have not been written, and the engine's own catalog has no counterpart for extended
+  properties, see below);
 * columnstore and hash indexes (a columnstore index can be created again after the import, see [columnstore.md](columnstore.md); there
   is no hash index), and filtered indexes lose their filter (their definition is not read);
 * XML schema collections and the typed xml columns that use them: the collections are stored as compiled components, not as
@@ -141,6 +144,12 @@ What does not:
   seen in a backup), and the typed XML types listed below, which come over as NULL with a warning that names the column and
   the count;
 * the `MOVE` options are ignored.
+
+Two kinds of object in the sample are **not restored**, which `tsql-bakinfo FILE --objects` shows (it counts what a backup holds, by
+kind): the 538 extended properties (`MS_Description` and the like: the engine accepts `sp_addextendedproperty` and keeps nothing, and
+`sys.extended_properties` is empty) and the six XML schema collections (stored as compiled components in `sysxmlcomponent`,
+`sysxmlfacet` and `sysxmlplacement`, not as XSD text, so the typed `xml` columns come over untyped). The three service broker queues
+of the sample are the system's own.
 
 Objects that use what the engine lacks fail to be created and are listed (see [triggers.md](triggers.md) for the XML methods
 and full-text search, which this server now has in a reduced form). `WITH EXECUTE AS CALLER` and `NOT FOR REPLICATION`, which AdventureWorks uses, are
@@ -197,7 +206,7 @@ been tried on a real SQL Server, which probably would not restore the file**: th
 levels above the leaves of clustered indexes are not written (this server rebuilds indexes from the rows), the allocation
 maps are minimal (no IAM pages, an all-zero GAM and SGAM), pages carry no checksum, the log is not written, the
 configuration stream `MQCI` is a simplified one, and statistics are absent. What the reader cannot read is not written
-either: sequences, synonyms, user-defined types (a column of an alias type is written with its base type), users, roles and
+either: sequences, synonyms, users, roles and
 permissions, XML schema collections (typed `xml` columns come back untyped), row-level security, the filter of a filtered
 index, the tessellation settings of a spatial index, and the referential actions other than `ON DELETE CASCADE`. A check
 constraint or default written without the outer parentheses that SQL Server keeps comes back with them. `sql_variant` values

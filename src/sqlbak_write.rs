@@ -27,6 +27,8 @@ pub struct Image {
     pub tables: Vec<TableMeta>,
     pub modules: Vec<ModuleMeta>,
     pub ft_catalogs: Vec<FtCatalogMeta>,
+    /// the alias types (`CREATE TYPE ... FROM`); a column of one has its id as the `utype`
+    pub aliases: Vec<crate::sqlbak::AliasType>,
 }
 
 /// Delivers the rows of a table, one at a time. A row holds the table's stored columns (those that are not computed) in
@@ -752,6 +754,7 @@ const SYSIDXSTATS: u32 = 54;
 const SYSOBJVALUES: u32 = 60;
 const SYSFTINDS: u32 = 25;
 const SYSSINGLEOBJREFS: u32 = 74;
+const SYSSCALARTYPES: u32 = 50;
 
 /// The records of every system table, collected before they are written.
 #[derive(Default)]
@@ -767,6 +770,7 @@ struct Sys {
     objvalues: Vec<Vec<u8>>,
     ftinds: Vec<Vec<u8>>,
     singlerefs: Vec<Vec<u8>>,
+    scalartypes: Vec<Vec<u8>>,
 }
 
 fn now() -> [u8; 8] {
@@ -791,6 +795,14 @@ impl Sys {
     fn clsobj(&mut self, class: u8, id: u32, status: u32, ty: &[u8; 2], name: &str) {
         let fixed = Fx::default().u8(class).u32(id).u32(status).bytes(ty).u32(0).bytes(&now()).bytes(&now()).0;
         self.clsobjs.push(record(&fixed, 8, &[], &[(utf16(name), false)]));
+    }
+
+    /// An alias type in `sysscalartypes`: id, schema id, xtype, length, precision, scale, collation id, status (1: NOT NULL), created,
+    /// modified, default and rule ids; the name.
+    fn scalar_type(&mut self, a: &crate::sqlbak::AliasType, nsid: u32) {
+        let coll = if matches!(a.xtype, 167 | 175 | 231 | 239 | 35 | 99) { COLLATION_ID } else { 0 };
+        let fixed = Fx::default().u32(a.id).u32(nsid).u8(a.xtype).u16(a.length as u16).u8(a.prec).u8(a.scale).u32(coll).u32(a.not_null as u32).bytes(&now()).bytes(&now()).u32(0).u32(0).0;
+        self.scalartypes.push(record(&fixed, 13, &[], &[(utf16(&a.name), false)]));
     }
 
     /// A piece of text in `sysobjvalues` (8-bit characters, in pieces).
@@ -974,7 +986,7 @@ pub fn write_pages(img: &Image, src: &mut dyn RowSource, p: &mut Pager) -> Res<S
                 .u16(c.colid as u16)
                 .u32(c.colid)
                 .u8(xtype)
-                .u32(if xtype == 240 { c.utype } else { xtype as u32 })
+                .u32(if xtype == 240 || c.utype > 256 { c.utype } else { xtype as u32 })
                 .u16(length as u16)
                 .u8(prec)
                 .u8(scale)
@@ -1051,6 +1063,10 @@ pub fn write_pages(img: &Image, src: &mut dyn RowSource, p: &mut Pager) -> Res<S
             sys.single_ref(39, obj, 0, ft.catalog, 0);
         }
     }
+    for a in &img.aliases {
+        let nsid = schema_id(&a.schema);
+        sys.scalar_type(a, nsid);
+    }
     for m in &img.modules {
         let ty: [u8; 2] = m.kind;
         sys.schobj(m.id, &m.name, schema_id(&m.schema), &ty, m.parent, 0, 0);
@@ -1078,6 +1094,7 @@ pub fn write_pages(img: &Image, src: &mut dyn RowSource, p: &mut Pager) -> Res<S
     write_sys(&sys.objvalues, SYSOBJVALUES, 1, p)?;
     write_sys(&sys.ftinds, SYSFTINDS, 1, p)?;
     write_sys(&sys.singlerefs, SYSSINGLEOBJREFS, 1, p)?;
+    write_sys(&sys.scalartypes, SYSSCALARTYPES, 1, p)?;
     // sysallocunits last: its own first page is recorded in the boot page
     let alloc_first = p.next;
     write_sys(&sys.allocunits, SYSALLOCUNITS, 0, p)?;

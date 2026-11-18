@@ -378,6 +378,12 @@ to this server's format in a temporary file, as a single-node restore does).
   committed rows (a durable or replicated shard takes ordinary `INSERT`s, which its log and its replicas keep). The foreign keys
   are not checked again for the restored rows (they come from a consistent database), and on an in-memory shard neither are the
   check constraints.
+* **Unique keys that do not contain the shard key.** A cluster checks uniqueness only within a shard, so a unique index or
+  unique constraint (other than the primary key, which must contain the shard key) that lacks the shard key is refused, as the
+  rest of what a cluster cannot hold; `WITH CONTINUE_AFTER_ERROR` makes it an ordinary index and says so (`Not restored: the
+  uniqueness of the unique index ...`). AdventureWorks has such keys on `rowguid` and on business keys.
+* **Computed columns that call a stored function** (the cluster has none) are left out with their indexes, with a note, under
+  `CONTINUE_AFTER_ERROR` (`Sales.Customer.AccountNumber` of AdventureWorks calls `dbo.ufnLeadingZeros`).
 * **What a cluster cannot hold is refused** before anything is made: stored functions, triggers, sequences, synonyms,
   system-versioned and graph tables, columnstore indexes, xml typed by a schema collection, foreign keys to other databases,
   security policies and DDL triggers. `WITH CONTINUE_AFTER_ERROR` restores the rest and says what it left out (as messages

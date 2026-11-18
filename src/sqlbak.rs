@@ -127,6 +127,21 @@ pub struct ColMeta {
     pub persisted: bool,
 }
 
+/// An alias type: `CREATE TYPE schema.name FROM base [NOT] NULL`.
+#[derive(Debug, Clone)]
+pub struct AliasType {
+    pub id: u32,
+    pub schema: String,
+    pub name: String,
+    pub xtype: u8,
+    pub length: i16,
+    pub prec: u8,
+    pub scale: u8,
+    pub not_null: bool,
+    /// the engine's type for the base type
+    pub ty: DataType,
+}
+
 /// The full-text index of a table: the id of its key index (an index number of the table), the id of its catalog, and the
 /// indexed columns (column id, language id).
 #[derive(Debug, Clone)]
@@ -287,8 +302,8 @@ const SYSIDXSTATS: u32 = 54;
 const SYSOBJVALUES: u32 = 60;
 const SYSFTINDS: u32 = 25;
 const SYSSINGLEOBJREFS: u32 = 74;
-#[cfg(test)]
 const SYSXPROPS: u32 = 49;
+const SYSSCALARTYPES: u32 = 50;
 
 impl<R: Read + Seek> Backup<R> {
     /// Index the pages of a backup whose container has been opened.
@@ -612,6 +627,74 @@ impl<R: Read + Seek> Backup<R> {
         }
         found.sort_by_key(|m| m.id);
         Ok(found)
+    }
+
+    /// The alias types (`CREATE TYPE ... FROM`): `sysscalartypes` (id int, schid int, xtype tinyint, length smallint, prec tinyint,
+    /// scale tinyint, collationid int, status int, ...; name). The system types have ids below 257, and `sysname` (256) is in `sys`.
+    /// A column of such a type has the type's id as its `utype`.
+    pub fn alias_types(&mut self) -> Res<Vec<AliasType>> {
+        let mut out: Vec<AliasType> = vec![];
+        self.each_record(SYSSCALARTYPES, 1, true, &mut |r| {
+            let id = r.fu32(0);
+            if id <= 256 {
+                return;
+            }
+            let (xtype, length, prec, scale) = (r.fixed(8, 1).map(|b| b[0]).unwrap_or(0), r.fixed(9, 2).map(|b| i16::from_le_bytes([b[0], b[1]])).unwrap_or(0), r.fixed(11, 1).map(|b| b[0]).unwrap_or(0), r.fixed(12, 1).map(|b| b[0]).unwrap_or(0));
+            out.push(AliasType {
+                id,
+                schema: r.fu32(4).to_string(),
+                name: r.var(0).map(|(n, _)| utf16(n)).unwrap_or_default(),
+                xtype,
+                length,
+                prec,
+                scale,
+                not_null: r.fu32(17) & 1 != 0,
+                ty: col_type(xtype, length, prec, scale, 0),
+            });
+        })?;
+        for t in &mut out {
+            t.schema = self.schemas.get(&t.schema.parse().unwrap_or(0)).cloned().unwrap_or_else(|| "dbo".to_string());
+        }
+        out.retain(|t| t.schema != "sys");
+        out.sort_by_key(|t| t.id);
+        Ok(out)
+    }
+
+    /// What the backup holds, by kind, outside the system schemas: the `type` of each row of `sysschobjs` (`U ` table, `V ` view,
+    /// `SO` sequence, `SN` synonym, `TT` table type, `D ` default, `PK` ...), the `class` of each row of `sysclsobjs` (32 full-text
+    /// catalog, 50 schema, 51 user or role ... as far as known), and the rows of `sysxprops` (extended properties). For a report of
+    /// what a restore leaves out.
+    pub fn inventory(&mut self) -> Res<Vec<(String, usize)>> {
+        let mut types: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut rows: Vec<(u32, [u8; 2], u32, String)> = vec![];
+        self.each_record(SYSSCHOBJS, 1, true, &mut |r| {
+            if let Some(ty) = r.fixed(13, 2) {
+                rows.push((r.fu32(4), [ty[0], ty[1]], r.fu32(0), r.var(0).map(|(n, _)| utf16(n)).unwrap_or_default()));
+            }
+        })?;
+        for (nsid, ty, id, name) in rows {
+            let schema = self.schemas.get(&nsid).cloned().unwrap_or_default();
+            if schema == "sys" || schema == "INFORMATION_SCHEMA" {
+                continue;
+            }
+            *types.entry(format!("object {}", String::from_utf8_lossy(&ty).trim_end())).or_default() += 1;
+        }
+        let mut classes: std::collections::BTreeMap<u8, Vec<String>> = Default::default();
+        self.each_record(SYSCLSOBJS, 1, true, &mut |r| {
+            if let Some(c) = r.fixed(0, 1) {
+                classes.entry(c[0]).or_default().push(r.var(0).map(|(n, _)| utf16(n)).unwrap_or_default());
+            }
+        })?;
+        for (c, names) in classes {
+            let shown: Vec<&str> = names.iter().take(4).map(|n| n.as_str()).collect();
+            types.insert(format!("class {} ({}{})", c, shown.join(", "), if names.len() > 4 { ", ..." } else { "" }), names.len());
+        }
+        let mut props = 0usize;
+        self.each_record(SYSXPROPS, 1, true, &mut |_| props += 1)?;
+        if props > 0 {
+            types.insert("extended properties".into(), props);
+        }
+        Ok(types.into_iter().collect())
     }
 
     /// Full-text indexes: `sysftinds` (id int, indid int, status int ...: the table and the number of its key index), the columns

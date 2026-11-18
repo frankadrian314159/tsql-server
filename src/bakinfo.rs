@@ -9,9 +9,10 @@ use tsql_server::mssqlbak;
 use tsql_server::mtf::{self, Block};
 
 fn usage() -> ! {
-    eprintln!("usage: tsql-bakinfo FILE.bak [--hex N] [--all] [--extract OUT] [--tables]");
+    eprintln!("usage: tsql-bakinfo FILE.bak [--hex N] [--all] [--extract OUT] [--tables] [--objects]");
     eprintln!("  --hex N  also show the first N bytes of every stream other than padding");
     eprintln!("  --all    list every block (by default a long run of blocks of one kind is summarised)");
+    eprintln!("  --objects  read the database in the backup and count what it holds by kind (compressed backups)");
     eprintln!("  --tables  read the database in the backup and list its tables with their row counts (compressed backups)");
     eprintln!("  --extract OUT  write the expanded stream (Microsoft Tape Format) of a compressed backup to OUT");
     std::process::exit(2);
@@ -64,12 +65,14 @@ fn main() {
     let mut all = false;
     let mut extract = None;
     let mut tables = false;
+    let mut objects = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--hex" => hex_bytes = args.next().and_then(|n| n.parse().ok()).unwrap_or_else(|| usage()),
             "--all" => all = true,
             "--tables" => tables = true,
+            "--objects" => objects = true,
             "--extract" => extract = Some(args.next().unwrap_or_else(|| usage())),
             "-h" | "--help" => usage(),
             _ if path.is_none() => path = Some(a),
@@ -126,6 +129,10 @@ fn main() {
             }
             w.flush().unwrap();
             println!("wrote {} bytes to {}", ex.layout.total, out);
+        }
+        if objects {
+            list_objects(ex);
+            return;
         }
         if tables {
             list_tables(ex);
@@ -230,4 +237,25 @@ fn list_tables<R: Read + Seek>(ex: mssqlbak::Expanded<R>) {
         }
     }
     println!("{} table(s), {} row(s); {} table(s) do not match the catalog", tables.len(), total, bad);
+}
+
+fn list_objects<R: Read + Seek>(ex: mssqlbak::Expanded<R>) {
+    let mut b = match tsql_server::sqlbak::Backup::open(ex) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("tsql-bakinfo: {}", e);
+            std::process::exit(1);
+        }
+    };
+    match b.inventory() {
+        Ok(v) => {
+            for (k, n) in v {
+                println!("{:<24} {:>6}", k, n);
+            }
+        }
+        Err(e) => {
+            eprintln!("tsql-bakinfo: {}", e);
+            std::process::exit(1);
+        }
+    }
 }

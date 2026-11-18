@@ -50,8 +50,9 @@ fn describe(c: &mut Connection, db: &str) -> BTreeMap<String, String> {
         out.insert(format!("table {}", full), d);
     }
     // objects that are not in a table: schemas, triggers, full-text objects, XML and spatial indexes, computed columns, key columns
-    let extras: [(&str, &str); 10] = [
+    let extras: [(&str, &str); 11] = [
         ("schemas", "SELECT name FROM sys.schemas ORDER BY name"),
+        ("alias types", "SELECT s.name, t.name, b.name, t.max_length, t.precision, t.scale, t.is_nullable FROM sys.types t JOIN sys.schemas s ON s.schema_id = t.schema_id JOIN sys.types b ON b.user_type_id = t.system_type_id WHERE t.is_user_defined = 1 ORDER BY 1, 2"),
         ("triggers", "SELECT name, OBJECT_NAME(parent_id), is_disabled, is_instead_of_trigger FROM sys.triggers ORDER BY 1"),
         ("fulltext catalogs", "SELECT name, is_default, is_accent_sensitivity_on FROM sys.fulltext_catalogs ORDER BY 1"),
         ("fulltext indexes", "SELECT OBJECT_NAME(i.object_id), i.unique_index_id, i.change_tracking_state_desc, i.is_enabled, (SELECT name FROM sys.fulltext_catalogs k WHERE k.fulltext_catalog_id = i.fulltext_catalog_id) FROM sys.fulltext_indexes i ORDER BY 1"),
@@ -114,6 +115,11 @@ fn a_database_of_every_kind_of_column_survives_a_sql_server_backup() {
     );
     exec(&mut c, "CREATE INDEX IX_everything_vc ON dbo.everything (vc DESC, ti) INCLUDE (si)");
     exec(&mut c, "CREATE TABLE hr.child (n INT NOT NULL, parent INT NOT NULL CONSTRAINT FK_child_parent FOREIGN KEY REFERENCES dbo.everything (id) ON DELETE CASCADE, label NVARCHAR(20) NULL CONSTRAINT UQ_child_label UNIQUE)");
+    // alias types, in dbo and in another schema, used by columns
+    exec(&mut c, "CREATE TYPE dbo.Flag FROM BIT NOT NULL");
+    exec(&mut c, "CREATE TYPE hr.Phone FROM NVARCHAR(25) NULL");
+    exec(&mut c, "CREATE TABLE dbo.typed (id INT NOT NULL PRIMARY KEY, f dbo.Flag NOT NULL, p hr.Phone NULL, q Flag NULL)");
+    exec(&mut c, "INSERT dbo.typed VALUES (1, 1, N'555-0100', 0)");
     exec(&mut c, "CREATE TABLE dbo.heap (a INT, b VARCHAR(10))");
     exec(&mut c, "CREATE TABLE dbo.empty (a INT NOT NULL PRIMARY KEY)");
     exec(&mut c, "INSERT dbo.everything (b, b2, ti, si, bi, d, d2, m, sm, f, r, c, vc, nc, nvc, bn, vb, g, dt, sdt, dd, tm, dt2, dto, notes, blob, x, tx, ntx, img, h, v) VALUES (0, 1, 7, -300, 9000000000, 12345.678, 12345678901234567890.0123456789, 922.5025, -214.75, 3.141592653589793, 2.5, 'abc', 'caf\u{e9} \u{201c}x\u{201d}', N'\u{4e16}\u{754c}', N'Unicode \u{2603} text', 0x01020304, 0xDEADBEEF, '6F9619FF-8B86-D011-B42D-00C04FC964FF', '2024-03-04T05:06:07.123', '2024-03-04T05:07:00', '2024-03-04', '05:06:07.123', '2024-03-04T05:06:07.12345', '2024-03-04T05:06:07.12+02:00', N'short note', 0x00FF, '<a x=\"1\"><b>t &amp; u</b><!--c--><?p d?></a>', 'old text', N'old unicode text', 0x424344, hierarchyid::Parse('/1/2/'), CAST(42 AS INT))");
@@ -129,7 +135,9 @@ fn a_database_of_every_kind_of_column_survives_a_sql_server_backup() {
     exec(&mut c, "CREATE FUNCTION dbo.f_twice (@n INT) RETURNS INT AS BEGIN RETURN @n * 2 END");
     exec(&mut c, "CREATE TRIGGER dbo.tr_heap ON dbo.heap AFTER INSERT AS BEGIN SET NOCOUNT ON END");
     let before = describe(&mut c, "src");
-    assert_eq!(before.keys().filter(|k| k.starts_with("table")).count(), 4);
+    assert_eq!(before.keys().filter(|k| k.starts_with("table")).count(), 5);
+    assert!(before["alias types"].contains("Phone") && before["alias types"].contains("Flag"), "{}", before["alias types"]);
+    assert!(before["table [dbo].[typed]"].contains("Phone"), "the column of an alias type reports it: {}", before["table [dbo].[typed]"]);
     exec(&mut c, "USE master");
     exec(&mut c, &format!("BACKUP DATABASE src TO DISK = '{}' WITH SQL_SERVER_FORMAT", path));
     // the file is a Microsoft Tape Format file, as an uncompressed SQL Server backup is

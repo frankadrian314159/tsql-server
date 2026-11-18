@@ -599,6 +599,9 @@ impl<'a> Engine<'a> {
                     "Created {} primary/unique key(s), {} index(es), {} XML index(es), {} spatial index(es), {} full-text catalog(s), {} full-text index(es), {} foreign key(s), {} default(s) and {} check constraint(s).",
                     report.keys, report.indexes, report.xml_indexes, report.spatial_indexes, report.fulltext_catalogs, report.fulltext_indexes, report.foreign_keys, report.defaults, report.checks
                 )));
+                if report.alias_types > 0 {
+                    self.emit(Event::Message(format!("Created {} alias type(s).", report.alias_types)));
+                }
                 self.emit(Event::Message(format!(
                     "Created {} view(s), {} procedure(s), {} function(s) and {} trigger(s).",
                     report.views, report.procedures, report.functions, report.triggers

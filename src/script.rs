@@ -76,9 +76,31 @@ fn column(c: &Column) -> String {
 
 /// The statements that recreate table `t` (see [`TableScript`]). Call [`not_scriptable`] first.
 pub fn table(t: &Table) -> TableScript {
+    table_sharded(t, None, &[])
+}
+
+/// The unique indexes and constraints of `t` (not its primary key) that do not contain column `key`: a cluster that shards the table
+/// on `key` cannot check them across its shards.
+pub fn uniques_without(t: &Table, key: usize) -> Vec<&str> {
+    t.uniques.iter().filter(|u| !u.cols.contains(&key)).map(|u| u.name.as_str()).collect()
+}
+
+/// As [`table`], for a table that is sharded on column `shard_key`: a unique index or constraint that does not contain it is made an
+/// ordinary index (uniqueness across shards is not checked), and a note in `skipped` says so. A computed column whose expression
+/// mentions one of `missing_functions` (lower case names of functions that will not be there) is left out, with a note.
+pub fn table_sharded(t: &Table, shard_key: Option<usize>, missing_functions: &[String]) -> TableScript {
     let tq = table_name(t);
     let col = |i: usize| t.columns.get(i).map(|c| bracket(&c.name)).unwrap_or_default();
-    let mut lines: Vec<String> = t.columns.iter().map(|c| format!("    {}", column(c))).collect();
+    let mut skipped = vec![];
+    let left_out = |c: &crate::catalog::Column| c.computed.is_some() && c.computed_text.as_ref().is_some_and(|x| {
+        let x = x.to_lowercase();
+        missing_functions.iter().any(|f| x.contains(&format!("[{}]", f)) || x.contains(&format!("{}(", f)))
+    });
+    for c in t.columns.iter().filter(|c| left_out(c)) {
+        skipped.push(format!("the computed column {} of {} (it calls a stored function)", bracket(&c.name), tq));
+    }
+    let gone: Vec<usize> = (0..t.columns.len()).filter(|&i| left_out(&t.columns[i])).collect();
+    let mut lines: Vec<String> = t.columns.iter().filter(|c| !left_out(c)).map(|c| format!("    {}", column(c))).collect();
     let kind = |clustered: bool| if clustered { "CLUSTERED" } else { "NONCLUSTERED" };
     if let Some(pk) = &t.pk {
         let cols = pk.cols.iter().map(|&c| col(c)).collect::<Vec<_>>().join(", ");
@@ -89,7 +111,16 @@ pub fn table(t: &Table) -> TableScript {
         // (a unique index also has an index definition, which knows the sort direction of its columns)
         let desc = |pos: usize| t.indexes.iter().find(|i| i.name == u.name).and_then(|i| i.cols.get(pos)).map(|c| c.1).unwrap_or(false);
         let cols = u.cols.iter().enumerate().map(|(p, &c)| format!("{}{}", col(c), if desc(p) { " DESC" } else { "" })).collect::<Vec<_>>().join(", ");
-        if u.is_index {
+        if u.cols.iter().chain(u.include.iter()).any(|c| gone.contains(c)) {
+            skipped.push(format!("the {} {} of {} (it uses a computed column that was left out)", if u.is_index { "unique index" } else { "unique constraint" }, u.name, tq));
+            continue;
+        }
+        if let Some(k) = shard_key.filter(|k| !u.cols.contains(k)) {
+            let include = if u.include.is_empty() { String::new() } else { format!(" INCLUDE ({})", u.include.iter().map(|&c| col(c)).collect::<Vec<_>>().join(", ")) };
+            let filter = u.filter.as_ref().map(|f| format!(" WHERE {}", f.text)).unwrap_or_default();
+            indexes.push(format!("CREATE INDEX {} ON {} ({}){}{}", bracket(&u.name), tq, cols, include, filter));
+            skipped.push(format!("the uniqueness of the {} {} of {} (it does not contain the shard key {}, and a cluster checks uniqueness only within a shard; it is an ordinary index)", if u.is_index { "unique index" } else { "unique constraint" }, u.name, tq, col(k)));
+        } else if u.is_index {
             let include = if u.include.is_empty() { String::new() } else { format!(" INCLUDE ({})", u.include.iter().map(|&c| col(c)).collect::<Vec<_>>().join(", ")) };
             let filter = u.filter.as_ref().map(|f| format!(" WHERE {}", f.text)).unwrap_or_default();
             indexes.push(format!("CREATE UNIQUE {} INDEX {} ON {} ({}){}{}", kind(u.clustered), bracket(&u.name), tq, cols, include, filter));
@@ -106,12 +137,15 @@ pub fn table(t: &Table) -> TableScript {
     }
     let create = format!("CREATE TABLE {} (\n{}\n)", tq, lines.join(",\n"));
     for i in t.indexes.iter().filter(|i| !i.unique) {
+        if i.cols.iter().map(|c| &c.0).chain(i.include.iter()).any(|c| gone.contains(c)) {
+            skipped.push(format!("the index {} of {} (it uses a computed column that was left out)", i.name, tq));
+            continue;
+        }
         let cols = i.cols.iter().map(|&(c, d)| format!("{}{}", col(c), if d { " DESC" } else { "" })).collect::<Vec<_>>().join(", ");
         let include = if i.include.is_empty() { String::new() } else { format!(" INCLUDE ({})", i.include.iter().map(|&c| col(c)).collect::<Vec<_>>().join(", ")) };
         let filter = i.filter.as_ref().map(|f| format!(" WHERE {}", f.text)).unwrap_or_default();
         indexes.push(format!("CREATE INDEX {} ON {} ({}){}{}", bracket(&i.name), tq, cols, include, filter));
     }
-    let mut skipped = vec![];
     // (XML and spatial indexes are declarations only, which change no answer; a cluster does not take them)
     for x in &t.xml_indexes {
         skipped.push(format!("the XML index {} of {}", x.name, tq));

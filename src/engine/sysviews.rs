@@ -203,7 +203,7 @@ impl<'a> Engine<'a> {
                                     (Some(_), "$to_id") => (Value::Int(8), sv("GRAPH_TO_ID_COMPUTED")),
                                     _ => (Value::Null, Value::Null),
                                 };
-                                rows.push(vec![Value::Int(t.object_id), sv(&c.name), Value::Int(i as i32 + 1), Value::Int(if matches!(c.ty, DataType::HierarchyId | DataType::Geometry | DataType::Geography) { 240 } else { st }), Value::Int(st), Value::Int(ml), Value::Int(p), Value::Int(s), Value::Bit(c.nullable), Value::Bit(c.identity.is_some()), Value::Bit(c.computed.is_some()), if c.ty.is_string() { sv(c.collation.as_deref().unwrap_or(&db.collation_or_default())) } else { Value::Null }, Value::Int(if c.default_name.is_some() { t.object_id * 1000 + 500 + i as i32 } else { 0 }), gt, gd]);
+                                rows.push(vec![Value::Int(t.object_id), sv(&c.name), Value::Int(i as i32 + 1), Value::Int(if matches!(c.ty, DataType::HierarchyId | DataType::Geometry | DataType::Geography) { 240 } else { st }), Value::Int(c.user_type.as_ref().and_then(|ut| db.types.values().find(|u| matches!(u.kind, crate::catalog::UserTypeKind::Alias(..)) && (format!("{}.{}", u.schema, u.name).eq_ignore_ascii_case(ut) || (u.schema.eq_ignore_ascii_case("dbo") && u.name.eq_ignore_ascii_case(ut))))).map(|u| u.type_id).unwrap_or(st)), Value::Int(ml), Value::Int(p), Value::Int(s), Value::Bit(c.nullable), Value::Bit(c.identity.is_some()), Value::Bit(c.computed.is_some()), if c.ty.is_string() { sv(c.collation.as_deref().unwrap_or(&db.collation_or_default())) } else { Value::Null }, Value::Int(if c.default_name.is_some() { t.object_id * 1000 + 500 + i as i32 } else { 0 }), gt, gd]);
                             }
                         }
                     }
@@ -628,7 +628,15 @@ impl<'a> Engine<'a> {
                         })
                         .collect();
                     for u in db.types.values() {
-                        rows.push(vec![sv(&u.name), Value::Int(u.type_id), Value::Int(0), Value::Int(sid(&u.schema)), Value::Bit(true), Value::Int(0), Value::Int(0), Value::Int(0), Value::Bit(true)]);
+                        // (an alias type has the system type and the size of its base type)
+                        let (base, ml, p, sc, nullable) = match &u.kind {
+                            crate::catalog::UserTypeKind::Alias(t, n) => {
+                                let (st, ml, p, sc) = type_info(t);
+                                (st, ml, p, sc, *n)
+                            }
+                            _ => (0, 0, 0, 0, true),
+                        };
+                        rows.push(vec![sv(&u.name), Value::Int(u.type_id), Value::Int(base), Value::Int(sid(&u.schema)), Value::Bit(true), Value::Int(ml), Value::Int(p), Value::Int(sc), Value::Bit(nullable)]);
                     }
                     Some(rs(&[("name", nv()), ("user_type_id", DataType::Int), ("system_type_id", DataType::Int), ("schema_id", DataType::Int), ("is_user_defined", DataType::Bit), ("max_length", DataType::SmallInt), ("precision", DataType::TinyInt), ("scale", DataType::TinyInt), ("is_nullable", DataType::Bit)], rows))
                 }

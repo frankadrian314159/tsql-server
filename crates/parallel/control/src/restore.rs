@@ -167,7 +167,18 @@ impl ClusterSession {
                 None => DistChoice::By(default_key(t)?),
             };
             if let DistChoice::By(k) = &choice {
-                check_key(t, k)?;
+                let at = check_key(t, k)?;
+                // a unique index or constraint without the shard key cannot be checked across shards: refused, or (with
+                // CONTINUE_AFTER_ERROR) made an ordinary index, and said so
+                let weak = script::uniques_without(t, at);
+                if !weak.is_empty() && !keep_going {
+                    return Err(unsupported(&format!(
+                        "the unique key(s) {} of {} that do not contain the shard key {} (RESTORE ... WITH CONTINUE_AFTER_ERROR makes them ordinary indexes; or name another key with DISTRIBUTION, or REPLICATED)",
+                        weak.join(", "),
+                        t.name,
+                        k
+                    )));
+                }
             }
             plan.push((t, choice));
         }
@@ -210,7 +221,9 @@ impl ClusterSession {
 
         // ---- make it, send the rows; undo it all on a failure
         let mut made: Vec<Made> = vec![];
-        let out = self.restore_into(&src, &plan, &modules, keep_going, &mut made, events).await;
+        // (the stored functions of the backup are left out, so a computed column that calls one is too)
+        let missing_functions: Vec<String> = cat.objects.values().filter_map(|o| if let Object::Func(f) = o { Some(f.name.to_lowercase()) } else { None }).collect();
+        let out = self.restore_into(&src, &plan, &modules, keep_going, &missing_functions, &mut made, events).await;
         let (nrows, sharded, replicated) = match out {
             Ok(x) => x,
             Err(e) => {
@@ -247,7 +260,7 @@ impl ClusterSession {
 
     /// The part of the restore that changes the cluster: returns (rows, sharded tables, replicated tables).
     #[allow(clippy::too_many_arguments)]
-    async fn restore_into(&mut self, src: &BackupSource, plan: &[(&Table, DistChoice)], modules: &[(&'static str, Name, String)], keep_going: bool, made: &mut Vec<Made>, events: &mut Vec<Event>) -> Result<(u64, usize, usize), SqlError> {
+    async fn restore_into(&mut self, src: &BackupSource, plan: &[(&Table, DistChoice)], modules: &[(&'static str, Name, String)], keep_going: bool, missing_functions: &[String], made: &mut Vec<Made>, events: &mut Vec<Event>) -> Result<(u64, usize, usize), SqlError> {
         // the schemas the objects are in (the shards need them too)
         let mut schemas: Vec<String> = plan.iter().map(|(t, _)| t.schema.clone()).chain(modules.iter().filter_map(|(_, n, _)| n.first().cloned())).filter(|s| !s.eq_ignore_ascii_case("dbo")).collect();
         schemas.sort_by_key(|s| s.to_lowercase());
@@ -273,7 +286,11 @@ impl ClusterSession {
         let mut scripts = vec![];
         let (mut sharded, mut replicated) = (0usize, 0usize);
         for (t, choice) in plan {
-            let s = script::table(t);
+            let shard_at = match choice {
+                DistChoice::By(k) => t.columns.iter().position(|c| c.name.eq_ignore_ascii_case(k)),
+                DistChoice::Replicated => None,
+            };
+            let s = script::table_sharded(t, shard_at, missing_functions);
             let name: Name = vec![t.schema.clone(), t.name.clone()];
             let id = table_id(&name);
             self.create_dist = Some(choice.clone());
@@ -423,19 +440,16 @@ fn default_key(t: &Table) -> Result<String, SqlError> {
 
 /// A shard key must be a column of a type the cluster hashes, and in every unique key (else uniqueness is not checked across
 /// shards).
-fn check_key(t: &Table, key: &str) -> Result<(), SqlError> {
+fn check_key(t: &Table, key: &str) -> Result<usize, SqlError> {
     let shown = format!("{}.{}", t.schema, t.name);
     let at = t.columns.iter().position(|c| c.name.eq_ignore_ascii_case(key)).ok_or_else(|| SqlError::new(207, format!("Invalid column name '{}' (DISTRIBUTION of {}).", key, shown)))?;
     if KeyClass::of_type_name(&script::type_name(&t.columns[at].ty)).is_none() {
         return Err(unsupported(&format!("the shard key {} of {} (type {})", key, shown, t.columns[at].ty)));
     }
-    let keys = t.pk.iter().map(|k| &k.cols).chain(t.uniques.iter().map(|u| &u.cols));
-    for cols in keys {
-        if !cols.contains(&at) {
-            return Err(unsupported(&format!("the shard key {} of {}, which a primary key or unique constraint of the table does not contain", key, shown)));
-        }
+    if t.pk.as_ref().is_some_and(|k| !k.cols.contains(&at)) {
+        return Err(unsupported(&format!("the shard key {} of {}, which the primary key of the table does not contain", key, shown)));
     }
-    Ok(())
+    Ok(at)
 }
 
 /// `DISTRIBUTION = N'dbo.orders BY customer_id; region REPLICATED'`: entries separated by `;` or `,`, names in brackets or not.

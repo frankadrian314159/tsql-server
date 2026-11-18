@@ -58,8 +58,9 @@ fn type_numbers(ty: &DataType) -> (u8, u32, i16, u8, u8) {
     }
 }
 
-fn col_meta(i: usize, c: &Column, last: Option<i64>) -> ColMeta {
+fn col_meta(i: usize, c: &Column, last: Option<i64>, alias_id: Option<u32>) -> ColMeta {
     let (xtype, utype, length, prec, scale) = type_numbers(&c.ty);
+    let utype = alias_id.unwrap_or(utype);
     ColMeta {
         colid: i as u32 + 1,
         name: c.name.clone(),
@@ -103,6 +104,31 @@ fn parenthesized(text: &str) -> String {
     format!("({})", t)
 }
 
+/// The id of the alias type a column was declared with (`schema.name`; a name alone is in `dbo`).
+fn alias_id(db: &Database, user_type: &str) -> Option<u32> {
+    db.types
+        .values()
+        .find(|u| matches!(u.kind, crate::catalog::UserTypeKind::Alias(..)) && (format!("{}.{}", u.schema, u.name).eq_ignore_ascii_case(user_type) || (u.schema.eq_ignore_ascii_case("dbo") && u.name.eq_ignore_ascii_case(user_type))))
+        .map(|u| u.type_id as u32)
+}
+
+/// The alias types of a database, as the backup records them.
+fn alias_types(db: &Database) -> Vec<crate::sqlbak::AliasType> {
+    let mut out: Vec<crate::sqlbak::AliasType> = db
+        .types
+        .values()
+        .filter_map(|u| match &u.kind {
+            crate::catalog::UserTypeKind::Alias(ty, nullable) => {
+                let (xtype, _, length, prec, scale) = type_numbers(ty);
+                Some(crate::sqlbak::AliasType { id: u.type_id as u32, schema: u.schema.clone(), name: u.name.clone(), xtype, length, prec, scale, not_null: !*nullable, ty: ty.clone() })
+            }
+            _ => None,
+        })
+        .collect();
+    out.sort_by_key(|a| a.id);
+    out
+}
+
 fn colid(t: &Table, name: &str) -> u32 {
     t.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name)).map(|i| i as u32 + 1).unwrap_or(0)
 }
@@ -110,7 +136,7 @@ fn colid(t: &Table, name: &str) -> u32 {
 /// What the writer needs to know about a table, from the catalog.
 fn table_meta(db: &Database, t: &Table, schema_ids: &HashMap<String, u32>) -> TableMeta {
     let last = t.identity_next.get().and_then(|n| t.columns.iter().find_map(|c| c.identity.map(|(_, inc)| n - inc)));
-    let cols: Vec<ColMeta> = t.columns.iter().enumerate().map(|(i, c)| col_meta(i, c, last)).collect();
+    let cols: Vec<ColMeta> = t.columns.iter().enumerate().map(|(i, c)| col_meta(i, c, last, c.user_type.as_ref().and_then(|ut| alias_id(db, ut)))).collect();
     // indexes: the clustered key (a primary key or unique constraint) is index 1, the others follow
     let mut indexes: Vec<IndexMeta> = vec![];
     let key_index = |k: &crate::catalog::KeyDef, id: u32, primary: bool| IndexMeta {
@@ -313,7 +339,7 @@ impl Engine<'_> {
         }
         tables.sort_by(|a, b| (a.schema.as_str(), a.name.as_str()).cmp(&(b.schema.as_str(), b.name.as_str())));
         let ft_catalogs = db.fulltext_catalogs.iter().enumerate().map(|(i, c)| FtCatalogMeta { id: i as u32 + 1, name: c.name.clone(), is_default: c.is_default, accent_sensitive: c.accent_sensitive }).collect();
-        let img = Image { name: db.name.clone(), schemas, tables, modules: modules(&db), ft_catalogs };
+        let img = Image { name: db.name.clone(), schemas, tables, modules: modules(&db), ft_catalogs, aliases: alias_types(&db) };
         let pages_path = format!("{}.pages", tmp);
         let result = (|| -> std::result::Result<(u64, u64), String> {
             let mut pager = Pager::create(std::path::Path::new(&pages_path)).map_err(|e| e.to_string())?;

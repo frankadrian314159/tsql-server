@@ -35,7 +35,14 @@ impl<'a> Engine<'a> {
                 }
                 let (ty, user_type) = match &c.ty {
                     Some(tr) => {
-                        let ut = if tr.parts.len() == 1 && DataType::from_name(&tr.parts[0], &tr.args, false).is_err() { Some(tr.parts[0].clone()) } else { None };
+                        // (the alias type a column was declared with, as `schema.name`: a backup in SQL Server's form records it)
+                        let ut = {
+                            let (sch, nm) = match tr.parts.len() {
+                                1 => ("dbo".to_string(), tr.parts[0].clone()),
+                                _ => (tr.parts[tr.parts.len() - 2].clone(), tr.parts[tr.parts.len() - 1].clone()),
+                            };
+                            self.srv.databases.get(&self.ses.db.to_lowercase()).and_then(|d| d.types.get(&obj_key(&sch, &nm))).filter(|u| matches!(u.kind, UserTypeKind::Alias(..))).map(|u| format!("{}.{}", u.schema, u.name))
+                        };
                         (self.resolve_type(tr)?, ut)
                     }
                     None => (DataType::Variant, None),
