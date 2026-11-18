@@ -78,6 +78,7 @@ pub struct ShuffleReq {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LoadReq {
     pub session: u64,
+    /// `name`, or `schema.name` (a restore loads the tables it makes)
     pub table: String,
     pub rows: Vec<Vec<Value>>,
 }

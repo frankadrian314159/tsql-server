@@ -8,7 +8,8 @@
 //!
 //! Parameterized statements (what drivers send as `sp_executesql`, and what prepared statements become) are run by binding
 //! their parameters as variables of the session and substituting them in the statement. Not supported through the front
-//! end: OUTPUT parameters, server cursors, table-valued parameters and bulk load.
+//! end: OUTPUT parameters (other than those of `sp_executesql`), and the T-SQL `BULK INSERT` statement. `INSERT BULK` (the
+//! protocol's bulk load) works: the listener turns its rows into `INSERT` statements, which come here.
 use crate::astutil::*;
 use crate::*;
 use std::collections::HashMap;
@@ -53,6 +54,10 @@ impl ClusterSession {
                 Some(inner) => self.wants(&inner),
                 None => false,
             },
+            // a restore puts the backup's tables on the shards (see restore.rs); a backup of the cluster's database is refused there
+            // (the engine here holds none of its rows). The other RESTOREs (HEADERONLY, VERIFYONLY) only read the file.
+            Stmt::Restore(r) => r.kind == RestoreKind::Database,
+            Stmt::Backup(b) => b.db.eq_ignore_ascii_case(&self.mirror.current_database()),
             Stmt::Declare(_) | Stmt::Set { .. } => false,
             _ => false,
         }

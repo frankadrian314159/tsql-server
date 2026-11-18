@@ -66,6 +66,9 @@ any other change.
   recovery**. Records are timestamped with the wall clock when they are written;
 * `RESTORE LOG` on a database that is not restoring is error 3117.
 
+In a cluster, `RESTORE DATABASE` sent to the control node puts the tables on the shards and sends them the rows as the backup is read;
+see [distributed.md](distributed.md#restoring-a-backup-into-a-cluster).
+
 ## Format and limits
 
 Backup files are `TSQLBAK1` + frames of `[length][crc32][postcard]`; a damaged frame is error 3043, a truncated or foreign

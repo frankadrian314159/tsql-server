@@ -282,13 +282,15 @@ impl ShardNode {
             let mut c = conn.lock().unwrap_or_else(|e| e.into_inner());
             // (the rows go in as committed rows, without the machinery of an INSERT: a durable shard or a session in a transaction
             // takes the ordinary INSERT, see `Connection::load_rows`)
+            // (`schema.name` for a table outside dbo, as a restore sends; a shuffle's temporary tables have one-part names)
+            let name: Vec<String> = table.split('.').map(|p| p.to_string()).collect();
             let mut it = rows.into_iter();
             loop {
                 let part: Vec<Vec<tsql_server::Value>> = it.by_ref().take(20_000).collect();
                 if part.is_empty() {
                     break;
                 }
-                c.load_rows(std::slice::from_ref(&table), None, part).map_err(|e| WireError::from_sql(&e))?;
+                c.load_rows(&name, None, part).map_err(|e| WireError::from_sql(&e))?;
             }
             Ok(())
         })

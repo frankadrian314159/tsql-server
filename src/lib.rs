@@ -38,6 +38,7 @@ pub mod fulltext;
 pub mod hierarchyid;
 pub mod spatial;
 pub mod rewrite;
+pub mod script;
 pub mod xsd;
 pub mod xpress;
 

@@ -353,6 +353,45 @@ the `$graph_id` of every row comes from a counter in its state, and the shards (
 does what a deleted node means for the edges at it (`ON DELETE CASCADE`, `NO ACTION`), since the edges may be on other shards. Rows copied
 between shards (a new shard, a rebalance, the copies a join makes) are copied with every column by name, the hidden ones included.
 
+## Restoring a backup into a cluster
+
+```sql
+RESTORE DATABASE shop FROM DISK = '/backups/shop.bak'
+    WITH DISTRIBUTION = N'dbo.orders BY customer_id; dbo.currencies REPLICATED', REPLACE;
+```
+
+`RESTORE DATABASE` sent to the control node restores the backup into the cluster: the tables are made through the cluster (as
+`CREATE TABLE` makes them) and the rows go to the shards that own them **as the backup is read**, a batch at a time with the
+`load` action (`crates/parallel/control/src/restore.rs`). The control node never holds the database: its own engine gets the
+schema, as for every distributed table. A backup of this server and a SQL Server `.bak` both work (a `.bak` is first converted
+to this server's format in a temporary file, as a single-node restore does).
+
+* **How each table is spread.** `WITH DISTRIBUTION = N'table BY column; table REPLICATED; ...'` says it (names with or without a
+  schema and brackets, entries separated by `;` or `,`). A table it does not name is **replicated when it has at most 10,000
+  rows** and otherwise sharded on the first column of its primary key, as `CREATE TABLE` does. A shard key must be of a type the
+  cluster hashes (integer, character, `uniqueidentifier`) and be in every primary key and unique constraint of its table;
+  otherwise the restore is refused before anything is made, and says to name another key or `REPLICATED`.
+* **The order.** The backup is checked (every checksum) and each table's rows counted; then the schemas (on the control node and
+  every shard), the tables with their keys, defaults, computed columns, collations, masks and check constraints, the foreign
+  keys (while the tables are empty, so the tables can come in any order), the rows, the other indexes, the identity counters
+  (they go on from the source's), and last the views and procedures in the order they were made. The rows are written as
+  committed rows (a durable or replicated shard takes ordinary `INSERT`s, which its log and its replicas keep). The foreign keys
+  are not checked again for the restored rows (they come from a consistent database), and on an in-memory shard neither are the
+  check constraints.
+* **What a cluster cannot hold is refused** before anything is made: stored functions, triggers, sequences, synonyms,
+  system-versioned and graph tables, columnstore indexes, xml typed by a schema collection, foreign keys to other databases,
+  security policies and DDL triggers. `WITH CONTINUE_AFTER_ERROR` restores the rest and says what it left out (as messages
+  beginning `Not restored:`), including views and procedures that could not be made without what was left out. Never restored,
+  with a message: user-defined types (columns keep their base types), the database's users, roles and permissions (the
+  cluster's database keeps its own), disabled foreign keys (the cluster enforces every foreign key it knows), and XML, spatial
+  and full-text indexes (declarations here, which change no answer).
+* **One database.** The objects go into the cluster's database whatever the statement names. If any of their names is taken,
+  the restore is error 3159; `WITH REPLACE` drops the cluster's objects of those names first. A failure drops everything the
+  restore made. Only a full backup restores, `WITH RECOVERY`: `NORECOVERY`, `STANDBY`, `STOPAT`, and log and differential backups
+  are refused, as is a restore inside a transaction (574). While it runs, other sessions can see the tables filling.
+* **`BACKUP DATABASE` of the cluster's database is refused** (error 50100): the control node's engine holds none of its rows, so the
+  backup would be empty.
+
 ## Foreign keys
 
 The shards cannot see each other's rows, so they are not given foreign keys; the control node keeps the definitions (in its
@@ -420,7 +459,9 @@ generated rows.
   functions and triggers (they would need an interpreter next to the data; a procedure is made on every shard and can be
   declared to run on one, see *Procedures that run on one shard*), `CREATE DATABASE`/`USE`, temporal
   tables, DML with joins (`UPDATE ... FROM`), `OUTPUT` or `TOP` in DML, `INSERT ... DEFAULT VALUES`/`EXEC`, correlated
-  subqueries in DML, and schema changes inside a transaction. Views cannot be written through.
+  subqueries in DML, schema changes inside a transaction, the T-SQL `BULK INSERT` statement (`INSERT BULK`, the protocol's bulk
+  load, works), `BACKUP` of the cluster's database, and restoring anything but a full backup (see *Restoring a backup into a
+  cluster*). Views cannot be written through.
 * **Foreign keys and identity values are the control node's**: the checks are not atomic across sessions (see Foreign keys),
   and a control node that loses its state file loses the identity counters and the foreign keys with it.
 * **Gather moves whole tables** (queries with a correlated subquery that is not an equality, `STDEV`, recursive CTEs and the

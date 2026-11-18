@@ -911,3 +911,134 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 }
+
+// ------------------------------------------------------------------ a backup restored elsewhere
+
+/// A full database backup opened to be restored somewhere other than this engine's catalog. A cluster's control node uses it:
+/// it creates the tables through the cluster and sends their rows to the shards a batch at a time, so the whole database is
+/// never held in one place. The backup is checked first (every frame's checksum, as `RESTORE VERIFYONLY` does). A SQL Server
+/// backup is converted to this server's format in a temporary file first, which is removed when this is dropped.
+pub struct BackupSource {
+    path: String,
+    temp: Option<std::path::PathBuf>,
+    /// The name of the database the backup was taken of.
+    pub database: String,
+    /// Its catalog: the tables (without rows), views, procedures and the rest.
+    pub catalog: Database,
+    /// What reading a SQL Server backup reported (values it could not read, objects it could not convert), to pass on.
+    pub notes: Vec<String>,
+}
+
+impl BackupSource {
+    /// Open and check the backup at `path`. Only a full backup describes a whole database: a log backup is error 3154, a
+    /// differential one 3136.
+    pub fn open(path: &str) -> Result<BackupSource> {
+        let mut notes = vec![];
+        let mut temp: Option<std::path::PathBuf> = None;
+        let mut file = path.to_string();
+        if is_sqlserver_backup(path) {
+            let tmp = std::env::temp_dir().join(format!("tsql-import-{}-{}.tbak", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)));
+            let tmp_path = tmp.to_string_lossy().to_string();
+            let report = super::bakimport::convert(path, &tmp_path).map_err(|why| {
+                let _ = std::fs::remove_file(&tmp);
+                bad_media(path, &why)
+            })?;
+            notes.push(format!("Read the SQL Server backup of database '{}': {} table(s), {} row(s).", report.database, report.tables, report.rows));
+            for (table, col, n) in &report.skipped {
+                notes.push(format!("Warning: {} value(s) of {}.{} are stored in a form that is not read yet (large objects, XML) and were set to NULL.", n, table, col));
+            }
+            for p in report.problems.iter().take(30) {
+                notes.push(format!("Warning: {}.", p));
+            }
+            if report.problems.len() > 30 {
+                notes.push(format!("Warning: {} more problem(s) like these.", report.problems.len() - 30));
+            }
+            if !report.computed.is_empty() {
+                let list: Vec<String> = report.computed.iter().map(|(t, c)| format!("{}.{}", t, c)).collect();
+                notes.push(format!("Warning: computed column(s) were not created: {}.", list.join(", ")));
+            }
+            temp = Some(tmp);
+            file = tmp_path;
+        }
+        let opened = (|| -> Result<(String, Database)> {
+            let (h, ..) = verify(&file)?;
+            if h.log {
+                return Err(SqlError::with(3154, 16, 1, "The backup set holds a log backup; use RESTORE LOG. A full backup is needed to restore a database."));
+            }
+            if h.diff_base.is_some() {
+                return Err(SqlError::with(3136, 16, 1, "This differential backup cannot be restored here: only a full backup can be restored into a cluster."));
+            }
+            let mut rd = FrameReader::open(&file)?;
+            let Frame::Header(_) = rd.next()? else { return Err(bad_media(&file, "the header is missing")) };
+            let Frame::Catalog(db) = rd.next()? else { return Err(bad_media(&file, "the catalog is missing")) };
+            Ok((h.db, *db))
+        })();
+        match opened {
+            Ok((database, catalog)) => Ok(BackupSource { path: file, temp, database, catalog, notes }),
+            Err(e) => {
+                if let Some(t) = &temp {
+                    let _ = std::fs::remove_file(t);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// The number of rows of each table (by its catalog key), counted by reading the backup through without keeping them.
+    pub fn row_counts(&self) -> Result<std::collections::HashMap<String, u64>> {
+        let mut out = std::collections::HashMap::new();
+        for b in self.batches()? {
+            let (key, rows) = b?;
+            *out.entry(key).or_insert(0) += rows.len() as u64;
+        }
+        Ok(out)
+    }
+
+    /// The rows of the backup a batch at a time, as (table key, rows), in the order they were written (table by table). Each
+    /// row has a value for every column of its table, in the table's order.
+    pub fn batches(&self) -> Result<RowBatches> {
+        let mut rd = FrameReader::open(&self.path)?;
+        // (the header and the catalog come first)
+        rd.next()?;
+        rd.next()?;
+        Ok(RowBatches { rd, done: false })
+    }
+}
+
+impl Drop for BackupSource {
+    fn drop(&mut self) {
+        if let Some(t) = &self.temp {
+            let _ = std::fs::remove_file(t);
+        }
+    }
+}
+
+/// The row batches of a [`BackupSource`].
+pub struct RowBatches {
+    rd: FrameReader,
+    done: bool,
+}
+
+impl Iterator for RowBatches {
+    type Item = Result<(String, Vec<Row>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        loop {
+            match self.rd.next() {
+                Ok(Frame::Rows { key, rows }) => return Some(Ok((key, rows.into_iter().map(|(_, r)| r).collect()))),
+                Ok(Frame::End { .. }) => {
+                    self.done = true;
+                    return None;
+                }
+                Ok(_) => continue,
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            }
+        }
+    }
+}

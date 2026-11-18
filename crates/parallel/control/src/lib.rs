@@ -42,6 +42,7 @@ pub mod procs;
 pub mod rebalance;
 pub mod split;
 pub mod replicas;
+pub mod restore;
 pub mod txn;
 
 use astutil::*;
@@ -389,7 +390,7 @@ impl Cluster {
     }
 
     pub fn session(self: &Arc<Self>) -> ClusterSession {
-        ClusterSession { cluster: self.clone(), id: self.next_session.fetch_add(1, Ordering::Relaxed), mirror: self.mirror.connect_internal(), plan: vec![], temp_counter: 0, txn: std::cell::RefCell::new(None), stmt_shards: std::cell::Cell::new(0), commit_seq: 0, vars: HashMap::new(), local_tables: HashMap::new(), tvars: HashMap::new(), identity_insert: Default::default(), last_identity: None }
+        ClusterSession { cluster: self.clone(), id: self.next_session.fetch_add(1, Ordering::Relaxed), mirror: self.mirror.connect_internal(), plan: vec![], temp_counter: 0, txn: std::cell::RefCell::new(None), stmt_shards: std::cell::Cell::new(0), commit_seq: 0, vars: HashMap::new(), local_tables: HashMap::new(), tvars: HashMap::new(), identity_insert: Default::default(), last_identity: None, create_dist: None }
     }
 
     pub fn shard_status(&self) -> Vec<Result<ShardStatus, SqlError>> {
@@ -423,6 +424,8 @@ pub struct ClusterSession {
     identity_insert: std::collections::HashSet<String>,
     /// the last identity value this session handed out (`SCOPE_IDENTITY()`, `@@IDENTITY`)
     last_identity: Option<i64>,
+    /// how the table that `create_table` is about to make is spread, when a RESTORE chooses it (taken by `create_table`)
+    create_dist: Option<restore::DistChoice>,
     /// the table variables of the session (by lower-case name) with their columns and rows: a query that reads one has its
     /// rows sent to the shards as a temporary table (see `nested.rs`). (The engine keeps variables for one batch only, so the
     /// session keeps these itself.)
@@ -1142,6 +1145,9 @@ impl ClusterSession {
                 events.push(Event::Rows(rs));
                 Ok(())
             }
+            Stmt::Restore(r) if r.kind == RestoreKind::Database => self.restore_database(r, events).await,
+            // (the control node's own copy of the cluster's database holds no rows: a backup of it would be empty)
+            Stmt::Backup(_) => Err(unsupported("BACKUP of the cluster's database (its rows are on the shards)")),
             other => Err(unsupported(&format!("the statement {}", stmt_kind(other)))),
         }
     }
@@ -1205,16 +1211,26 @@ impl ClusterSession {
         let fks = self.declared_fks(name, defs, &pk)?;
         let stripped = without_fks(st);
         let st = &stripped;
-        // the shard key: the first column of the primary key, else the first column
-        let key_name = pk.first().cloned().or_else(|| cols.iter().find(|c| !c.computed && !c.hidden).or_else(|| cols.iter().find(|c| !c.computed)).map(|c| c.name.clone())).ok_or_else(|| SqlError::new(1113, "A table needs at least one column."))?;
-        let key = cols.iter().position(|c| c.name.eq_ignore_ascii_case(&key_name)).ok_or_else(|| SqlError::new(1911, format!("Column name '{}' does not exist in the target table.", key_name)))?;
-        let class = KeyClass::of_type_name(&cols[key].type_name)
-            .ok_or_else(|| unsupported(&format!("the shard key {} of type {} (use an integer, character or uniqueidentifier first key column, or DISTRIBUTE TABLE ... REPLICATED)", key_name, cols[key].type_name)))?;
-        for u in &uniques {
-            if !u.iter().any(|c| c.eq_ignore_ascii_case(&key_name)) {
-                return Err(unsupported(&format!("a UNIQUE constraint that does not contain the shard key ({})", key_name)));
+        // the shard key: the first column of the primary key, else the first column (a RESTORE may name another, or make the
+        // table replicated: see restore.rs)
+        let choice = self.create_dist.take();
+        let dist = if choice == Some(restore::DistChoice::Replicated) {
+            Dist::Replicated
+        } else {
+            let key_name = match &choice {
+                Some(restore::DistChoice::By(c)) => c.clone(),
+                _ => pk.first().cloned().or_else(|| cols.iter().find(|c| !c.computed && !c.hidden).or_else(|| cols.iter().find(|c| !c.computed)).map(|c| c.name.clone())).ok_or_else(|| SqlError::new(1113, "A table needs at least one column."))?,
+            };
+            let key = cols.iter().position(|c| c.name.eq_ignore_ascii_case(&key_name)).ok_or_else(|| SqlError::new(1911, format!("Column name '{}' does not exist in the target table.", key_name)))?;
+            let class = KeyClass::of_type_name(&cols[key].type_name)
+                .ok_or_else(|| unsupported(&format!("the shard key {} of type {} (use an integer, character or uniqueidentifier first key column, or DISTRIBUTE TABLE ... REPLICATED)", key_name, cols[key].type_name)))?;
+            for u in &uniques {
+                if !u.iter().any(|c| c.eq_ignore_ascii_case(&key_name)) {
+                    return Err(unsupported(&format!("a UNIQUE constraint that does not contain the shard key ({})", key_name)));
+                }
             }
-        }
+            Dist::Sharded { key, class }
+        };
         if let Err(e) = self.broadcast(st).await {
             // the mirror (and perhaps some shards) made the table: take it back, so that nothing knows a table the
             // cluster does not have
@@ -1227,7 +1243,7 @@ impl ClusterSession {
             return Err(e);
         }
         let id = table_id(name);
-        self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), DistTable { id, name: name.clone(), cols, dist: Dist::Sharded { key, class }, version: 0, loaded: None, rows: None, identity: identity.map(|(col, next, inc)| Identity { col, next, inc }), indexes: vec![], graph: graph_meta, edge_cons });
+        self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), DistTable { id, name: name.clone(), cols, dist, version: 0, loaded: None, rows: None, identity: identity.map(|(col, next, inc)| Identity { col, next, inc }), indexes: vec![], graph: graph_meta, edge_cons });
         self.cluster.fks.lock().unwrap_or_else(|e| e.into_inner()).extend(fks);
         self.cluster.log_schema(st);
         Ok(())

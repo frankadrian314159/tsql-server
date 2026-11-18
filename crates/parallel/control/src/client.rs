@@ -8,7 +8,7 @@ use tsql_server::{ResultSet, SqlError};
 use tsql_shared_ces::arrowconv;
 use tsql_shared_ces::wire::{sql_error_of, Fragment, PrepareReq, RunReply, SettleReq, ShardStatus, Work, ACTION_CLOSE_SESSION, ACTION_KILL, ACTION_MEMBERS, ACTION_PREPARE, ACTION_PREPARED, ACTION_RUN, ACTION_SETTLE, ACTION_STATUS, ACTION_WAITS, IN_DOUBT, NOT_LEADER};
 use tsql_shared_ces::wire::MemberReq;
-use tsql_shared_ces::wire::{ShuffleReq, ACTION_METRICS, ACTION_SHUFFLE};
+use tsql_shared_ces::wire::{LoadReq, ShuffleReq, ACTION_LOAD, ACTION_METRICS, ACTION_SHUFFLE};
 use tsql_shared_ces::metrics::NodeMetrics;
 
 /// What became of a transaction that a shard holds prepared (decided by the coordinator, see `txn.rs`).
@@ -216,6 +216,15 @@ impl ShardClient {
             }
         })
         .await
+    }
+
+    /// Insert rows into a table of the session on this shard (`table`: `name` or `schema.name`), as committed rows (the action
+    /// `load`, which a shuffle uses between shards; see `LoadReq`). Each row has a value for every column of the table that is not
+    /// computed, `rowversion` or an identity column, in the table's order.
+    pub async fn load(&self, session: u64, table: &str, rows: Vec<Vec<tsql_server::Value>>) -> Result<(), SqlError> {
+        let body = postcard::to_allocvec(&LoadReq { session, table: table.to_string(), rows }).map_err(|e| SqlError::new(50000, e.to_string()))?;
+        self.action(ACTION_LOAD, body).await?;
+        Ok(())
     }
 
     /// Have this shard run a scan and send its rows to the shards that own them (see `ShuffleReq`). Returns the rows sent.
