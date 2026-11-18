@@ -65,6 +65,10 @@ pub struct ColInfo {
     pub computed: bool,
     /// the lower-case name of the column's type
     pub type_name: String,
+    /// a column the control node gives and the user does not see (the `$graph_id` of a graph table): not in a `*`, not in the values of an
+    /// `INSERT` that names no columns, but part of the row when rows are copied
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -92,6 +96,46 @@ pub struct DistTable {
     /// global secondary indexes (`DISTRIBUTE TABLE t INDEX BY col`): see `GlobalIndex`
     #[serde(default)]
     pub indexes: Vec<GlobalIndex>,
+    /// a node or edge table: the control node numbers its rows (`$graph_id`), as it numbers an IDENTITY column
+    #[serde(default)]
+    pub graph: Option<GraphMeta>,
+    /// the `CONNECTION` constraints of an edge table (the shards check what an edge may connect; what becomes of the edges at a deleted node is
+    /// the control node's to do, as the foreign keys are)
+    #[serde(default)]
+    pub edge_cons: Vec<EdgeCons>,
+}
+
+impl DistTable {
+    /// What a read of the rows of the table that are to be copied selects: `*`, except for a graph table, whose `*` leaves out the hidden
+    /// `$graph_id`: every column, by name, in the order of `cols` (so that a position in `cols` is a position in the row).
+    pub(crate) fn copy_items(&self) -> Vec<SelectItem> {
+        if self.graph.is_some() {
+            self.cols.iter().map(|c| SelectItem::Expr { e: Expr::Col(vec![c.name.clone()]), alias: None }).collect()
+        } else {
+            vec![SelectItem::Star(None)]
+        }
+    }
+
+    /// The columns of a copied row that an `INSERT` can give, with their positions: `None` when a row is inserted whole, as it is (every
+    /// table but a graph table, whose rows have generated columns an `INSERT` cannot be given).
+    pub(crate) fn insertable(&self) -> Option<Vec<(usize, String)>> {
+        self.graph.as_ref().map(|_| self.cols.iter().enumerate().filter(|(_, c)| !c.computed).map(|(i, c)| (i, c.name.clone())).collect())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GraphMeta {
+    pub edge: bool,
+    /// the next `$graph_id` to hand out
+    pub next: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EdgeCons {
+    pub name: String,
+    /// the ids of the node tables an edge may go from and to
+    pub pairs: Vec<(String, String)>,
+    pub cascade: bool,
 }
 
 /// A global secondary index of a sharded table: a table of its own, `(gv, gk)`, sharded by `gv` (the indexed value), whose rows say
@@ -262,6 +306,19 @@ impl Cluster {
         };
         self.save_state();
         Some(out)
+    }
+
+    /// Reserve `count` `$graph_id`s of a node or edge table: the first of them (they go up by one). Saved with the control state.
+    pub(crate) fn take_graph_ids(&self, id: &str, count: usize) -> Option<i64> {
+        let first = {
+            let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+            let g = t.get_mut(id)?.graph.as_mut()?;
+            let first = g.next;
+            g.next += count as i64;
+            first
+        };
+        self.save_state();
+        Some(first)
     }
 
     /// An explicit value was inserted into an IDENTITY column: the numbers handed out from now on are past it.
@@ -888,7 +945,9 @@ impl ClusterSession {
 
     /// Run a statement on the mirror first (which checks it), then on every shard.
     async fn broadcast(&mut self, st: &Stmt) -> Result<(), SqlError> {
-        merge::check(&self.mirror.execute_stmts(std::slice::from_ref(st)))?;
+        // (the mirror takes the rows of a graph table as the shards do, with the `$graph_id` they were given, so it makes the table in their form)
+        let for_mirror = if matches!(st, Stmt::CreateTable { defs, .. } if defs.iter().any(|d| matches!(d, TableDef::Graph { .. }))) { shard_form(st) } else { st.clone() };
+        merge::check(&self.mirror.execute_stmts(std::slice::from_ref(&for_mirror)))?;
         let shards = self.all_shards();
         let on_shards = shard_form(st);
         self.fan_run(&shards, |_| Work::Stmts(vec![on_shards.clone()])).await?;
@@ -1090,6 +1149,8 @@ impl ClusterSession {
         let mut pk: Vec<String> = vec![];
         let mut uniques: Vec<Vec<String>> = vec![];
         let mut identity: Option<(usize, i64, i64)> = None;
+        let mut graph: Option<bool> = None;
+        let mut edge_cons: Vec<EdgeCons> = vec![];
         for d in defs {
             match d {
                 TableDef::Column(cd) => {
@@ -1105,23 +1166,42 @@ impl ClusterSession {
                         uniques.push(vec![cd.name.clone()]);
                     }
                     let type_name = cd.ty.as_ref().and_then(|t| t.parts.last()).map(|s| s.to_lowercase()).unwrap_or_default();
-                    cols.push(ColInfo { name: cd.name.clone(), computed: cd.computed.is_some(), type_name });
+                    cols.push(ColInfo { name: cd.name.clone(), computed: cd.computed.is_some(), type_name, hidden: false });
                 }
                 TableDef::PrimaryKey { cols: c, .. } => pk = c.iter().map(|(n, _)| n.clone()).collect(),
                 TableDef::Unique { cols: c, .. } => uniques.push(c.iter().map(|(n, _)| n.clone()).collect()),
                 TableDef::Index { cols: c, unique: true, .. } => uniques.push(c.iter().map(|(n, _)| n.clone()).collect()),
                 TableDef::Period { .. } => return Err(unsupported("system-versioned tables")),
-                // (the shards would each number a node table's rows from 0: two nodes of a table could have the one id)
-                TableDef::Graph { .. } | TableDef::EdgeConstraint { .. } => return Err(unsupported("graph (node and edge) tables")),
+                // (the control node numbers the rows of a graph table, `$graph_id`: the shards would each number them from 0)
+                TableDef::Graph { edge, .. } => graph = Some(*edge),
+                TableDef::EdgeConstraint { name: n, pairs, cascade } => {
+                    edge_cons.push(EdgeCons { name: n.clone().unwrap_or_else(|| format!("EC__{}", name.last().cloned().unwrap_or_default())), pairs: pairs.iter().map(|(f, t)| (table_id(f), table_id(t))).collect(), cascade: *cascade });
+                }
                 _ => {}
             }
+        }
+        // a graph table's own columns come first, as the engine puts them (see graph_columns in the engine)
+        let mut graph_meta: Option<GraphMeta> = None;
+        if let Some(edge) = graph {
+            let col = |n: &str, computed: bool, hidden: bool| ColInfo { name: n.to_string(), computed, type_name: if n == "$graph_id" { "bigint".to_string() } else { "nvarchar".to_string() }, hidden };
+            let mut own = vec![col("$graph_id", false, true), col(if edge { "$edge_id" } else { "$node_id" }, true, false)];
+            if edge {
+                own.push(col("$from_id", false, false));
+                own.push(col("$to_id", false, false));
+            }
+            if let Some(i) = identity.as_mut() {
+                i.0 += own.len();
+            }
+            own.extend(cols);
+            cols = own;
+            graph_meta = Some(GraphMeta { edge, next: 0 });
         }
         // foreign keys are the control node's to enforce (the shards and its own engine are not given them)
         let fks = self.declared_fks(name, defs, &pk)?;
         let stripped = without_fks(st);
         let st = &stripped;
         // the shard key: the first column of the primary key, else the first column
-        let key_name = pk.first().cloned().or_else(|| cols.iter().find(|c| !c.computed).map(|c| c.name.clone())).ok_or_else(|| SqlError::new(1113, "A table needs at least one column."))?;
+        let key_name = pk.first().cloned().or_else(|| cols.iter().find(|c| !c.computed && !c.hidden).or_else(|| cols.iter().find(|c| !c.computed)).map(|c| c.name.clone())).ok_or_else(|| SqlError::new(1113, "A table needs at least one column."))?;
         let key = cols.iter().position(|c| c.name.eq_ignore_ascii_case(&key_name)).ok_or_else(|| SqlError::new(1911, format!("Column name '{}' does not exist in the target table.", key_name)))?;
         let class = KeyClass::of_type_name(&cols[key].type_name)
             .ok_or_else(|| unsupported(&format!("the shard key {} of type {} (use an integer, character or uniqueidentifier first key column, or DISTRIBUTE TABLE ... REPLICATED)", key_name, cols[key].type_name)))?;
@@ -1142,7 +1222,7 @@ impl ClusterSession {
             return Err(e);
         }
         let id = table_id(name);
-        self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), DistTable { id, name: name.clone(), cols, dist: Dist::Sharded { key, class }, version: 0, loaded: None, rows: None, identity: identity.map(|(col, next, inc)| Identity { col, next, inc }), indexes: vec![] });
+        self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), DistTable { id, name: name.clone(), cols, dist: Dist::Sharded { key, class }, version: 0, loaded: None, rows: None, identity: identity.map(|(col, next, inc)| Identity { col, next, inc }), indexes: vec![], graph: graph_meta, edge_cons });
         self.cluster.fks.lock().unwrap_or_else(|e| e.into_inner()).extend(fks);
         self.cluster.log_schema(st);
         Ok(())
@@ -1240,10 +1320,27 @@ impl ClusterSession {
         self.broadcast(st).await?;
         self.cluster.fks.lock().unwrap_or_else(|e| e.into_inner()).extend(new_fks);
         self.cluster.fks.lock().unwrap_or_else(|e| e.into_inner()).retain(|f| !(f.child == t.id && dropped_fks.iter().any(|d| d.eq_ignore_ascii_case(&f.name))));
+        // the edge constraints of an edge table, as they are now
+        {
+            let mut tables = self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(e) = tables.get_mut(&t.id) {
+                match action {
+                    AlterAction::AddDefs(defs) => {
+                        for d in defs {
+                            if let TableDef::EdgeConstraint { name: n, pairs, cascade } = d {
+                                e.edge_cons.push(EdgeCons { name: n.clone().unwrap_or_else(|| format!("EC__{}", name.last().cloned().unwrap_or_default())), pairs: pairs.iter().map(|(f, to)| (table_id(f), table_id(to))).collect(), cascade: *cascade });
+                            }
+                        }
+                    }
+                    AlterAction::DropConstraint(names, _) => e.edge_cons.retain(|c| !names.iter().any(|n| n.eq_ignore_ascii_case(&c.name))),
+                    _ => {}
+                }
+            }
+        }
         // the columns as the control node's engine now has them
         let shown = format!("[{}].[{}]", if name.len() >= 2 { name[name.len() - 2].clone() } else { "dbo".to_string() }, name.last().cloned().unwrap_or_default());
         if let Some(info) = self.mirror.table_info(&shown) {
-            let cols: Vec<ColInfo> = info.columns.iter().map(|c| ColInfo { name: c.name.clone(), computed: c.computed, type_name: c.ty.split('(').next().unwrap_or("").trim().to_lowercase() }).collect();
+            let cols: Vec<ColInfo> = info.columns.iter().map(|c| ColInfo { name: c.name.clone(), computed: c.computed, type_name: c.ty.split('(').next().unwrap_or("").trim().to_lowercase(), hidden: t.graph.is_some() && c.name == "$graph_id" }).collect();
             let mut tables = self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(e) = tables.get_mut(&t.id) {
                 if let (Dist::Sharded { key, .. }, Some(k)) = (&mut e.dist, &key_col) {
@@ -1529,7 +1626,7 @@ impl ClusterSession {
         // without a column list the values are for the columns that are not computed (and not the identity column, unless
         // IDENTITY_INSERT is on)
         let mut names: Vec<String> = given.clone().unwrap_or_else(|| {
-            t.cols.iter().filter(|c| !c.computed && !(ident_col.as_deref() == Some(c.name.as_str()) && !self.identity_insert.contains(&t.id))).map(|c| c.name.clone()).collect()
+            t.cols.iter().filter(|c| !c.computed && !c.hidden && !(ident_col.as_deref() == Some(c.name.as_str()) && !self.identity_insert.contains(&t.id))).map(|c| c.name.clone()).collect()
         });
         if let Some(bad) = rows.iter().find(|r| r.len() != names.len()) {
             return Err(SqlError::new(213, format!("Column name or number of supplied values does not match table definition ({} values for {} columns).", bad.len(), names.len())));
@@ -1566,10 +1663,25 @@ impl ClusterSession {
                 }
             }
         }
+        // a graph table: the control node numbers the rows (`$graph_id`), the same numbers whichever shard a row goes to
+        if t.graph.is_some() {
+            let explicit = names.iter().any(|c| c.eq_ignore_ascii_case("$graph_id"));
+            if explicit && !self.identity_insert.contains(&t.id) {
+                return Err(SqlError::new(544, format!("Cannot insert explicit value for identity column in table '{}' when IDENTITY_INSERT is set to OFF.", t.name.last().cloned().unwrap_or_default())));
+            }
+            if !explicit {
+                if let Some(first) = self.cluster.take_graph_ids(&t.id, rows.len()) {
+                    for (k, r) in rows.iter_mut().enumerate() {
+                        r.push(Expr::Lit(Value::BigInt(first + k as i64)));
+                    }
+                    names.push("$graph_id".to_string());
+                }
+            }
+        }
         if !self.cluster.fks_of_child(&t.id).is_empty() {
             self.fk_check_insert(&t, &names, &rows).await?;
         }
-        let cols_for_shards: Option<Vec<String>> = if ident_col.is_some() || given.is_some() { Some(names.clone()) } else { None };
+        let cols_for_shards: Option<Vec<String>> = if ident_col.is_some() || given.is_some() || t.graph.is_some() { Some(names.clone()) } else { None };
         let make = |rows: Vec<Vec<Expr>>| Stmt::Insert(Box::new(Insert { ctes: vec![], target: ins.target.clone(), cols: cols_for_shards.clone(), output: None, src: InsertSrc::Values(rows), top: None }));
         let count: i64;
         match &t.dist {
@@ -1736,6 +1848,9 @@ impl ClusterSession {
             match s {
                 SetItem::Col { parts, e, .. } => {
                     let col = parts.last().cloned().unwrap_or_default();
+                    if t.graph.is_some() && col.eq_ignore_ascii_case("$graph_id") {
+                        return Err(SqlError::new(8102, format!("Cannot update identity column '{}'.", col)));
+                    }
                     if let Some(i) = &t.identity {
                         if t.cols[i.col].name.eq_ignore_ascii_case(&col) {
                             return Err(SqlError::new(8102, format!("Cannot update identity column '{}'.", col)));
@@ -1855,8 +1970,53 @@ impl ClusterSession {
             }
         }
         self.fk_before_delete(&t, d.where_.as_ref(), events).await?;
+        self.edges_before_node_delete(&t, d.where_.as_ref(), events).await?;
         let shards = self.dml_shards(&t, d.where_.as_ref()).await?;
         self.run_dml(&t, Stmt::Delete(Box::new(d.clone())), shards, events).await
+    }
+
+    /// Deleting nodes: the edges at them, in the edge tables whose `CONNECTION` constraints name the node's table, are deleted too with
+    /// `ON DELETE CASCADE`, and stop the delete (error 547) without it, as in the engine (see graph.rs there). Each shard checks only
+    /// the edges it holds, so the control node does it for all of them. (The cascade is a statement of its own, before the delete of the
+    /// nodes: inside a transaction they are one.)
+    async fn edges_before_node_delete(&mut self, t: &DistTable, where_: Option<&Expr>, events: &mut Vec<Event>) -> Result<(), SqlError> {
+        if !matches!(&t.graph, Some(g) if !g.edge) {
+            return Ok(());
+        }
+        let edge_tables: Vec<(DistTable, bool)> = {
+            let all = self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner());
+            all.values()
+                .filter_map(|e| {
+                    let mine: Vec<&EdgeCons> = e.edge_cons.iter().filter(|c| c.pairs.iter().any(|(f, to)| *f == t.id || *to == t.id)).collect();
+                    (!mine.is_empty()).then(|| (e.clone(), mine.iter().any(|c| c.cascade)))
+                })
+                .collect()
+        };
+        if edge_tables.is_empty() {
+            return Ok(());
+        }
+        let ids_q = simple_query(Select { distinct: false, top: None, items: vec![SelectItem::Expr { e: col("$node_id"), alias: None }], into: None, from: vec![TableRef::Table { name: t.name.clone(), alias: None, hints: vec![] }], where_: where_.cloned(), group: None, having: None });
+        let ids: Vec<Expr> = self.run_query(&ids_q).await?.rows.into_iter().filter_map(|r| r.into_iter().next()).filter(|v| !v.is_null()).map(Expr::Lit).collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        // (what stops the delete first, so that nothing has been cascaded when it does)
+        let at = |c: &str| Expr::InList(Box::new(col(c)), ids.clone(), false);
+        let cond = || Expr::Or(Box::new(at("$from_id")), Box::new(at("$to_id")));
+        for (e, _) in edge_tables.iter().filter(|(_, cascade)| !cascade) {
+            let found_q = simple_query(Select { distinct: false, top: None, items: vec![SelectItem::Expr { e: col("$graph_id"), alias: None }], into: None, from: vec![TableRef::Table { name: e.name.clone(), alias: None, hints: vec![] }], where_: Some(cond()), group: None, having: None });
+            if !self.run_query(&found_q).await?.rows.is_empty() {
+                return Err(SqlError::new(547, format!("The DELETE statement conflicted with the EDGE REFERENCE constraint \"{}\". The conflict occurred in table \"{}\".", e.edge_cons[0].name, e.name.join("."))));
+            }
+        }
+        for (e, _) in edge_tables.iter().filter(|(_, cascade)| *cascade) {
+            let del = Delete { ctes: vec![], target: Target::Table(e.name.clone()), from: vec![], where_: Some(cond()), output: None, top: None, current_of: None };
+            let mut quiet = vec![];
+            Box::pin(self.delete(&del, &mut quiet)).await?;
+            self.plan.push(format!("ON DELETE CASCADE: the edges at the deleted nodes deleted from {}", e.id));
+        }
+        let _ = events;
+        Ok(())
     }
 
     // ------------------------------------------------------------------ queries
@@ -1868,6 +2028,11 @@ impl ClusterSession {
         if tables.is_empty() {
             self.plan.push("local: reads no distributed table".into());
             return self.mirror_query(q);
+        }
+        // a shortest path is worked out over the whole graph (see graph.rs in the engine): the tables are copied to the control node's engine
+        if serde_json::to_string(q).map(|s| s.contains("__SHORTEST_PATH")).unwrap_or(false) {
+            self.plan.push("gather: a shortest path is worked out over the whole graph, on the control node".into());
+            return self.gather_whole(q, &tables).await;
         }
         if tables.iter().all(|t| matches!(t.dist, Dist::Replicated)) {
             self.plan.push("direct: replicated tables, on shard 0".into());
@@ -2179,7 +2344,7 @@ impl ClusterSession {
         let scan = simple_query(Select {
             distinct: false,
             top: None,
-            items: vec![SelectItem::Star(None)],
+            items: p.table.copy_items(),
             into: None,
             from: vec![TableRef::Table { name: p.table.name.clone(), alias: Some(p.alias.clone()), hints: vec![] }],
             where_: p.filter.clone(),
@@ -2190,7 +2355,7 @@ impl ClusterSession {
         let create = Stmt::Query(Box::new(simple_query(Select {
             distinct: false,
             top: Some(Top { e: Expr::Lit(Value::Int(0)), percent: false, ties: false }),
-            items: vec![SelectItem::Star(None)],
+            items: p.table.copy_items(),
             into: Some(vec![p.temp.clone()]),
             from: vec![TableRef::Table { name: p.table.name.clone(), alias: None, hints: vec![] }],
             where_: None,

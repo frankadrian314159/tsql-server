@@ -108,12 +108,21 @@ pub(crate) fn pushable(e: &Expr) -> bool {
 impl ClusterSession {
     /// Copy the tables to the control node's engine (whole and kept, or pruned for this query) and run the query there.
     pub(crate) async fn gather(&mut self, q: &Query, tables: &[DistTable]) -> Result<ResultSet, SqlError> {
+        self.gather_opts(q, tables, false).await
+    }
+
+    /// `gather` with every table copied whole (a query that reads columns the statement does not name, as a shortest path does).
+    pub(crate) async fn gather_whole(&mut self, q: &Query, tables: &[DistTable]) -> Result<ResultSet, SqlError> {
+        self.gather_opts(q, tables, true).await
+    }
+
+    async fn gather_opts(&mut self, q: &Query, tables: &[DistTable], whole: bool) -> Result<ResultSet, SqlError> {
         let cl = self.cluster.clone();
         let _guard = cl.gather.lock().unwrap_or_else(|e| e.into_inner());
         let small = self.cluster.broadcast_limit.load(Ordering::Relaxed);
         let mut qj = serde_json::to_value(q).map_err(|e| SqlError::new(50000, format!("the query could not be rewritten for the cluster: {}", e)))?;
         let mut used = HashSet::new();
-        let star = !used_columns(&qj, &mut used);
+        let star = !used_columns(&qj, &mut used) || whole;
         let mut eq_cols = HashSet::new();
         equated_columns(&qj, &mut eq_cols);
         for t in tables.iter().filter(|t| matches!(t.dist, Dist::Sharded { .. })) {

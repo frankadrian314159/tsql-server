@@ -17,12 +17,13 @@ impl<'a> Engine<'a> {
         let oid = self.srv.new_object_id();
         let mut cols: Vec<Column> = vec![];
         // AS NODE / AS EDGE: the columns of a graph table come before its own (see graph.rs)
-        let graph = defs.iter().find_map(|d| if let TableDef::Graph { edge } = d { Some(if *edge { GraphKind::Edge } else { GraphKind::Node }) } else { None });
+        let graph_def = defs.iter().find_map(|d| if let TableDef::Graph { edge, external } = d { Some((if *edge { GraphKind::Edge } else { GraphKind::Node }, *external)) } else { None });
+        let graph = graph_def.map(|g| g.0);
         if let Some(kind) = graph {
             if is_temp {
                 return Err(SqlError::new(13918, "A graph table cannot be a temporary table."));
             }
-            cols.extend(super::graph::graph_columns(kind, schema, name));
+            cols.extend(super::graph::graph_columns(kind, schema, name, graph_def.map(|g| g.1).unwrap_or(false)));
         }
         for d in defs {
             if let TableDef::Column(c) = d {

@@ -123,6 +123,8 @@ pub fn shard_form(st: &Stmt) -> Stmt {
                         c.identity = None;
                         TableDef::Column(c)
                     }
+                    // a graph table's rows are numbered by the control node, too
+                    TableDef::Graph { edge, .. } => TableDef::Graph { edge: *edge, external: true },
                     other => other.clone(),
                 })
                 .collect();

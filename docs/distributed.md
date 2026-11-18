@@ -345,6 +345,14 @@ span front ends are found by each front end's detector (it sees every wait on th
 
 A join whose tables' keys are all fixed by `key = literal` conditions to the same shard (TPC-C Stock-Level) runs on that shard alone.
 
+## Graph tables
+
+Node and edge tables (see [graph.md](graph.md)) work in a cluster. The control node numbers their rows, as it numbers `IDENTITY` values:
+the `$graph_id` of every row comes from a counter in its state, and the shards (and its own engine) make the table in the form that takes
+`$graph_id` as given. `MATCH` is joins, planned as any; `SHORTEST_PATH` gathers the graph to the control node; the control node
+does what a deleted node means for the edges at it (`ON DELETE CASCADE`, `NO ACTION`), since the edges may be on other shards. Rows copied
+between shards (a new shard, a rebalance, the copies a join makes) are copied with every column by name, the hidden ones included.
+
 ## Foreign keys
 
 The shards cannot see each other's rows, so they are not given foreign keys; the control node keeps the definitions (in its
@@ -411,7 +419,7 @@ generated rows.
 * **Refused** (error 50100 says so): `UNIQUE` constraints or unique indexes that do not contain the shard key, stored
   functions and triggers (they would need an interpreter next to the data; a procedure is made on every shard and can be
   declared to run on one, see *Procedures that run on one shard*), `CREATE DATABASE`/`USE`, temporal
-  tables, graph (node and edge) tables, DML with joins (`UPDATE ... FROM`), `OUTPUT` or `TOP` in DML, `INSERT ... DEFAULT VALUES`/`EXEC`, correlated
+  tables, DML with joins (`UPDATE ... FROM`), `OUTPUT` or `TOP` in DML, `INSERT ... DEFAULT VALUES`/`EXEC`, correlated
   subqueries in DML, and schema changes inside a transaction. Views cannot be written through.
 * **Foreign keys and identity values are the control node's**: the checks are not atomic across sessions (see Foreign keys),
   and a control node that loses its state file loses the identity counters and the foreign keys with it.

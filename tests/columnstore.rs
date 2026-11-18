@@ -3,7 +3,7 @@
 //! and must give the same rows, whatever has been written to them since.
 mod common;
 use common::*;
-use std::sync::Once;
+use std::sync::{Mutex, Once};
 use tsql_server::Connection;
 
 static INIT: Once = Once::new();
@@ -46,8 +46,12 @@ fn sorted(c: &mut Connection, sql: &str) -> Vec<Vec<String>> {
     r
 }
 
+/// In the spill mode every grouping and sort of these queries goes to thousands of small files: one of them at a time over all the tests.
+static SPILL: Mutex<()> = Mutex::new(());
+
 /// The same statement over both tables gives the same rows.
 fn same(c: &mut Connection, sql: &str) -> Vec<Vec<String>> {
+    let _one_at_a_time = spilling().then(|| SPILL.lock().unwrap_or_else(|e| e.into_inner()));
     let a = sorted(c, &sql.replace("{t}", "cs"));
     let b = sorted(c, &sql.replace("{t}", "hp"));
     assert_eq!(a, b, "{sql}");

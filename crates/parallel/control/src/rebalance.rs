@@ -271,7 +271,7 @@ impl ClusterSession {
         let scan = Stmt::Query(Box::new(simple_query(Select {
             distinct: false,
             top: None,
-            items: vec![SelectItem::Star(None)],
+            items: t.copy_items(),
             into: None,
             from: vec![TableRef::Table { name: t.name.clone(), alias: None, hints: vec![] }],
             where_: None,
@@ -286,8 +286,17 @@ impl ClusterSession {
     }
 
     async fn insert_rows(&mut self, t: &DistTable, shard: usize, rows: &[Vec<Value>]) -> Result<(), SqlError> {
-        let values: Vec<Vec<Expr>> = rows.iter().map(|r| r.iter().cloned().map(Expr::Lit).collect()).collect();
-        let ins = Stmt::Insert(Box::new(Insert { ctes: vec![], target: Target::Table(t.name.clone()), cols: None, output: None, src: InsertSrc::Values(values), top: None }));
+        // (a graph table's rows have columns that are generated: the others are given by name)
+        let given = t.insertable();
+        let values: Vec<Vec<Expr>> = rows
+            .iter()
+            .map(|r| match &given {
+                Some(g) => g.iter().map(|(i, _)| Expr::Lit(r[*i].clone())).collect(),
+                None => r.iter().cloned().map(Expr::Lit).collect(),
+            })
+            .collect();
+        let cols = given.map(|g| g.into_iter().map(|(_, n)| n).collect::<Vec<String>>());
+        let ins = Stmt::Insert(Box::new(Insert { ctes: vec![], target: Target::Table(t.name.clone()), cols, output: None, src: InsertSrc::Values(values), top: None }));
         self.fan_run(&[shard], |_| Work::Stmts(vec![ins.clone()])).await?;
         Ok(())
     }
@@ -302,7 +311,7 @@ impl ClusterSession {
             let scan = Stmt::Query(Box::new(simple_query(Select {
                 distinct: false,
                 top: None,
-                items: vec![SelectItem::Star(None)],
+                items: t.copy_items(),
                 into: None,
                 from: vec![TableRef::Table { name: t.name.clone(), alias: None, hints: vec![] }],
                 where_: None,

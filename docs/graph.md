@@ -98,10 +98,34 @@ the paths of at least `m` steps are taken from the shortest paths (a node reache
   `GRAPH_TO_ID_COMPUTED`).
 * `sys.edge_constraints` and `sys.edge_constraint_clauses`: the constraints and the pairs of tables they connect.
 
+## In a cluster
+
+Node and edge tables work in a cluster ([distributed.md](distributed.md)), with the same answers as on one node: a test runs the same
+statements on both and compares them, ids included.
+
+* **The control node numbers the rows.** Each shard would number a table's rows from its own counter, and two nodes of a table could
+  get the one id. So, as it numbers an `IDENTITY` column, the control node hands out the `$graph_id` of each row (the counter is kept
+  with the rest of its state, and survives a restart), and the shards make the table with `$graph_id` as a plain column that the `INSERT`
+  gives (the table's "external ids" form: nothing in the syntax says it). The ids are the same whichever shard a row goes to, and the
+  same as a single node gives when the rows are inserted in the same order.
+* **Placement.** A graph table is sharded as any table is: by the first column of its primary key, else by its first column (an edge
+  table with no column of its own: by `$from_id`, so that an edge is on the shard of its first end only if that node is hashed alike,
+  which is not arranged: `MATCH` over shards is a repartition or broadcast join).
+* **`MATCH`** is the equalities it is parsed into: the cluster plans them as it plans any join of sharded tables (co-located,
+  broadcast or repartitioned, see [distributed.md](distributed.md)).
+* **`SHORTEST_PATH`** is worked out over the whole graph: the tables are copied to the control node's engine (and kept, as for any gather)
+  and the engine runs the query there. It is correct and as slow as a gather of both tables.
+* **Edge constraints.** Which node tables an edge may join is checked by the shard that gets the edge, from the ids in it. What becomes
+  of the edges at a deleted node is the control node's to do: before the nodes are deleted it reads their ids and looks, in every
+  edge table with a constraint that names the node table, for edges at them: `NO ACTION` refuses the delete (547); `ON DELETE CASCADE`
+  deletes the edges first. (They are statements of their own: inside a transaction they are one; outside, a delete of nodes that fails
+  after the cascade has deleted edges does not give them back.)
+* A constraint added with `ALTER TABLE` and given no name is known to the control node by a name of its own (`EC__table`), which is
+  not the one the engine gave it: drop it by naming it when you add it.
+
 ## Not done
 
-* Graph tables are not in a cluster (the shards would each number a table's rows from 0; error 50100) and not in a SQL Server `.bak`
-  that is imported (the tables come over as plain tables if their columns can be read).
+* Graph tables are not in a SQL Server `.bak` that is imported (the tables come over as plain tables if their columns can be read).
 * The ids are text, not SQL Server's binary pairs: a program that reads `$node_id` as `nvarchar` gets what SQL Server gives it; one that
   expects the internal columns by their real names (`graph_id_<hex>`, `$node_id_<hex>`) does not.
 * `SHORTEST_PATH` is described above; `MATCH` over `LAST_NODE`, the arbitrary-length pattern with `+` and `{m,n}` of more than one step,

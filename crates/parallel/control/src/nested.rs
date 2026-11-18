@@ -651,12 +651,14 @@ impl ClusterSession {
             id: table_id(std::slice::from_ref(&temp)),
             name: vec![temp.clone()],
             indexes: vec![],
-            cols: names.iter().zip(&types).map(|(n, t)| ColInfo { name: n.clone(), computed: false, type_name: t.to_string().to_lowercase().split('(').next().unwrap_or("").to_string() }).collect(),
+            cols: names.iter().zip(&types).map(|(n, t)| ColInfo { name: n.clone(), computed: false, type_name: t.to_string().to_lowercase().split('(').next().unwrap_or("").to_string(), hidden: false }).collect(),
             dist: Dist::Replicated,
             version: 0,
             loaded: None,
             rows: Some((0, rs.rows.len() as u64)),
             identity: None,
+            graph: None,
+            edge_cons: vec![],
         };
         self.local_tables.insert(table.id.clone(), table);
         self.plan.push(format!("materialized {} rows as the replicated table {}", rs.rows.len(), temp));
@@ -719,12 +721,14 @@ impl ClusterSession {
             id: table_id(std::slice::from_ref(&temp)),
             name: vec![temp.clone()],
             indexes: vec![],
-            cols: names.iter().zip(&types).map(|(n, t)| ColInfo { name: n.clone(), computed: false, type_name: base(t) }).collect(),
+            cols: names.iter().zip(&types).map(|(n, t)| ColInfo { name: n.clone(), computed: false, type_name: base(t), hidden: false }).collect(),
             dist: Dist::Sharded { key, class },
             version: 0,
             loaded: None,
             rows: Some((0, n as u64)),
             identity: None,
+            graph: None,
+            edge_cons: vec![],
         };
         self.local_tables.insert(table.id.clone(), table);
         self.plan.push(format!("materialized {} rows spread over the shards by {} as {}", n, column, temp));

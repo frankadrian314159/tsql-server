@@ -265,7 +265,7 @@ fn errors_come_back_as_the_engine_gives_them() {
     let a = p.cl.execute("SELECT * FROM nothing_here");
     assert_eq!(a.first_error().map(|e| e.number), Some(208));
     // what is not supported says so
-    for sql in ["CREATE DATABASE other", "UPDATE TOP (1) t SET v = 'x'", "DELETE FROM t OUTPUT deleted.id WHERE id = 1", "CREATE TABLE g (id INT) AS NODE", "CREATE TABLE ge AS EDGE"] {
+    for sql in ["CREATE DATABASE other", "UPDATE TOP (1) t SET v = 'x'", "DELETE FROM t OUTPUT deleted.id WHERE id = 1"] {
         let a = p.cl.execute(sql);
         assert_eq!(a.first_error().map(|e| e.number), Some(50100), "{}: {:?}", sql, a.first_error());
     }
@@ -1715,4 +1715,167 @@ fn an_ordering_with_top_over_the_shards_is_merged_as_the_engine_would() {
     ] {
         p.check(sql, true);
     }
+}
+
+fn node_id(table: &str, id: usize) -> String {
+    format!("{{\"type\":\"node\",\"schema\":\"dbo\",\"table\":\"{table}\",\"id\":{id}}}")
+}
+
+#[test]
+fn graph_tables_are_numbered_by_the_control_node_and_answer_as_on_one_node() {
+    let mut p = Pair::new(3);
+    p.both("CREATE TABLE Person (ID INT PRIMARY KEY, name VARCHAR(20) NOT NULL) AS NODE");
+    p.both("CREATE TABLE City (name VARCHAR(20)) AS NODE");
+    p.both("CREATE TABLE Knows (since INT) AS EDGE");
+    p.both("CREATE TABLE LivesIn (CONSTRAINT EC_L CONNECTION (Person TO City) ON DELETE CASCADE) AS EDGE");
+    p.both("CREATE TABLE Visited (n INT, CONSTRAINT EC_V CONNECTION (Person TO City)) AS EDGE");
+    // 40 people (numbered in the order they are inserted, whichever shard a row goes to) and three cities
+    let people: Vec<String> = (1..=40).map(|i| format!("({i}, 'P{i}')")).collect();
+    p.both(&format!("INSERT Person VALUES {}", people.join(", ")));
+    p.both("INSERT City VALUES ('Oslo'), ('Rome'), ('Lima')");
+    // a ring with chords: i knows i+1 and i+7; the ids are known, so the edges can be written out
+    let mut knows = vec![];
+    for i in 0..40usize {
+        knows.push(format!("('{}', '{}', {})", node_id("Person", i), node_id("Person", (i + 1) % 40), 2000 + i));
+        knows.push(format!("('{}', '{}', {})", node_id("Person", i), node_id("Person", (i + 7) % 40), 3000 + i));
+    }
+    p.both(&format!("INSERT Knows ($from_id, $to_id, since) VALUES {}", knows.join(", ")));
+    let lives: Vec<String> = (0..40usize).map(|i| format!("('{}', '{}')", node_id("Person", i), node_id("City", i % 3))).collect();
+    p.both(&format!("INSERT LivesIn ($from_id, $to_id) VALUES {}", lives.join(", ")));
+    let visited: Vec<String> = (0..6usize).map(|i| format!("('{}', '{}', {})", node_id("Person", i), node_id("City", 1), i)).collect();
+    p.both(&format!("INSERT Visited ($from_id, $to_id, n) VALUES {}", visited.join(", ")));
+    // the ids are the same on the cluster as on one node
+    p.check("SELECT ID, name, $node_id FROM Person", false);
+    p.check("SELECT name, $node_id FROM City", false);
+    p.check("SELECT $edge_id, $from_id, $to_id, since FROM Knows", false);
+    p.check("SELECT * FROM City", false);
+    // MATCH patterns are joins over shards
+    p.check("SELECT a.name, b.name FROM Person a, Knows k, Person b WHERE MATCH(a-(k)->b) AND k.since < 2010", false);
+    p.check("SELECT a.name, c.name FROM Person a, Knows k, Person b, Knows k2, Person c WHERE MATCH(a-(k)->b-(k2)->c) AND a.ID = 3", false);
+    p.check("SELECT c.name, COUNT(*) FROM Person a, LivesIn l, City c WHERE MATCH(a-(l)->c) GROUP BY c.name", false);
+    p.check("SELECT a.name, c.name FROM Person a, Knows k, Person b, LivesIn l, City c WHERE MATCH(a-(k)->b-(l)->c) AND c.name = 'Lima' AND a.ID < 8", false);
+    p.check("SELECT b.name FROM Person a, Knows k, Person b WHERE MATCH(a<-(k)-b) AND a.name = 'P1'", false);
+    // a shortest path is worked out over the whole graph
+    let plan = p.check(
+        "SELECT p.name, LAST_VALUE(q.name) WITHIN GROUP (GRAPH PATH) AS last, STRING_AGG(q.name, '->') WITHIN GROUP (GRAPH PATH) AS via, COUNT(q.name) WITHIN GROUP (GRAPH PATH) AS hops
+         FROM Person AS p, Person FOR PATH AS q, Knows FOR PATH AS k WHERE MATCH(SHORTEST_PATH(p(-(k)->q)+)) AND p.name = 'P1'",
+        false,
+    );
+    assert!(plan.iter().any(|l| l.contains("shortest path")), "{plan:?}");
+    // writes to the ids are refused, as the engine refuses them
+    for sql in ["UPDATE Person SET $node_id = 'x'", "UPDATE Person SET $graph_id = 5", "INSERT Person ($graph_id, ID, name) VALUES (99, 99, 'z')", "INSERT Knows ($from_id, $to_id) VALUES ('nope', 'nope')", "INSERT LivesIn ($from_id, $to_id) VALUES ('{\"type\":\"node\",\"schema\":\"dbo\",\"table\":\"Person\",\"id\":0}', '{\"type\":\"node\",\"schema\":\"dbo\",\"table\":\"Person\",\"id\":1}')"] {
+        let (a, b) = (p.cl.execute(sql), p.oracle.execute(sql));
+        assert!(b.first_error().is_some(), "{sql}");
+        assert_eq!(a.first_error().map(|e| e.number), b.first_error().map(|e| e.number), "{sql}: {:?}", a.first_error());
+    }
+    // deleting a node: NO ACTION (Visited) stops it, on the shard that holds the edge or another
+    let (a, b) = (p.cl.execute("DELETE FROM City WHERE name = 'Rome'"), p.oracle.execute("DELETE FROM City WHERE name = 'Rome'"));
+    assert_eq!(b.first_error().map(|e| e.number), Some(547));
+    assert_eq!(a.first_error().map(|e| e.number), Some(547), "{:?}", a.first_error());
+    p.check("SELECT COUNT(*) FROM City", false);
+    // a city with no Visited edge goes, and the edges of LivesIn (ON DELETE CASCADE) with it
+    p.both("DELETE FROM City WHERE name = 'Lima'");
+    p.check("SELECT COUNT(*) FROM City", false);
+    p.check("SELECT COUNT(*) FROM LivesIn", false);
+    p.check("SELECT c.name, COUNT(*) FROM Person a, LivesIn l, City c WHERE MATCH(a-(l)->c) GROUP BY c.name", false);
+    // a node deleted by a condition, and the edges at it left alone where nothing names the table
+    p.both("DELETE FROM Person WHERE ID = 40");
+    p.check("SELECT COUNT(*) FROM Person", false);
+    // the numbers go on from where they were
+    p.both("INSERT Person VALUES (100, 'late')");
+    p.check("SELECT $node_id FROM Person WHERE ID = 100", false);
+    p.both("INSERT City VALUES ('Kyiv')");
+    p.check("SELECT name, $node_id FROM City", false);
+    // a constraint added later, and dropped
+    p.both("CREATE TABLE Likes (w INT) AS EDGE");
+    p.both("ALTER TABLE Likes ADD CONSTRAINT EC_Likes CONNECTION (Person TO Person)");
+    let (a, b) = (
+        p.cl.execute(&format!("INSERT Likes ($from_id, $to_id) VALUES ('{}', '{}')", node_id("Person", 1), node_id("City", 0))),
+        p.oracle.execute(&format!("INSERT Likes ($from_id, $to_id) VALUES ('{}', '{}')", node_id("Person", 1), node_id("City", 0))),
+    );
+    assert_eq!(b.first_error().map(|e| e.number), Some(547));
+    assert_eq!(a.first_error().map(|e| e.number), Some(547), "{:?}", a.first_error());
+    p.both("ALTER TABLE Likes DROP CONSTRAINT EC_Likes");
+    p.both(&format!("INSERT Likes ($from_id, $to_id) VALUES ('{}', '{}')", node_id("Person", 1), node_id("City", 0)));
+}
+
+#[test]
+fn graph_numbers_and_constraints_survive_a_restart_of_the_control_node() {
+    let h = start(2);
+    let cfg = ClusterConfig { shards: h.shards.iter().enumerate().map(|(i, s)| ShardInfo { id: i as u32, addr: s.addr.to_string() }).collect() };
+    let path = std::env::temp_dir().join(format!("tsql_graph_state_{}.bin", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let cluster = Cluster::open(&path, &cfg).unwrap();
+        let mut cl = cluster.session();
+        for sql in [
+            "CREATE TABLE N (id INT PRIMARY KEY, label VARCHAR(5)) AS NODE",
+            "CREATE TABLE E (w INT, CONSTRAINT EC CONNECTION (N TO N) ON DELETE CASCADE) AS EDGE",
+            "INSERT N VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+        ] {
+            assert!(cl.execute(sql).first_error().is_none(), "{sql}");
+        }
+        let edges = format!("INSERT E ($from_id, $to_id, w) VALUES ('{}', '{}', 12), ('{}', '{}', 23)", node_id("N", 0), node_id("N", 1), node_id("N", 1), node_id("N", 2));
+        assert!(cl.execute(&edges).first_error().is_none());
+    }
+    let cluster = Cluster::open(&path, &ClusterConfig::default()).unwrap();
+    let mut cl = cluster.session();
+    // the numbers go on, the pattern finds what was there, the constraint is still the control node's to enforce
+    assert!(cl.execute("INSERT N VALUES (4, 'd')").first_error().is_none());
+    let ids: Vec<String> = cl.query("SELECT $node_id FROM N WHERE id = 4").unwrap().iter().map(|r| display(&r[0])).collect();
+    assert_eq!(ids, vec![node_id("N", 3)]);
+    let found: Vec<String> = cl.query("SELECT a.label, b.label FROM N a, E e, N b WHERE MATCH(a-(e)->b) ORDER BY e.w").unwrap().iter().map(|r| format!("{}{}", display(&r[0]), display(&r[1]))).collect();
+    assert_eq!(found, vec!["ab", "bc"]);
+    assert_eq!(cl.execute(&format!("INSERT E ($from_id, $to_id) VALUES ('{}', '{}')", node_id("N", 0), "x")).first_error().map(|e| e.number), Some(13919));
+    // ON DELETE CASCADE still holds across the shards
+    assert!(cl.execute("DELETE FROM N WHERE id = 2").first_error().is_none());
+    let left: Vec<String> = cl.query("SELECT COUNT(*) FROM E").unwrap().iter().map(|r| display(&r[0])).collect();
+    assert_eq!(left, vec!["0"]);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn graph_tables_follow_a_shard_that_is_added_and_removed() {
+    let mut p = Pair::new(2);
+    p.both("CREATE TABLE Person (ID INT PRIMARY KEY, name VARCHAR(20) NOT NULL) AS NODE");
+    p.both("CREATE TABLE Knows (since INT) AS EDGE");
+    p.both("CREATE TABLE Tag (t VARCHAR(10)) AS NODE");
+    p.cl.execute("DISTRIBUTE TABLE Tag REPLICATED");
+    p.oracle.execute("SELECT 1");
+    let people: Vec<String> = (1..=60).map(|i| format!("({i}, 'P{i}')")).collect();
+    p.both(&format!("INSERT Person VALUES {}", people.join(", ")));
+    let knows: Vec<String> = (0..60usize).map(|i| format!("('{}', '{}', {})", node_id("Person", i), node_id("Person", (i + 3) % 60), i)).collect();
+    p.both(&format!("INSERT Knows ($from_id, $to_id, since) VALUES {}", knows.join(", ")));
+    p.both("INSERT Tag VALUES ('red'), ('blue')");
+    let checks = [
+        "SELECT ID, name, $node_id FROM Person",
+        "SELECT $edge_id, $from_id, $to_id, since FROM Knows",
+        "SELECT t, $node_id FROM Tag",
+        "SELECT a.name, b.name FROM Person a, Knows k, Person b WHERE MATCH(a-(k)->b) AND k.since % 7 = 0",
+        "SELECT a.name, c.name FROM Person a, Knows k, Person b, Knows k2, Person c WHERE MATCH(a-(k)->b-(k2)->c) AND a.ID <= 5",
+    ];
+    for q in checks {
+        p.check(q, false);
+    }
+    // a third shard joins: the rows of the graph tables, the generated columns with them, move to it
+    let s3 = p.h._rt.block_on(spawn(ShardNode::new(2, Server::new()), "127.0.0.1:0".parse().unwrap())).unwrap();
+    let addr = s3.addr.to_string();
+    p.h.shards.push(s3);
+    assert_eq!(p.h.cluster.add_shard(&addr).unwrap(), 2);
+    assert!(shard_rows(&p.h.shards[2], "Person") > 0);
+    assert_eq!(shard_rows(&p.h.shards[2], "Tag"), 2);
+    for q in checks {
+        p.check(q, false);
+    }
+    p.both("INSERT Person VALUES (100, 'late'), (101, 'later')");
+    p.both(&format!("INSERT Knows ($from_id, $to_id, since) VALUES ('{}', '{}', 99)", node_id("Person", 60), node_id("Person", 61)));
+    p.check("SELECT $node_id FROM Person WHERE ID >= 100", false);
+    p.check("SELECT a.name, b.name FROM Person a, Knows k, Person b WHERE MATCH(a-(k)->b) AND k.since = 99", false);
+    // and it leaves again
+    p.h.cluster.remove_last_shard().unwrap();
+    assert_eq!(shard_rows(&p.h.shards[2], "Person"), 0);
+    for q in checks {
+        p.check(q, false);
+    }
+    p.check("SELECT $node_id FROM Person WHERE ID >= 100", false);
 }

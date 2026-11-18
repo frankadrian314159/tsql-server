@@ -366,8 +366,10 @@ pub enum TableDef {
     ForeignKey(ForeignKeyDef),
     DefaultFor { name: String, e: Expr, col: String, text: String },
     Index { name: String, cols: Vec<(String, bool)>, unique: bool },
-    /// `AS NODE` or `AS EDGE` after the columns of a `CREATE TABLE`: a graph table
-    Graph { edge: bool },
+    /// `AS NODE` or `AS EDGE` after the columns of a `CREATE TABLE`: a graph table. `external`: the `$graph_id` of its rows is given by the
+    /// statement that inserts them (a plain column, not a counter of the table's own): how a cluster's shards make the table, since the
+    /// control node numbers the rows. Not a syntax: only the cluster's own statements say it.
+    Graph { edge: bool, external: bool },
     /// `CONSTRAINT name CONNECTION (a TO b, ...) [ON DELETE CASCADE | NO ACTION]`: the node tables an edge table may connect
     EdgeConstraint { name: Option<String>, pairs: Vec<(Name, Name)>, cascade: bool },
     /// `INDEX name [NONCLUSTERED | CLUSTERED] COLUMNSTORE [(columns)]` in a table definition

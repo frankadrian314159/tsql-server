@@ -3770,7 +3770,7 @@ impl Parser {
                 if self.is_kw("AS") && self.peek_kw(1, &["NODE", "EDGE"]) {
                     self.i += 1;
                     let edge = self.advance_up() == "EDGE";
-                    defs.push(TableDef::Graph { edge });
+                    defs.push(TableDef::Graph { edge, external: false });
                     GRAPH_USED.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 let mut versioning = None;

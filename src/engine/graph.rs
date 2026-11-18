@@ -36,7 +36,7 @@ pub fn parse_id(s: &str) -> Option<GraphId> {
 }
 
 /// The columns a graph table has before its own.
-pub fn graph_columns(kind: GraphKind, schema: &str, table: &str) -> Vec<Column> {
+pub fn graph_columns(kind: GraphKind, schema: &str, table: &str, external: bool) -> Vec<Column> {
     let col = |name: &str, ty: DataType, nullable: bool| Column {
         name: name.to_string(),
         ty,
@@ -71,7 +71,8 @@ pub fn graph_columns(kind: GraphKind, schema: &str, table: &str) -> Vec<Column> 
         within: None,
     }));
     let mut gid = col("$graph_id", DataType::BigInt, false);
-    gid.identity = Some((0, 1));
+    // (a cluster's control node numbers the rows, and the shards' tables take the numbers as they are given)
+    gid.identity = if external { None } else { Some((0, 1)) };
     gid.hidden = true;
     let mut id = col(if edge { "$edge_id" } else { "$node_id" }, DataType::NVarChar(MAX), true);
     id.computed = Some(Arc::new(id_expr));
