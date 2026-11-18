@@ -265,6 +265,36 @@ impl<'a> Engine<'a> {
                 self.emit_rowset(rs);
                 Ok(Some(Value::Int(0)))
             }
+            // what a driver asks of the server before it uses it (ODBC's SQLGetInfo reads sp_server_info)
+            "sp_server_info" => {
+                let info: [(i32, &str, String); 9] = [
+                    (1, "DBMS_NAME", "Microsoft SQL Server".to_string()),
+                    (2, "DBMS_VER", funcs::VERSION_STRING.lines().next().unwrap_or("").to_string()),
+                    (10, "OWNER_TERM", "owner".to_string()),
+                    (11, "TABLE_TERM", "table".to_string()),
+                    (12, "MAX_OWNER_NAME_LENGTH", "128".to_string()),
+                    (13, "TABLE_LENGTH", "128".to_string()),
+                    (14, "MAX_QUAL_LENGTH", "128".to_string()),
+                    (17, "QUALIFIER_TERM", "database".to_string()),
+                    (500, "SERVER_NAME", self.srv.server_name.clone()),
+                ];
+                let rows: Vec<Row> = info.iter().map(|(id, n, v)| vec![Value::Int(*id), Value::Str(n.to_string()), Value::Str(v.clone())]).collect();
+                self.emit_rowset(Rowset::from_rows(&["attribute_id".into(), "attribute_name".into(), "attribute_value".into()], rows));
+                Ok(Some(Value::Int(0)))
+            }
+            "xp_msver" => {
+                let ver = funcs::VERSION_STRING.lines().next().unwrap_or("").to_string();
+                let rows: Vec<Row> = vec![
+                    vec![Value::Int(1), Value::Str("ProductName".into()), Value::Null, Value::Str("Microsoft SQL Server".into())],
+                    vec![Value::Int(2), Value::Str("ProductVersion".into()), Value::Int(0), Value::Str("16.0.1000.6".into())],
+                    vec![Value::Int(3), Value::Str("Language".into()), Value::Int(1033), Value::Str("English (United States)".into())],
+                    vec![Value::Int(4), Value::Str("Platform".into()), Value::Null, Value::Str(if cfg!(windows) { "NT x64" } else { "Linux" }.into())],
+                    vec![Value::Int(5), Value::Str("Comments".into()), Value::Null, Value::Str(ver)],
+                    vec![Value::Int(8), Value::Str("ProcessorCount".into()), Value::Int(std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(1)), Value::Str(std::thread::available_parallelism().map(|n| n.get().to_string()).unwrap_or_else(|_| "1".into()))],
+                ];
+                self.emit_rowset(Rowset::from_rows(&["Index".into(), "Name".into(), "Internal_Value".into(), "Character_Value".into()], rows));
+                Ok(Some(Value::Int(0)))
+            }
             "sp_databases" => {
                 let rows: Vec<Row> = self.srv.databases.values().map(|d| vec![Value::Str(d.name.clone()), Value::Int(0), Value::Null]).collect();
                 self.emit_rowset(Rowset::from_rows(&["DATABASE_NAME".into(), "DATABASE_SIZE".into(), "REMARKS".into()], rows));

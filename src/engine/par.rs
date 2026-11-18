@@ -88,6 +88,7 @@ impl SessionState {
         w.context_info = self.context_info.clone();
         w.app_name = self.app_name.clone();
         w.host_name = self.host_name.clone();
+        w.conn_info = self.conn_info.clone();
         // the variables of the batch being run
         if let Some(top) = self.frames.last() {
             w.frames = vec![Frame { vars: top.vars.clone(), ..Frame::default() }];
@@ -111,6 +112,7 @@ impl SessionState {
         f.rowcount_limit = self.rowcount_limit;
         f.xact_abort = self.xact_abort;
         f.stat_buf = self.stat_buf.clone();
+        f.conn_info = self.conn_info.clone();
         f
     }
 }

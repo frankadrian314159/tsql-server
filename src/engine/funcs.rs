@@ -1739,6 +1739,140 @@ impl<'a> Engine<'a> {
                     }
                 }
             }
+            // CONNECTIONPROPERTY(property): how this connection came in (SSMS and the drivers ask when they connect). A connection that is not
+            // over TDS is "Shared memory", as an in-process one would be
+            // HAS_DBACCESS(db): 1 when the login can use the database (SSMS asks for each database it lists), NULL for one that is not there
+            "HAS_DBACCESS" => {
+                need(name, &a, 1)?;
+                if a[0].is_null() {
+                    Value::Null
+                } else {
+                    let key = s(&a[0]).to_lowercase();
+                    match self.srv.databases.get(&key) {
+                        None => Value::Null,
+                        Some(d) if d.restoring => Value::Int(0),
+                        Some(d) => {
+                            let login = self.eff_login();
+                            let mapped = d.security.principals.values().any(|p| !p.is_role && p.login.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(&login)));
+                            Value::Int((self.is_sysadmin() || mapped || d.security.principals.contains_key("guest")) as i32)
+                        }
+                    }
+                }
+            }
+            // the files and filegroups of a database, as the catalog views show them: a data file `name` (1) and a log file `name_log` (2),
+            // in the one filegroup PRIMARY
+            "FILE_ID" => {
+                need(name, &a, 1)?;
+                let (n, db) = (s(&a[0]).to_lowercase(), self.ses.db.to_lowercase());
+                if n == db { Value::Int(1) } else if n == format!("{}_log", db) { Value::Int(2) } else { Value::Null }
+            }
+            "FILE_NAME" => {
+                need(name, &a, 1)?;
+                match a[0].as_i64() {
+                    Some(1) => Value::Str(self.ses.db.clone()),
+                    Some(2) => Value::Str(format!("{}_log", self.ses.db)),
+                    _ => Value::Null,
+                }
+            }
+            "FILEGROUP_ID" => {
+                need(name, &a, 1)?;
+                if s(&a[0]).eq_ignore_ascii_case("PRIMARY") { Value::Int(1) } else { Value::Null }
+            }
+            "FILEGROUP_NAME" => {
+                need(name, &a, 1)?;
+                if a[0].as_i64() == Some(1) { Value::Str("PRIMARY".into()) } else { Value::Null }
+            }
+            "FILEGROUPPROPERTY" => {
+                need(name, &a, 2)?;
+                if !s(&a[0]).eq_ignore_ascii_case("PRIMARY") { Value::Null } else {
+                    match s(&a[1]).to_lowercase().as_str() {
+                        "isdefault" => Value::Int(1),
+                        "isreadonly" | "isuserdefinedfg" | "isautogrowall" => Value::Int(0),
+                        _ => Value::Null,
+                    }
+                }
+            }
+            "FILEPROPERTY" => {
+                need(name, &a, 2)?;
+                let (n, db) = (s(&a[0]).to_lowercase(), self.ses.db.to_lowercase());
+                let (data, log) = (n == db, n == format!("{}_log", db));
+                if !data && !log { Value::Null } else {
+                    match s(&a[1]).to_lowercase().as_str() {
+                        "isprimaryfile" => Value::Int(data as i32),
+                        "islogfile" => Value::Int(log as i32),
+                        "isreadonly" | "isreadonlymedia" | "isoffline" | "issparsefile" => Value::Int(0),
+                        "spaceused" => Value::Int(0),
+                        _ => Value::Null,
+                    }
+                }
+            }
+            "TYPEPROPERTY" => {
+                need(name, &a, 2)?;
+                let t = s(&a[0]).to_lowercase();
+                let precision = match t.as_str() { "tinyint" => Some(3), "smallint" => Some(5), "int" => Some(10), "bigint" => Some(19), "bit" => Some(1), "float" => Some(53), "real" => Some(24), "date" => Some(10), "datetime" => Some(23), "money" => Some(19), "smallmoney" => Some(10), _ => None };
+                match (s(&a[1]).to_lowercase().as_str(), precision) {
+                    ("precision", Some(p)) => Value::Int(p),
+                    ("scale", Some(_)) => Value::Int(0),
+                    ("allowsnull", Some(_)) => Value::Int(1),
+                    ("ownerid", Some(_)) => Value::Int(4),
+                    _ => Value::Null,
+                }
+            }
+            // INDEXPROPERTY(table_id, index, property) for the properties an index has here
+            "INDEXPROPERTY" => {
+                need(name, &a, 3)?;
+                let (oid, ix, prop) = (int(&a[0])? as i32, s(&a[1]), s(&a[2]).to_lowercase());
+                let found = self.srv.databases.get(&self.ses.db.to_lowercase()).and_then(|d| {
+                    d.objects.values().find_map(|o| match o {
+                        Object::Table(t) if t.object_id == oid => Some(t),
+                        _ => None,
+                    })
+                });
+                match found {
+                    None => Value::Null,
+                    Some(t) => {
+                        let clustered = t.pk.as_ref().is_some_and(|k| k.name.eq_ignore_ascii_case(&ix));
+                        let unique = clustered || t.uniques.iter().any(|k| k.name.eq_ignore_ascii_case(&ix)) || t.indexes.iter().any(|i| i.unique && i.name.eq_ignore_ascii_case(&ix));
+                        let exists = clustered || unique || t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(&ix));
+                        match (exists, prop.as_str()) {
+                            (false, _) => Value::Null,
+                            (_, "isclustered") => Value::Int(clustered as i32),
+                            (_, "isunique") => Value::Int(unique as i32),
+                            (_, "isdisabled" | "ishypothetical" | "isautostatistics" | "ispagelockdisallowed" | "isrowlockdisallowed" | "isfulltextkey") => Value::Int(0),
+                            (_, "indexfillfactor") => Value::Int(0),
+                            _ => Value::Null,
+                        }
+                    }
+                }
+            }
+            "USER_ID" | "DATABASE_PRINCIPAL_ID" => {
+                let who = if a.is_empty() || a[0].is_null() { self.current_user_name() } else { s(&a[0]) };
+                match self.srv.databases.get(&self.ses.db.to_lowercase()).and_then(|d| d.security.principals.get(&who.to_lowercase())) {
+                    Some(p) => Value::Int(p.id),
+                    None if who.eq_ignore_ascii_case("dbo") => Value::Int(1),
+                    None => Value::Null,
+                }
+            }
+            "ORIGINAL_DB_NAME" => Value::Str(self.ses.db.clone()),
+            "SESSION_CONTEXT" => Value::Null,
+            "CURRENT_REQUEST_ID" => Value::Int(0),
+            "CONNECTIONPROPERTY" => {
+                need(name, &a, 1)?;
+                if a[0].is_null() {
+                    Value::Null
+                } else {
+                    let ci = self.ses.conn_info.clone();
+                    match s(&a[0]).trim().to_lowercase().as_str() {
+                        "net_transport" | "physical_net_transport" => Value::Str(ci.map(|c| c.transport).unwrap_or_else(|| "Shared memory".to_string())),
+                        "protocol_type" => Value::Str("TSQL".to_string()),
+                        "auth_scheme" => Value::Str(ci.map(|c| c.auth_scheme).unwrap_or_else(|| "SQL".to_string())),
+                        "local_net_address" => ci.map(|c| Value::Str(c.local_addr)).unwrap_or(Value::Null),
+                        "local_tcp_port" => ci.map(|c| Value::Int(c.local_port)).unwrap_or(Value::Null),
+                        "client_net_address" => Value::Str(ci.map(|c| c.client_addr).unwrap_or_else(|| "<local machine>".to_string())),
+                        _ => Value::Null,
+                    }
+                }
+            }
             "NODE_ID_FROM_PARTS" | "EDGE_ID_FROM_PARTS" => {
                 need(name, &a, 2)?;
                 self.graph_function(name, &a)?
@@ -1805,7 +1939,25 @@ impl<'a> Engine<'a> {
             "USER_NAME" | "CURRENT_USER" | "SESSION_USER" | "USER" => Value::Str(self.current_user_name()),
             "SUSER_SNAME" | "SUSER_NAME" | "SYSTEM_USER" => Value::Str(self.eff_login()),
             "ORIGINAL_LOGIN" => Value::Str(self.ses.login.clone()),
-            "IS_MEMBER" => {
+            // SUSER_ID([login]): the principal id the server_principals view gives the login (NULL for none)
+            "SUSER_ID" => {
+                need_range(name, &a, 0, 1)?;
+                let who = if a.is_empty() { self.eff_login() } else if a[0].is_null() { String::new() } else { s(&a[0]) };
+                match self.srv.security.logins.values().position(|l| l.name.eq_ignore_ascii_case(&who)) {
+                    Some(i) => Value::Int(i as i32 + 1),
+                    None => Value::Null,
+                }
+            }
+            // SESSIONPROPERTY(option): the SET options of the session, as 1 or 0
+            "SESSIONPROPERTY" => {
+                need(name, &a, 1)?;
+                match s(&a[0]).trim().to_uppercase().as_str() {
+                    "ANSI_NULLS" | "ANSI_PADDING" | "ANSI_WARNINGS" | "ARITHABORT" | "CONCAT_NULL_YIELDS_NULL" | "QUOTED_IDENTIFIER" => Value::Int(1),
+                    "ANSI_NULL_DFLT_ON" | "ANSI_NULL_DFLT_OFF" | "NUMERIC_ROUNDABORT" => Value::Int(0),
+                    _ => Value::Null,
+                }
+            }
+            "IS_MEMBER" | "IS_ROLEMEMBER" => {
                 need(name, &a, 1)?;
                 let dbk = self.ses.db.to_lowercase();
                 let user = self.current_user_name();
@@ -1853,6 +2005,20 @@ impl<'a> Engine<'a> {
             "HOST_NAME" => Value::Str(self.ses.host_name.clone()),
             "APP_NAME" => Value::Str(self.ses.app_name.clone()),
             "HOST_ID" => Value::Str("1234".into()),
+            // (DATABASEPROPERTY is the old name of DATABASEPROPERTYEX, for the properties they share)
+            "DATABASEPROPERTY" => {
+                need(name, &a, 2)?;
+                return self.builtin("DATABASEPROPERTYEX", a, fc);
+            }
+            "SUSER_SID" => {
+                need_range(name, &a, 0, 2)?;
+                let who = if a.is_empty() || a[0].is_null() { self.eff_login() } else { s(&a[0]) };
+                if self.srv.security.logins.values().any(|l| l.name.eq_ignore_ascii_case(&who)) {
+                    Value::Bin(who.to_lowercase().into_bytes())
+                } else {
+                    Value::Null
+                }
+            }
             "DATABASEPROPERTYEX" => {
                 need(name, &a, 2)?;
                 let key = s(&a[0]).to_lowercase();
@@ -1878,18 +2044,42 @@ impl<'a> Engine<'a> {
                     _ => Value::Null,
                 }
             }
+            // SERVERPROPERTY(name): what SSMS and the drivers read when they connect, some of them straight into a boolean or a number, so
+            // they have values (NULL only where SQL Server's is, as the instance name of a default instance)
             "SERVERPROPERTY" => {
                 need(name, &a, 1)?;
+                let machine = || std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| self.srv.server_name.clone());
+                let here = || std::env::current_dir().map(|p| format!("{}{}", p.display(), std::path::MAIN_SEPARATOR)).unwrap_or_default();
                 match s(&a[0]).to_lowercase().as_str() {
                     "productversion" => Value::Str("16.0.1000.6".into()),
                     "productmajorversion" => Value::Str("16".into()),
-                    "edition" => Value::Str("Developer Edition (64-bit)".into()),
-                    "engineedition" => Value::Int(3),
-                    "servername" | "machinename" => Value::Str(self.srv.server_name.clone()),
-                    "collation" => Value::Str(crate::collation::DEFAULT_NAME.into()),
-                    "isclustered" | "isintegratedsecurityonly" => Value::Int(0),
+                    "productminorversion" => Value::Str("0".into()),
+                    "productbuild" => Value::Int(1000),
+                    "productbuildtype" => Value::Str("OD".into()),
                     "productlevel" => Value::Str("RTM".into()),
-                    "instancename" => Value::Null,
+                    "productupdatelevel" | "productupdatereference" | "instancename" | "numlicenses" | "hadrmanagerstatus" => Value::Null,
+                    "resourceversion" => Value::Str("16.00.1000".into()),
+                    "edition" => Value::Str("Developer Edition (64-bit)".into()),
+                    "editionid" => Value::BigInt(-2117995310),
+                    "engineedition" => Value::Int(3),
+                    "servername" => Value::Str(self.srv.server_name.clone()),
+                    "machinename" | "computernamephysicalnetbios" => Value::Str(machine()),
+                    "collation" => Value::Str(crate::collation::DEFAULT_NAME.into()),
+                    "collationid" | "comparisonstyle" => Value::Int(if s(&a[0]).eq_ignore_ascii_case("collationid") { 872468488 } else { 196609 }),
+                    "lcid" => Value::Int(1033),
+                    "sqlcharset" => Value::Int(1),
+                    "sqlsortorder" => Value::Int(52),
+                    "sqlcharsetname" => Value::Str("iso_1".into()),
+                    "sqlsortordername" => Value::Str("nocase_iso".into()),
+                    "isclustered" | "isintegratedsecurityonly" | "issingleuser" | "ishadrenabled" | "islocaldb" | "isxtpsupported" | "ispolybaseinstalled" | "isadvancedanalyticsinstalled" | "isexternalauthenticationonly" | "isbigdatacluster" | "istempdbmetadatamemoryoptimized" | "isfulltextinstalled" | "isinmemoryoltpinstalled" => Value::Int(0),
+                    "filestreamconfiguredlevel" | "filestreameffectivelevel" => Value::Int(0),
+                    "filestreamsharename" => Value::Str("MSSQLSERVER".into()),
+                    "licensetype" => Value::Str("DISABLED".into()),
+                    "buildclrversion" => Value::Str("v4.0.30319".into()),
+                    "processid" => Value::Int(std::process::id() as i32),
+                    "pathseparator" => Value::Str(std::path::MAIN_SEPARATOR.to_string()),
+                    "instancedefaultdatapath" | "instancedefaultlogpath" | "instancedefaultbackuppath" => Value::Str(here()),
+                    "errorlogfilename" => Value::Str(format!("{}ERRORLOG", here())),
                     _ => Value::Null,
                 }
             }
@@ -1963,7 +2153,23 @@ impl<'a> Engine<'a> {
                 }
                 r
             }
-            "OBJECTPROPERTY" => {
+            // FULLTEXTSERVICEPROPERTY(property): the full-text service. There is none (full-text search here scans the text), so it says it is not
+            // installed, as SERVERPROPERTY does, and gives the settings a client reads with it as they are with the service stopped
+            "FULLTEXTSERVICEPROPERTY" => {
+                need(name, &a, 1)?;
+                match s(&a[0]).trim().to_lowercase().as_str() {
+                    "isfulltextinstalled" | "loadosresources" | "verifysignature" | "allowcloning" | "pauseindexpopulation" => Value::Int(0),
+                    "resourceusage" => Value::Int(3),
+                    "connecttimeout" | "datatimeout" => Value::Int(60),
+                    _ => Value::Null,
+                }
+            }
+            // FULLTEXTCATALOGPROPERTY(catalog, property): a catalog has none of these to report
+            "FULLTEXTCATALOGPROPERTY" => {
+                need(name, &a, 2)?;
+                Value::Null
+            }
+            "OBJECTPROPERTY" | "OBJECTPROPERTYEX" => {
                 need(name, &a, 2)?;
                 let id = int(&a[0])? as i32;
                 let prop = s(&a[1]).to_lowercase();

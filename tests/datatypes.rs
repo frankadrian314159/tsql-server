@@ -203,3 +203,24 @@ fn user_defined_alias_types() {
     assert_eq!(scalar(&mut c, "SELECT m FROM t"), "1.24");
     exec(&mut c, "DECLARE @x Money2 = 5; SELECT @x");
 }
+
+#[test]
+fn an_empty_string_is_zero_as_a_number_and_1900_as_a_date() {
+    // (as in SQL Server; SSMS runs statements that depend on it)
+    let mut c = conn();
+    for (sql, want) in [
+        ("SELECT CAST('' AS INT)", "0"), ("SELECT CAST('   ' AS INT)", "0"), ("SELECT CAST('' AS BIGINT)", "0"), ("SELECT CAST('' AS SMALLINT)", "0"), ("SELECT CAST('' AS TINYINT)", "0"),
+        ("SELECT CAST('' AS DECIMAL(5,2))", "0.00"), ("SELECT CAST('' AS FLOAT)", "0"), ("SELECT CAST('' AS BIT)", "0"), ("SELECT CONVERT(INT, '')", "0"), ("SELECT TRY_CAST('' AS INT)", "0"),
+        ("SELECT '' + 1", "1"), ("SELECT CASE WHEN 5 = '' THEN 'eq' ELSE 'ne' END", "ne"), ("SELECT CASE WHEN 0 = '' THEN 'eq' ELSE 'ne' END", "eq"),
+        ("SELECT CAST('' AS DATE)", "1900-01-01"), ("SELECT CAST('' AS DATETIME)", "1900-01-01 00:00:00.000"), ("SELECT ISNUMERIC('')", "0"),
+    ] {
+        assert_eq!(scalar(&mut c, sql), want, "{sql}");
+    }
+    // stored into a column, too
+    exec(&mut c, "CREATE TABLE e (n INT, d DATE)");
+    exec(&mut c, "INSERT e VALUES ('', '')");
+    assert_eq!(rows(&mut c, "SELECT n, d FROM e"), vec![vec!["0".to_string(), "1900-01-01".to_string()]]);
+    // anything that is not blank still fails
+    assert_eq!(err_no(&mut c, "SELECT CAST('x' AS INT)"), 245);
+    assert_eq!(err_no(&mut c, "SELECT CAST('' AS UNIQUEIDENTIFIER)"), 8169);
+}

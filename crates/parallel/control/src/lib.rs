@@ -990,6 +990,11 @@ impl ClusterSession {
                 return Ok(());
             }
         }
+        // control of flow: a batch that mixes the cluster's tables with BEGIN ... END, IF and WHILE (SSMS's connect batches do) runs its
+        // statements here, one after the other, each as it would be alone
+        if matches!(st, Stmt::Block(_) | Stmt::If { .. } | Stmt::While { .. }) {
+            return self.exec_flow(st, events).await;
+        }
         if self.exec_variable_stmt(st).await? {
             return Ok(());
         }
@@ -1226,6 +1231,47 @@ impl ClusterSession {
         self.cluster.fks.lock().unwrap_or_else(|e| e.into_inner()).extend(fks);
         self.cluster.log_schema(st);
         Ok(())
+    }
+
+    /// `BEGIN ... END`, `IF ... ELSE` and `WHILE`: the condition is worked out by the cluster (it may read the cluster's tables), and the
+    /// statements of the branch it takes run through the cluster as they would alone. Not here: `BREAK`, `CONTINUE`, `RETURN`, `TRY ... CATCH`.
+    async fn exec_flow(&mut self, st: &Stmt, events: &mut Vec<Event>) -> Result<(), SqlError> {
+        match st {
+            Stmt::Block(stmts) => {
+                for s in stmts {
+                    Box::pin(self.exec_stmt(s, events)).await?;
+                }
+                Ok(())
+            }
+            Stmt::If { cond, then, els } => {
+                if self.condition(cond).await? {
+                    Box::pin(self.exec_stmt(then, events)).await
+                } else if let Some(e) = els {
+                    Box::pin(self.exec_stmt(e, events)).await
+                } else {
+                    Ok(())
+                }
+            }
+            Stmt::While { cond, body } => {
+                let mut rounds = 0usize;
+                while self.condition(cond).await? {
+                    Box::pin(self.exec_stmt(body, events)).await?;
+                    rounds += 1;
+                    if rounds >= 1_000_000 {
+                        return Err(unsupported("a WHILE loop of more than a million rounds"));
+                    }
+                }
+                Ok(())
+            }
+            other => Err(unsupported(&format!("the statement {}", stmt_kind(other)))),
+        }
+    }
+
+    /// Whether a condition holds (a NULL does not).
+    async fn condition(&mut self, cond: &Expr) -> Result<bool, SqlError> {
+        let bound = self.bind_expr(cond)?;
+        let case = Expr::Case { operand: None, whens: vec![(bound, Expr::Lit(Value::Int(1)))], els: Some(Box::new(Expr::Lit(Value::Int(0)))) };
+        Ok(matches!(self.eval_scalar(&case).await?, Value::Int(1)))
     }
 
     /// `ALTER TABLE`: run on the control node's engine and on every shard, and keep the columns the control node knows. What
@@ -1563,6 +1609,24 @@ impl ClusterSession {
         }
     }
 
+    /// The rows of the first result set of `EXEC`, for `INSERT ... EXEC`: a `sp_executesql` of a literal `SELECT` is that query, run on the
+    /// cluster; anything else (the system procedures SSMS and the drivers fill their temporary tables from) is run by the control node's own
+    /// engine. A procedure that is the cluster's (made with `CREATE PROCEDURE`) is not run here.
+    async fn exec_rows(&mut self, exec: &Stmt) -> Result<Vec<Vec<Value>>, SqlError> {
+        if let Stmt::Exec(ex) = exec {
+            if let Some(inner) = self.executesql_text(ex) {
+                if let Ok(stmts) = tsql_server::parser::parse(&inner) {
+                    if let [Stmt::Query(q)] = stmts.as_slice() {
+                        return Ok(self.run_query(q).await?.rows);
+                    }
+                }
+            }
+        }
+        let res = self.mirror.execute_stmts(std::slice::from_ref(exec));
+        merge::check(&res)?;
+        Ok(first_rows(res)?.rows)
+    }
+
     async fn insert_values(&mut self, ins: &Insert, events: &mut Vec<Event>) -> Result<(), SqlError> {
         tsql_server::span!("ctl_insert_values");
         let name = match &ins.target {
@@ -1618,7 +1682,10 @@ impl ClusterSession {
                 rs.rows.into_iter().map(|r| r.into_iter().map(Expr::Lit).collect()).collect()
             }
             InsertSrc::DefaultValues => return Err(unsupported("INSERT ... DEFAULT VALUES")),
-            InsertSrc::Exec(_) => return Err(unsupported("INSERT ... EXEC")),
+            InsertSrc::Exec(ex) => {
+                // the rows the procedure returns (see `exec_rows`)
+                self.exec_rows(ex).await?.into_iter().map(|r| r.into_iter().map(Expr::Lit).collect()).collect()
+            }
         };
         let n = self.cluster.shard_count();
         let ident_col = t.identity.as_ref().map(|i| t.cols[i.col].name.clone());

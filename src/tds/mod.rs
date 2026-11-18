@@ -1063,6 +1063,19 @@ fn handshake(server: &Server, mut t: Transport, cfg: &Config) -> io::Result<Opti
             }
         }
     };
+    let mut conn = conn;
+    {
+        // how the connection came in, for CONNECTIONPROPERTY
+        let tcp = t.stream.tcp();
+        let (local, peer) = (tcp.local_addr(), tcp.peer_addr());
+        conn.set_connection_info(crate::engine::ConnInfo {
+            transport: "TCP".to_string(),
+            auth_scheme: if login.sspi && login.fedauth.is_none() { "KERBEROS" } else { "SQL" }.to_string(),
+            local_addr: local.as_ref().map(|a| a.ip().to_string()).unwrap_or_default(),
+            local_port: local.as_ref().map(|a| a.port() as i32).unwrap_or(0),
+            client_addr: peer.as_ref().map(|a| a.ip().to_string()).unwrap_or_default(),
+        });
+    }
     let mut s = Session { t, conn, db: String::new(), prepared: HashMap::new(), next_handle: 0, tx_descriptor: 0, tx_counter: 0, in_tx: false, bulk: None, cursors: HashMap::new(), next_cursor: 0 };
     if login.ansi_defaults {
         // ODBC and OLE DB drivers get SET ANSI_DEFAULTS ON (and no implicit transactions) from the login

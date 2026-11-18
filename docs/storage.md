@@ -39,6 +39,13 @@ if needed, loads `snapshot.bin`, replays `wal.log` and returns a server whose co
 `Server::new()` is the in-memory variant used for tests and embedding; it runs the same storage engine with a
 page store that has no file and never evicts. The shell takes `-D dir` and `--pool-pages N`.
 
+## Format of the checkpoint
+
+The first eight bytes of `snapshot.bin` name the format (`TSQLSNP6`). The encoding is positional: a field added to a stored struct,
+or an enum variant put before others, changes what a file means, so it needs a new number. The previous format (`TSQLSNP5`, a table
+without the graph fields) is still read, with its log, and the directory is given a checkpoint of the current format when it is
+opened. New variants of the stored enums (such as `TableDef`) go at the end.
+
 ## Pages, the buffer pool and the page file
 
 All table data lives in **B+trees made of 8 KiB pages** (`src/storage/page.rs`):

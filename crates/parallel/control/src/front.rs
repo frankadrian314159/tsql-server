@@ -82,7 +82,7 @@ impl ClusterSession {
     }
 
     /// The statement text of `EXEC sp_executesql N'...'` when it is a literal.
-    fn executesql_text(&self, ex: &ExecStmt) -> Option<String> {
+    pub(crate) fn executesql_text(&self, ex: &ExecStmt) -> Option<String> {
         if ex.name_is_var || !ex.name.last().map(|n| n.eq_ignore_ascii_case("sp_executesql")).unwrap_or(false) {
             return None;
         }

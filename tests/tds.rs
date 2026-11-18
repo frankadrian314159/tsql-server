@@ -364,3 +364,22 @@ async fn a_client_that_disconnects_mid_result_does_not_hurt_the_server() {
     let _ = s;
     l.shutdown();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn connectionproperty_says_how_the_connection_came_in() {
+    // (SSMS and the drivers ask when they connect)
+    let (l, _s) = start();
+    let mut c = sa(&l).await;
+    let sql = "SELECT CAST(CONNECTIONPROPERTY('net_transport') AS NVARCHAR(40)) t, CAST(CONNECTIONPROPERTY('protocol_type') AS NVARCHAR(40)) p, CAST(CONNECTIONPROPERTY('auth_scheme') AS NVARCHAR(40)) a,                CAST(CONNECTIONPROPERTY('local_net_address') AS NVARCHAR(40)) la, CAST(CONNECTIONPROPERTY('local_tcp_port') AS INT) lp, CAST(CONNECTIONPROPERTY('client_net_address') AS NVARCHAR(40)) ca,                CAST(CONNECTIONPROPERTY('physical_net_transport') AS NVARCHAR(40)) pt, CAST(CONNECTIONPROPERTY('nonsense') AS NVARCHAR(40)) n";
+    let rows = c.simple_query(sql).await.unwrap().into_first_result().await.unwrap();
+    let r = &rows[0];
+    assert_eq!(r.get::<&str, _>("t"), Some("TCP"));
+    assert_eq!(r.get::<&str, _>("pt"), Some("TCP"));
+    assert_eq!(r.get::<&str, _>("p"), Some("TSQL"));
+    assert_eq!(r.get::<&str, _>("a"), Some("SQL"));
+    assert_eq!(r.get::<&str, _>("la"), Some("127.0.0.1"));
+    assert_eq!(r.get::<i32, _>("lp"), Some(l.local_addr().port() as i32));
+    assert_eq!(r.get::<&str, _>("ca"), Some("127.0.0.1"));
+    assert_eq!(r.get::<&str, _>("n"), None);
+    l.shutdown();
+}

@@ -16,7 +16,33 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
-const MAGIC: &[u8; 8] = b"TSQLSNP5";
+/// The format of the checkpoint file. 6: a table has the graph fields. 5 (still read, and rewritten as 6 when the directory is opened): a
+/// table without them. A change to what is stored (a field added to a struct, a variant put before others in an enum) needs a new number here:
+/// the encoding is positional, and a file of the old layout read as the new one is garbage, or an error that says nothing of why.
+const MAGIC: &[u8; 8] = b"TSQLSNP6";
+const MAGIC_V5: &[u8; 8] = b"TSQLSNP5";
+
+/// Write checkpoints in format 5, for the tests of the upgrade from it.
+#[doc(hidden)]
+pub fn write_format_5(on: bool) {
+    crate::catalog::LEGACY_V5_WRITE.with(|f| f.set(on));
+}
+
+/// Sets `LEGACY_V5_READ` for as long as it lives.
+struct ReadingV5;
+
+impl ReadingV5 {
+    fn start() -> ReadingV5 {
+        crate::catalog::LEGACY_V5_READ.with(|f| f.set(true));
+        ReadingV5
+    }
+}
+
+impl Drop for ReadingV5 {
+    fn drop(&mut self) {
+        crate::catalog::LEGACY_V5_READ.with(|f| f.set(false));
+    }
+}
 
 /// One logged change. Applying a record's operations in order reproduces the commit.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -243,18 +269,30 @@ impl Persist {
         let mut srv = ServerState::new();
         let mut lsn = 0u64;
         let mut image: Option<StoreImage> = None;
+        // the checkpoint is of format 5: it, and the log that goes with it, are read without the graph fields, and the directory is
+        // given a checkpoint of the current format before anything else is written to it
+        let mut legacy = false;
         let snap = dir.join("snapshot.bin");
         if snap.exists() {
             let mut buf = vec![];
             File::open(&snap).and_then(|mut f| f.read_to_end(&mut buf)).map_err(io_err)?;
-            if buf.len() < 12 || &buf[..8] != MAGIC {
-                return Err(crate::error::SqlError::with(824, 24, 2, "The checkpoint file is not a valid tsql-server snapshot."));
+            let magic5 = buf.len() >= 12 && &buf[..8] == MAGIC_V5;
+            if buf.len() < 12 || (&buf[..8] != MAGIC && !magic5) {
+                return Err(crate::error::SqlError::with(824, 24, 2, "The checkpoint file is not a valid tsql-server snapshot (or it was written by a version of the server whose format this one does not read)."));
             }
+            legacy = magic5;
             let crc = u32::from_le_bytes(buf[8..12].try_into().unwrap());
             if crc32fast::hash(&buf[12..]) != crc {
                 return Err(crate::error::SqlError::with(824, 24, 2, "The checkpoint file failed its checksum; the database is corrupt."));
             }
-            let cp: Checkpoint = postcard::from_bytes(&buf[12..]).map_err(|e| crate::error::SqlError::with(824, 24, 2, format!("Corrupt checkpoint: {}", e)))?;
+            let _v5 = legacy.then(ReadingV5::start);
+            let cp: Checkpoint = postcard::from_bytes(&buf[12..]).map_err(|e| {
+                if legacy {
+                    crate::error::SqlError::with(824, 24, 2, format!("The checkpoint is of format 5 and could not be read ({}): it was written by a version of the server older than the one that added columnstore indexes, which this one cannot read. Open the directory with that version and take a BACKUP DATABASE.", e))
+                } else {
+                    crate::error::SqlError::with(824, 24, 2, format!("Corrupt checkpoint: {}", e))
+                }
+            })?;
             lsn = cp.lsn;
             srv.core.advance_clock(cp.clock);
             srv.core.raise_object_id(cp.next_object_id);
@@ -282,6 +320,7 @@ impl Persist {
         let mut off = 0usize;
         let mut good = 0usize;
         let base_lsn = lsn;
+        let _v5_log = legacy.then(ReadingV5::start);
         while off + 8 <= data.len() {
             let len = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
             let crc = u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap());
@@ -316,7 +355,12 @@ impl Persist {
             return Err(crate::error::SqlError::with(824, 24, 2, format!("Recovery failed: {}", e)));
         }
         let wal = Arc::new(WalFile { state: Mutex::new(WalState { file: wal, next: 0 }), turn: Condvar::new() });
-        let p = Persist { dir: dir.to_path_buf(), wal, pending: vec![], ticket: 0, wal_len: good as u64, lsn, checkpoint_threshold: 16 * 1024 * 1024, _lock: lock };
+        drop(_v5_log);
+        let mut p = Persist { dir: dir.to_path_buf(), wal, pending: vec![], ticket: 0, wal_len: good as u64, lsn, checkpoint_threshold: 16 * 1024 * 1024, _lock: lock };
+        if legacy {
+            // (the upgrade: what was read is written again in the current format, and the log it came with is emptied)
+            p.checkpoint(&srv)?;
+        }
         Ok((p, srv))
     }
 
@@ -428,7 +472,7 @@ impl Persist {
         let tmp = self.dir.join("snapshot.tmp");
         {
             let mut f = File::create(&tmp).map_err(io_err)?;
-            f.write_all(MAGIC).map_err(io_err)?;
+            f.write_all(if crate::catalog::LEGACY_V5_WRITE.with(|f| f.get()) { MAGIC_V5 } else { MAGIC }).map_err(io_err)?;
             f.write_all(&crc32fast::hash(&body).to_le_bytes()).map_err(io_err)?;
             f.write_all(&body).map_err(io_err)?;
             f.sync_all().map_err(io_err)?;

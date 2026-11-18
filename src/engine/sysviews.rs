@@ -340,23 +340,255 @@ impl<'a> Engine<'a> {
                         .databases
                         .values()
                         .map(|d| {
+                            let state = if d.restoring { 1 } else { 0 };
+                            let b = |x: bool| Value::Bit(x);
                             vec![
                                 sv(&d.name),
                                 Value::Int(d.id),
+                                Value::Null,
+                                Value::Bin(vec![1]),
                                 date(d.created),
-                                sv(&d.collation),
                                 Value::Int(160),
+                                sv(&d.collation),
+                                Value::Int(0),
+                                sv("MULTI_USER"),
+                                b(false),
+                                b(false),
+                                b(false),
+                                Value::Int(state),
                                 sv(if d.restoring { "RESTORING" } else { "ONLINE" }),
+                                b(false),
+                                b(true),
+                                Value::Int(if d.allow_snapshot { 1 } else { 0 }),
+                                sv(if d.allow_snapshot { "ON" } else { "OFF" }),
+                                b(d.rcsi),
                                 Value::Int(if d.recovery_full { 1 } else { 3 }),
                                 sv(if d.recovery_full { "FULL" } else { "SIMPLE" }),
+                                Value::Int(2),
+                                sv("CHECKSUM"),
+                                b(true),
+                                b(true),
+                                b(false),
+                                b(false),
+                                b(true),
+                                b(true),
+                                b(true),
+                                b(true),
+                                b(false),
+                                b(true),
+                                b(false),
+                                b(false),
+                                b(false),
+                                b(false),
+                                b(false),
+                                b(false),
+                                b(false),
+                                b(false),
+                                b(false),
+                                b(false),
+                                b(false),
+                                b(false),
+                                b(false),
+                                Value::Int(0),
+                                sv("NOTHING"),
+                                b(false),
+                                b(false),
+                                b(false),
+                                b(false),
+                                Value::Int(0),
+                                sv("NONE"),
+                                Value::Int(60),
+                                Value::Int(0),
+                                sv("DISABLED"),
+                                b(false),
                             ]
                         })
                         .collect();
                     Some(rs(
-                        &[("name", nv()), ("database_id", DataType::Int), ("create_date", DataType::DateTime), ("collation_name", nv()), ("compatibility_level", DataType::TinyInt), ("state_desc", nv()), ("recovery_model", DataType::TinyInt), ("recovery_model_desc", nv())],
+                        &[
+                            ("name", nv()),
+                            ("database_id", DataType::Int),
+                            ("source_database_id", DataType::Int),
+                            ("owner_sid", DataType::VarBinary(85)),
+                            ("create_date", DataType::DateTime),
+                            ("compatibility_level", DataType::TinyInt),
+                            ("collation_name", nv()),
+                            ("user_access", DataType::TinyInt),
+                            ("user_access_desc", nv()),
+                            ("is_read_only", DataType::Bit),
+                            ("is_auto_close_on", DataType::Bit),
+                            ("is_auto_shrink_on", DataType::Bit),
+                            ("state", DataType::TinyInt),
+                            ("state_desc", nv()),
+                            ("is_in_standby", DataType::Bit),
+                            ("is_cleanly_shutdown", DataType::Bit),
+                            ("snapshot_isolation_state", DataType::TinyInt),
+                            ("snapshot_isolation_state_desc", nv()),
+                            ("is_read_committed_snapshot_on", DataType::Bit),
+                            ("recovery_model", DataType::TinyInt),
+                            ("recovery_model_desc", nv()),
+                            ("page_verify_option", DataType::TinyInt),
+                            ("page_verify_option_desc", nv()),
+                            ("is_auto_create_stats_on", DataType::Bit),
+                            ("is_auto_update_stats_on", DataType::Bit),
+                            ("is_auto_update_stats_async_on", DataType::Bit),
+                            ("is_ansi_null_default_on", DataType::Bit),
+                            ("is_ansi_nulls_on", DataType::Bit),
+                            ("is_ansi_padding_on", DataType::Bit),
+                            ("is_ansi_warnings_on", DataType::Bit),
+                            ("is_arithabort_on", DataType::Bit),
+                            ("is_concat_null_yields_null_on", DataType::Bit),
+                            ("is_numeric_roundabort_on", DataType::Bit),
+                            ("is_quoted_identifier_on", DataType::Bit),
+                            ("is_recursive_triggers_on", DataType::Bit),
+                            ("is_cursor_close_on_commit_on", DataType::Bit),
+                            ("is_local_cursor_default", DataType::Bit),
+                            ("is_fulltext_enabled", DataType::Bit),
+                            ("is_trustworthy_on", DataType::Bit),
+                            ("is_db_chaining_on", DataType::Bit),
+                            ("is_parameterization_forced", DataType::Bit),
+                            ("is_master_key_encrypted_by_server", DataType::Bit),
+                            ("is_published", DataType::Bit),
+                            ("is_subscribed", DataType::Bit),
+                            ("is_merge_published", DataType::Bit),
+                            ("is_distributor", DataType::Bit),
+                            ("log_reuse_wait", DataType::TinyInt),
+                            ("log_reuse_wait_desc", nv()),
+                            ("is_broker_enabled", DataType::Bit),
+                            ("is_date_correlation_on", DataType::Bit),
+                            ("is_cdc_enabled", DataType::Bit),
+                            ("is_encrypted", DataType::Bit),
+                            ("containment", DataType::TinyInt),
+                            ("containment_desc", nv()),
+                            ("target_recovery_time_in_seconds", DataType::Int),
+                            ("delayed_durability", DataType::Int),
+                            ("delayed_durability_desc", nv()),
+                            ("is_ledger_on", DataType::Bit),
+                        ],
                         rows,
                     ))
                 }
+                "sql_logins" | "server_principals" => {
+                    // the logins, then the fixed server roles; a login's id is its place in the list
+                    let sql_only = lname == "sql_logins";
+                    let mut rows: Vec<Vec<Value>> = vec![];
+                    for (i, l) in self.srv.security.logins.values().enumerate() {
+                        let ty = match l.external.as_deref() {
+                            Some("WINDOWS") => "U",
+                            Some(_) => "E",
+                            None => "S",
+                        };
+                        if sql_only && ty != "S" {
+                            continue;
+                        }
+                        let desc = match ty {
+                            "U" => "WINDOWS_LOGIN",
+                            "E" => "EXTERNAL_LOGIN",
+                            _ => "SQL_LOGIN",
+                        };
+                        let mut r = vec![sv(&l.name), Value::Int(i as i32 + 1), Value::Bin(l.name.to_lowercase().into_bytes()), sv(ty), sv(desc), Value::Bit(l.disabled), date(self.srv.start_time), date(self.srv.start_time), sv(&l.default_db), sv("us_english"), Value::Null, Value::Null, Value::Bit(false)];
+                        if sql_only {
+                            // sql_logins: no sid column or type_desc split, and its own columns for the policy
+                            r.truncate(13);
+                            r.push(Value::Bit(l.check_expiration));
+                            r.push(Value::Bit(l.check_policy));
+                            r.push(Value::Bin(l.hash.clone()));
+                        }
+                        rows.push(r);
+                    }
+                    if !sql_only {
+                        let base = rows.len() as i32;
+                        for (k, role) in ["sysadmin", "securityadmin", "serveradmin", "setupadmin", "processadmin", "diskadmin", "dbcreator", "bulkadmin"].iter().enumerate() {
+                            rows.push(vec![sv(role), Value::Int(base + k as i32 + 1), Value::Bin(role.as_bytes().to_vec()), sv("R"), sv("SERVER_ROLE"), Value::Bit(false), date(self.srv.start_time), date(self.srv.start_time), Value::Null, Value::Null, Value::Null, Value::Null, Value::Bit(true)]);
+                        }
+                    }
+                    let mut cols = vec![("name", nv()), ("principal_id", DataType::Int), ("sid", DataType::VarBinary(85)), ("type", DataType::Char(1)), ("type_desc", nv()), ("is_disabled", DataType::Bit), ("create_date", DataType::DateTime), ("modify_date", DataType::DateTime), ("default_database_name", nv()), ("default_language_name", nv()), ("credential_id", DataType::Int), ("owning_principal_id", DataType::Int), ("is_fixed_role", DataType::Bit)];
+                    if sql_only {
+                        cols.push(("is_expiration_checked", DataType::Bit));
+                        cols.push(("is_policy_checked", DataType::Bit));
+                        cols.push(("password_hash", DataType::VarBinary(256)));
+                    }
+                    Some(rs(&cols, rows))
+                }
+                "server_role_members" => {
+                    // every sysadmin login is a member of the sysadmin role (the first fixed role)
+                    let n = self.srv.security.logins.len() as i32;
+                    let rows = self.srv.security.logins.values().enumerate().filter(|(_, l)| l.name.eq_ignore_ascii_case("sa")).map(|(i, _)| vec![Value::Int(n + 1), Value::Int(i as i32 + 1)]).collect();
+                    Some(rs(&[("role_principal_id", DataType::Int), ("member_principal_id", DataType::Int)], rows))
+                }
+                "server_permissions" => Some(rs(&[("class", DataType::TinyInt), ("class_desc", nv()), ("major_id", DataType::Int), ("minor_id", DataType::Int), ("grantee_principal_id", DataType::Int), ("grantor_principal_id", DataType::Int), ("type", DataType::Char(4)), ("permission_name", nv()), ("state", DataType::Char(1)), ("state_desc", nv())], vec![])),
+                "servers" => Some(rs(
+                    &[("server_id", DataType::Int), ("name", nv()), ("product", nv()), ("provider", nv()), ("data_source", nv()), ("is_linked", DataType::Bit), ("is_remote_login_enabled", DataType::Bit), ("is_rpc_out_enabled", DataType::Bit), ("is_data_access_enabled", DataType::Bit), ("modify_date", DataType::DateTime)],
+                    vec![vec![Value::Int(0), sv(&self.srv.server_name), sv("SQL Server"), sv("SQLNCLI"), sv(&self.srv.server_name), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), date(self.srv.start_time)]],
+                )),
+                "endpoints" => Some(rs(
+                    &[("name", nv()), ("endpoint_id", DataType::Int), ("principal_id", DataType::Int), ("protocol", DataType::TinyInt), ("protocol_desc", nv()), ("type", DataType::TinyInt), ("type_desc", nv()), ("state", DataType::TinyInt), ("state_desc", nv()), ("is_admin_endpoint", DataType::Bit)],
+                    vec![vec![sv("TSQL Default TCP"), Value::Int(4), Value::Int(1), Value::Int(2), sv("TCP"), Value::Int(2), sv("TSQL"), Value::Int(0), sv("STARTED"), Value::Bit(false)]],
+                )),
+                "master_files" => {
+                    // a data file and a log file for each database, as the engine reports them (see `database_files`)
+                    let mut rows = vec![];
+                    for d in self.srv.databases.values() {
+                        for (k, (kind, desc, ext)) in [(0, "ROWS", "mdf"), (1, "LOG", "ldf")].iter().enumerate() {
+                            rows.push(vec![Value::Int(d.id), Value::Int(k as i32 + 1), sv(&format!("{}{}", d.name, if k == 0 { "" } else { "_log" })), sv(&format!("{}.{}", d.name, ext)), Value::Int(*kind), sv(desc), Value::Int(128), Value::Int(-1), Value::Int(0), sv("ONLINE")]);
+                        }
+                    }
+                    Some(rs(&[("database_id", DataType::Int), ("file_id", DataType::Int), ("name", nv()), ("physical_name", nv()), ("type", DataType::TinyInt), ("type_desc", nv()), ("size", DataType::Int), ("max_size", DataType::Int), ("growth", DataType::Int), ("state_desc", nv())], rows))
+                }
+                "dm_exec_connections" => {
+                    let rows = self
+                        .srv
+                        .core
+                        .session_list()
+                        .into_iter()
+                        .map(|s| vec![Value::Int(s.spid), Value::Int(s.spid), date(s.login_time), sv("TCP"), sv("TSQL"), sv("SQL"), Value::Int(4096), Value::Int(s.batches as i32), Value::Int(s.batches as i32), date(s.last_batch), date(s.last_batch), Value::Null, Value::Null, Value::Null])
+                        .collect();
+                    Some(rs(
+                        &[("session_id", DataType::Int), ("most_recent_session_id", DataType::Int), ("connect_time", DataType::DateTime), ("net_transport", nv()), ("protocol_type", nv()), ("auth_scheme", nv()), ("net_packet_size", DataType::Int), ("num_reads", DataType::Int), ("num_writes", DataType::Int), ("last_read", DataType::DateTime), ("last_write", DataType::DateTime), ("client_net_address", nv()), ("local_net_address", nv()), ("local_tcp_port", DataType::Int)],
+                        rows,
+                    ))
+                }
+                // views that SSMS lists in Object Explorer or the server properties: this server has none of what they describe
+                "assemblies" => Some(rs(&[("name", nv()), ("principal_id", DataType::Int), ("assembly_id", DataType::Int), ("clr_name", nv()), ("permission_set", DataType::TinyInt), ("permission_set_desc", nv()), ("is_visible", DataType::Bit), ("create_date", DataType::DateTime), ("modify_date", DataType::DateTime)], vec![])),
+                "availability_replicas" => Some(rs(&[("replica_id", DataType::Guid), ("group_id", DataType::Guid), ("replica_metadata_id", DataType::Int), ("replica_server_name", nv()), ("owner_sid", DataType::VarBinary(85)), ("endpoint_url", nv()), ("availability_mode", DataType::TinyInt), ("availability_mode_desc", nv()), ("failover_mode", DataType::TinyInt), ("failover_mode_desc", nv())], vec![])),
+                "dm_hadr_database_replica_states" => Some(rs(&[("database_id", DataType::Int), ("group_id", DataType::Guid), ("replica_id", DataType::Guid), ("group_database_id", DataType::Guid), ("is_local", DataType::Bit), ("synchronization_state", DataType::TinyInt), ("synchronization_state_desc", nv()), ("is_suspended", DataType::Bit), ("database_state", DataType::TinyInt), ("database_state_desc", nv())], vec![])),
+                // one row per database, none of them mirrored
+                "database_mirroring" => {
+                    let rows = self.srv.databases.values().map(|d| vec![Value::Int(d.id), Value::Null, Value::Null, Value::Null, Value::Null, Value::Null, Value::Null, Value::Null, Value::Null, Value::Null, Value::Null, Value::Null]).collect();
+                    Some(rs(&[("database_id", DataType::Int), ("mirroring_guid", DataType::Guid), ("mirroring_state", DataType::TinyInt), ("mirroring_state_desc", nv()), ("mirroring_role", DataType::TinyInt), ("mirroring_role_desc", nv()), ("mirroring_role_sequence", DataType::Int), ("mirroring_safety_level", DataType::TinyInt), ("mirroring_safety_level_desc", nv()), ("mirroring_safety_sequence", DataType::Int), ("mirroring_partner_name", nv()), ("mirroring_partner_instance", nv())], rows))
+                }
+                "availability_groups" => Some(rs(&[("group_id", DataType::Guid), ("name", nv()), ("resource_id", nv()), ("failure_condition_level", DataType::Int), ("cluster_type", DataType::TinyInt), ("cluster_type_desc", nv())], vec![])),
+                "dm_hadr_availability_replica_states" => Some(rs(&[("replica_id", DataType::Guid), ("group_id", DataType::Guid), ("is_local", DataType::Bit), ("role", DataType::TinyInt), ("role_desc", nv()), ("operational_state", DataType::TinyInt), ("operational_state_desc", nv()), ("connected_state", DataType::TinyInt), ("connected_state_desc", nv()), ("synchronization_health", DataType::TinyInt), ("synchronization_health_desc", nv())], vec![])),
+                "dm_db_mirroring_connections" => Some(rs(&[("connection_id", DataType::Guid), ("transport_stream_id", DataType::Guid), ("state", DataType::TinyInt), ("state_desc", nv()), ("connect_time", DataType::DateTime), ("login_state", DataType::TinyInt), ("login_state_desc", nv())], vec![])),
+                "resource_governor_configuration" => Some(rs(&[("classifier_function_id", DataType::Int), ("is_reconfiguration_pending", DataType::Bit), ("max_outstanding_io_per_volume", DataType::Int)], vec![vec![Value::Int(0), Value::Bit(false), Value::Int(0)]])),
+                "traces" => Some(rs(&[("id", DataType::Int), ("status", DataType::Int), ("path", nv()), ("max_size", DataType::BigInt), ("stop_time", DataType::DateTime), ("max_files", DataType::Int), ("is_rowset", DataType::Bit), ("is_default", DataType::Bit)], vec![])),
+                "trace_events" => Some(rs(&[("trace_event_id", DataType::SmallInt), ("category_id", DataType::SmallInt), ("name", nv())], vec![])),
+                "credentials" => Some(rs(&[("credential_id", DataType::Int), ("name", nv()), ("credential_identity", nv()), ("create_date", DataType::DateTime), ("modify_date", DataType::DateTime), ("target_type", nv()), ("target_id", DataType::Int)], vec![])),
+                "linked_logins" => Some(rs(&[("server_id", DataType::Int), ("local_principal_id", DataType::Int), ("uses_self_credential", DataType::Bit), ("remote_name", nv()), ("modify_date", DataType::DateTime)], vec![])),
+                "backup_devices" => Some(rs(&[("name", nv()), ("type", DataType::TinyInt), ("type_desc", nv()), ("physical_name", nv())], vec![])),
+                "change_tracking_databases" => Some(rs(&[("database_id", DataType::Int), ("is_auto_cleanup_on", DataType::TinyInt), ("retention_period", DataType::Int), ("retention_period_units", DataType::TinyInt), ("retention_period_units_desc", nv())], vec![])),
+                "service_broker_endpoints" => Some(rs(&[("name", nv()), ("endpoint_id", DataType::Int), ("principal_id", DataType::Int), ("protocol", DataType::TinyInt), ("protocol_desc", nv()), ("type", DataType::TinyInt), ("type_desc", nv()), ("state", DataType::TinyInt), ("state_desc", nv()), ("is_admin_endpoint", DataType::Bit), ("port", DataType::Int), ("is_dynamic_port", DataType::Bit), ("ip_address", nv())], vec![])),
+                "sysdatabases" => {
+                    let rows = self.srv.databases.values().map(|d| vec![sv(&d.name), Value::Int(d.id), Value::Bin(vec![1]), Value::Int(0), Value::Int(16), Value::Int(0), date(d.created), date(d.created), Value::Int(0), Value::Int(160), sv(&format!("{}.mdf", d.name)), Value::Int(957)]).collect();
+                    Some(rs(&[("name", nv()), ("dbid", DataType::SmallInt), ("sid", DataType::VarBinary(85)), ("mode", DataType::SmallInt), ("status", DataType::Int), ("status2", DataType::Int), ("crdate", DataType::DateTime), ("reserved", DataType::DateTime), ("category", DataType::Int), ("cmptlevel", DataType::TinyInt), ("filename", nv()), ("version", DataType::SmallInt)], rows))
+                }
+                "dm_os_performance_counters" => Some(rs(&[("object_name", nv()), ("counter_name", nv()), ("instance_name", nv()), ("cntr_value", DataType::BigInt), ("cntr_type", DataType::Int)], vec![])),
+                "dm_os_wait_stats" => Some(rs(&[("wait_type", nv()), ("waiting_tasks_count", DataType::BigInt), ("wait_time_ms", DataType::BigInt), ("max_wait_time_ms", DataType::BigInt), ("signal_wait_time_ms", DataType::BigInt)], vec![])),
+                "dm_os_sys_memory" => Some(rs(
+                    &[("total_physical_memory_kb", DataType::BigInt), ("available_physical_memory_kb", DataType::BigInt), ("total_page_file_kb", DataType::BigInt), ("available_page_file_kb", DataType::BigInt), ("system_memory_state_desc", nv())],
+                    vec![vec![Value::BigInt(16 * 1024 * 1024), Value::BigInt(8 * 1024 * 1024), Value::BigInt(32 * 1024 * 1024), Value::BigInt(16 * 1024 * 1024), sv("Available physical memory is high")]],
+                )),
+                "dm_os_process_memory" => {
+                    let s = self.srv.store.stats();
+                    Some(rs(
+                        &[("physical_memory_in_use_kb", DataType::BigInt), ("virtual_address_space_committed_kb", DataType::BigInt), ("process_physical_memory_low", DataType::Bit), ("process_virtual_memory_low", DataType::Bit)],
+                        vec![vec![Value::BigInt(s.pages_cached as i64 * 8), Value::BigInt(s.pages_cached as i64 * 8), Value::Bit(false), Value::Bit(false)]],
+                    ))
+                }
+                "dm_server_services" => Some(rs(
+                    &[("servicename", nv()), ("startup_type", DataType::Int), ("startup_type_desc", nv()), ("status", DataType::Int), ("status_desc", nv()), ("process_id", DataType::Int), ("last_startup_time", DataType::DateTime)],
+                    vec![vec![sv("SQL Server"), Value::Int(2), sv("Automatic"), Value::Int(4), sv("Running"), Value::Int(std::process::id() as i32), date(self.srv.start_time)]],
+                )),
                 "types" | "systypes" => {
                     let builtin = [("int", 56), ("bigint", 127), ("smallint", 52), ("tinyint", 48), ("bit", 104), ("decimal", 106), ("numeric", 108), ("money", 60), ("smallmoney", 122), ("float", 62), ("real", 59), ("char", 175), ("varchar", 167), ("nchar", 239), ("nvarchar", 231), ("text", 35), ("ntext", 99), ("binary", 173), ("varbinary", 165), ("image", 34), ("date", 40), ("time", 41), ("datetime", 61), ("smalldatetime", 58), ("datetime2", 42), ("datetimeoffset", 43), ("uniqueidentifier", 36), ("xml", 241), ("sql_variant", 98), ("timestamp", 189), ("hierarchyid", 128), ("geometry", 129), ("geography", 130)];
                     // (max_length, precision, scale) of each system type
@@ -929,10 +1161,6 @@ impl<'a> Engine<'a> {
                     }
                     Some(rs(&[("object_id", DataType::Int), ("type_desc", nv())], rows))
                 }
-                "server_principals" => {
-                    let rows = self.srv.security.logins.values().enumerate().map(|(i, l)| vec![sv(&l.name), Value::Int(i as i32 + 1), sv(match l.external.as_deref() { Some("WINDOWS") => "U", Some(_) => "E", None => "S" }), Value::Bit(l.disabled)]).collect();
-                    Some(rs(&[("name", nv()), ("principal_id", DataType::Int), ("type", DataType::Char(1)), ("is_disabled", DataType::Bit)], rows))
-                }
                 "database_permissions" => {
                     let rows = db
                         .security
@@ -1014,7 +1242,25 @@ impl<'a> Engine<'a> {
                     let rows = self.srv.core.config_list().into_iter().map(|o| vec![sv(o.name), Value::BigInt(o.config), Value::BigInt(o.minimum), Value::BigInt(o.maximum), Value::BigInt(o.run), Value::Bit(o.dynamic), Value::Bit(o.advanced), sv(o.description)]).collect();
                     Some(rs(&[("name", nv()), ("value", DataType::BigInt), ("minimum", DataType::BigInt), ("maximum", DataType::BigInt), ("value_in_use", DataType::BigInt), ("is_dynamic", DataType::Bit), ("is_advanced", DataType::Bit), ("description", nv())], rows))
                 }
-                "dm_os_sys_info" => Some(rs(&[("cpu_count", DataType::Int), ("sqlserver_start_time", DataType::DateTime)], vec![vec![Value::Int(std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(1)), date(self.srv.start_time)]])),
+                "dm_os_sys_info" => {
+                    let cpus = std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(1);
+                    Some(rs(
+                        &[("cpu_count", DataType::Int), ("hyperthread_ratio", DataType::Int), ("scheduler_count", DataType::Int), ("max_workers_count", DataType::Int), ("sqlserver_start_time", DataType::DateTime), ("affinity_type", DataType::Int), ("affinity_type_desc", nv())],
+                        vec![vec![Value::Int(cpus), Value::Int(1), Value::Int(cpus), Value::Int(cpus * 64), date(self.srv.start_time), Value::Int(2), sv("AUTO")]],
+                    ))
+                }
+                // the machine the server runs on, as SQL Server shows it (SSMS reads it when it connects)
+                "dm_os_host_info" => {
+                    let (platform, distribution, release, sku) = match std::env::consts::OS {
+                        "windows" => ("Windows", "Windows", "10.0", 48),
+                        "macos" => ("Linux", "macOS", "", 0),
+                        _ => ("Linux", "Linux", "", 0),
+                    };
+                    Some(rs(
+                        &[("host_platform", nv()), ("host_distribution", nv()), ("host_release", nv()), ("host_service_pack_level", nv()), ("host_sku", DataType::Int), ("os_language_version", DataType::Int)],
+                        vec![vec![sv(platform), sv(distribution), sv(release), sv(""), Value::Int(sku), Value::Int(1033)]],
+                    ))
+                }
                 _ => None,
             }
         } else {

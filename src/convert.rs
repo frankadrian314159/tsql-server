@@ -57,6 +57,10 @@ fn money_re() -> &'static Regex {
 
 /// Implicit string -> number conversion (used by arithmetic and comparison).
 pub fn str_to_number(s: &str, target: &str) -> Result<Value> {
+    // (an empty string, or one of spaces, is 0 as a number: `CAST('' AS INT)`, `'' + 1`, `int_column = ''`)
+    if s.trim().is_empty() {
+        return Ok(Value::Int(0));
+    }
     if int_re().is_match(s) {
         let t = s.trim();
         if let Ok(v) = t.parse::<i64>() {
@@ -443,6 +447,20 @@ fn to_spatial(v: &Value, kind: crate::spatial::Kind) -> Result<Value> {
 fn cast_inner(v: &Value, t: &DataType, style: Option<i32>, strict: bool) -> Result<Value> {
     if v.is_null() {
         return Ok(Value::Null);
+    }
+    // an empty string (or one of spaces) is 0 as a number and 1900-01-01 as a date or time, as in SQL Server (SSMS relies on it)
+    if let Value::Str(st) = v {
+        if st.trim().is_empty() {
+            match t {
+                DataType::Bit | DataType::TinyInt | DataType::SmallInt | DataType::Int | DataType::BigInt | DataType::Decimal(..) | DataType::Float | DataType::Real | DataType::Money | DataType::SmallMoney => return cast_inner(&Value::Int(0), t, style, strict),
+                DataType::Date | DataType::DateTime | DataType::SmallDateTime | DataType::DateTime2(_) | DataType::DateTimeOffset(_) => {
+                    let d = NaiveDate::from_ymd_opt(1900, 1, 1).expect("a date");
+                    return cast_inner(&Value::Date(d), t, style, strict);
+                }
+                DataType::Time(_) => return cast_inner(&Value::Time(NaiveTime::from_hms_opt(0, 0, 0).expect("a time")), t, style, strict),
+                _ => {}
+            }
+        }
     }
     // a geometry or geography converted to a string is its text, converted to binary it is SQL Server's bytes
     if let Value::Bin(b) = v {

@@ -271,3 +271,47 @@ fn security_settings_are_durable() {
     assert_eq!(scalar(&mut a, "SELECT x FROM secret"), "42");
     assert_eq!(err_no(&mut a, "DELETE secret"), 229);
 }
+
+#[test]
+fn a_directory_of_format_5_is_read_and_upgraded() {
+    // Format 5 is what the checkpoint was before a table had the fields of a graph table. A directory of it is read (the checkpoint and the log
+    // that goes with it), and given a checkpoint of the current format before anything is written to it.
+    let dir = tempfile::tempdir().unwrap();
+    tsql_server::persist::write_format_5(true);
+    {
+        let s = open(dir.path());
+        let mut c = s.connect();
+        exec(&mut c, "CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(10), INDEX cci CLUSTERED COLUMNSTORE)");
+        exec(&mut c, "INSERT t VALUES (1, 'one'), (2, 'two')");
+        exec(&mut c, "CHECKPOINT");
+        // after the checkpoint: the log has a table of its own (a format 5 table) and rows
+        exec(&mut c, "CREATE TABLE u (a INT, b DECIMAL(8,2) DEFAULT 1.5)");
+        exec(&mut c, "INSERT u (a) VALUES (7)");
+        exec(&mut c, "INSERT t VALUES (3, 'three')");
+        drop(c);
+        s.simulate_crash();
+    }
+    tsql_server::persist::write_format_5(false);
+    let snap = dir.path().join("snapshot.bin");
+    assert_eq!(&fs::read(&snap).unwrap()[..8], b"TSQLSNP5");
+    {
+        let s = open(dir.path());
+        let mut c = s.connect();
+        assert_eq!(rows(&mut c, "SELECT id, v FROM t ORDER BY id"), vec![vec!["1", "one"], vec!["2", "two"], vec!["3", "three"]]);
+        assert_eq!(rows(&mut c, "SELECT a, b FROM u"), vec![vec!["7", "1.50"]]);
+        assert_eq!(scalar(&mut c, "SELECT type_desc FROM sys.indexes WHERE name = 'cci'"), "CLUSTERED COLUMNSTORE");
+        // upgraded on opening: the file is of the current format, and the log was folded into it
+        assert_eq!(&fs::read(&snap).unwrap()[..8], b"TSQLSNP6");
+        assert_eq!(fs::metadata(dir.path().join("wal.log")).unwrap().len(), 0);
+        // and it takes what is new: a graph table, and a restart
+        exec(&mut c, "CREATE TABLE n (id INT) AS NODE");
+        exec(&mut c, "INSERT n VALUES (10), (20)");
+        exec(&mut c, "INSERT t VALUES (4, 'four')");
+        drop(c);
+        s.simulate_crash();
+    }
+    let s = open(dir.path());
+    let mut c = s.connect();
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM t"), "4");
+    assert_eq!(rows(&mut c, "SELECT id, GRAPH_ID_FROM_NODE_ID($node_id) FROM n ORDER BY id"), vec![vec!["10", "0"], vec!["20", "1"]]);
+}

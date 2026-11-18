@@ -165,6 +165,15 @@ does not use MARS is unchanged. Checked with `System.Data.SqlClient` (`MultipleA
 kept open while a scalar command, DDL, DML and a second reader run; a transaction shared by the sessions; hundreds of
 commands in a row) and by hand-written frames (`tests/tds_raw.rs`).
 
+## SSMS
+
+SQL Server Management Studio connects and lists the databases. At connect and in Object Explorer it asks for many functions and
+views (`SERVERPROPERTY` values that must not be NULL, `CONNECTIONPROPERTY`, `HAS_DBACCESS`, `sys.dm_os_host_info`,
+`sys.availability_replicas`, `sys.database_mirroring` and others; those about features the server does not have are empty), runs
+`INSERT ... EXEC` and `IF` batches, and sends a big statement as an `NTEXT` parameter (a length and the bytes, without the text pointer
+a column value has). When a client fails against the server, set `TSQL_TDS_TRACE=1`: the server prints each request (the batch or
+the RPC and the batch it becomes) and the errors, to its standard error.
+
 ## Not supported
 
 * Group-based logins and NTLM-only domains; see [authentication.md](authentication.md) for what Azure AD and Kerberos do cover.

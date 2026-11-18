@@ -948,6 +948,8 @@ impl<'a> Engine<'a> {
             "@@VERSION" => Value::Str(funcs::VERSION_STRING.to_string()),
             "@@NESTLEVEL" => Value::Int(self.ses.nest_level),
             "@@LANGUAGE" => Value::Str(self.ses.language.clone()),
+            "@@LANGID" => Value::Int(0),
+            "@@REMSERVER" => Value::Null,
             "@@DATEFIRST" => Value::Int(self.ses.datefirst),
             "@@MAX_CONNECTIONS" => Value::Int(32767),
             "@@MICROSOFTVERSION" => Value::Int(0x10000000 + 4000),

@@ -652,6 +652,11 @@ impl Connection {
     pub fn current_database(&self) -> String {
         self.session.db.clone()
     }
+
+    /// Say how this connection came in, for `CONNECTIONPROPERTY` (the TDS server does, for each connection it accepts).
+    pub fn set_connection_info(&mut self, info: engine::ConnInfo) {
+        self.session.conn_info = Some(info);
+    }
 }
 
 impl Connection {

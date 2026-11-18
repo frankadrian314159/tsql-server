@@ -1879,3 +1879,62 @@ fn graph_tables_follow_a_shard_that_is_added_and_removed() {
     }
     p.check("SELECT $node_id FROM Person WHERE ID >= 100", false);
 }
+
+#[test]
+fn insert_exec_fills_a_temporary_table_from_a_procedure_or_a_query() {
+    // (SSMS and the drivers fill their temporary tables this way when they connect)
+    let mut p = Pair::new(3);
+    p.both("CREATE TABLE src (id INT PRIMARY KEY, v VARCHAR(10))");
+    p.both(&format!("INSERT src VALUES {}", (1..=20).map(|i| format!("({i}, 'v{i}')")).collect::<Vec<_>>().join(", ")));
+    p.both("CREATE TABLE #t (id INT, v VARCHAR(10))");
+    p.both("INSERT #t EXEC sp_executesql N'SELECT id, v FROM src WHERE id <= 5'");
+    p.check("SELECT id, v FROM #t", false);
+    // a system procedure, run by the control node's own engine
+    p.both("CREATE TABLE #dbs (name VARCHAR(40), size INT, remarks VARCHAR(40))");
+    p.both("INSERT #dbs EXEC sp_databases");
+    p.check("SELECT name, size FROM #dbs", false);
+    p.check("SELECT t.id, d.name FROM #t t, #dbs d WHERE t.id = 1 AND d.name = 'master'", false);
+    // with a column list, and into a table of the cluster
+    p.both("CREATE TABLE dst (id INT PRIMARY KEY, v VARCHAR(10))");
+    p.both("INSERT dst (id, v) EXEC sp_executesql N'SELECT id, v FROM src WHERE id > 15'");
+    p.check("SELECT id, v FROM dst", false);
+}
+
+#[test]
+fn a_batch_with_if_and_begin_end_over_the_clusters_tables_runs_statement_by_statement() {
+    // (SSMS's connect batches create a temporary table, fill it, and branch on what is in it)
+    let mut p = Pair::new(3);
+    p.both("CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    p.both(&format!("INSERT t VALUES {}", (1..=30).map(|i| format!("({i}, {})", i * 2)).collect::<Vec<_>>().join(", ")));
+    let batch = "CREATE TABLE #r (k INT, note VARCHAR(10));
+        IF EXISTS (SELECT 1 FROM t WHERE v > 50)
+        BEGIN
+            INSERT #r VALUES (1, 'big');
+            INSERT #r SELECT id, 'row' FROM t WHERE id <= 3;
+        END
+        ELSE
+            INSERT #r VALUES (0, 'none');
+        IF (SELECT COUNT(*) FROM t) = 0 INSERT #r VALUES (99, 'empty');
+        DECLARE @n INT = 0;
+        WHILE @n < 3 BEGIN INSERT #r VALUES (100 + @n, 'loop'); SET @n = @n + 1; END;
+        SELECT k, note FROM #r;";
+    let a = p.cl.execute(batch);
+    let b = p.oracle.execute(batch);
+    assert!(a.first_error().is_none(), "cluster: {:?}", a.first_error());
+    assert!(b.first_error().is_none(), "oracle: {:?}", b.first_error());
+    let (mut x, mut y) = (rows_of(&a), rows_of(&b));
+    x.sort();
+    y.sort();
+    assert_eq!(x, y);
+    assert_eq!(x.len(), 7, "{x:?}");
+    // the other branch
+    p.both("DELETE t");
+    p.both("DROP TABLE #r");
+    let a = p.cl.execute(batch);
+    let b = p.oracle.execute(batch);
+    let (mut x, mut y) = (rows_of(&a), rows_of(&b));
+    x.sort();
+    y.sort();
+    assert_eq!(x, y);
+    assert!(x.iter().any(|r| r[1] == "none") && x.iter().any(|r| r[1] == "empty"), "{x:?}");
+}

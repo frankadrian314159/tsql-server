@@ -97,6 +97,22 @@ pub struct IndexDef {
     pub filter: Option<crate::storage::FilterPred>,
 }
 
+thread_local! {
+    /// Set while a checkpoint (or log) of format 5 is being read: that format has no graph fields in a table, so they are not read (see
+    /// `persist.rs`). Postcard is positional: a field that is not there cannot be told from the next one, so the reader has to be told.
+    pub static LEGACY_V5_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set by the tests of the upgrade, to write a table the way format 5 did.
+    pub static LEGACY_V5_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn read_unless_v5<'de, D: serde::Deserializer<'de>, T: serde::Deserialize<'de> + Default>(d: D) -> Result<T, D::Error> {
+    if LEGACY_V5_READ.with(|f| f.get()) {
+        Ok(T::default())
+    } else {
+        T::deserialize(d)
+    }
+}
+
 /// What a graph table is: `AS NODE` or `AS EDGE` (see docs/graph.md).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GraphKind {
@@ -295,14 +311,19 @@ pub struct Table {
     pub spatial_indexes: Vec<SpatialIndexDef>,
     #[serde(default)]
     pub columnstore: Option<ColumnstoreDef>,
+    // The three fields below were added after format 5 of the checkpoint: a format 5 table has none of them (see `LEGACY_V5_READ`).
     /// `AS NODE` / `AS EDGE`
-    #[serde(default)]
+    #[serde(default, deserialize_with = "read_unless_v5", skip_serializing_if = "legacy_v5_write")]
     pub graph: Option<GraphKind>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "read_unless_v5", skip_serializing_if = "legacy_v5_write")]
     pub edge_constraints: Vec<EdgeConstraintDef>,
     /// the next `$graph_id` of a graph table (a counter of its own, so that a table's `IDENTITY` column is not disturbed by it)
-    #[serde(default)]
+    #[serde(default, deserialize_with = "read_unless_v5", skip_serializing_if = "legacy_v5_write")]
     pub graph_next: SharedCounter,
+}
+
+fn legacy_v5_write<T>(_: &T) -> bool {
+    LEGACY_V5_WRITE.with(|f| f.get())
 }
 
 /// A counter that clones share: the next identity value of a table, the current value of a sequence. A statement

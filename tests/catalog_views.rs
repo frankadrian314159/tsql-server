@@ -105,3 +105,97 @@ fn computed_columns_are_listed() {
     assert_eq!(scalar(&mut c, "SELECT name FROM sys.computed_columns WHERE object_id = OBJECT_ID('dbo.cc')"), "s");
     assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.computed_columns WHERE object_id = OBJECT_ID('dbo.p')"), "0");
 }
+
+#[test]
+fn the_host_and_the_instance_can_be_asked_who_they_are() {
+    // (SSMS reads these when it connects)
+    let mut c = conn();
+    let host = rows(&mut c, "SELECT host_platform, host_release, os_language_version FROM sys.dm_os_host_info");
+    assert_eq!(host.len(), 1);
+    assert!(matches!(host[0][0].as_str(), "Windows" | "Linux"), "{host:?}");
+    assert_eq!(host[0][2], "1033");
+    let info = rows(&mut c, "SELECT cpu_count, scheduler_count, affinity_type_desc FROM sys.dm_os_sys_info");
+    assert_eq!(info.len(), 1);
+    assert_eq!(info[0][2], "AUTO");
+    assert_eq!(info[0][0], info[0][1]);
+}
+
+#[test]
+fn connectionproperty_of_an_embedded_connection() {
+    let mut c = conn();
+    assert_eq!(scalar(&mut c, "SELECT CAST(CONNECTIONPROPERTY('net_transport') AS NVARCHAR(40))"), "Shared memory");
+    assert_eq!(scalar(&mut c, "SELECT CAST(CONNECTIONPROPERTY('protocol_type') AS NVARCHAR(40))"), "TSQL");
+    assert_eq!(scalar(&mut c, "SELECT CAST(CONNECTIONPROPERTY('client_net_address') AS NVARCHAR(40))"), "<local machine>");
+    assert_eq!(scalar(&mut c, "SELECT ISNULL(CAST(CONNECTIONPROPERTY('local_tcp_port') AS INT), -1)"), "-1");
+    assert_eq!(scalar(&mut c, "SELECT ISNULL(CAST(CONNECTIONPROPERTY('nonsense') AS NVARCHAR(40)), 'none')"), "none");
+}
+
+#[test]
+fn the_statements_ssms_runs_when_it_connects_all_work() {
+    let mut c = conn();
+    for sql in [
+        "SELECT SERVERPROPERTY('EngineEdition'), SERVERPROPERTY('ProductVersion'), SERVERPROPERTY('Edition'), SERVERPROPERTY('IsClustered'), SERVERPROPERTY('ServerName'), SERVERPROPERTY('IsHadrEnabled'), SERVERPROPERTY('Collation')",
+        "SELECT @@VERSION, @@SERVERNAME, @@SERVICENAME, @@LANGUAGE, @@LANGID, @@MAX_CONNECTIONS, @@TEXTSIZE, @@DATEFIRST, @@REMSERVER, @@SPID",
+        "SELECT SUSER_SNAME(), SUSER_ID(), SUSER_SID(), ORIGINAL_LOGIN(), IS_SRVROLEMEMBER('sysadmin'), HAS_PERMS_BY_NAME(null, null, 'VIEW SERVER STATE')",
+        "SELECT SESSIONPROPERTY('ANSI_NULLS'), CONNECTIONPROPERTY('net_transport'), DATABASEPROPERTY('master', 'Collation'), DATABASEPROPERTYEX('master', 'Status')",
+        "SELECT name, database_id, owner_sid, collation_name, compatibility_level, user_access_desc, is_read_only, state_desc, recovery_model_desc, snapshot_isolation_state, is_read_committed_snapshot_on, is_broker_enabled, containment, is_auto_close_on, page_verify_option_desc, create_date FROM sys.databases",
+        "SELECT name, principal_id, sid, type, type_desc, is_disabled, default_database_name, default_language_name, is_fixed_role FROM sys.server_principals",
+        "SELECT name, is_policy_checked, is_expiration_checked, password_hash FROM sys.sql_logins",
+        "SELECT role_principal_id, member_principal_id FROM sys.server_role_members",
+        "SELECT name, value, value_in_use FROM sys.configurations",
+        "SELECT session_id, net_transport, auth_scheme FROM sys.dm_exec_connections",
+        "SELECT database_id, name, physical_name, type_desc FROM sys.master_files",
+        "SELECT name, product, is_linked FROM sys.servers",
+        "SELECT name, protocol_desc, type_desc, state_desc FROM sys.endpoints",
+        "SELECT * FROM sys.server_permissions", "SELECT * FROM sys.assemblies", "SELECT * FROM sys.availability_groups", "SELECT * FROM sys.dm_hadr_availability_replica_states",
+        "SELECT * FROM sys.resource_governor_configuration", "SELECT * FROM sys.traces", "SELECT * FROM sys.credentials", "SELECT * FROM sys.linked_logins", "SELECT * FROM sys.backup_devices",
+        "SELECT * FROM sys.change_tracking_databases", "SELECT * FROM sys.sysdatabases", "SELECT * FROM sys.dm_os_sys_memory", "SELECT * FROM sys.dm_os_process_memory", "SELECT * FROM sys.dm_server_services",
+        "SELECT * FROM sys.dm_os_performance_counters", "SELECT * FROM sys.dm_os_wait_stats", "SELECT * FROM sys.dm_os_host_info",
+        "EXEC sp_server_info", "EXEC xp_msver", "EXEC sp_databases",
+        "SELECT HAS_DBACCESS('master'), FILE_ID('master'), FILE_NAME(1), FILEGROUP_ID('PRIMARY'), FILEGROUP_NAME(1), FILEGROUPPROPERTY('PRIMARY', 'IsDefault'), FILEPROPERTY('master', 'IsPrimaryFile'), TYPEPROPERTY('int', 'Precision'), IS_ROLEMEMBER('public'), USER_ID(), DATABASE_PRINCIPAL_ID('dbo'), ORIGINAL_DB_NAME(), SESSION_CONTEXT(N'k'), CURRENT_REQUEST_ID(), OBJECTPROPERTYEX(1, 'IsTable'), INDEXPROPERTY(1, 'ix', 'IsUnique')",
+        "SELECT FULLTEXTSERVICEPROPERTY('IsFullTextInstalled'), FULLTEXTSERVICEPROPERTY('ResourceUsage'), FULLTEXTCATALOGPROPERTY('c', 'ItemCount')",
+    ] {
+        let r = c.execute(sql);
+        assert!(r.first_error().is_none(), "{sql}: {:?}", r.first_error());
+    }
+    // what they say
+    assert_eq!(rows(&mut c, "SELECT name FROM sys.server_principals WHERE type = 'R' ORDER BY principal_id").first().unwrap(), &["sysadmin"]);
+    assert_eq!(scalar(&mut c, "SELECT type_desc FROM sys.server_principals WHERE name = 'sa'"), "SQL_LOGIN");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.server_role_members m JOIN sys.server_principals r ON r.principal_id = m.role_principal_id JOIN sys.server_principals p ON p.principal_id = m.member_principal_id WHERE r.name = 'sysadmin' AND p.name = 'sa'"), "1");
+    assert_eq!(scalar(&mut c, "SELECT SUSER_ID('sa') - (SELECT principal_id FROM sys.server_principals WHERE name = 'sa')"), "0");
+    assert_eq!(scalar(&mut c, "SELECT user_access_desc FROM sys.databases WHERE name = 'master'"), "MULTI_USER");
+    // what SSMS reads of each database: the columns line up with their names, and the views of availability and mirroring are there (empty)
+    assert_eq!(rows(&mut c, "SELECT is_distributor, log_reuse_wait, log_reuse_wait_desc, containment, containment_desc, delayed_durability_desc, is_ledger_on FROM sys.databases WHERE name = 'master'"), vec![vec!["0".to_string(), "0".into(), "NOTHING".into(), "0".into(), "NONE".into(), "DISABLED".into(), "0".into()]]);
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.availability_replicas"), "0");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.dm_hadr_database_replica_states"), "0");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.database_mirroring WHERE mirroring_role IS NULL AND database_id = 1"), "1");
+    assert_eq!(scalar(&mut c, "SELECT HAS_DBACCESS('master')"), "1");
+    assert_eq!(scalar(&mut c, "SELECT ISNULL(HAS_DBACCESS('nowhere'), -1)"), "-1");
+    exec(&mut c, "CREATE TABLE ixt (a INT PRIMARY KEY, b INT, c INT)");
+    exec(&mut c, "CREATE UNIQUE INDEX ix_b ON ixt (b)");
+    exec(&mut c, "CREATE INDEX ix_c ON ixt (c)");
+    assert_eq!(rows(&mut c, "SELECT INDEXPROPERTY(OBJECT_ID('ixt'), 'ix_b', 'IsUnique'), INDEXPROPERTY(OBJECT_ID('ixt'), 'ix_c', 'IsUnique'), INDEXPROPERTY(OBJECT_ID('ixt'), 'ix_c', 'IsClustered')"), vec![vec!["1".to_string(), "0".into(), "0".into()]]);
+    assert_eq!(scalar(&mut c, "SELECT FILE_NAME(FILE_ID('master'))"), "master");
+    exec(&mut c, "CREATE DATABASE snap");
+    exec(&mut c, "ALTER DATABASE snap SET ALLOW_SNAPSHOT_ISOLATION ON");
+    assert_eq!(scalar(&mut c, "SELECT snapshot_isolation_state_desc FROM sys.databases WHERE name = 'snap'"), "ON");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.master_files WHERE type_desc = 'LOG'"), scalar(&mut c, "SELECT COUNT(*) FROM sys.databases"));
+}
+
+#[test]
+fn the_server_properties_that_ssms_reads_into_numbers_and_booleans_are_not_null() {
+    // (a client that converts a NULL to a boolean or a number stops with "Object cannot be cast from DBNull to other types")
+    let mut c = conn();
+    for p in [
+        "ProductVersion", "ProductMajorVersion", "ProductMinorVersion", "ProductBuild", "ProductLevel", "ResourceVersion", "Edition", "EditionID", "EngineEdition", "ServerName", "MachineName",
+        "ComputerNamePhysicalNetBIOS", "Collation", "LCID", "SqlCharSet", "SqlSortOrder", "ComparisonStyle", "IsClustered", "IsIntegratedSecurityOnly", "IsSingleUser", "IsHadrEnabled", "IsLocalDB",
+        "IsXTPSupported", "IsPolyBaseInstalled", "IsFullTextInstalled", "FilestreamConfiguredLevel", "FilestreamEffectiveLevel", "LicenseType", "BuildClrVersion", "ProcessID", "PathSeparator",
+        "InstanceDefaultDataPath", "InstanceDefaultLogPath", "InstanceDefaultBackupPath", "ErrorLogFileName", "IsExternalAuthenticationOnly", "IsBigDataCluster",
+    ] {
+        assert_ne!(scalar(&mut c, &format!("SELECT SERVERPROPERTY('{p}')")), "NULL", "{p}");
+    }
+    // a default instance has no instance name
+    assert_eq!(scalar(&mut c, "SELECT SERVERPROPERTY('InstanceName')"), "NULL");
+    assert_eq!(scalar(&mut c, "SELECT SERVERPROPERTY('IsHadrEnabled')"), "0");
+    assert_eq!(scalar(&mut c, "SELECT SERVERPROPERTY('LCID')"), "1033");
+}

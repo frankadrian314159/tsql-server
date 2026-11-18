@@ -168,7 +168,21 @@ pub struct TriggerCtx {
     pub instead_of: bool,
 }
 
+/// What the network layer knows of a connection, for `CONNECTIONPROPERTY` (see `Engine::builtin`): a connection that is not over TDS has none.
+#[derive(Clone, Debug)]
+pub struct ConnInfo {
+    /// `TCP`
+    pub transport: String,
+    /// `SQL`, `KERBEROS` (an Azure AD token is `SQL`, as in SQL Server)
+    pub auth_scheme: String,
+    pub local_addr: String,
+    pub local_port: i32,
+    pub client_addr: String,
+}
+
 pub struct SessionState {
+    /// the connection's addresses and how it logged in, when it came over TDS
+    pub conn_info: Option<ConnInfo>,
     pub spid: i32,
     /// The record of the transaction that is committing, proposed to the replicator and not yet confirmed.
     pub pending_repl: Option<crate::persist::PendingRepl>,
@@ -349,6 +363,7 @@ impl SessionState {
             push_plans: HashMap::new(),
             no_fold_agg: false,
             scan_needed: None,
+            conn_info: None,
             sel_names: Vec::new(),
             temp_stats: Vec::new(),
             sub_names: HashMap::new(),

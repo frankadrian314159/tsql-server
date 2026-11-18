@@ -134,7 +134,22 @@ pub fn parse(payload: &[u8]) -> R<Vec<Rpc>> {
                 (Ti { w: Wire::Int(4), fixed: false, cp: 1252 }, Value::Null)
             } else {
                 let ti = read_typeinfo(&mut rd)?;
-                let val = read_value(&mut rd, &ti)?;
+                // (a legacy large object parameter is a length and the bytes: no text pointer, as a column value has)
+                let val = if matches!(ti.w, Wire::Text | Wire::NText | Wire::Image) {
+                    let n = rd.u32()?;
+                    if n == u32::MAX {
+                        Value::Null
+                    } else {
+                        let d = rd.take(n as usize)?;
+                        match ti.w {
+                            Wire::Text => Value::Str(decode_cp(ti.cp, d)),
+                            Wire::NText => Value::Str(decode_utf16(d)),
+                            _ => Value::Bin(d.to_vec()),
+                        }
+                    }
+                } else {
+                    read_value(&mut rd, &ti)?
+                };
                 (ti, val)
             };
             params.push(Param { name, out: status & 1 != 0, ti, val, tvp: None });
@@ -282,5 +297,30 @@ mod tests {
         let d = chrono::NaiveDate::from_ymd_opt(2024, 3, 4).unwrap().and_hms_milli_opt(5, 6, 7, 123).unwrap();
         assert_eq!(literal(&Value::DateTime(d, crate::types::DtKind::DateTime)), "'2024-03-04T05:06:07.123'");
         assert_eq!(literal(&Value::Date(d.date())), "'2024-03-04'");
+    }
+
+    /// SSMS sends the text of a big statement as an NTEXT parameter: a length and the bytes, with no text pointer.
+    #[test]
+    fn an_ntext_parameter_is_a_length_and_the_bytes() {
+        let text = "select 1";
+        let bytes: Vec<u8> = text.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+        let mut m: Vec<u8> = vec![];
+        m.extend_from_slice(&22u32.to_le_bytes()); // ALL_HEADERS: total length, then one transaction descriptor header
+        m.extend_from_slice(&18u32.to_le_bytes());
+        m.extend_from_slice(&2u16.to_le_bytes());
+        m.extend_from_slice(&[0; 8]);
+        m.extend_from_slice(&1u32.to_le_bytes());
+        m.extend_from_slice(&[0xFF, 0xFF]);
+        m.extend_from_slice(&SP_EXECUTESQL.to_le_bytes());
+        m.extend_from_slice(&[0, 0]); // flags
+        m.extend_from_slice(&[0, 0]); // no name, status 0
+        m.push(0x63);
+        m.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        m.extend_from_slice(&[0x09, 0x04, 0xD0, 0x00, 0x34]);
+        m.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        m.extend_from_slice(&bytes);
+        let calls = parse(&m).unwrap();
+        assert_eq!(calls[0].params.len(), 1);
+        assert_eq!(convert::to_str(&calls[0].params[0].val), text);
     }
 }
