@@ -383,3 +383,23 @@ async fn connectionproperty_says_how_the_connection_came_in() {
     assert_eq!(r.get::<&str, _>("n"), None);
     l.shutdown();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn isnull_of_a_tinyint_or_bit_column_is_one_on_the_wire_also_when_the_column_is_null() {
+    // (SMO reads the result as a byte or a boolean, and fails on an int: SSMS scripts an index with ISNULL(op.state, 2) and ISNULL(s.no_recompute, 0))
+    let (l, _s) = start();
+    let mut c = sa(&l).await;
+    c.simple_query("CREATE TABLE tb (t TINYINT NULL, b BIT NULL, n INT NULL)").await.unwrap().into_results().await.unwrap();
+    c.simple_query("INSERT tb VALUES (NULL, NULL, NULL), (7, 1, 3)").await.unwrap().into_results().await.unwrap();
+    let rows = c.simple_query("SELECT ISNULL(t, 2) AS t, ISNULL(b, 0) AS b, ISNULL(n, 5) AS n FROM tb ORDER BY tb.n").await.unwrap().into_first_result().await.unwrap();
+    assert_eq!(rows[0].get::<u8, _>("t"), Some(2));
+    assert_eq!(rows[0].get::<bool, _>("b"), Some(false));
+    assert_eq!(rows[0].get::<i32, _>("n"), Some(5));
+    assert_eq!(rows[1].get::<u8, _>("t"), Some(7));
+    assert_eq!(rows[1].get::<bool, _>("b"), Some(true));
+    // the same through a LEFT JOIN that finds nothing, as SSMS's query does
+    let rows = c.simple_query("SELECT ISNULL(op.state, 2) AS s, ISNULL(st.no_recompute, 0) AS r FROM tb LEFT JOIN sys.index_resumable_operations op ON op.object_id = 1 LEFT JOIN sys.stats st ON st.object_id = 1 WHERE tb.n = 3").await.unwrap().into_first_result().await.unwrap();
+    assert_eq!(rows[0].get::<u8, _>("s"), Some(2));
+    assert_eq!(rows[0].get::<bool, _>("r"), Some(false));
+    l.shutdown();
+}

@@ -1938,3 +1938,17 @@ fn a_batch_with_if_and_begin_end_over_the_clusters_tables_runs_statement_by_stat
     assert_eq!(x, y);
     assert!(x.iter().any(|r| r[1] == "none") && x.iter().any(|r| r[1] == "empty"), "{x:?}");
 }
+
+/// A variable or a comment that has the name of a table is not a mention of it: SSMS's connect batches have `@ErrorLog` (and `dbo.ErrorLog` is a
+/// table of AdventureWorks), and the cluster must not claim a batch it cannot run for that.
+#[test]
+fn a_variable_or_a_comment_named_like_a_table_does_not_make_a_batch_the_clusters() {
+    let h = start(2);
+    let mut s = h.cluster.session();
+    let r = s.execute("CREATE TABLE orders (id INT PRIMARY KEY, n INT)");
+    assert!(r.first_error().is_none(), "{:?}", r.first_error());
+    assert!(!s.wants("DECLARE @orders INT\nselect @orders = 1\nexec master.dbo.xp_instance_regread N'a', N'b', N'c', @orders OUTPUT"));
+    assert!(!s.wants("-- orders\n/* orders */ SELECT 1"));
+    assert!(s.wants("SELECT * FROM orders"));
+    assert!(s.wants("SELECT 1 FROM [orders] -- x"));
+}

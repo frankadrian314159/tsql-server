@@ -1854,6 +1854,24 @@ impl<'a> Engine<'a> {
                 }
             }
             "ORIGINAL_DB_NAME" => Value::Str(self.ses.db.clone()),
+            // SID_BINARY(name): the SID of a Windows account, which this server cannot look up; NULL, as for an account that is not there
+            "SID_BINARY" => Value::Null,
+            // sys.fn_varbintohexsubstring(add_0x, binary, start, length): the hex of part of a binary value (length 0: the rest)
+            "FN_VARBINTOHEXSUBSTRING" => {
+                need(name, &a, 4)?;
+                match &a[1] {
+                    Value::Bin(b) => {
+                        let start = (a[2].as_i64().unwrap_or(1).max(1) - 1) as usize;
+                        let len = a[3].as_i64().unwrap_or(0).max(0) as usize;
+                        let end = if len == 0 { b.len() } else { (start + len).min(b.len()) };
+                        let hex: String = b.get(start.min(b.len())..end).unwrap_or(&[]).iter().map(|x| format!("{:02X}", x)).collect();
+                        Value::Str(if a[0].as_i64() == Some(1) { format!("0x{}", hex) } else { hex })
+                    }
+                    _ => Value::Null,
+                }
+            }
+            // the policy-based management of SQL Server: off
+            "FN_SYSPOLICY_IS_AUTOMATION_ENABLED" => Value::Int(0),
             "SESSION_CONTEXT" => Value::Null,
             "CURRENT_REQUEST_ID" => Value::Int(0),
             "CONNECTIONPROPERTY" => {
@@ -1937,6 +1955,12 @@ impl<'a> Engine<'a> {
                 }
             }
             "USER_NAME" | "CURRENT_USER" | "SESSION_USER" | "USER" => Value::Str(self.current_user_name()),
+            // SUSER_SNAME([sid]): the login of a SID (the ones SUSER_SID gives), NULL for none; without an argument, the current login
+            "SUSER_SNAME" | "SUSER_NAME" | "SYSTEM_USER" if !a.is_empty() => match &a[0] {
+                Value::Bin(b) => self.srv.security.logins.values().find(|l| l.name.to_lowercase().as_bytes() == b.as_slice()).map(|l| Value::Str(l.name.clone())).unwrap_or(Value::Null),
+                Value::Int(_) | Value::BigInt(_) => Value::Str(self.eff_login()),
+                _ => Value::Null,
+            },
             "SUSER_SNAME" | "SUSER_NAME" | "SYSTEM_USER" => Value::Str(self.eff_login()),
             "ORIGINAL_LOGIN" => Value::Str(self.ses.login.clone()),
             // SUSER_ID([login]): the principal id the server_principals view gives the login (NULL for none)
@@ -2573,6 +2597,25 @@ impl<'a> Engine<'a> {
                         }
                     }
                     return Ok(Rowset::new(col(if big { DataType::BigInt } else { DataType::Int }), rows));
+                }
+                // the objects that refer to the named one (and those it refers to), from their definitions
+                "DM_SQL_REFERENCING_ENTITIES" | "DM_SQL_REFERENCED_ENTITIES" => {
+                    let referencing = up == "DM_SQL_REFERENCING_ENTITIES";
+                    let full = s(args.first().unwrap_or(&Value::Null));
+                    let parts: Vec<String> = full.split('.').map(|p| p.trim().trim_matches(|c| c == '[' || c == ']').to_string()).collect();
+                    let (sch, nm) = if parts.len() >= 2 { (parts[parts.len() - 2].clone(), parts[parts.len() - 1].clone()) } else { ("dbo".to_string(), parts.first().cloned().unwrap_or_default()) };
+                    let mut rows = vec![];
+                    for d in self.dependency_rows() {
+                        if referencing && d.ref_schema.eq_ignore_ascii_case(&sch) && d.ref_name.eq_ignore_ascii_case(&nm) {
+                            rows.push(vec![Value::Str(d.referencing_schema.clone()), Value::Str(d.referencing_name.clone()), Value::Int(d.referencing_id), Value::Int(1), Value::Str("OBJECT_OR_COLUMN".into()), Value::Bit(false)]);
+                        } else if !referencing && d.referencing_schema.eq_ignore_ascii_case(&sch) && d.referencing_name.eq_ignore_ascii_case(&nm) {
+                            rows.push(vec![Value::Str(d.ref_schema.clone()), Value::Str(d.ref_name.clone()), d.ref_id.map(Value::Int).unwrap_or(Value::Null), Value::Int(1), Value::Str("OBJECT_OR_COLUMN".into()), Value::Bit(false)]);
+                        }
+                    }
+                    let c = |n: &str, t: DataType| ColMeta { qual: None, name: n.into(), ty: Some(t), denied: None, hidden: false, coll: None, mask: None };
+                    let names = if referencing { ["referencing_schema_name", "referencing_entity_name", "referencing_id"] } else { ["referenced_schema_name", "referenced_entity_name", "referenced_id"] };
+                    let cols = vec![c(names[0], DataType::NVarChar(128)), c(names[1], DataType::NVarChar(128)), c(names[2], DataType::Int), c(if referencing { "referencing_class" } else { "referenced_class" }, DataType::TinyInt), c(if referencing { "referencing_class_desc" } else { "referenced_class_desc" }, DataType::NVarChar(60)), c("is_caller_dependent", DataType::Bit)];
+                    return Ok(Rowset::new(Schema::new(cols), rows));
                 }
                 "OPENJSON" => return self.openjson(&args, with),
                 "OPENXML" => return self.openxml(&args, with),

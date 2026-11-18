@@ -145,6 +145,11 @@ pub fn table_id(name: &[String]) -> String {
 /// The ids of all tables that appear in table references of a query (found by walking its serialized form: a table
 /// reference is `{"Table": {"name": [...], ...}}`).
 pub fn referenced_tables(q: &Query) -> Vec<String> {
+    referenced_tables_of(q)
+}
+
+/// As [`referenced_tables`], for anything that serializes: the body of a procedure or a trigger, a function.
+pub fn referenced_tables_of<T: serde::Serialize>(q: &T) -> Vec<String> {
     fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
         match v {
             serde_json::Value::Object(m) => {

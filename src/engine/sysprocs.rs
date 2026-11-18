@@ -339,6 +339,9 @@ impl<'a> Engine<'a> {
                 self.exec_security(&crate::ast::SecStmt::CreateUser { name: user, login: Some(login), default_schema: None })?;
                 Ok(Some(Value::Int(0)))
             }
+            // the registry and the installation of Windows: this server has neither, so a value that is asked for stays NULL (SSMS reads
+            // the paths and settings of the instance with these when it connects)
+            "xp_instance_regread" | "xp_regread" | "xp_instance_regenumvalues" | "xp_regenumvalues" | "xp_instance_regenumkeys" | "xp_regenumkeys" | "xp_qv" => Ok(Some(Value::Int(0))),
             "sp_addextendedproperty" | "sp_updateextendedproperty" | "sp_dropextendedproperty" | "sp_recompile" | "sp_refreshview" | "sp_updatestats" | "sp_autostats" | "sp_setapprole" | "sp_procoption" | "sp_unbindrule" | "sp_bindrule" => Ok(Some(Value::Int(0))),
             "sp_spaceused" => {
                 self.emit_rowset(Rowset::from_rows(&["database_name".into(), "database_size".into()], vec![vec![Value::Str(self.ses.db.clone()), Value::Str("8.00 MB".into())]]));

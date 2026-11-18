@@ -1005,6 +1005,17 @@ impl<'a> Engine<'a> {
                         Expr::Cast { ty: tr, try_: _, .. } => {
                             ty = self.resolve_type_cast(tr).ok();
                         }
+                        // ISNULL(column, value) has the type of the column (a tinyint column gives a tinyint, a bit column a bit, whatever the
+                        // replacement is, and also when the column is NULL): a client that reads a byte or a boolean fails on an int
+                        Expr::Func(fc) if fc.name == "ISNULL" && fc.args.len() == 2 => {
+                            if let Expr::Col(parts) = &fc.args[0] {
+                                if let Found::One(i) = schema.find_parts(parts) {
+                                    if matches!(schema.cols[i].ty, Some(DataType::Bit | DataType::TinyInt | DataType::SmallInt | DataType::Int | DataType::BigInt)) {
+                                        ty = schema.cols[i].ty.clone();
+                                    }
+                                }
+                            }
+                        }
                         _ => {}
                     }
                     cols.push(OutCol { name, expr: Some(e), src_idx: None, ty, coll, mask });
@@ -1902,6 +1913,19 @@ impl<'a> Engine<'a> {
                 if let Some(mut rs) = self.sysview(sch, &display) {
                     rs.schema.cols.iter_mut().for_each(|c| c.qual = Some(q.clone()));
                     return Ok(rs);
+                }
+            }
+        }
+        // the compatibility views of SQL Server 2000 (sysobjects, sysusers, sysdatabases), which are found without the schema (or as dbo)
+        if let Some(last) = name.last() {
+            let schema_ok = name.len() == 1 || name[name.len() - 2].eq_ignore_ascii_case("dbo");
+            if schema_ok && matches!(last.to_lowercase().as_str(), "sysobjects" | "sysusers" | "sysdatabases") {
+                let found = self.locate(name);
+                if self.table_ref(&found).is_none() {
+                    if let Some(mut rs) = self.sysview("sys", &display) {
+                        rs.schema.cols.iter_mut().for_each(|c| c.qual = Some(q.clone()));
+                        return Ok(rs);
+                    }
                 }
             }
         }

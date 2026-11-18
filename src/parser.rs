@@ -2948,7 +2948,21 @@ impl Parser {
                 "ROWCOUNT" | "DATEFIRST" | "TEXTSIZE" | "LOCK_TIMEOUT" | "DEADLOCK_PRIORITY" | "LANGUAGE" | "DATEFORMAT" | "CONTEXT_INFO" => {
                     // SET LANGUAGE british and SET DATEFORMAT dmy take a bare name as well as a string or variable
                     let bare = matches!(name.as_str(), "LANGUAGE" | "DATEFORMAT") && matches!(self.tok().tok, Tok::Id(_)) && !self.is_kw_any(&["NULL", "N"]);
-                    let e = if bare {
+                    // SET DEADLOCK_PRIORITY LOW | NORMAL | HIGH (SSMS sends NORMAL for every connection): -5, 0 and 5
+                    let priority = if name == "DEADLOCK_PRIORITY" {
+                        match &self.tok().tok {
+                            Tok::Id(w) if w.eq_ignore_ascii_case("LOW") => Some(-5),
+                            Tok::Id(w) if w.eq_ignore_ascii_case("NORMAL") => Some(0),
+                            Tok::Id(w) if w.eq_ignore_ascii_case("HIGH") => Some(5),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let e = if let Some(p) = priority {
+                        self.advance();
+                        Expr::Lit(Value::Int(p))
+                    } else if bare {
                         let word = match self.advance().tok {
                             Tok::Id(w) => w.to_string(),
                             _ => String::new(),

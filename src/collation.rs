@@ -181,7 +181,12 @@ fn split_accent(c: char) -> (char, u32) {
 }
 
 /// Parsed collations by name (parsing and key building are cheap, but they happen once per index key).
+/// (DATABASE_DEFAULT and CATALOG_DEFAULT, which a script may give for a column or an expression, are the default collation: SSMS's
+/// dependency discovery makes temporary tables with them.)
 pub fn get(name: &str) -> Option<Arc<Collation>> {
+    if name.eq_ignore_ascii_case("database_default") || name.eq_ignore_ascii_case("catalog_default") {
+        return get(DEFAULT_NAME);
+    }
     static CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<Collation>>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
     let mut m = cache.lock().unwrap_or_else(|e| e.into_inner());

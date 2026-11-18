@@ -392,3 +392,17 @@ fn execute_as_and_not_for_replication_options_are_accepted() {
     exec(&mut c, "EXEC q 6");
     assert_eq!(rows(&mut c, "SELECT a, b FROM t ORDER BY a"), vec![vec!["5", "1"], vec!["6", "2"]]);
 }
+
+#[test]
+fn a_variable_declared_in_a_block_is_known_to_the_whole_batch() {
+    // (a DECLARE in a branch that is not taken, or in a block that has ended: the variable is still declared, as in SQL Server; SSMS's dependency
+    // discovery declares its cursor variables inside an IF)
+    let mut c = conn();
+    assert_eq!(scalar(&mut c, "IF 1 = 0 BEGIN DECLARE @z INT END SET @z = 3 SELECT @z"), "3");
+    assert_eq!(scalar(&mut c, "DECLARE @i INT = 0 WHILE @i < 3 BEGIN DECLARE @x INT = @i SET @i = @i + 1 END SELECT @x"), "2");
+    assert_eq!(scalar(&mut c, "IF 1 = 1 BEGIN DECLARE @a INT = 1 END ELSE BEGIN DECLARE @a INT = 2 END SELECT @a"), "1");
+    // two DECLAREs of the name that both run are still an error
+    assert_eq!(err_no(&mut c, "DECLARE @d INT DECLARE @d INT"), 134);
+    exec(&mut c, "CREATE PROCEDURE p_hoist AS BEGIN IF 1 = 0 BEGIN DECLARE @q INT END SET @q = 7 SELECT @q END");
+    assert_eq!(scalar(&mut c, "EXEC p_hoist"), "7");
+}

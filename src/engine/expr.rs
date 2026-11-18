@@ -949,6 +949,7 @@ impl<'a> Engine<'a> {
             "@@NESTLEVEL" => Value::Int(self.ses.nest_level),
             "@@LANGUAGE" => Value::Str(self.ses.language.clone()),
             "@@LANGID" => Value::Int(0),
+            "@@MAX_PRECISION" => Value::Int(38),
             "@@REMSERVER" => Value::Null,
             "@@DATEFIRST" => Value::Int(self.ses.datefirst),
             "@@MAX_CONNECTIONS" => Value::Int(32767),

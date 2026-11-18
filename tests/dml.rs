@@ -306,3 +306,17 @@ fn truncate_and_drop() {
     assert_eq!(err_no(&mut c, "DROP TABLE t"), 3701);
     exec(&mut c, "DROP TABLE IF EXISTS t");
 }
+
+#[test]
+fn an_update_whose_table_is_not_in_its_from_clause_joins_it_by_the_where_clause() {
+    // (SSMS's dependency discovery: UPDATE #t2 SET ... FROM sys.objects o JOIN ... WHERE o.object_id = #t2.object_id)
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE tgt (k INT, v INT, w INT)");
+    exec(&mut c, "INSERT tgt VALUES (1, 0, 0), (2, 0, 0), (3, 0, 0)");
+    exec(&mut c, "CREATE TABLE src (id INT, x INT)");
+    exec(&mut c, "INSERT src VALUES (1, 10), (2, 20)");
+    exec(&mut c, "UPDATE tgt SET v = src.x FROM src WHERE src.id = tgt.k");
+    assert_eq!(rows(&mut c, "SELECT k, v, w FROM tgt ORDER BY k"), vec![vec!["1", "10", "0"], vec!["2", "20", "0"], vec!["3", "0", "0"]].into_iter().map(|r| r.into_iter().map(String::from).collect::<Vec<_>>()).collect::<Vec<_>>());
+    exec(&mut c, "DELETE tgt FROM src WHERE src.id = tgt.k AND src.x = 20");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM tgt"), "2");
+}

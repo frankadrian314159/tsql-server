@@ -279,6 +279,8 @@ impl ClusterSession {
                         }
                     }
                 }
+                // (logged, so that a control node started again from its state file has the schema before the tables made in it)
+                self.cluster.log_schema(&st);
             }
         }
         // the tables, with what must be there before the rows

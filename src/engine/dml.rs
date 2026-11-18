@@ -1407,9 +1407,16 @@ impl<'a> Engine<'a> {
                 let r = self.eval_table_ref(tr, None)?;
                 cur = self.join_rowsets(JoinKind::Cross, cur, r, &None, None)?;
             }
-            let tcols: Vec<usize> = (0..cur.schema.cols.len())
+            let mut tcols: Vec<usize> = (0..cur.schema.cols.len())
                 .filter(|&i| cur.schema.cols[i].qual.as_deref().map(|q| tname_aliases.iter().any(|a| a.eq_ignore_ascii_case(q))).unwrap_or(false))
                 .collect();
+            if tcols.is_empty() {
+                // the table being changed is not in the FROM clause (`UPDATE t SET ... FROM other WHERE other.k = t.k`): it is joined to the
+                // tables of the FROM clause, and the WHERE clause says which pairs go together, as in SQL Server
+                let target = Rowset::table_rows(t, &t.name, scanned.iter().map(|(_, r)| r.clone()).collect());
+                cur = self.join_rowsets(JoinKind::Cross, target, cur, &None, None)?;
+                tcols = (0..cur.schema.cols.len()).filter(|&i| cur.schema.cols[i].qual.as_deref().map(|q| q.eq_ignore_ascii_case(&t.name)).unwrap_or(false)).collect();
+            }
             if tcols.len() != t.columns.len() {
                 return Err(SqlError::new(4104, "The multi-part identifier could not be bound: target table not found in FROM clause."));
             }

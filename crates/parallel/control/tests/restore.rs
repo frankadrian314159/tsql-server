@@ -204,6 +204,33 @@ GO";
 }
 
 #[test]
+fn a_restored_schema_and_its_tables_are_still_there_when_the_control_node_starts_again() {
+    let h = start(2);
+    let path = backup_path("again");
+    let state = std::env::temp_dir().join(format!("tsql-restore-test-{}-again.state", std::process::id()));
+    let _ = std::fs::remove_file(&state);
+    let src_server = Server::new();
+    let _src = source(&src_server, &path, "GO
+CREATE SCHEMA hr;
+GO
+CREATE TABLE hr.staff (id INT PRIMARY KEY, name VARCHAR(20));
+INSERT hr.staff VALUES (1, 'a'), (2, 'b');
+GO");
+    let cfg = ClusterConfig { shards: h.shards.iter().enumerate().map(|(i, s)| ShardInfo { id: i as u32, addr: s.addr.to_string() }).collect() };
+    {
+        let cluster = Cluster::open(&state, &cfg).unwrap();
+        ok(&cluster.session().execute(&format!("RESTORE DATABASE shop FROM DISK = '{}'", path)), "the restore");
+    }
+    // a control node started again from the state file knows the schema, the table made in it and the rows on the shards
+    let cluster = Cluster::open(&state, &cfg).unwrap();
+    let mut s = cluster.session();
+    assert_eq!(rows_of(&s.execute("SELECT COUNT(*) FROM sys.tables WHERE name = 'staff'")), vec![vec!["1".to_string()]]);
+    assert_eq!(rows_of(&s.execute("SELECT COUNT(*) FROM hr.staff")), vec![vec!["2".to_string()]]);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&state);
+}
+
+#[test]
 fn options_a_cluster_cannot_honour_are_errors() {
     let h = start(2);
     let path = backup_path("options");

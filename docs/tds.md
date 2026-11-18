@@ -174,6 +174,12 @@ views (`SERVERPROPERTY` values that must not be NULL, `CONNECTIONPROPERTY`, `HAS
 a column value has). When a client fails against the server, set `TSQL_TDS_TRACE=1`: the server prints each request (the batch or
 the RPC and the batch it becomes) and the errors, to its standard error.
 
+Scripting a table and View Dependencies send long batches that need the catalog to look like SQL Server's: `sys.sql_expression_dependencies`
+(from the definitions of views, procedures, functions and triggers), `sys.dm_sql_referencing_entities`, the property columns of `sys.tables`,
+`sys.columns`, `sys.indexes` and `sys.databases`, `COLLATE DATABASE_DEFAULT`, `UPDATE ... FROM` a table that does not name the target,
+and variables that are declared inside a block and used after it. A result column that SMO reads as a byte or a boolean must be sent as one:
+`ISNULL(column, value)` has the type of the column. On a cluster, View Dependencies does not work yet: see [distributed.md](distributed.md).
+
 ## Not supported
 
 * Group-based logins and NTLM-only domains; see [authentication.md](authentication.md) for what Azure AD and Kerberos do cover.

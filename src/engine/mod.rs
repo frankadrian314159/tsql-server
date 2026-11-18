@@ -129,6 +129,8 @@ pub struct Frame {
     /// The DECLARE statement that declared each variable: running the same one again (in a loop) redeclares it, while a
     /// different one for the same name is error 134.
     pub decl_sites: HashMap<String, usize>,
+    /// Variables made ahead of their DECLARE (see `hoist_declares`): the DECLARE that runs is not a second one.
+    pub hoisted: std::collections::HashSet<String>,
 }
 
 /// See [`Engine::enter_module`].
@@ -710,6 +712,7 @@ impl<'a> Engine<'a> {
         self.ses.try_depth = 0;
         self.ses.strict = 0;
         self.ses.nest_level = 0;
+        self.hoist_declares(stmts);
         let r = self.exec_stmts(stmts);
         if let Err(Interrupt::Error(e)) = r {
             self.report_error(e);
@@ -730,6 +733,47 @@ impl<'a> Engine<'a> {
     }
 
     // ----------------------------------------------------------- statements
+    /// A variable is declared for the whole batch (or procedure) wherever its DECLARE is: one in a branch that is not taken, or in a
+    /// block that has ended, can still be used after it (as NULL, until its DECLARE runs). The variables declared in the blocks of
+    /// `stmts` are made here, with their types, so that the batch that discovers dependencies in SSMS (it declares a cursor's variables
+    /// inside an IF) runs.
+    fn hoist_declares(&mut self, stmts: &[Stmt]) {
+        fn walk<'a>(s: &'a Stmt, nested: bool, out: &mut Vec<&'a Decl>) {
+            match s {
+                Stmt::Declare(ds) if nested => out.extend(ds.iter()),
+                Stmt::Block(v) => v.iter().for_each(|x| walk(x, true, out)),
+                Stmt::If { then, els, .. } => {
+                    walk(then, true, out);
+                    if let Some(e) = els {
+                        walk(e, true, out);
+                    }
+                }
+                Stmt::While { body, .. } => walk(body, true, out),
+                Stmt::Try { body, catch } => body.iter().chain(catch.iter()).for_each(|x| walk(x, true, out)),
+                _ => {}
+            }
+        }
+        let mut found: Vec<&Decl> = vec![];
+        for s in stmts {
+            walk(s, false, &mut found);
+        }
+        for d in found {
+            if let Decl::Var { name, ty, .. } = d {
+                if self.table_type_defs(ty).is_some() {
+                    continue;
+                }
+                let Ok(dt) = self.resolve_type(ty) else { continue };
+                let site = d as *const Decl as usize;
+                let f = self.ses.frames.last_mut().unwrap();
+                if !f.vars.contains_key(name) && !f.tables.contains_key(name) {
+                    f.vars.insert(name.clone(), Var { ty: dt, val: Value::Null });
+                    f.decl_sites.insert(name.clone(), site);
+                    f.hoisted.insert(name.clone());
+                }
+            }
+        }
+    }
+
     pub fn exec_stmts(&mut self, stmts: &[Stmt]) -> Flow<()> {
         let mut i = 0;
         while i < stmts.len() {
@@ -1320,7 +1364,7 @@ impl<'a> Engine<'a> {
                     let site = d as *const Decl as usize;
                     {
                         let f = self.ses.frames.last().unwrap();
-                        if (f.vars.contains_key(name) || f.tables.contains_key(name)) && f.decl_sites.get(name) != Some(&site) {
+                        if (f.vars.contains_key(name) || f.tables.contains_key(name)) && f.decl_sites.get(name) != Some(&site) && !f.hoisted.contains(name) {
                             return Err(SqlError::new(134, format!("The variable name '{}' has already been declared. Variable names must be unique within a query batch or stored procedure.", name)).into());
                         }
                     }
@@ -1335,6 +1379,7 @@ impl<'a> Engine<'a> {
                     let f = self.ses.frames.last_mut().unwrap();
                     f.vars.insert(name.clone(), Var { ty: dt, val });
                     f.decl_sites.insert(name.clone(), site);
+                    f.hoisted.remove(name);
                 }
                 Decl::Table { name, defs } => {
                     let t = self.build_table(&self.ses.db.clone(), "dbo", name, defs, true)?;
@@ -1971,6 +2016,7 @@ impl<'a> Engine<'a> {
         self.ses.frames.push(frame);
         self.ses.nest_level += 1;
         self.ses.ret = Value::Null;
+        self.hoist_declares(body);
         let r = self.exec_stmts(body);
         self.ses.nest_level -= 1;
         let callee = self.ses.frames.pop().unwrap();

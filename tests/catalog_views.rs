@@ -133,7 +133,37 @@ fn connectionproperty_of_an_embedded_connection() {
 #[test]
 fn the_statements_ssms_runs_when_it_connects_all_work() {
     let mut c = conn();
+    // (a table, so that the columns of the views are looked up: with none, a query over a view that has no rows may not look at its columns)
+    exec(&mut c, "CREATE TABLE ssms_t (a INT PRIMARY KEY, b INT NULL, CONSTRAINT ck_ssms CHECK (a > 0))");
+    exec(&mut c, "CREATE INDEX ix_ssms ON ssms_t (b)");
     for sql in [
+        // the settings SSMS applies to each query window's connection
+        "SET ROWCOUNT 0 SET TEXTSIZE 2147483647 SET NOCOUNT OFF SET CONCAT_NULL_YIELDS_NULL ON SET ARITHABORT ON SET LOCK_TIMEOUT -1 SET QUERY_GOVERNOR_COST_LIMIT 0 SET DEADLOCK_PRIORITY NORMAL SET TRANSACTION ISOLATION LEVEL READ COMMITTED SET ANSI_NULLS ON SET ANSI_NULL_DFLT_ON ON SET ANSI_PADDING ON SET ANSI_WARNINGS ON SET CURSOR_CLOSE_ON_COMMIT OFF SET IMPLICIT_TRANSACTIONS OFF SET QUOTED_IDENTIFIER ON",
+        "SET DEADLOCK_PRIORITY LOW SET DEADLOCK_PRIORITY HIGH SET DEADLOCK_PRIORITY -3 SET DEADLOCK_PRIORITY NORMAL",
+        // what SSMS reads to script an object and to list its database: the columns of a database and of its principals, the old system tables
+        "SELECT dtb.name, dtb.catalog_collation_type, dtb.catalog_collation_type_desc, dtb.is_ledger_on, dtb.default_language_name, dtb.is_query_store_on, dtb.two_digit_year_cutoff, dtb.resource_pool_id FROM master.sys.databases AS dtb LEFT OUTER JOIN sys.master_files AS df ON df.database_id = dtb.database_id AND 1 = df.data_space_id AND 1 = df.file_id",
+        "SELECT name, type_desc, create_date, is_fixed_role, authentication_type_desc, sid FROM sys.database_principals",
+        "SELECT v.name, v.has_opaque_metadata, v.with_check_option FROM sys.all_views AS v LEFT OUTER JOIN sys.sql_modules AS m ON m.object_id = v.object_id LEFT OUTER JOIN sys.system_sql_modules AS sm ON sm.object_id = v.object_id",
+        "SELECT name, system_type_id, is_table_type, type_table_object_id, is_memory_optimized FROM sys.table_types",
+        "SELECT su.name, so.name, isr.DATA_TYPE, isr.SPECIFIC_NAME FROM sysobjects so INNER JOIN sysusers su ON so.uid = su.uid INNER JOIN INFORMATION_SCHEMA.ROUTINES isr ON so.name = isr.SPECIFIC_NAME WHERE so.type = N'AF'",
+        "SELECT su.name, so.name FROM sysobjects so INNER JOIN sysusers su ON so.uid = su.uid WHERE so.type = N'AF'",
+        "SELECT name FROM master.dbo.sysdatabases",
+        // what SMO reads of a column to script it: the encryption keys and classifications, the identity and computed columns
+        "SELECT clmns.name, clmns.system_type_id, clmns.column_encryption_key_id, ek.name, sc.label, ic.is_not_for_replication, ic.seed_value, cc.definition FROM sys.all_columns AS clmns LEFT OUTER JOIN sys.column_encryption_keys ek ON clmns.column_encryption_key_id = ek.column_encryption_key_id LEFT OUTER JOIN sys.sensitivity_classifications sc ON sc.major_id = clmns.object_id AND sc.minor_id = clmns.column_id LEFT OUTER JOIN sys.identity_columns ic ON ic.object_id = clmns.object_id AND ic.column_id = clmns.column_id LEFT OUTER JOIN sys.computed_columns cc ON cc.object_id = clmns.object_id AND cc.column_id = clmns.column_id",
+        "SELECT usrt.name, usrt.schema_id, usrt.is_table_type, usrt.is_assembly_type, usrt.collation_name, usrt.default_object_id FROM sys.types usrt WHERE usrt.is_table_type = 0",
+        "SELECT name FROM sys.column_master_keys UNION ALL SELECT CAST(column_encryption_key_id AS NVARCHAR(20)) FROM sys.column_encryption_key_values",
+        // what SSMS reads of a table for its properties: change tracking, external and file tables, the period, the ledger
+        "SELECT t.object_id, c.is_track_columns_updated_on, c.begin_version FROM sys.tables t INNER JOIN sys.change_tracking_tables AS c ON c.object_id = t.object_id",
+        "SELECT et.object_id, ds.name, ff.name FROM sys.external_tables et LEFT JOIN sys.external_data_sources ds ON ds.data_source_id = et.data_source_id LEFT JOIN sys.external_file_formats ff ON ff.file_format_id = et.file_format_id",
+        "SELECT t.object_id FROM sys.tables t INNER JOIN sys.filetables f ON t.object_id = f.object_id",
+        "SELECT t.object_id, t.ledger_view_id, t.history_retention_period, t.history_retention_period_unit_desc, t.Filestream_data_space_id, p.start_column_id, c.is_data_deletion_filter_column, c.ledger_view_column_type FROM sys.tables t LEFT JOIN sys.periods p ON p.object_id = t.object_id JOIN sys.columns c ON c.object_id = t.object_id",
+        // the index and login properties SSMS reads when it scripts a table or shows the logins
+        "SELECT it.parent_id, it.object_id FROM sys.internal_tables it WHERE it.name LIKE 'extended[_]index[_]%'",
+        "SELECT object_id, index_id, MAX(data_compression), MAX(CASE WHEN xml_compression = 1 THEN 1 ELSE 0 END), MAX(data_compression_desc) FROM sys.partitions GROUP BY object_id, index_id",
+        "SELECT i.name, CAST(i.compression_delay AS INT), i.is_ignored_in_optimization, hi.bucket_count, op.state, ip.path FROM sys.indexes i LEFT JOIN sys.hash_indexes hi ON hi.object_id = i.object_id AND hi.index_id = i.index_id LEFT JOIN sys.index_resumable_operations op ON op.index_id = i.index_id AND op.object_id = i.object_id LEFT JOIN sys.selective_xml_index_paths ip ON ip.object_id = i.object_id LEFT JOIN sys.filetable_system_defined_objects ft ON ft.object_id = i.object_id",
+        "SELECT log.name, l.alias, sys.fn_varbintohexsubstring(0, log.sid, 1, 0), ak.name, cert.name, c.name FROM sys.server_principals AS log LEFT OUTER JOIN sys.syslanguages AS l ON l.name = log.default_language_name LEFT OUTER JOIN master.sys.asymmetric_keys AS ak ON ak.sid = log.sid LEFT OUTER JOIN master.sys.certificates AS cert ON cert.sid = log.sid LEFT OUTER JOIN sys.credentials AS c ON log.credential_id = c.credential_id",
+        "SELECT tr.name, tr.object_id, tr.is_ms_shipped, tr.type, ssmod.definition FROM master.sys.server_triggers AS tr LEFT OUTER JOIN sys.server_sql_modules AS ssmod ON ssmod.object_id = tr.object_id WHERE (tr.parent_class = 100) ORDER BY 1",
+        "SELECT name FROM sys.partition_schemes UNION ALL SELECT name FROM sys.partition_functions UNION ALL SELECT name FROM sys.certificates",
         "SELECT SERVERPROPERTY('EngineEdition'), SERVERPROPERTY('ProductVersion'), SERVERPROPERTY('Edition'), SERVERPROPERTY('IsClustered'), SERVERPROPERTY('ServerName'), SERVERPROPERTY('IsHadrEnabled'), SERVERPROPERTY('Collation')",
         "SELECT @@VERSION, @@SERVERNAME, @@SERVICENAME, @@LANGUAGE, @@LANGID, @@MAX_CONNECTIONS, @@TEXTSIZE, @@DATEFIRST, @@REMSERVER, @@SPID",
         "SELECT SUSER_SNAME(), SUSER_ID(), SUSER_SID(), ORIGINAL_LOGIN(), IS_SRVROLEMEMBER('sysadmin'), HAS_PERMS_BY_NAME(null, null, 'VIEW SERVER STATE')",
@@ -164,6 +194,27 @@ fn the_statements_ssms_runs_when_it_connects_all_work() {
     assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.server_role_members m JOIN sys.server_principals r ON r.principal_id = m.role_principal_id JOIN sys.server_principals p ON p.principal_id = m.member_principal_id WHERE r.name = 'sysadmin' AND p.name = 'sa'"), "1");
     assert_eq!(scalar(&mut c, "SELECT SUSER_ID('sa') - (SELECT principal_id FROM sys.server_principals WHERE name = 'sa')"), "0");
     assert_eq!(scalar(&mut c, "SELECT user_access_desc FROM sys.databases WHERE name = 'master'"), "MULTI_USER");
+    // the table list of SSMS: sys.tables has the columns it filters on, and the indexes are joined to the data space
+    exec(&mut c, "CREATE TABLE tl (a INT PRIMARY KEY)");
+    assert_eq!(rows(&mut c, "SELECT t.name, t.is_memory_optimized, t.temporal_type, t.is_external, t.is_filetable, t.ledger_type, t.is_node, t.is_edge, ds.name FROM sys.tables t JOIN sys.indexes i ON i.object_id = t.object_id LEFT OUTER JOIN sys.data_spaces ds ON ds.data_space_id = i.data_space_id WHERE t.name = 'tl'"), vec![vec!["tl".to_string(), "0".into(), "0".into(), "0".into(), "0".into(), "0".into(), "0".into(), "0".into(), "PRIMARY".into()]]);
+    assert_eq!(rows(&mut c, "SELECT (SELECT COUNT(*) FROM sys.all_columns WHERE object_id = OBJECT_ID('tl') AND is_sparse = 1), (SELECT COUNT(*) FROM sys.indexes WHERE object_id = OBJECT_ID('tl') AND is_hypothetical = 0 AND allow_row_locks = 1), (SELECT generated_always_type_desc FROM sys.columns WHERE object_id = OBJECT_ID('tl') AND name = 'a')"), vec![vec!["0".to_string(), "1".into(), "NOT_APPLICABLE".into()]]);
+    // what SSMS asks when a table is expanded: its constraints, triggers and columns, with the columns it selects and filters on
+    exec(&mut c, "CREATE TABLE tl2 (id INT PRIMARY KEY, a INT NOT NULL CONSTRAINT df_tl2_a DEFAULT (1) CONSTRAINT ck_tl2_a CHECK (a > 0), p INT NULL CONSTRAINT fk_tl2_p REFERENCES tl (a) ON DELETE CASCADE, u INT NULL CONSTRAINT uq_tl2_u UNIQUE)");
+    exec(&mut c, "CREATE TRIGGER tr_tl2 ON tl2 AFTER INSERT AS BEGIN SET NOCOUNT ON END");
+    assert_eq!(rows(&mut c, "SELECT (SELECT COUNT(*) FROM sys.foreign_keys f WHERE f.parent_object_id = OBJECT_ID('tl2') AND f.is_disabled = 0 AND f.is_not_trusted = 0 AND f.delete_referential_action = 1 AND f.key_index_id = 1 AND f.create_date IS NOT NULL), (SELECT COUNT(*) FROM sys.check_constraints k WHERE k.parent_object_id = OBJECT_ID('tl2') AND k.is_system_named = 0 AND k.create_date IS NOT NULL), (SELECT COUNT(*) FROM sys.default_constraints k WHERE k.parent_object_id = OBJECT_ID('tl2') AND k.create_date IS NOT NULL), (SELECT COUNT(*) FROM sys.key_constraints k WHERE k.parent_object_id = OBJECT_ID('tl2') AND k.create_date IS NOT NULL AND k.unique_index_id >= 1), (SELECT COUNT(*) FROM sys.triggers t JOIN sys.sql_modules m ON m.object_id = t.object_id WHERE t.parent_id = OBJECT_ID('tl2') AND t.create_date IS NOT NULL AND m.uses_ansi_nulls = 1), (SELECT COUNT(*) FROM sys.system_sql_modules), (SELECT COUNT(*) FROM sys.all_columns WHERE object_id = OBJECT_ID('tl2') AND is_dropped_ledger_column = 1), (SELECT value_in_use FROM sys.configurations WHERE configuration_id = 16384)"), vec![vec!["1".to_string(), "1".into(), "1".into(), "2".into(), "1".into(), "0".into(), "0".into(), "0".into()]]);
+    // the server information SSMS reads before it shows the rows of a table: registry values (NULL here), the cluster and statistics views
+    assert_eq!(rows(&mut c, "DECLARE @n INT; EXEC master.dbo.xp_instance_regread N'HKEY_LOCAL_MACHINE', N'SOFTWARE\\x', N'NumErrorLogs', @n OUTPUT; SELECT ISNULL(@n, -1), @@MAX_PRECISION, ISNULL(suser_sname(sid_binary(N'nobody')), N'none'), (SELECT COUNT(*) FROM sys.dm_hadr_cluster), (SELECT COUNT(*) FROM sys.stats), (SELECT COUNT(*) FROM sys.dm_hadr_cluster_members)"), vec![vec!["-1".to_string(), "38".into(), "none".into(), "0".into(), "0".into(), "0".into()]]);
+    // View Dependencies: the references of views, procedures, functions and triggers, and the collation DATABASE_DEFAULT of its temporary tables
+    exec(&mut c, "CREATE TABLE dep_a (x INT)");
+    exec(&mut c, "CREATE VIEW dep_v AS SELECT x FROM dep_a");
+    exec(&mut c, "CREATE PROCEDURE dep_p AS SELECT * FROM dep_v");
+    assert_eq!(rows(&mut c, "SELECT OBJECT_NAME(referencing_id), referenced_entity_name, referenced_schema_name FROM sys.sql_expression_dependencies WHERE referencing_id IN (OBJECT_ID('dep_v'), OBJECT_ID('dep_p')) ORDER BY 1"), vec![vec!["dep_p".to_string(), "dep_v".into(), "dbo".into()], vec!["dep_v".to_string(), "dep_a".into(), "dbo".into()]]);
+    assert_eq!(rows(&mut c, "SELECT referencing_entity_name, referencing_schema_name FROM sys.dm_sql_referencing_entities('dbo.dep_a', 'OBJECT')"), vec![vec!["dep_v".to_string(), "dbo".into()]]);
+    assert_eq!(rows(&mut c, "SELECT referenced_entity_name FROM sys.dm_sql_referenced_entities('dbo.dep_p', 'OBJECT')"), vec![vec!["dep_v".to_string()]]);
+    exec(&mut c, "CREATE TABLE #t1 (object_name sysname collate database_default NULL, o2 VARCHAR(5) COLLATE catalog_default)");
+    exec(&mut c, "INSERT #t1 VALUES (N'x', 'y')");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM #t1 WHERE object_name = N'X' COLLATE DATABASE_DEFAULT"), "1");
+    assert_eq!(rows(&mut c, "SELECT name, schema_id, is_schema_bound FROM sys.security_policies"), Vec::<Vec<String>>::new());
     // what SSMS reads of each database: the columns line up with their names, and the views of availability and mirroring are there (empty)
     assert_eq!(rows(&mut c, "SELECT is_distributor, log_reuse_wait, log_reuse_wait_desc, containment, containment_desc, delayed_durability_desc, is_ledger_on FROM sys.databases WHERE name = 'master'"), vec![vec!["0".to_string(), "0".into(), "NOTHING".into(), "0".into(), "NONE".into(), "DISABLED".into(), "0".into()]]);
     assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.availability_replicas"), "0");

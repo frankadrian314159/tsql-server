@@ -15,6 +15,41 @@ use crate::*;
 use std::collections::HashMap;
 use tsql_server::{Interceptor, Streamed};
 
+/// The words of a batch that can name a table: not those of comments, and not variables (`@ErrorLog` is not the table `ErrorLog`).
+fn identifiers(sql: &str) -> Vec<String> {
+    let c: Vec<char> = sql.chars().collect();
+    let mut out = vec![];
+    let mut i = 0;
+    while i < c.len() {
+        if c[i] == '-' && c.get(i + 1) == Some(&'-') {
+            while i < c.len() && c[i] != '\n' {
+                i += 1;
+            }
+        } else if c[i] == '/' && c.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i < c.len() && !(c[i] == '*' && c.get(i + 1) == Some(&'/')) {
+                i += 1;
+            }
+            i += 2;
+        } else if c[i] == '@' {
+            // a variable (or @@function): its whole name
+            i += 1;
+            while i < c.len() && (c[i].is_alphanumeric() || c[i] == '_' || c[i] == '@') {
+                i += 1;
+            }
+        } else if c[i].is_alphanumeric() || c[i] == '_' {
+            let start = i;
+            while i < c.len() && (c[i].is_alphanumeric() || c[i] == '_') {
+                i += 1;
+            }
+            out.push(c[start..i].iter().collect());
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 impl ClusterSession {
     /// Whether a batch needs the cluster (else the engine runs it itself).
     pub fn wants(&self, sql: &str) -> bool {
@@ -34,7 +69,7 @@ impl ClusterSession {
         if tables.is_empty() && views.is_empty() {
             return false;
         }
-        sql.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|w| !w.is_empty()).any(|w| tables.iter().any(|t| t.name.last().map(|n| n.eq_ignore_ascii_case(w)).unwrap_or(false)) || views.iter().any(|v| v.eq_ignore_ascii_case(w)))
+        identifiers(sql).iter().any(|w| tables.iter().any(|t| t.name.last().map(|n| n.eq_ignore_ascii_case(w)).unwrap_or(false)) || views.iter().any(|v| v.eq_ignore_ascii_case(w)))
     }
 
     fn is_view(&self, id: &str) -> bool {
