@@ -124,8 +124,8 @@ What comes over:
 What does not:
 
 * user-defined types (columns of an alias type get the base type), sequences, users and permissions, and CLR objects;
-* columnstore and hash indexes (the engine has no equivalent), and filtered indexes lose their filter (their definition is
-  not read);
+* columnstore and hash indexes (a columnstore index can be created again after the import, see [columnstore.md](columnstore.md); there
+  is no hash index), and filtered indexes lose their filter (their definition is not read);
 * XML schema collections and the typed xml columns that use them: the collections are stored as compiled components, not as
   XSD text, and are not read, so such columns come over as untyped `xml` (their values are read as before);
 * referential actions other than `ON DELETE CASCADE` (the other bits of the status of a foreign key are not decoded, and

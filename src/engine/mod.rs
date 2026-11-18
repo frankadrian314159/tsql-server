@@ -12,6 +12,8 @@ macro_rules! plan_note {
     };
 }
 
+pub mod colbatch;
+pub mod colstore;
 pub mod ddl;
 pub mod dml;
 pub mod expr;
@@ -237,6 +239,9 @@ pub struct SessionState {
     pub no_fold_agg: bool,
     /// For the next table scan only: the columns the query reads (see `Engine::needed_cols`); the others are read as NULL.
     pub scan_needed: Option<Vec<bool>>,
+    /// The names of the columns each SELECT being run mentions (innermost last), kept only once a columnstore index exists: a scan of a
+    /// table that has one reads the columns of its select (`None`: a `*`, all of them).
+    pub sel_names: Vec<Option<std::collections::HashSet<String>>>,
     /// Column statistics of the temporary tables and table variables read in this session (see `Engine::table_stats`): they are
     /// not kept with the server's, which belong to tables that outlive a session. Few, and dropped with the tables.
     pub temp_stats: Vec<(crate::storage::HeapRef, Arc<stats::TableStats>)>,
@@ -343,6 +348,7 @@ impl SessionState {
             push_plans: HashMap::new(),
             no_fold_agg: false,
             scan_needed: None,
+            sel_names: Vec::new(),
             temp_stats: Vec::new(),
             sub_names: HashMap::new(),
             sub_memo: HashMap::new(),
@@ -1177,7 +1183,8 @@ impl<'a> Engine<'a> {
             | Stmt::AlterSequence { .. }
             | Stmt::AlterTable { .. }
             | Stmt::Drop { .. }
-            | Stmt::DropIndex { .. } => {
+            | Stmt::DropIndex { .. }
+            | Stmt::AlterIndex { .. } => {
                 self.exec_ddl(st)?;
                 self.ses.last_error = 0;
             }

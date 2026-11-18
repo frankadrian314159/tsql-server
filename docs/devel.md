@@ -41,6 +41,7 @@ The root crate is the single-node server (`src/`). The cluster is a workspace be
 | the value of an expression, a built-in function | `src/engine/expr.rs` (the evaluator, `Engine::ev`), `src/engine/funcs.rs` (`Engine::builtin`, the functions) |
 | a data type, a conversion, a comparison | `src/types.rs` (`DataType`, `Value`), `src/convert.rs` (`CAST`, `compare`, `arith`), `src/decimal.rs` |
 | how a query is answered | `src/engine/query.rs` (the general executor), `src/engine/stream.rs` (the streaming executor), `src/engine/optimizer.rs` (access paths, pushdown), `src/engine/joins.rs` and `hashjoin.rs` (joins), `src/engine/stats.rs` (column statistics), `src/engine/aggacc.rs` (folded aggregates), `src/engine/par.rs` (parallelism), `src/rewrite/` (subquery rewrites) |
+| columnstore indexes | the build, the dirty set and the row groups in `src/storage/colstore.rs`; the scan (segment elimination, vector conditions) in `src/engine/colstore.rs`; batch mode in `src/engine/colbatch.rs` and `colfold_spec` in `src/engine/stream.rs`; the statements in `ddl.rs` (`make_columnstore`, `alter_index`); the views in `sysviews.rs` |
 | tables, rows, indexes, locks | `src/storage/`, `src/catalog.rs`, `src/coord.rs` (sessions, the lock and commit coordination) |
 | the log, checkpoints, recovery | `src/persist.rs` |
 | permissions, logins, masking, row-level security, audit | `src/security.rs`, `src/mask.rs`, `src/engine/rls.rs`, `src/audit.rs`, `src/engine/auditing.rs` |
@@ -178,6 +179,7 @@ example that it did not gather). Change a test that expects a gather only when t
 | how the cluster ran a statement | `ClusterSession::last_plan()`, or `TSQL_PLAN_TRACE=1` on the control node for one line per statement; `TSQL_GATHER_TRACE=1` for what a gather copied |
 | the TDS conversation | `TSQL_TDS_TRACE=1` |
 | a fresh parallel or spill configuration in a test | `TSQL_PARALLEL_FORCE_DOP`, `TSQL_PARALLEL_MIN_SLOTS`, `TSQL_SPILL_DIR` |
+| columnstore behaviour | `TSQL_COLUMNSTORE_ROWGROUP` (rows in a row group: the tests use 1,000), `TSQL_COLUMNSTORE_MIN_ROWS`, `TSQL_NO_BATCH` (no batch mode); the plan says `columnstore scan of ...` and `batch mode` |
 
 ## Before a change is done
 

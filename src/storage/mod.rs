@@ -4,6 +4,7 @@
 //! versions, oldest first. A version is stamped either with the id of the transaction that
 //! wrote it (still uncommitted) or with its commit timestamp. Readers choose a version
 //! according to their [`ReadView`]; writers push a new version and undo it on rollback.
+pub mod colstore;
 pub mod lock;
 pub mod page;
 pub mod tx;
@@ -337,6 +338,8 @@ pub struct TableData {
     /// statistics compare it with the count they were sampled at, so an update that changes values but not the row count still
     /// makes them stale. It is not persisted: it starts again at 0 when the table is decoded.
     mods: Arc<std::sync::atomic::AtomicU64>,
+    /// The columnstore built from this heap, when the table has a columnstore index (see `colstore`).
+    cs: Arc<colstore::ColCell>,
 }
 
 impl Serialize for TableData {
@@ -348,26 +351,26 @@ impl<'de> Deserialize<'de> for TableData {
     /// The result is not attached to a page store; call [`TableData::attach`].
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<TableData, D::Error> {
         let desc = TableDataDesc::deserialize(d)?;
-        Ok(TableData { heap: Arc::new(Tree::from_desc(desc.heap, None)), specs: desc.specs, indexes: desc.indexes.into_iter().map(|t| Arc::new(Tree::from_desc(t, None))).collect(), mods: Default::default() })
+        Ok(TableData { heap: Arc::new(Tree::from_desc(desc.heap, None)), specs: desc.specs, indexes: desc.indexes.into_iter().map(|t| Arc::new(Tree::from_desc(t, None))).collect(), mods: Default::default(), cs: Default::default() })
     }
 }
 
 impl TableData {
     pub fn new(store: &Arc<PageStore>) -> TableData {
-        TableData { heap: Arc::new(Tree::new(store)), specs: vec![], indexes: vec![], mods: Default::default() }
+        TableData { heap: Arc::new(Tree::new(store)), specs: vec![], indexes: vec![], mods: Default::default(), cs: Default::default() }
     }
 
     /// Storage that holds nothing and is attached to no page store (dropping it frees nothing): the shape of rows that are not a
     /// table's, such as the `inserted` and `deleted` rows of a trigger on a view.
     pub fn detached() -> TableData {
         let tree = || Arc::new(Tree::from_desc(page::TreeDesc { root: 0, entries: 0, has_ovf: false, next_id: 0 }, None));
-        TableData { heap: tree(), specs: vec![], indexes: vec![], mods: Default::default() }
+        TableData { heap: tree(), specs: vec![], indexes: vec![], mods: Default::default(), cs: Default::default() }
     }
 
     /// An empty table with the same index layout.
     pub fn fresh(&self) -> TableData {
         let store = self.store().clone();
-        TableData { heap: Arc::new(Tree::new(&store)), specs: self.specs.clone(), indexes: self.specs.iter().map(|_| Arc::new(Tree::new(&store))).collect(), mods: Default::default() }
+        TableData { heap: Arc::new(Tree::new(&store)), specs: self.specs.clone(), indexes: self.specs.iter().map(|_| Arc::new(Tree::new(&store))).collect(), mods: Default::default(), cs: Default::default() }
     }
 
     /// A handle that recognises this table's heap later, for as long as the heap lives, and never mistakes another heap for it (a page
@@ -504,11 +507,13 @@ impl TableData {
         } else {
             self.heap.put(heap_key(), rid as u64, slot);
         }
+        self.cs_mark(rid);
     }
 
     // ---- writes
     pub fn push_version(&self, rowid: RowId, row: Option<Row>, stamp: Stamp) {
         self.mods.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // (the heap is written first, then the row is marked: a columnstore build that read the old version has its mark after it)
         // the index keys of the new version; an index already holding the key (an earlier version of the row has
         // it, as in an update that leaves the key alone) needs no entry
         let keys: Vec<Option<KeyVals>> = match &row {
@@ -527,6 +532,7 @@ impl TableData {
             slot.versions.push(v.take().expect("version pushed once"));
             true
         });
+        self.cs_mark(rowid);
         for (i, k) in keys.into_iter().enumerate() {
             if let Some(k) = k {
                 if !present[i] {
@@ -543,6 +549,7 @@ impl TableData {
             return;
         }
         self.mods.fetch_add(items.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        let marked: Vec<RowId> = items.iter().map(|(r, _)| *r).collect();
         let rids: Vec<u64> = items.iter().map(|(r, _)| *r as u64).collect();
         let mut keys: Vec<Vec<Option<KeyVals>>> = items
             .iter()
@@ -568,6 +575,7 @@ impl TableData {
             k += 1;
             true
         });
+        self.cs_mark_many(&marked);
         for i in 0..self.specs.len() {
             let mut batch: Vec<(KeyVals, u64, Slot)> = vec![];
             for (j, ks) in keys.iter_mut().enumerate() {
@@ -755,6 +763,7 @@ impl TableData {
 
     /// Replace a slot by a single committed version (or remove it); used by log replay.
     pub fn replace_slot(&self, rowid: RowId, row: Option<Row>, ts: u64) {
+        self.cs_mark(rowid);
         if let Some(old) = self.slot(rowid) {
             for v in old.versions {
                 if let Some(r) = v.row {

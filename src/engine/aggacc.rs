@@ -79,6 +79,12 @@ impl AggAcc {
         AggAcc { count: 0, val: None, err: None, coll: None, started: false }
     }
 
+    /// The state a vectorised pass over a row group's column segments arrives at (see colstore.rs): `count` values (or rows) seen, the
+    /// sum or the best value `val`, and whether any row was looked at at all. To be merged with the states of the other groups.
+    pub fn from_parts(count: u64, val: Option<Value>, started: bool) -> AggAcc {
+        AggAcc { count, val, err: None, coll: None, started }
+    }
+
     /// Take one row of the group into account.
     pub fn update(&mut self, eng: &mut Engine<'_>, fc: &FuncCall, env: &Env<'_>) {
         self.update_pre(eng, fc, env, None)

@@ -170,11 +170,8 @@ impl<'a> Engine<'a> {
     /// (working it out costs more than it saves), has a computed column, or the query has a `*` anywhere. A column is read when its
     /// name is used anywhere in the statement, in a subquery too (the match is by name alone, so more columns than needed are kept
     /// when two tables share a name, never fewer).
-    pub(super) fn needed_cols(&mut self, sel: &Select, order: &[OrderItem], t: &Table) -> Option<Vec<bool>> {
-        // (`TSQL_NO_SCAN_PRUNE`: for the tests that compare an answer with and without the pruning)
-        if t.data.slot_count() < 2000 || t.columns.iter().any(|c| c.computed.is_some()) || std::env::var_os("TSQL_NO_SCAN_PRUNE").is_some() {
-            return None;
-        }
+    /// The (lower-case) names of the columns a SELECT mentions anywhere, subqueries included; `None` when it has a `*`.
+    pub(super) fn names_of(sel: &Select, order: &[OrderItem]) -> Option<std::collections::HashSet<String>> {
         fn walk(v: &serde_json::Value, names: &mut std::collections::HashSet<String>) -> bool {
             match v {
                 serde_json::Value::Object(m) => {
@@ -194,9 +191,111 @@ impl<'a> Engine<'a> {
         }
         let mut names = std::collections::HashSet::new();
         let ok = serde_json::to_value(sel).map(|j| walk(&j, &mut names)).unwrap_or(false) && order.iter().all(|o| serde_json::to_value(&o.e).map(|j| walk(&j, &mut names)).unwrap_or(false));
-        if !ok {
+        ok.then_some(names)
+    }
+
+    /// What batch mode asks of the row groups of `t` for this query, when it can be done there: every group column and every aggregate
+    /// argument is a plain column, the `WHERE` is nothing but simple conditions on columns, no other column is named by the select list,
+    /// `HAVING` or `ORDER BY` (the groups' representative rows hold the group columns only), and the aggregates are ones whose
+    /// partial states merge exactly (see `AggAcc::merge`).
+    #[allow(clippy::too_many_arguments)]
+    fn colfold_spec(&mut self, sel: &Select, order: &[OrderItem], t: &Table, schema: &super::query::Schema, ap: &super::optimizer::Access, group_exprs: &[&Expr], agg_calls: &[&FuncCall], group_colls: &Colls, windows: bool) -> Option<super::colbatch::FoldSpec> {
+        use super::colbatch::{AggKind, AggSpec, FoldSpec};
+        let colmap = Self::columnstore_cols(t)?;
+        if !matches!(ap, super::optimizer::Access::Full) || !group_colls.is_empty() || windows || sel.into.is_some() || schema.cols.iter().any(|c| c.denied.is_some()) || std::env::var_os("TSQL_NO_BATCH").is_some() {
             return None;
         }
+        let col_of = |e: &Expr| -> Option<usize> {
+            let mut e = e;
+            while let Expr::Paren(x) = e {
+                e = x;
+            }
+            let Expr::Col(p) = e else { return None };
+            match schema.find_parts(p) {
+                super::query::Found::One(i) if colmap.contains(&i) => Some(i),
+                _ => None,
+            }
+        };
+        let group_cols: Vec<usize> = group_exprs.iter().map(|e| col_of(e)).collect::<Option<_>>()?;
+        let mut aggs = vec![];
+        let mut allowed: std::collections::HashSet<String> = group_cols.iter().map(|c| t.columns[*c].name.to_lowercase()).collect();
+        for fc in agg_calls {
+            let kind = match (fc.name.as_str(), fc.star) {
+                ("COUNT" | "COUNT_BIG", true) => {
+                    aggs.push(AggSpec { kind: AggKind::CountStar, col: 0 });
+                    continue;
+                }
+                ("COUNT" | "COUNT_BIG", false) => AggKind::Count,
+                ("SUM", false) => AggKind::Sum,
+                ("AVG", false) => AggKind::Avg,
+                ("MIN", false) => AggKind::Min,
+                ("MAX", false) => AggKind::Max,
+                _ => return None,
+            };
+            let arg = fc.args.first()?;
+            let col = col_of(arg)?;
+            if matches!(kind, AggKind::Sum | AggKind::Avg) && !super::aggacc::exact_number(arg, schema) {
+                return None;
+            }
+            allowed.insert(t.columns[col].name.to_lowercase());
+            aggs.push(AggSpec { kind, col });
+        }
+        let (preds, complete) = match &sel.where_ {
+            Some(w) => super::colstore::extract_preds(schema, t, std::slice::from_ref(w), &colmap),
+            None => (vec![], true),
+        };
+        if !complete {
+            return None;
+        }
+        // the columns the output names (not the `WHERE`'s) must be among those the groups carry
+        let mut names = std::collections::HashSet::new();
+        let mut ok = true;
+        let mut walk = |v: serde_json::Result<serde_json::Value>| {
+            fn go(v: &serde_json::Value, names: &mut std::collections::HashSet<String>) -> bool {
+                match v {
+                    serde_json::Value::Object(m) => {
+                        if m.contains_key("Star") {
+                            return false;
+                        }
+                        if let Some(serde_json::Value::Array(p)) = m.get("Col") {
+                            if let Some(n) = p.last().and_then(|n| n.as_str()) {
+                                names.insert(n.to_lowercase());
+                            }
+                        }
+                        m.values().all(|c| go(c, names))
+                    }
+                    serde_json::Value::Array(a) => a.iter().all(|c| go(c, names)),
+                    _ => true,
+                }
+            }
+            ok &= v.map(|j| go(&j, &mut names)).unwrap_or(false);
+        };
+        walk(serde_json::to_value(&sel.items));
+        walk(serde_json::to_value(&sel.having));
+        walk(serde_json::to_value(&sel.group));
+        for o in order {
+            walk(serde_json::to_value(&o.e));
+        }
+        // (`ORDER BY c` may name a column alias of the select list; one that is also a column of the table is not taken for one)
+        for it in &sel.items {
+            if let SelectItem::Expr { alias: Some(al), .. } = it {
+                if !t.columns.iter().any(|c| c.name.eq_ignore_ascii_case(al)) {
+                    allowed.insert(al.to_lowercase());
+                }
+            }
+        }
+        if !ok || !names.is_subset(&allowed) {
+            return None;
+        }
+        Some(FoldSpec { group_cols, aggs, preds, plain_strings: !crate::collation::in_use() })
+    }
+
+    pub(super) fn needed_cols(&mut self, sel: &Select, order: &[OrderItem], t: &Table) -> Option<Vec<bool>> {
+        // (`TSQL_NO_SCAN_PRUNE`: for the tests that compare an answer with and without the pruning)
+        if (t.data.slot_count() < 2000 && Self::columnstore_cols(t).is_none()) || t.columns.iter().any(|c| c.computed.is_some()) || std::env::var_os("TSQL_NO_SCAN_PRUNE").is_some() {
+            return None;
+        }
+        let names = Self::names_of(sel, order)?;
         let needed: Vec<bool> = t.columns.iter().map(|c| names.contains(&c.name.to_lowercase())).collect();
         if needed.iter().all(|n| *n) {
             return None;
@@ -346,7 +445,8 @@ impl<'a> Engine<'a> {
                 return Ok(None);
             }
             let Some(t) = self.table_ref(&loc).cloned() else { return Ok(None) };
-            if t.data.slot_count() < self.srv.work.stream_min_slots {
+            // (a table with a columnstore index streams whatever its size: batch mode is for its aggregates)
+            if t.data.slot_count() < self.srv.work.stream_min_slots && Self::columnstore_cols(&t).is_none() {
                 return Ok(None);
             }
             let a = alias.clone().unwrap_or_else(|| name.last().cloned().unwrap_or_default());
@@ -647,7 +747,45 @@ impl<'a> Engine<'a> {
                 }
             } else if let Some(o) = &one {
                 let scanned = &mut scanned;
-                if par_dop > 1 {
+                // a table with a columnstore index and a grouped query of the right shape: its row groups are folded over the column
+                // vectors (batch mode, see colbatch.rs); the rest of the rows go through `handle` as always
+                let colfold = if foldable && !agg_calls.is_empty() || foldable && grouped { self.colfold_spec(sel, order, &o.t, &o.schema, &o.ap, &group_exprs, &agg_calls, &group_colls, win_over.is_some()) } else { None };
+                if let Some(spec) = colfold {
+                    self.ses.scan_needed = self.needed_cols(sel, order, &o.t);
+                    let width = o.t.columns.len();
+                    let hc = std::cell::RefCell::new(&mut handle);
+                    let counted = std::cell::Cell::new(0usize);
+                    self.scan_each_fold(
+                        &o.loc,
+                        &o.t,
+                        &o.ap,
+                        Some((&o.schema, &o.pushed)),
+                        &spec,
+                        &mut |eng, kp| {
+                            counted.set(counted.get() + kp.rows);
+                            let mut map: std::collections::HashMap<String, GroupAcc> = std::collections::HashMap::new();
+                            for kg in kp.groups {
+                                let mut rep: Row = vec![Value::Null; width];
+                                for (c, v) in spec.group_cols.iter().zip(kg.key.iter()) {
+                                    rep[*c] = v.clone();
+                                }
+                                map.insert(key_of(&kg.key), GroupAcc { rep, first_seq: kg.first as u64 + 1, accs: kg.accs });
+                            }
+                            let prep = Prep { gk: None, args: vec![], proj: None, partial: Some((map, kp.rows)) };
+                            (*hc.borrow_mut())(eng, vec![], Some(prep))
+                        },
+                        &mut |eng, chunk| {
+                            for (_, row) in chunk {
+                                counted.set(counted.get() + 1);
+                                if !(*hc.borrow_mut())(eng, row, None)? {
+                                    return Ok(false);
+                                }
+                            }
+                            Ok(true)
+                        },
+                    )?;
+                    *scanned += counted.get();
+                } else if par_dop > 1 {
                     // collect batches of rows, evaluate them on the workers, take the results in the order of the rows
                     let batch = par_dop * 2048;
                     let mut buf: Vec<Row> = Vec::new();

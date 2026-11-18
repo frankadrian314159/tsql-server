@@ -248,7 +248,7 @@ impl ClusterSession {
                 if n > 1000 {
                     let keys: Vec<(String, bool)> = names.iter().filter(|c| eq_cols.contains(&c.to_lowercase())).map(|c| (c.clone(), false)).collect();
                     if !keys.is_empty() {
-                        let ix = Stmt::CreateIndex { name: format!("ix_{}", temp.trim_start_matches('#')), table: vec![temp.clone()], cols: keys, unique: false, include: vec![], filter: None, xml: None, spatial: None };
+                        let ix = Stmt::CreateIndex { name: format!("ix_{}", temp.trim_start_matches('#')), table: vec![temp.clone()], cols: keys, unique: false, include: vec![], filter: None, xml: None, spatial: None, columnstore: None };
                         merge::check(&self.mirror.execute_stmts(&[ix]))?;
                     }
                 }

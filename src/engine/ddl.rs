@@ -130,6 +130,7 @@ impl<'a> Engine<'a> {
                     let idx: Vec<(usize, bool)> = kc.iter().map(|(c, d)| idx_of(&t, c).map(|i| (i, *d))).collect::<Result<_>>()?;
                     t.indexes.push(IndexDef { name: n.clone(), cols: idx, unique: *unique, include: vec![], filter: None });
                 }
+                TableDef::Columnstore { name: n, clustered, cols } => Self::make_columnstore(&mut t, n, *clustered, cols)?,
                 TableDef::ForeignKey(_) | TableDef::Period { .. } => {}
             }
         }
@@ -361,7 +362,7 @@ impl<'a> Engine<'a> {
                     }
                 }
             }
-            Stmt::CreateIndex { name, table, cols, unique, include, filter, xml, spatial } => {
+            Stmt::CreateIndex { name, table, cols, unique, include, filter, xml, spatial, columnstore } => {
                 let loc = self.locate(table);
                 let t = self.table_ref(&loc).cloned().ok_or_else(|| self.invalid_object(table))?;
                 self.check_alter(&loc, table.last().unwrap())?;
@@ -375,8 +376,15 @@ impl<'a> Engine<'a> {
                     if let Some(sp) = spatial {
                         return Self::create_spatial_index(&mut t, name, cols, sp);
                     }
+                    if let Some(cs) = columnstore {
+                        if filter.is_some() || !include.is_empty() || *unique {
+                            return Err(SqlError::new(35302, "A columnstore index cannot be unique, filtered or have included columns on this server."));
+                        }
+                        let names: Vec<String> = cols.iter().map(|(c, _)| c.clone()).collect();
+                        return Self::make_columnstore(&mut t, name, cs.clustered, &names);
+                    }
                     let idx: Vec<(usize, bool)> = cols.iter().map(|(c, d)| t.col_index(c).map(|i| (i, *d)).ok_or_else(|| SqlError::new(1911, format!("Column name '{}' does not exist in the target table or view.", c)))).collect::<Result<_>>()?;
-                    if t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name)) || t.all_keys().iter().any(|k| k.name.eq_ignore_ascii_case(name)) || t.xml_indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name)) || t.spatial_indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name)) {
+                    if t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name)) || t.all_keys().iter().any(|k| k.name.eq_ignore_ascii_case(name)) || t.xml_indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name)) || t.spatial_indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name)) || t.columnstore.as_ref().is_some_and(|c| c.name.eq_ignore_ascii_case(name)) {
                         return Err(SqlError::new(1913, format!("The operation failed because an index or statistics with name '{}' already exists on table '{}'.", name, t.name)));
                     }
                     // INCLUDE columns ride along in the index; they may not also be key columns
@@ -413,7 +421,11 @@ impl<'a> Engine<'a> {
                 })();
                 self.put_table(&loc, t);
                 r?;
+                if columnstore.is_some() {
+                    self.columnstore_build(&loc, true)?;
+                }
             }
+            Stmt::AlterIndex { name, table, action } => self.alter_index(name, table, action)?,
             Stmt::CreateView { name, cols, query, text, or_alter, alter, check_option } => {
                 let (db, schema, n) = self.ddl_names(name);
                 self.check_schema(&db, &schema)?;
@@ -723,6 +735,11 @@ impl<'a> Engine<'a> {
                         t.xml_indexes.retain(|x| !x.name.eq_ignore_ascii_case(&idx) && !x.using.as_deref().is_some_and(|u| u.eq_ignore_ascii_case(&idx)));
                         found = true;
                     }
+                    if t.columnstore.as_ref().is_some_and(|c| c.name.eq_ignore_ascii_case(&idx)) {
+                        t.columnstore = None;
+                        t.data.columnstore_clear();
+                        found = true;
+                    }
                     t.sync_indexes();
                     self.put_table(&loc, t);
                     if !found && !*if_exists {
@@ -731,6 +748,95 @@ impl<'a> Engine<'a> {
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// `CREATE [NONCLUSTERED | CLUSTERED] COLUMNSTORE INDEX` (also inside a table definition): checked, then recorded (see
+    /// `ColumnstoreDef`). A table has one; the numbers of the errors are SQL Server's where it has one for the case.
+    pub(super) fn make_columnstore(t: &mut Table, name: &str, clustered: bool, cols: &[String]) -> Result<()> {
+        if t.columnstore.is_some() {
+            return Err(SqlError::new(35339, "Multiple columnstore indexes are not supported."));
+        }
+        if t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name)) || t.all_keys().iter().any(|k| k.name.eq_ignore_ascii_case(name)) || t.xml_indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name)) || t.spatial_indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name)) {
+            return Err(SqlError::new(1913, format!("The operation failed because an index or statistics with name '{}' already exists on table '{}'.", name, t.name)));
+        }
+        let mut idx: Vec<usize> = vec![];
+        if clustered {
+            if !cols.is_empty() {
+                return Err(SqlError::new(35305, "A clustered columnstore index takes all of the table's columns: it has no column list."));
+            }
+        } else {
+            if cols.is_empty() {
+                return Err(SqlError::new(35306, "A nonclustered columnstore index needs a list of columns."));
+            }
+            for c in cols {
+                let i = t.col_index(c).ok_or_else(|| SqlError::new(1911, format!("Column name '{}' does not exist in the target table or view.", c)))?;
+                if idx.contains(&i) {
+                    return Err(SqlError::new(1909, format!("Cannot use duplicate column names in index. Column name '{}' listed more than once.", c)));
+                }
+                idx.push(i);
+            }
+        }
+        let checked: Vec<usize> = if clustered { (0..t.columns.len()).collect() } else { idx.clone() };
+        for i in checked {
+            let c = &t.columns[i];
+            if matches!(c.ty, DataType::Text | DataType::NText | DataType::Image | DataType::Xml | DataType::Variant | DataType::Geometry | DataType::Geography | DataType::HierarchyId | DataType::Timestamp | DataType::Other(_)) {
+                return Err(SqlError::new(35343, format!("The statement failed. Column '{}' has a data type that cannot participate in a columnstore index.", c.name)));
+            }
+        }
+        t.columnstore = Some(crate::catalog::ColumnstoreDef { name: name.to_string(), clustered, cols: idx, disabled: false });
+        crate::storage::colstore::USED.store(true, std::sync::atomic::Ordering::Relaxed);
+        t.data.columnstore_clear();
+        Ok(())
+    }
+
+    /// `ALTER INDEX name | ALL ON table action`: a columnstore index is rebuilt, reorganized or disabled; for any other index the
+    /// statement is accepted and does nothing, as it always did (the other indexes are B-trees kept in order, with nothing to defragment).
+    pub(super) fn alter_index(&mut self, name: &Option<String>, table: &[String], action: &str) -> Result<()> {
+        let tname = table.to_vec();
+        let loc = self.locate(&tname);
+        let Some(t) = self.table_ref(&loc).cloned() else { return Err(self.invalid_object(&tname)) };
+        let Some(cs) = t.columnstore.clone() else {
+            if let Some(n) = name {
+                let known = t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n)) || t.all_keys().iter().any(|k| k.name.eq_ignore_ascii_case(n)) || t.xml_indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n)) || t.spatial_indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n));
+                if !known {
+                    return Err(SqlError::new(1911, format!("Index '{}' does not exist on table '{}'.", n, t.name)));
+                }
+            }
+            return Ok(());
+        };
+        if let Some(n) = name {
+            if !cs.name.eq_ignore_ascii_case(n) {
+                return Ok(());
+            }
+        }
+        if !matches!(action, "DISABLE" | "REBUILD" | "REORGANIZE") {
+            return Ok(());
+        }
+        self.check_alter(&loc, table.last().unwrap())?;
+        self.ddl_lock(&loc, &t)?;
+        self.undo_table(&loc, &t);
+        let mut t = self.take_table(&loc).ok_or_else(|| self.invalid_object(&tname))?;
+        match action {
+            "DISABLE" => {
+                if let Some(c) = t.columnstore.as_mut() {
+                    c.disabled = true;
+                }
+                t.data.columnstore_clear();
+            }
+            "REBUILD" => {
+                if let Some(c) = t.columnstore.as_mut() {
+                    c.disabled = false;
+                }
+                t.data.columnstore_clear();
+            }
+            // REORGANIZE: what the writes since the last build left out of the row groups is compressed (see `columnstore_build`)
+            _ => {}
+        }
+        self.put_table(&loc, t);
+        if action != "DISABLE" {
+            self.columnstore_build(&loc, action == "REBUILD")?;
         }
         Ok(())
     }
@@ -972,7 +1078,12 @@ impl<'a> Engine<'a> {
         match r {
             Ok(()) => {
                 t.sync_indexes();
+                let cs = t.columnstore.is_some();
                 self.put_table(&loc, t);
+                // (a columnstore index added, or one whose table changed shape, is built now; one that is up to date is left alone)
+                if cs {
+                    self.columnstore_build(&loc, false)?;
+                }
                 Ok(())
             }
             Err(e) => {
@@ -1078,6 +1189,7 @@ impl<'a> Engine<'a> {
                             let idx: Vec<(usize, bool)> = cols.iter().filter_map(|(c, d)| t.col_index(c).map(|i| (i, *d))).collect();
                             t.indexes.push(IndexDef { name: name.clone(), cols: idx, unique: *unique, include: vec![], filter: None });
                         }
+                        TableDef::Columnstore { name, clustered, cols } => Self::make_columnstore(t, name, *clustered, cols)?,
                         TableDef::Column(_) => {}
                         TableDef::Period { .. } => {}
                     }
@@ -1140,7 +1252,7 @@ impl<'a> Engine<'a> {
                         }
                     };
                     let in_key = t.all_keys().iter().any(|k| k.cols.contains(&ci)) || t.fks.iter().any(|f| f.cols.contains(&ci)) || t.checks.iter().any(|c| c.col.as_deref() == Some(n.as_str())) || t.indexes.iter().any(|i| i.cols.iter().any(|(c, _)| *c == ci));
-                    let in_key = in_key || t.xml_indexes.iter().any(|x| x.col == ci) || t.spatial_indexes.iter().any(|x| x.col == ci) || t.fulltext.as_ref().is_some_and(|f| f.cols.iter().any(|c| c.0 == ci));
+                    let in_key = in_key || t.xml_indexes.iter().any(|x| x.col == ci) || t.spatial_indexes.iter().any(|x| x.col == ci) || t.fulltext.as_ref().is_some_and(|f| f.cols.iter().any(|c| c.0 == ci)) || t.columnstore.as_ref().is_some_and(|c| c.cols.contains(&ci));
                     if in_key {
                         return Err(SqlError::new(5074, format!("The object depends on column '{}'. ALTER TABLE DROP COLUMN failed because one or more objects access this column.", n)));
                     }
@@ -1184,6 +1296,13 @@ impl<'a> Engine<'a> {
                     for x in t.spatial_indexes.iter_mut() {
                         if x.col > ci {
                             x.col -= 1;
+                        }
+                    }
+                    if let Some(c) = t.columnstore.as_mut() {
+                        for x in c.cols.iter_mut() {
+                            if *x > ci {
+                                *x -= 1;
+                            }
                         }
                     }
                     if let Some(f) = t.fulltext.as_mut() {

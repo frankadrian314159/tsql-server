@@ -439,7 +439,7 @@ impl<'a> Engine<'a> {
         // row-level security: a filter predicate hides rows from every reader of the table
         if self.has_filter_policy(loc) {
             // (a policy's predicate reads columns of its own: every column is read)
-            return self.scan_each_inner(loc, t, ap, flt, None, &mut |eng, rows| {
+            return self.scan_each_inner(loc, t, ap, flt, None, None, &mut |eng, rows| {
                 let rows = eng.rls_filter(loc, t, rows)?;
                 if rows.is_empty() {
                     return Ok(true);
@@ -447,10 +447,22 @@ impl<'a> Engine<'a> {
                 f(eng, rows)
             });
         }
-        self.scan_each_inner(loc, t, ap, flt, needed.as_deref(), f)
+        self.scan_each_inner(loc, t, ap, flt, needed.as_deref(), None, f)
     }
 
-    fn scan_each_inner(&mut self, loc: &Loc, t: &Table, ap: &optimizer::Access, flt: Option<(&Schema, &[Expr])>, needed: Option<&[bool]>, f: &mut dyn FnMut(&mut Self, Vec<(RowId, Row)>) -> Result<bool>) -> Result<()> {
+    /// `scan_each` for a query that folds its aggregates: where the table's columnstore can do it, a row group is handed to `part` as
+    /// its groups and their aggregates (see colbatch.rs); every other row goes to `f` as it would in `scan_each`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn scan_each_fold(&mut self, loc: &Loc, t: &Table, ap: &optimizer::Access, flt: Option<(&Schema, &[Expr])>, spec: &super::colbatch::FoldSpec, part: &mut dyn FnMut(&mut Self, super::colbatch::KPart) -> Result<bool>, f: &mut dyn FnMut(&mut Self, Vec<(RowId, Row)>) -> Result<bool>) -> Result<()> {
+        if self.has_filter_policy(loc) {
+            return self.scan_each(loc, t, ap, flt, f);
+        }
+        let needed = self.ses.scan_needed.take();
+        self.scan_each_inner(loc, t, ap, flt, needed.as_deref(), Some((spec, part)), f)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_each_inner(&mut self, loc: &Loc, t: &Table, ap: &optimizer::Access, flt: Option<(&Schema, &[Expr])>, needed: Option<&[bool]>, fold: Option<(&super::colbatch::FoldSpec, &mut dyn FnMut(&mut Self, super::colbatch::KPart) -> Result<bool>)>, f: &mut dyn FnMut(&mut Self, Vec<(RowId, Row)>) -> Result<bool>) -> Result<()> {
         let db = match loc {
             Loc::Db(d, _) => d.clone(),
             // global temporary tables are shared between sessions, so they are locked like any table
@@ -505,6 +517,21 @@ impl<'a> Engine<'a> {
             // stream the heap in chunks, keeping only rows that pass the filter
             let view = self.read_view_iso(&db, iso);
             let mut after = None;
+            // a table with a columnstore index: its row groups, then the rows they do not hold (see colstore.rs)
+            if !h.write_lock && !h.readpast && matches!(iso, Isolation::ReadUncommitted | Isolation::ReadCommitted | Isolation::Snapshot) {
+                // (the columns the scan must supply: the query's pruning, or else the ones its SELECT names)
+                let by_name: Option<Vec<bool>> = match needed {
+                    None if t.columnstore.is_some() => self.ses.sel_names.last().and_then(|n| n.as_ref()).map(|n| t.columns.iter().map(|c| n.contains(&c.name.to_lowercase())).collect()),
+                    _ => None,
+                };
+                let cs_needed = needed.or(by_name.as_deref());
+                if let Some(cs) = self.columnstore_for_scan(t, &view, cs_needed) {
+                    if !self.scan_columnar(&db, t, iso, &cs, cs_needed, flt, fold, f)? {
+                        return Ok(());
+                    }
+                    after = cs.data.upto;
+                }
+            }
             // a big scan with conditions that only read the row: the rows read are collected into batches whose conditions are
             // evaluated by several threads (see par.rs); the rows that pass go to `f` in the order they were read
             let (batch, dop) = if h.write_lock { (0, 1) } else { self.par_batch(t, flt) };
@@ -596,7 +623,7 @@ impl<'a> Engine<'a> {
         Ok(rows)
     }
 
-    fn read_rids(&mut self, db: &str, t: &Table, iso: Isolation, rids: &[RowId], flt: Option<(&Schema, &[Expr])>) -> Result<Vec<(RowId, Row)>> {
+    pub(super) fn read_rids(&mut self, db: &str, t: &Table, iso: Isolation, rids: &[RowId], flt: Option<(&Schema, &[Expr])>) -> Result<Vec<(RowId, Row)>> {
         let oid = t.object_id;
         let h = self.table_hints(oid);
         let iso = h.iso.unwrap_or(iso);

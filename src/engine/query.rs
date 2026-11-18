@@ -694,6 +694,18 @@ impl<'a> Engine<'a> {
 
     // ------------------------------------------------------------- SELECT
     fn exec_select(&mut self, sel: &Select, order: &[OrderItem], offset: &Option<Expr>, fetch: &Option<Expr>, outer: Option<&Env<'_>>) -> Result<Rowset> {
+        // (once a table has a columnstore index, what each SELECT names is kept for the scans that read it)
+        if !crate::storage::colstore::USED.load(std::sync::atomic::Ordering::Relaxed) {
+            return self.exec_select_inner(sel, order, offset, fetch, outer);
+        }
+        let names = Self::names_of(sel, order);
+        self.ses.sel_names.push(names);
+        let r = self.exec_select_inner(sel, order, offset, fetch, outer);
+        self.ses.sel_names.pop();
+        r
+    }
+
+    fn exec_select_inner(&mut self, sel: &Select, order: &[OrderItem], offset: &Option<Expr>, fetch: &Option<Expr>, outer: Option<&Env<'_>>) -> Result<Rowset> {
         crate::span!("exec_select");
         // only the outermost SELECT of a statement may stream; subqueries started from it must not
         let may_stream = std::mem::take(&mut self.ses.stream_ok);

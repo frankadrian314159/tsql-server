@@ -388,16 +388,26 @@ impl<'a> Engine<'a> {
                                 let code = match ty {
                                     "HEAP" => 0,
                                     "CLUSTERED" => 1,
+                                    "CLUSTERED COLUMNSTORE" => 5,
+                                    "NONCLUSTERED COLUMNSTORE" => 6,
                                     _ => 2,
                                 };
                                 let uq_constraint = uniq && !pk && !f.is_some() && matches!(&name, Value::Str(n) if t.uniques.iter().any(|u| !u.is_index && u.name == *n));
                                 vec![Value::Int(t.object_id), name, Value::Int(id), sv(ty), Value::Bit(uniq), Value::Bit(pk), Value::Bit(f.is_some()), f.as_ref().map(|f| sv(&f.text)).unwrap_or(Value::Null), Value::Int(code), Value::Bit(uq_constraint), Value::Bit(false), Value::Int(0)]
                             };
-                            if t.pk.is_none() {
+                            // a clustered columnstore index stands where the heap or clustered index would: the key of the table is nonclustered
+                            let cci = t.columnstore.as_ref().filter(|c| c.clustered);
+                            if t.pk.is_none() && cci.is_none() {
                                 rows.push(row(Value::Null, 0, "HEAP", false, false, &None));
                             }
+                            if let Some(c) = cci {
+                                let mut r = row(sv(&c.name), id, "CLUSTERED COLUMNSTORE", false, false, &None);
+                                r[10] = Value::Bit(c.disabled);
+                                rows.push(r);
+                                id += 1;
+                            }
                             if let Some(pk) = &t.pk {
-                                rows.push(row(sv(&pk.name), id, "CLUSTERED", true, true, &None));
+                                rows.push(row(sv(&pk.name), id, if cci.is_some() { "NONCLUSTERED" } else { "CLUSTERED" }, true, true, &None));
                                 id += 1;
                             }
                             for u in t.uniques.iter().filter(|u| !u.is_index) {
@@ -406,6 +416,12 @@ impl<'a> Engine<'a> {
                             }
                             for i in &t.indexes {
                                 rows.push(row(sv(&i.name), id, "NONCLUSTERED", i.unique, false, &i.filter));
+                                id += 1;
+                            }
+                            if let Some(c) = t.columnstore.as_ref().filter(|c| !c.clustered) {
+                                let mut r = row(sv(&c.name), id, "NONCLUSTERED COLUMNSTORE", false, false, &None);
+                                r[10] = Value::Bit(c.disabled);
+                                rows.push(r);
                                 id += 1;
                             }
                             // XML indexes are numbered from 256000
@@ -517,6 +533,13 @@ impl<'a> Engine<'a> {
                     for o in db.objects.values() {
                         if let Object::Table(t) = o {
                             let mut id = 1;
+                            if let Some(c) = t.columnstore.as_ref().filter(|c| c.clustered) {
+                                for k in 0..t.columns.len() {
+                                    rows.push(vec![Value::Int(t.object_id), Value::Int(id), Value::Int(k as i32 + 1), Value::Int(k as i32 + 1), Value::Bit(false), Value::Bit(false), Value::Int(0), Value::Int(0)]);
+                                }
+                                let _ = c;
+                                id += 1;
+                            }
                             if let Some(pk) = &t.pk {
                                 for (k, &c) in pk.cols.iter().enumerate() {
                                     rows.push(vec![Value::Int(t.object_id), Value::Int(id), Value::Int(k as i32 + 1), Value::Int(c as i32 + 1), Value::Bit(false), Value::Bit(false), Value::Int(k as i32 + 1), Value::Int(0)]);
@@ -545,6 +568,11 @@ impl<'a> Engine<'a> {
                                 }
                                 id += 1;
                             }
+                            if let Some(c) = t.columnstore.as_ref().filter(|c| !c.clustered) {
+                                for (k, &col) in c.cols.iter().enumerate() {
+                                    rows.push(vec![Value::Int(t.object_id), Value::Int(id), Value::Int(k as i32 + 1), Value::Int(col as i32 + 1), Value::Bit(false), Value::Bit(false), Value::Int(0), Value::Int(0)]);
+                                }
+                            }
                         }
                     }
                     Some(rs(&[("object_id", DataType::Int), ("index_id", DataType::Int), ("index_column_id", DataType::Int), ("column_id", DataType::Int), ("is_descending_key", DataType::Bit), ("is_included_column", DataType::Bit), ("key_ordinal", DataType::TinyInt), ("partition_ordinal", DataType::TinyInt)], rows))
@@ -564,6 +592,61 @@ impl<'a> Engine<'a> {
                     }
                     Some(rs(&[("name", nv()), ("object_id", DataType::Int), ("parent_object_id", DataType::Int), ("referenced_object_id", DataType::Int), ("delete_referential_action_desc", nv()), ("update_referential_action_desc", nv())], rows))
                 }
+                "column_store_row_groups" | "dm_db_column_store_row_group_physical_stats" => {
+                    // the row groups of each columnstore index: the compressed ones, and the delta store (the rows not in them yet)
+                    let mut rows = vec![];
+                    for o in db.objects.values() {
+                        if let Object::Table(t) = o {
+                            let Some(def) = &t.columnstore else { continue };
+                            let Some(cs) = t.data.columnstore_snapshot() else { continue };
+                            let index_id = if def.clustered { 1 } else { 2 + t.indexes.len() as i32 + i32::from(t.pk.is_some()) + t.uniques.iter().filter(|u| !u.is_index).count() as i32 };
+                            for (k, g) in cs.data.groups.iter().enumerate() {
+                                let (lo, hi) = (g.rowids[0], g.rowids[g.rows() - 1]);
+                                let deleted = cs.dirty[cs.dirty.partition_point(|r| *r < lo)..cs.dirty.partition_point(|r| *r <= hi)].iter().filter(|r| g.rowids.binary_search(r).is_ok()).count();
+                                rows.push(vec![Value::Int(t.object_id), Value::Int(index_id), Value::Int(1), Value::Int(k as i32), Value::Null, Value::Int(3), sv("COMPRESSED"), Value::BigInt(g.rows() as i64), Value::BigInt(deleted as i64), Value::BigInt(g.bytes() as i64)]);
+                            }
+                            let delta = t.data.slot_count().saturating_sub(cs.data.slots);
+                            if delta > 0 {
+                                rows.push(vec![Value::Int(t.object_id), Value::Int(index_id), Value::Int(1), Value::Int(cs.data.groups.len() as i32), Value::BigInt(t.object_id as i64 * 10 + 1), Value::Int(1), sv("OPEN"), Value::BigInt(delta as i64), Value::BigInt(0), Value::BigInt(delta as i64 * 64)]);
+                            }
+                        }
+                    }
+                    Some(rs(
+                        &[("object_id", DataType::Int), ("index_id", DataType::Int), ("partition_number", DataType::Int), ("row_group_id", DataType::Int), ("delta_store_hobt_id", DataType::BigInt), ("state", DataType::TinyInt), ("state_description", nv()), ("total_rows", DataType::BigInt), ("deleted_rows", DataType::BigInt), ("size_in_bytes", DataType::BigInt)],
+                        rows,
+                    ))
+                }
+                "column_store_segments" => {
+                    let mut rows = vec![];
+                    for o in db.objects.values() {
+                        if let Object::Table(t) = o {
+                            let Some(def) = &t.columnstore else { continue };
+                            let Some(cs) = t.data.columnstore_snapshot() else { continue };
+                            let index_id = if def.clustered { 1 } else { 2 + t.indexes.len() as i32 + i32::from(t.pk.is_some()) + t.uniques.iter().filter(|u| !u.is_index).count() as i32 };
+                            let pid = t.object_id as i64 * 10 + index_id as i64;
+                            for (k, g) in cs.data.groups.iter().enumerate() {
+                                for (p, seg) in g.cols.iter().enumerate() {
+                                    use crate::storage::colstore::SegData;
+                                    let (enc, dict) = match &seg.data {
+                                        SegData::Nulls | SegData::Int(..) | SegData::Float(_) | SegData::Dec(..) => (1, -1),
+                                        SegData::Dict { dict, .. } => (if dict.iter().any(|v| matches!(v, Value::Str(_))) { 3 } else { 2 }, 0),
+                                        SegData::Vals(_) => (4, -1),
+                                    };
+                                    let bound = |v: &Option<Value>| match v {
+                                        Some(Value::Int(i)) => Value::BigInt(*i as i64),
+                                        Some(Value::BigInt(i)) => Value::BigInt(*i),
+                                        _ => Value::Null,
+                                    };
+                                    rows.push(vec![Value::BigInt(pid), Value::BigInt(pid), Value::Int(cs.data.colmap[p] as i32 + 1), Value::Int(k as i32), Value::Int(1), Value::Int(enc), Value::Int(seg.rows as i32), Value::Int(i32::from(seg.null_count > 0)), Value::Int(dict), bound(&seg.min), bound(&seg.max), Value::BigInt(seg.bytes() as i64)]);
+                                }
+                            }
+                        }
+                    }
+                    Some(rs(
+                        &[("partition_id", DataType::BigInt), ("hobt_id", DataType::BigInt), ("column_id", DataType::Int), ("segment_id", DataType::Int), ("version", DataType::Int), ("encoding_type", DataType::Int), ("row_count", DataType::Int), ("has_nulls", DataType::Int), ("primary_dictionary_id", DataType::Int), ("min_data_id", DataType::BigInt), ("max_data_id", DataType::BigInt), ("on_disk_size", DataType::BigInt)],
+                        rows,
+                    ))
+                }
                 "partitions" | "dm_db_partition_stats" => {
                     // one partition per table (heap or clustered index); the sizes are estimates from the row count
                     let stats = lname == "dm_db_partition_stats";
@@ -572,11 +655,12 @@ impl<'a> Engine<'a> {
                         if let Object::Table(t) = o {
                             let n = t.data.slot_count() as i64;
                             let pages = (n / 40 + 1).max(1);
-                            let idx = if t.pk.is_some() { 1 } else { 0 };
+                            let cci = t.columnstore.as_ref().is_some_and(|c| c.clustered);
+                            let idx = if t.pk.is_some() || cci { 1 } else { 0 };
                             if stats {
                                 rows.push(vec![Value::Int(t.object_id), Value::Int(idx), Value::Int(1), Value::BigInt(n), Value::BigInt(pages), Value::BigInt(pages), Value::BigInt(pages)]);
                             } else {
-                                rows.push(vec![Value::Int(t.object_id), Value::Int(idx), Value::Int(1), Value::BigInt(n), Value::Int(0), Value::BigInt(t.object_id as i64 * 10 + idx as i64)]);
+                                rows.push(vec![Value::Int(t.object_id), Value::Int(idx), Value::Int(1), Value::BigInt(n), Value::Int(if cci { 3 } else { 0 }), Value::BigInt(t.object_id as i64 * 10 + idx as i64)]);
                             }
                         }
                     }

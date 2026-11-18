@@ -2195,6 +2195,25 @@ impl Parser {
                             let member = self.ident()?;
                             return Ok(Stmt::Security(Box::new(if server { SecStmt::AlterServerRole { role, add, member } } else { SecStmt::AlterRole { role, add, member } })));
                         }
+                        if self.is_kw("INDEX") {
+                            // ALTER INDEX name | ALL ON table action [options]: only a columnstore index does anything for it
+                            let save = self.i;
+                            self.i += 1;
+                            let name = if self.accept_kw("ALL") { None } else { Some(self.ident()?) };
+                            if self.accept_kw("ON") {
+                                let table = self.name_parts()?;
+                                let action = self.advance_up();
+                                while !self.at_eos() && !(self.is_stmt_start() && !self.is_kw_any(&["WITH", "SET"])) {
+                                    if self.is_op("(") {
+                                        self.skip_parens()?;
+                                    } else {
+                                        self.i += 1;
+                                    }
+                                }
+                                return Ok(Stmt::AlterIndex { name, table, action });
+                            }
+                            self.i = save;
+                        }
                         if self.is_kw_any(&["DATABASE", "INDEX", "SERVER", "AUTHORIZATION", "SCHEMA"]) {
                             return self.skip_ignored();
                         }
@@ -3589,12 +3608,16 @@ impl Parser {
         if self.accept_kw("UNIQUE") {
             unique = true;
         }
+        let mut clustered = false;
         if self.is_kw_any(&["CLUSTERED", "NONCLUSTERED"]) {
-            self.i += 1;
+            clustered = self.advance_up() == "CLUSTERED";
         }
-        if self.is_kw("COLUMNSTORE") {
+        let columnstore = if self.is_kw("COLUMNSTORE") {
             self.i += 1;
-        }
+            Some(ColumnstoreSpec { clustered })
+        } else {
+            None
+        };
         // CREATE [PRIMARY] XML INDEX
         let mut xml_primary = None;
         if self.is_kw("PRIMARY") && self.peek_kw(1, &["XML"]) && self.peek_kw(2, &["INDEX"]) {
@@ -3673,7 +3696,7 @@ impl Parser {
                     }
                 }
                 let (mut include, mut filter) = (vec![], None);
-                while self.is_kw_any(&["INCLUDE", "WHERE", "WITH", "ON"]) {
+                while self.is_kw_any(&["INCLUDE", "WHERE", "WITH", "ON", "ORDER"]) {
                     let w = self.advance_up();
                     if w == "WITH" && self.is_op("(") && spatial.is_some() {
                         self.spatial_options(spatial.as_mut().unwrap())?;
@@ -3694,7 +3717,7 @@ impl Parser {
                         self.i += 1;
                     }
                 }
-                Ok(Stmt::CreateIndex { name, table, cols, unique, include, filter, xml, spatial })
+                Ok(Stmt::CreateIndex { name, table, cols, unique, include, filter, xml, spatial, columnstore })
             }
             "VIEW" => {
                 let name = self.name_parts()?;
@@ -4085,8 +4108,14 @@ impl Parser {
         if self.is_kw("INDEX") {
             self.i += 1;
             let name = self.ident()?;
+            let mut clustered = false;
             if self.is_kw_any(&["CLUSTERED", "NONCLUSTERED"]) {
-                self.i += 1;
+                clustered = self.advance_up() == "CLUSTERED";
+            }
+            if self.accept_kw("COLUMNSTORE") {
+                let cols = if self.is_op("(") { self.col_list()? } else { vec![] };
+                self.skip_index_opts()?;
+                return Ok(TableDef::Columnstore { name, clustered, cols });
             }
             let cols = self.col_list_ord()?;
             return Ok(TableDef::Index { name, cols, unique: false });

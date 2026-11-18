@@ -15,6 +15,7 @@ which file to open for what, and in what order to read them.
 | understand why a query is slow, or make it faster | [optimizer.md](optimizer.md), then [performance.md](performance.md) |
 | run it on several machines | [distributed.md](distributed.md) |
 | understand how data reaches the disk and survives a crash | [storage.md](storage.md) |
+| read or add up many rows of a few columns fast (columnstore indexes, batch mode) | [columnstore.md](columnstore.md) |
 | find out whether a T-SQL feature is there, and how it differs from SQL Server | the feature files below, and the *Limitations* section of the [top-level README](../README.md#limitations) |
 | change the code | [devel.md](devel.md), then the file for the subject you are changing |
 | check the engine against something, or look for bugs | [benchmarks.md](benchmarks.md), [tsqlt.md](tsqlt.md) |
@@ -41,6 +42,7 @@ which file to open for what, and in what order to read them.
 | [hierarchyid.md](hierarchyid.md) | The `hierarchyid` type and its methods; values from restored SQL Server databases are used as they are. |
 | [spatial.md](spatial.md) | `geometry` and `geography`: shapes, methods, the binary form, spatial indexes, what is not supported. |
 | [xml-schema.md](xml-schema.md) | `CREATE XML SCHEMA COLLECTION`, typed `xml`, the validator, and what happens to typed columns in a SQL Server backup. |
+| [columnstore.md](columnstore.md) | `CREATE [NON]CLUSTERED COLUMNSTORE INDEX`, `ALTER INDEX ... REBUILD / REORGANIZE / DISABLE`: the derived in-memory column copy (row groups, segments, dictionaries, bounds), how writes and the delta store are tracked, what reads it (segment elimination, vector conditions), batch-mode aggregates, the catalog views, settings and limits. |
 | [triggers.md](triggers.md) | DML triggers (`AFTER`, `INSTEAD OF`, and `INSTEAD OF` triggers on views), DDL triggers, `LOGON` triggers, `ENABLE`/`DISABLE TRIGGER`, the xml methods and `OPENXML`, full-text search. |
 | [tsqlt.md](tsqlt.md) | A tSQLt-compatible unit-test framework written in T-SQL (the real one needs CLR), the suites that run on it, and where it differs. |
 

@@ -77,6 +77,13 @@ query's own conditions imply the filter (`amount > 600` implies `amount > 500`; 
 and ordered reads never rely on one. `INCLUDE` columns are recorded (`sys.index_columns.is_included_column`, scripts) but, with
 no covering-index reads, they change nothing at run time. `sys.indexes` shows `has_filter` and `filter_definition`.
 
+## Columnstore indexes
+
+A table with a columnstore index (see [columnstore.md](columnstore.md)) is read through its row groups by a scan that the index covers:
+groups are skipped by the bounds of their segments, simple conditions are evaluated over the column vectors, and a grouped or aggregate
+query of one table is worked out in batch mode. The planner does not cost the choice: a scan that can read the index does, and an index
+seek still wins where it was chosen (a point lookup on a key does not read row groups).
+
 ## XML indexes
 
 ```sql

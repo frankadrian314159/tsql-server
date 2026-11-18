@@ -42,7 +42,7 @@ impl ClusterSession {
 
     fn stmt_wants(&self, st: &Stmt) -> bool {
         match st {
-            Stmt::CreateTable { .. } | Stmt::AlterTable { .. } | Stmt::CreateIndex { .. } | Stmt::DropIndex { .. } | Stmt::Truncate(_) | Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::BeginTran(_) | Stmt::Commit(_) | Stmt::Rollback(_) | Stmt::SaveTran(_) => {
+            Stmt::CreateTable { .. } | Stmt::AlterTable { .. } | Stmt::CreateIndex { .. } | Stmt::DropIndex { .. } | Stmt::AlterIndex { .. } | Stmt::Truncate(_) | Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::BeginTran(_) | Stmt::Commit(_) | Stmt::Rollback(_) | Stmt::SaveTran(_) => {
                 self.touches_distributed(st) || matches!(st, Stmt::CreateTable { .. } | Stmt::BeginTran(_) | Stmt::Commit(_) | Stmt::Rollback(_) | Stmt::SaveTran(_))
             }
             Stmt::Drop { what, .. } if what.eq_ignore_ascii_case("VIEW") => true,
@@ -60,7 +60,7 @@ impl ClusterSession {
 
     fn touches_distributed(&self, st: &Stmt) -> bool {
         let names: Vec<&Name> = match st {
-            Stmt::CreateIndex { table, .. } => vec![table],
+            Stmt::CreateIndex { table, .. } | Stmt::AlterIndex { table, .. } => vec![table],
             Stmt::AlterTable { name, .. } => vec![name],
             Stmt::Truncate(Target::Table(n)) => vec![n],
             Stmt::Insert(i) => match &i.target {

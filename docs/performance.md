@@ -426,6 +426,19 @@ What is left in a row, measured as the extra time per row over a bare `COUNT(*)`
 0.5, a decimal operation 0.1-0.2. These are values cloned out of the row, walked through the expression tree, and the decimal arithmetic; a
 compiled form of an expression (column positions resolved once, no tree walk per row) is the next thing to try.
 
+## Ninth round: columnstore indexes
+
+What a row costs (the eighth round) is a floor for a scan of rows; for a query that reads a few columns of many rows and adds them up, the
+way past it is not to make rows. A columnstore index (see [columnstore.md](columnstore.md)) keeps the columns as vectors in row groups,
+with the bounds of each segment, and a grouped or aggregate query of one table is worked out over the vectors, a row group at a time on
+several threads, with the states of the aggregates merged by `AggAcc::merge`. TPC-H `lineitem` at sf 0.1 (600,046 rows, release build,
+the same statements before and after `CREATE CLUSTERED COLUMNSTORE INDEX`): the Q1-shaped grouping 0.37 -> 0.026 s, filtered global
+aggregates 0.25 -> 0.014 s, a grouping with a year's ship-date range 0.33 -> 0.005 s, `SUM(l_quantity)` 0.23 -> 0.002 s. The build took 2.4 s.
+
+What does not get faster: a query whose aggregates take an expression (`SUM(a * b)`) or whose conditions are on strings is still worked
+out row by row (its scan still skips row groups by bounds and makes only the columns it needs); a join reads the groups of its tables
+as any scan does.
+
 ## Where the time goes now
 
 A point lookup by primary key costs about 20 microseconds from `Connection::execute`: parsing 5-10 (statements with

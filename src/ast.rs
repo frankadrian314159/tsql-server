@@ -366,6 +366,8 @@ pub enum TableDef {
     ForeignKey(ForeignKeyDef),
     DefaultFor { name: String, e: Expr, col: String, text: String },
     Index { name: String, cols: Vec<(String, bool)>, unique: bool },
+    /// `INDEX name [NONCLUSTERED | CLUSTERED] COLUMNSTORE [(columns)]` in a table definition
+    Columnstore { name: String, clustered: bool, cols: Vec<String> },
     /// `PERIOD FOR SYSTEM_TIME (start, end)`
     Period { start: String, end: String },
 }
@@ -430,6 +432,12 @@ pub enum AlterAction {
     /// `ALTER COLUMN c ADD MASKED WITH (FUNCTION = '...')` / `DROP MASKED`
     AlterMask { col: String, mask: Option<String> },
     CheckConstraint { name: Option<String>, enable: bool },
+}
+
+/// What makes a `CREATE INDEX` a columnstore index: `CREATE [NONCLUSTERED | CLUSTERED] COLUMNSTORE INDEX`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ColumnstoreSpec {
+    pub clustered: bool,
 }
 
 /// What makes a `CREATE INDEX` an XML index: `PRIMARY`, or `USING XML INDEX name [FOR VALUE | PATH | PROPERTY]`.
@@ -522,7 +530,7 @@ pub enum Stmt {
     Kill(Expr),
     Reconfigure,
     CreateTable { name: Name, defs: Vec<TableDef>, versioning: Option<Versioning> },
-    CreateIndex { name: String, table: Name, cols: Vec<(String, bool)>, unique: bool, include: Vec<String>, filter: Option<(Expr, String)>, xml: Option<XmlIndexSpec>, spatial: Option<SpatialIndexSpec> },
+    CreateIndex { name: String, table: Name, cols: Vec<(String, bool)>, unique: bool, include: Vec<String>, filter: Option<(Expr, String)>, xml: Option<XmlIndexSpec>, spatial: Option<SpatialIndexSpec>, columnstore: Option<ColumnstoreSpec> },
     CreateView { name: Name, cols: Option<Vec<String>>, query: Rc<Query>, text: String, or_alter: bool, alter: bool, check_option: bool },
     CreateProc { name: Name, params: Vec<Param>, body: Rc<Vec<Stmt>>, text: String, or_alter: bool, alter: bool },
     CreateFunction(Box<CreateFunction>),
@@ -548,6 +556,8 @@ pub enum Stmt {
     AlterTable { name: Name, action: AlterAction },
     Drop { what: String, names: Vec<Name>, if_exists: bool },
     DropIndex { names: Vec<(Name, Option<Name>)>, if_exists: bool },
+    /// `ALTER INDEX name | ALL ON table REBUILD | REORGANIZE | DISABLE ...` (`action` upper case); only a columnstore index does anything
+    AlterIndex { name: Option<String>, table: Name, action: String },
     DeclareCursor { name: String, query: Rc<Query> },
     CursorOp { op: String, name: String },
     Fetch { orient: String, arg: Option<Expr>, name: String, into: Option<Vec<String>> },

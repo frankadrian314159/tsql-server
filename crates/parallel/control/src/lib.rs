@@ -919,7 +919,7 @@ impl ClusterSession {
             if t.doomed {
                 return Err(SqlError::new(3930, "The current transaction cannot be committed and cannot support operations that write to the log file. Roll back the transaction."));
             }
-            if matches!(st, Stmt::CreateTable { .. } | Stmt::AlterTable { .. } | Stmt::CreateView { .. } | Stmt::Drop { .. } | Stmt::CreateIndex { .. } | Stmt::DropIndex { .. } | Stmt::Truncate(_)) {
+            if matches!(st, Stmt::CreateTable { .. } | Stmt::AlterTable { .. } | Stmt::CreateView { .. } | Stmt::Drop { .. } | Stmt::CreateIndex { .. } | Stmt::DropIndex { .. } | Stmt::AlterIndex { .. } | Stmt::Truncate(_)) {
                 return Err(unsupported("schema changes and TRUNCATE inside a transaction"));
             }
         }
@@ -1029,7 +1029,7 @@ impl ClusterSession {
                 self.cluster.log_schema(st);
                 Ok(())
             }
-            Stmt::DropIndex { .. } => {
+            Stmt::DropIndex { .. } | Stmt::AlterIndex { .. } => {
                 self.broadcast(st).await?;
                 self.cluster.log_schema(st);
                 Ok(())
@@ -1378,7 +1378,7 @@ impl ClusterSession {
         let mut none = vec![];
         let create = Stmt::CreateTable { name: idx_table.clone(), defs: vec![plain("gv", &vcol), plain("gk", &kcol)], versioning: None };
         self.exec_stmt(&create, &mut none).await?;
-        let ix = Stmt::CreateIndex { name: format!("ix_{}", idx_name), table: idx_table.clone(), cols: vec![("gv".to_string(), false)], unique: false, include: vec![], filter: None, xml: None, spatial: None };
+        let ix = Stmt::CreateIndex { name: format!("ix_{}", idx_name), table: idx_table.clone(), cols: vec![("gv".to_string(), false)], unique: false, include: vec![], filter: None, xml: None, spatial: None, columnstore: None };
         self.exec_stmt(&ix, &mut none).await?;
         let _ = key_class;
         t.indexes.push(GlobalIndex { col: pos, table: idx_table, class });
@@ -2213,7 +2213,7 @@ impl ClusterSession {
         // a subquery that looks the copy up for each row of the outer query seeks it by an index instead of reading it each time
         if !p.index_on.is_empty() {
             let keys: Vec<(String, bool)> = p.index_on.iter().map(|c| (c.clone(), false)).collect();
-            let ix = Stmt::CreateIndex { name: format!("ix_{}", p.temp.trim_start_matches('#')), table: vec![p.temp.clone()], cols: keys, unique: false, include: vec![], filter: None, xml: None, spatial: None };
+            let ix = Stmt::CreateIndex { name: format!("ix_{}", p.temp.trim_start_matches('#')), table: vec![p.temp.clone()], cols: keys, unique: false, include: vec![], filter: None, xml: None, spatial: None, columnstore: None };
             self.fan_run(&shards, |_| Work::Stmts(vec![ix.clone()])).await?;
         }
         Ok(())

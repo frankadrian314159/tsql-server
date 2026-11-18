@@ -97,6 +97,20 @@ pub struct IndexDef {
     pub filter: Option<crate::storage::FilterPred>,
 }
 
+/// A columnstore index: the table's columns (all of them for a clustered one) kept as compressed column segments in row groups, a copy
+/// of the heap's rows that scans and aggregates read when they can (see `storage/colstore.rs` and docs/columnstore.md). The heap stays
+/// the table's storage and its source of truth; the copy is built from it, brought up to date as rows are written, and rebuilt when it
+/// is needed after a restart. It changes no result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ColumnstoreDef {
+    pub name: String,
+    pub clustered: bool,
+    /// the columns of a nonclustered index (empty for a clustered one: all of the table's columns, as they are now)
+    pub cols: Vec<usize>,
+    /// `ALTER INDEX ... DISABLE`: the index is kept but not read
+    pub disabled: bool,
+}
+
 /// An XML index. It has no structure of its own: this server evaluates XPath over the stored text, so such an index changes no
 /// result and no plan; it is kept so that scripts and backups that create one still work, and shows in the catalog views.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -262,6 +276,8 @@ pub struct Table {
     pub fulltext: Option<FullTextDef>,
     #[serde(default)]
     pub spatial_indexes: Vec<SpatialIndexDef>,
+    #[serde(default)]
+    pub columnstore: Option<ColumnstoreDef>,
 }
 
 /// A counter that clones share: the next identity value of a table, the current value of a sequence. A statement
@@ -331,6 +347,7 @@ impl Table {
             xml_indexes: vec![],
             fulltext: None,
             spatial_indexes: vec![],
+            columnstore: None,
         }
     }
     pub fn col_index(&self, name: &str) -> Option<usize> {
