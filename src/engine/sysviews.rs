@@ -222,12 +222,13 @@ impl<'a> Engine<'a> {
                     { let mut cols: Vec<(&str, DataType)> = vec![("name", nv()), ("object_id", DataType::Int), ("schema_id", DataType::Int), ("parent_object_id", DataType::Int), ("type", DataType::Char(2)), ("type_desc", nv()), ("create_date", DataType::DateTime), ("modify_date", DataType::DateTime), ("is_ms_shipped", DataType::Bit), ("principal_id", DataType::Int)];
                     if lname == "views" || lname == "all_views" {
                         for r in rows.iter_mut() {
-                            r.extend([Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false)]);
+                            r.extend([Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Int(0), sv("NON_LEDGER_VIEW"), Value::Null, Value::Bit(false)]);
                         }
                         cols.extend([
                             ("is_replicated", DataType::Bit), ("has_replication_filter", DataType::Bit), ("has_opaque_metadata", DataType::Bit), ("has_unchecked_assembly_data", DataType::Bit),
                             ("with_check_option", DataType::Bit), ("is_date_correlation_view", DataType::Bit), ("is_tracked_by_cdc", DataType::Bit), ("has_snapshot", DataType::Bit),
                         ]);
+                        cols.extend([("ledger_view_type", DataType::TinyInt), ("ledger_view_type_desc", nv()), ("ledger_view_id", DataType::Int), ("is_dropped_ledger_view", DataType::Bit)]);
                     }
                     if lname == "tables" {
                         for r in rows.iter_mut() {
@@ -289,6 +290,19 @@ impl<'a> Engine<'a> {
                                     _ => (Value::Null, Value::Null),
                                 };
                                 rows.push(vec![Value::Int(t.object_id), sv(&c.name), Value::Int(i as i32 + 1), Value::Int(if matches!(c.ty, DataType::HierarchyId | DataType::Geometry | DataType::Geography) { 240 } else { st }), Value::Int(c.user_type.as_ref().and_then(|ut| db.types.values().find(|u| matches!(u.kind, crate::catalog::UserTypeKind::Alias(..)) && (format!("{}.{}", u.schema, u.name).eq_ignore_ascii_case(ut) || (u.schema.eq_ignore_ascii_case("dbo") && u.name.eq_ignore_ascii_case(ut))))).map(|u| u.type_id).unwrap_or(st)), Value::Int(ml), Value::Int(p), Value::Int(s), Value::Bit(c.nullable), Value::Bit(c.identity.is_some()), Value::Bit(c.computed.is_some()), if c.ty.is_string() { sv(c.collation.as_deref().unwrap_or(&db.collation_or_default())) } else { Value::Null }, Value::Int(if c.default_name.is_some() { t.object_id * 1000 + 500 + i as i32 } else { 0 }), gt, gd]);
+                            }
+                        }
+                    }
+                    // the columns of the views (found when the catalog is read: see `prime_view_columns`)
+                    for o in db.objects.values() {
+                        if let Object::View(v) = o {
+                            let Some((_, cols)) = self.ses.view_cols.get(&v.object_id) else { continue };
+                            for (i, (name, ty, nullable)) in cols.iter().enumerate() {
+                                let ty = ty.clone().unwrap_or(DataType::NVarChar(MAX));
+                                let (st, ml, p, s) = type_info(&ty);
+                                let st = if matches!(ty, DataType::HierarchyId | DataType::Geometry | DataType::Geography) { 240 } else { st };
+                                let coll = if ty.is_string() { sv(&db.collation_or_default()) } else { Value::Null };
+                                rows.push(vec![Value::Int(v.object_id), sv(name), Value::Int(i as i32 + 1), Value::Int(st), Value::Int(st), Value::Int(ml), Value::Int(p), Value::Int(s), Value::Bit(*nullable), Value::Bit(false), Value::Bit(false), coll, Value::Int(0), Value::Null, Value::Null]);
                             }
                         }
                     }
@@ -788,6 +802,12 @@ impl<'a> Engine<'a> {
                     Some(rs(&[("name", nv()), ("system_type_id", DataType::TinyInt), ("user_type_id", DataType::Int), ("schema_id", DataType::Int), ("principal_id", DataType::Int), ("max_length", DataType::SmallInt), ("precision", DataType::TinyInt), ("scale", DataType::TinyInt),
                         ("collation_name", nv()), ("is_nullable", DataType::Bit), ("is_user_defined", DataType::Bit), ("is_assembly_type", DataType::Bit), ("default_object_id", DataType::Int), ("rule_object_id", DataType::Int), ("is_table_type", DataType::Bit), ("type_table_object_id", DataType::Int), ("is_memory_optimized", DataType::Bit)], rows))
                 }
+                // the policy store (msdb.dbo.syspolicy_*): Policy-Based Management is not implemented, so the store is as a new server's
+                // (policy management off, no policies), which is what SSMS's Management > Policy Management reads
+                "syspolicy_configuration" => Some(rs(
+                    &[("name", nv()), ("current_value", DataType::Int)],
+                    vec![vec![sv("Enabled"), Value::Int(0)], vec![sv("HistoryRetentionInDays"), Value::Int(90)], vec![sv("LogOnSuccess"), Value::Int(0)]],
+                )),
                 // the objects and users of SQL Server 2000, which SSMS reads for the aggregates and a few others
                 "sysobjects" => {
                     let rows = db
@@ -1117,7 +1137,10 @@ impl<'a> Engine<'a> {
                             }
                         }
                     }
-                    Some(rs(&[("object_id", DataType::Int), ("index_id", DataType::Int), ("index_column_id", DataType::Int), ("column_id", DataType::Int), ("is_descending_key", DataType::Bit), ("is_included_column", DataType::Bit), ("key_ordinal", DataType::TinyInt), ("partition_ordinal", DataType::TinyInt)], rows))
+                    for r in rows.iter_mut() {
+                        r.push(Value::Int(0));
+                    }
+                    Some(rs(&[("object_id", DataType::Int), ("index_id", DataType::Int), ("index_column_id", DataType::Int), ("column_id", DataType::Int), ("is_descending_key", DataType::Bit), ("is_included_column", DataType::Bit), ("key_ordinal", DataType::TinyInt), ("partition_ordinal", DataType::TinyInt), ("column_store_order_ordinal", DataType::TinyInt)], rows))
                 }
                 "foreign_keys" => {
                     let mut rows = vec![];
@@ -1249,8 +1272,8 @@ impl<'a> Engine<'a> {
                     })
                 }
                 "database_files" => Some(rs(
-                    &[("file_id", DataType::Int), ("name", nv()), ("physical_name", nv()), ("type_desc", nv()), ("state_desc", nv()), ("size", DataType::Int), ("max_size", DataType::Int), ("growth", DataType::Int)],
-                    vec![vec![Value::Int(1), sv(&dbname), sv(&format!("{}.mdf", dbname)), sv("ROWS"), sv("ONLINE"), Value::Int(128), Value::Int(-1), Value::Int(0)]],
+                    &[("file_id", DataType::Int), ("name", nv()), ("physical_name", nv()), ("type_desc", nv()), ("state_desc", nv()), ("size", DataType::Int), ("max_size", DataType::Int), ("growth", DataType::Int), ("type", DataType::TinyInt), ("data_space_id", DataType::Int), ("state", DataType::TinyInt), ("is_media_read_only", DataType::Bit), ("is_read_only", DataType::Bit), ("is_sparse", DataType::Bit), ("is_percent_growth", DataType::Bit), ("is_name_reserved", DataType::Bit)],
+                    vec![vec![Value::Int(1), sv(&dbname), sv(&format!("{}.mdf", dbname)), sv("ROWS"), sv("ONLINE"), Value::Int(128), Value::Int(-1), Value::Int(0), Value::Int(0), Value::Int(1), Value::Int(0), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false)]],
                 )),
                 "foreign_key_columns" => {
                     let mut rows = vec![];
@@ -1288,11 +1311,11 @@ impl<'a> Engine<'a> {
                         .objects
                         .values()
                         .filter_map(|o| match o {
-                            Object::Synonym(s) => Some(vec![sv(&s.name), Value::Int(s.object_id), Value::Int(sid(&s.schema)), sv(&s.target.iter().map(|p| format!("[{}]", p)).collect::<Vec<_>>().join(".")), sv("SN")]),
+                            Object::Synonym(s) => Some(vec![sv(&s.name), Value::Int(s.object_id), Value::Int(sid(&s.schema)), sv(&s.target.iter().map(|p| format!("[{}]", p)).collect::<Vec<_>>().join(".")), sv("SN"), date(db.created), Value::Null, Value::Bit(false)]),
                             _ => None,
                         })
                         .collect();
-                    Some(rs(&[("name", nv()), ("object_id", DataType::Int), ("schema_id", DataType::Int), ("base_object_name", nv()), ("type", DataType::Char(2))], rows))
+                    Some(rs(&[("name", nv()), ("object_id", DataType::Int), ("schema_id", DataType::Int), ("base_object_name", nv()), ("type", DataType::Char(2)), ("create_date", DataType::DateTime), ("principal_id", DataType::Int), ("is_ms_shipped", DataType::Bit)], rows))
                 }
                 // descriptions (MS_Description and the like) are not kept: clients ask for them and get none
                 "extended_properties" => Some(rs(&[("class", DataType::TinyInt), ("class_desc", nv()), ("major_id", DataType::Int), ("minor_id", DataType::Int), ("name", nv()), ("value", DataType::Variant)], vec![])),
@@ -1327,7 +1350,7 @@ impl<'a> Engine<'a> {
                     Some(rs(&[("name", nv()), ("parent_object_id", DataType::Int), ("type", DataType::Char(2)), ("type_desc", nv()),
                         ("object_id", DataType::Int), ("schema_id", DataType::Int), ("create_date", DataType::DateTime), ("modify_date", DataType::DateTime), ("is_ms_shipped", DataType::Bit), ("unique_index_id", DataType::Int), ("is_system_named", DataType::Bit), ("is_enforced", DataType::Bit), ("principal_id", DataType::Int)], rows))
                 }
-                "sql_modules" | "system_sql_modules" | "server_sql_modules" => {
+                "sql_modules" | "all_sql_modules" | "system_sql_modules" | "server_sql_modules" => {
                     let mut rows = vec![];
                     for o in db.objects.values() {
                         let def = match o {

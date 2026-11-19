@@ -1910,6 +1910,9 @@ impl<'a> Engine<'a> {
         if name.len() >= 2 {
             let sch = &name[name.len() - 2];
             if sch.eq_ignore_ascii_case("sys") || sch.eq_ignore_ascii_case("information_schema") {
+                if sch.eq_ignore_ascii_case("sys") && matches!(display.to_lowercase().as_str(), "columns" | "all_columns") {
+                    self.prime_view_columns();
+                }
                 if let Some(mut rs) = self.sysview(sch, &display) {
                     rs.schema.cols.iter_mut().for_each(|c| c.qual = Some(q.clone()));
                     return Ok(rs);
@@ -1919,7 +1922,9 @@ impl<'a> Engine<'a> {
         // the compatibility views of SQL Server 2000 (sysobjects, sysusers, sysdatabases), which are found without the schema (or as dbo)
         if let Some(last) = name.last() {
             let schema_ok = name.len() == 1 || name[name.len() - 2].eq_ignore_ascii_case("dbo");
-            if schema_ok && matches!(last.to_lowercase().as_str(), "sysobjects" | "sysusers" | "sysdatabases") {
+            // (and the tables of the policy store, which msdb has: see `sysview`)
+            let in_msdb = name.len() < 3 || name[name.len() - 3].eq_ignore_ascii_case("msdb");
+            if schema_ok && (matches!(last.to_lowercase().as_str(), "sysobjects" | "sysusers" | "sysdatabases") || (in_msdb && last.to_lowercase().starts_with("syspolicy_"))) {
                 let found = self.locate(name);
                 if self.table_ref(&found).is_none() {
                     if let Some(mut rs) = self.sysview("sys", &display) {
@@ -1955,6 +1960,29 @@ impl<'a> Engine<'a> {
         }
         // tempdb.dbo.#t style
         Err(self.invalid_object(name))
+    }
+
+    /// Find the columns of the views of the database (what `sys.columns` lists for them): each view's query is run for no rows, once
+    /// for the text of the view. A view that cannot be run (it names what is gone) has no columns.
+    fn prime_view_columns(&mut self) {
+        let views: Vec<(i32, String, String, String)> = {
+            let db = self.current_db();
+            db.objects.values().filter_map(|o| if let Object::View(v) = o { Some((v.object_id, v.schema.clone(), v.name.clone(), v.text.clone())) } else { None }).collect()
+        };
+        for (id, schema, name, text) in views {
+            if self.ses.view_cols.get(&id).is_some_and(|(t, _)| *t == text) {
+                continue;
+            }
+            let sql = format!("SELECT TOP 0 * FROM [{}].[{}]", schema.replace(']', "]]"), name.replace(']', "]]"));
+            let cols = match crate::parser::parse(&sql).ok().and_then(|mut s| s.pop()) {
+                Some(Stmt::Query(q)) => match self.exec_query(&q, None) {
+                    Ok(rs) => rs.schema.cols.iter().map(|c| (c.name.clone(), c.ty.clone(), true)).collect(),
+                    Err(_) => vec![],
+                },
+                _ => vec![],
+            };
+            self.ses.view_cols.insert(id, (text, cols));
+        }
     }
 
     fn eval_recursive_cte(&mut self, si: usize, lname: &str, query: &Arc<Query>, cols: &Option<Vec<String>>) -> Result<Rowset> {

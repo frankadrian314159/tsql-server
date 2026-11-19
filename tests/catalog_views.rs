@@ -72,6 +72,11 @@ fn objects_types_partitions_and_files() {
     assert_eq!(scalar(&mut c, "SELECT row_count FROM sys.dm_db_partition_stats WHERE object_id = OBJECT_ID('dbo.p')"), "3");
     assert_eq!(scalar(&mut c, "SELECT SUM(rows) FROM sys.partitions WHERE object_id = OBJECT_ID('dbo.p') AND index_id IN (0, 1)"), "3");
     assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.database_files WHERE type_desc = 'ROWS'"), "1");
+    // the Memory Optimization Advisor's query of a file group: the files of the group by its id
+    assert_eq!(
+        scalar(&mut c, "SELECT CAST(ISNULL((select sum(cast(gs.size as float))*convert(float,8) from sys.database_files gs where gs.data_space_id = g.data_space_id), 0) AS float) FROM sys.filegroups AS g WHERE g.name = 'PRIMARY'"),
+        "1024"
+    );
 }
 
 #[test]
@@ -249,4 +254,48 @@ fn the_server_properties_that_ssms_reads_into_numbers_and_booleans_are_not_null(
     assert_eq!(scalar(&mut c, "SELECT SERVERPROPERTY('InstanceName')"), "NULL");
     assert_eq!(scalar(&mut c, "SELECT SERVERPROPERTY('IsHadrEnabled')"), "0");
     assert_eq!(scalar(&mut c, "SELECT SERVERPROPERTY('LCID')"), "1033");
+}
+
+#[test]
+fn the_policy_store_is_there_with_a_new_servers_configuration() {
+    // what SSMS reads when Policy Management is opened
+    let mut c = conn();
+    assert_eq!(scalar(&mut c, "SELECT CAST((SELECT current_value FROM msdb.dbo.syspolicy_configuration WHERE name = 'HistoryRetentionInDays') AS int)"), "90");
+    assert_eq!(scalar(&mut c, "SELECT CAST((SELECT current_value FROM msdb.dbo.syspolicy_configuration WHERE name = 'Enabled') AS bit)"), "0");
+}
+
+#[test]
+fn the_views_node_of_ssms_can_list_views() {
+    // SSMS reads the ledger columns of sys.all_views; a missing one fails the query and the node shows nothing
+    let mut c = conn();
+    exec(&mut c, "CREATE VIEW dbo.v1 AS SELECT 1 AS a");
+    assert_eq!(scalar(&mut c, "SELECT v.name FROM sys.all_views AS v WHERE v.type = 'V' AND CAST(ISNULL(v.ledger_view_type, 0) AS tinyint) = 0 AND v.is_ms_shipped = 0"), "v1");
+}
+
+#[test]
+fn the_columns_of_a_view_are_listed_with_their_types() {
+    // SSMS's Views > Columns node
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE dbo.t (a int NOT NULL, b nvarchar(20))");
+    exec(&mut c, "CREATE VIEW dbo.v AS SELECT a, b, a + 1 AS c FROM dbo.t");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.all_columns AS c JOIN sys.all_views AS v ON c.object_id = v.object_id WHERE v.name = 'v'"), "3");
+    assert_eq!(scalar(&mut c, "SELECT c.name + ':' + TYPE_NAME(c.system_type_id) FROM sys.columns AS c JOIN sys.views AS v ON c.object_id = v.object_id WHERE v.name = 'v' AND c.column_id = 2"), "b:nvarchar");
+    // an altered view is listed with its new columns
+    exec(&mut c, "ALTER VIEW dbo.v AS SELECT a FROM dbo.t");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.columns AS c JOIN sys.views AS v ON c.object_id = v.object_id WHERE v.name = 'v'"), "1");
+}
+
+#[test]
+fn the_folders_of_ssms_under_programmability_and_synonyms_list_their_objects() {
+    // the columns these queries name that were missing made the folders empty
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE dbo.t (a int)");
+    exec(&mut c, "CREATE PROCEDURE dbo.p AS SELECT 1");
+    exec(&mut c, "CREATE SYNONYM dbo.sy FOR dbo.t");
+    exec(&mut c, "CREATE VIEW dbo.v AS SELECT a FROM dbo.t");
+    assert_eq!(scalar(&mut c, "SELECT sp.name FROM sys.all_objects AS sp LEFT JOIN sys.all_sql_modules AS m ON m.object_id = sp.object_id WHERE sp.type = 'P' AND sp.is_ms_shipped = 0"), "p");
+    assert_eq!(scalar(&mut c, "SELECT CAST(s.create_date AS date) FROM sys.synonyms AS s WHERE s.name = 'sy'").len() > 0, true);
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.all_views AS v WHERE CAST(ISNULL(v.is_dropped_ledger_view, 0) AS bit) = 0 AND v.name = 'v'"), "1");
+    exec(&mut c, "CREATE INDEX ix ON dbo.t (a)");
+    assert_eq!(scalar(&mut c, "SELECT CAST(ISNULL(ic.column_store_order_ordinal, 0) AS int) FROM sys.index_columns AS ic JOIN sys.tables t ON t.object_id = ic.object_id WHERE t.name = 't'"), "0");
 }

@@ -178,7 +178,14 @@ Scripting a table and View Dependencies send long batches that need the catalog 
 (from the definitions of views, procedures, functions and triggers), `sys.dm_sql_referencing_entities`, the property columns of `sys.tables`,
 `sys.columns`, `sys.indexes` and `sys.databases`, `COLLATE DATABASE_DEFAULT`, `UPDATE ... FROM` a table that does not name the target,
 and variables that are declared inside a block and used after it. A result column that SMO reads as a byte or a boolean must be sent as one:
-`ISNULL(column, value)` has the type of the column. On a cluster, View Dependencies does not work yet: see [distributed.md](distributed.md).
+`ISNULL(column, value)` has the type of the column, and arithmetic of an int with a binary literal (`(@@microsoftversion / 0x1000000) & 0xff`) is an int.
+On a cluster, a client's temporary tables are handled as [distributed.md](distributed.md) says, and View Dependencies works.
+
+The folders of Object Explorer (Tables, Views and their Columns, Synonyms, Programmability, Storage, Security, Memory Optimization Advisor,
+Policy Management) each run a catalog query; one that names a column or view the server lacks fails and SSMS shows an empty folder with no message.
+The columns of a view are found by running its query for no rows (once per connection and view text). `msdb.dbo.syspolicy_configuration`
+exists with a new server's values; Policy-Based Management is not implemented (no policies). The Memory Optimization Advisor opens but cannot
+continue: there is no In-Memory OLTP.
 
 ## Not supported
 

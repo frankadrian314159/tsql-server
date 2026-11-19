@@ -214,6 +214,9 @@ pub struct SessionState {
     pub lock_timeout: i64,
     pub login_id: i32,
     pub pushdown: Vec<Vec<(String, Vec<Expr>)>>,
+    /// The columns of the views (by object id) that `sys.columns` lists: found by running the view's query for no rows, kept with the
+    /// view's text so that an altered view is found again. See `Engine::prime_view_columns`.
+    pub view_cols: HashMap<i32, (String, Vec<(String, Option<DataType>, bool)>)>,
     pub imp_stack: Vec<(String, Option<String>)>,
     pub plan: Vec<String>,
     pub order_hint: Option<optimizer::OrderHint>,
@@ -339,6 +342,7 @@ impl SessionState {
             lock_timeout: -1,
             login_id: 0,
             pushdown: vec![],
+            view_cols: HashMap::new(),
             imp_stack: vec![],
             plan: vec![],
             order_hint: None,

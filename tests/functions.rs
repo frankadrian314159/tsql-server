@@ -318,3 +318,14 @@ fn time_zone_functions() {
     ]);
     assert_eq!(err_no(&mut c, "SELECT GETDATE() AT TIME ZONE 'Nowhere'"), 9820);
 }
+
+#[test]
+fn a_binary_operand_takes_the_int_type_of_the_other_operand() {
+    // SSMS reads `(@@microsoftversion / 0x1000000) & 0xff` as an int
+    let mut c = conn();
+    let p = |c: &mut tsql_server::Connection, e: &str| scalar(c, &format!("SELECT CAST(SQL_VARIANT_PROPERTY({}, 'BaseType') AS VARCHAR(30))", e));
+    assert_eq!(p(&mut c, "(@@microsoftversion / 0x1000000) & 0xff"), "int");
+    assert_eq!(scalar(&mut c, "SELECT (@@microsoftversion / 0x1000000) & 0xff"), "16");
+    assert_eq!(p(&mut c, "CAST(5 AS bigint) + 0x01"), "bigint");
+    assert_eq!(scalar(&mut c, "SELECT 0xff + 1"), "256");
+}

@@ -1209,16 +1209,28 @@ pub fn arith_with(op: BinOp, a: &Value, b: &Value, p1: Option<u32>, p2: Option<u
     } else {
         b
     };
+    // a binary operand takes the type of the other operand (int with an int: `@@microsoftversion / 0x1000000` is an int, as SMO reads it);
+    // two binaries, or a binary and a bigint, make a bigint
     let a3;
     let b3;
+    let a_int = matches!(a, Value::Int(_) | Value::Bit(_));
+    let b_int = matches!(b, Value::Int(_) | Value::Bit(_));
+    let from_bin = |x: &Vec<u8>, other_int: bool| {
+        let n = to_int_from_bin(x);
+        if other_int && x.len() <= 4 {
+            Value::Int(n as i32)
+        } else {
+            Value::BigInt(n)
+        }
+    };
     let a = if let Value::Bin(x) = a {
-        a3 = Value::BigInt(to_int_from_bin(x));
+        a3 = from_bin(x, b_int);
         &a3
     } else {
         a
     };
     let b = if let Value::Bin(x) = b {
-        b3 = Value::BigInt(to_int_from_bin(x));
+        b3 = from_bin(x, a_int);
         &b3
     } else {
         b
