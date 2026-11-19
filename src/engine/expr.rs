@@ -953,7 +953,7 @@ impl<'a> Engine<'a> {
             "@@REMSERVER" => Value::Null,
             "@@DATEFIRST" => Value::Int(self.ses.datefirst),
             "@@MAX_CONNECTIONS" => Value::Int(32767),
-            "@@MICROSOFTVERSION" => Value::Int(0x10000000 + 4000),
+            "@@MICROSOFTVERSION" => Value::Int(0x10000000 + 1000),
             "@@CURSOR_ROWS" => Value::Int(-1),
             "@@LOCK_TIMEOUT" => Value::Int(-1),
             "@@TEXTSIZE" => Value::Int(2147483647),

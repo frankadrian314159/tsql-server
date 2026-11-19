@@ -99,6 +99,36 @@ impl<'a> Engine<'a> {
         for tr in from {
             collect_cluster(tr, &mut leaves, &mut conds);
         }
+        // a column of the WHERE that two of the tables have is ambiguous: said before any row is read (the joined rows of a cross join
+        // are not made to find it out on the first of them)
+        if let (Some(w), true) = (where_, leaves.len() > 1) {
+            let mut sets: Vec<Vec<String>> = vec![];
+            for tr in &leaves {
+                match self.table_leaf(tr) {
+                    Some(tl) => sets.push(tl.t.columns.iter().map(|c| c.name.to_lowercase()).collect()),
+                    None => {
+                        sets.clear();
+                        break;
+                    }
+                }
+            }
+            if !sets.is_empty() {
+                let mut ambiguous: Option<String> = None;
+                crate::rewrite::astutil::walk_expr(w, &mut |x| {
+                    if let Expr::Col(p) = x {
+                        if p.len() == 1 && ambiguous.is_none() {
+                            let n = p[0].to_lowercase();
+                            if sets.iter().filter(|cols| cols.contains(&n)).count() > 1 {
+                                ambiguous = Some(p[0].clone());
+                            }
+                        }
+                    }
+                });
+                if let Some(n) = ambiguous {
+                    return Err(SqlError::new(209, format!("Ambiguous column name '{}'.", n)));
+                }
+            }
+        }
         let mut wconds: Vec<Expr> = vec![];
         // (a single table is read by `eval_table_ref` with the conditions already pushed down to it)
         if let (Some(w), true) = (where_, self.ses.optimizer && leaves.len() > 1) {

@@ -326,6 +326,27 @@ fn a_binary_operand_takes_the_int_type_of_the_other_operand() {
     let p = |c: &mut tsql_server::Connection, e: &str| scalar(c, &format!("SELECT CAST(SQL_VARIANT_PROPERTY({}, 'BaseType') AS VARCHAR(30))", e));
     assert_eq!(p(&mut c, "(@@microsoftversion / 0x1000000) & 0xff"), "int");
     assert_eq!(scalar(&mut c, "SELECT (@@microsoftversion / 0x1000000) & 0xff"), "16");
+    // the version number, the build and the text of @@VERSION agree: 16.0.1000
+    assert_eq!(scalar(&mut c, "SELECT @@microsoftversion & 0xffff"), "1000");
+    assert!(scalar(&mut c, "SELECT @@VERSION").contains("16.0.1000"));
+    assert_eq!(scalar(&mut c, "SELECT CAST(SERVERPROPERTY('ProductVersion') AS varchar(20))"), "16.0.1000.6");
     assert_eq!(p(&mut c, "CAST(5 AS bigint) + 0x01"), "bigint");
     assert_eq!(scalar(&mut c, "SELECT 0xff + 1"), "256");
+}
+
+#[test]
+fn an_ambiguous_column_in_a_join_is_reported_before_the_rows_are_joined() {
+    // `FROM orders a, orders b WHERE id = 7` over thousands of rows used to build the whole cross product (gigabytes) before the first row said the column was ambiguous
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE amb (id INT PRIMARY KEY, v INT)");
+    for k in 0..6 {
+        exec(&mut c, &format!("INSERT INTO amb VALUES {}", (1..=500).map(|i| format!("({}, {})", k * 500 + i, i)).collect::<Vec<_>>().join(",")));
+    }
+    assert_eq!(err_no(&mut c, "SELECT COUNT(*) FROM amb a, amb b WHERE id = 7"), 209);
+    assert_eq!(err_no(&mut c, "SELECT COUNT(*) FROM amb a, amb b WHERE v = 7 AND a.id = b.id"), 209);
+    // qualified, or a column only one table has, is fine
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM amb a, amb b WHERE a.id = 7 AND b.id = 7"), "1");
+    exec(&mut c, "CREATE TABLE amb2 (k INT, w INT)");
+    exec(&mut c, "INSERT INTO amb2 VALUES (1, 1)");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM amb a, amb2 b WHERE id = 7"), "1");
 }

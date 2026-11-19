@@ -299,3 +299,42 @@ fn the_folders_of_ssms_under_programmability_and_synonyms_list_their_objects() {
     exec(&mut c, "CREATE INDEX ix ON dbo.t (a)");
     assert_eq!(scalar(&mut c, "SELECT CAST(ISNULL(ic.column_store_order_ordinal, 0) AS int) FROM sys.index_columns AS ic JOIN sys.tables t ON t.object_id = ic.object_id WHERE t.name = 't'"), "0");
 }
+
+#[test]
+fn what_the_table_designer_asks_at_open_works() {
+    let mut c = conn();
+    assert_eq!(scalar(&mut c, "SELECT CASE WHEN permissions() <> 0 THEN 1 ELSE 0 END"), "1");
+    assert_eq!(
+        scalar(&mut c, "SELECT COUNT(*) FROM sys.database_files AS df INNER JOIN sys.databases AS dtb ON (db_id() = dtb.database_id) AND (df.type = 2 OR df.type = 0) AND (df.drop_lsn IS NULL) WHERE dtb.source_database_id IS NULL"),
+        "1"
+    );
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.master_files AS mf WHERE mf.type = 0 AND mf.drop_lsn IS NULL AND mf.state = 0 AND mf.database_id = db_id()"), "1");
+}
+
+#[test]
+fn the_information_schema_views_clients_read_are_all_there() {
+    // Beekeeper Studio (INFORMATION_SCHEMA.PARAMETERS) and others read the standard views; a missing one stopped the client
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE dbo.p (id int NOT NULL CONSTRAINT pk_p PRIMARY KEY, n varchar(10) CONSTRAINT ck_n CHECK (n <> 'x'))");
+    exec(&mut c, "CREATE TABLE dbo.c (id int NOT NULL, pid int NOT NULL CONSTRAINT fk_c_p FOREIGN KEY REFERENCES dbo.p (id) ON DELETE CASCADE)");
+    exec(&mut c, "CREATE VIEW dbo.v AS SELECT id, n FROM dbo.p");
+    exec(&mut c, "CREATE PROCEDURE dbo.pr @a int, @b varchar(20) OUTPUT AS SELECT 1");
+    exec(&mut c, "CREATE SEQUENCE dbo.sq AS int START WITH 5 INCREMENT BY 2");
+    exec(&mut c, "CREATE TYPE dbo.d FROM varchar(30) NOT NULL");
+    let n = |c: &mut tsql_server::Connection, v: &str| scalar(c, &format!("SELECT COUNT(*) FROM INFORMATION_SCHEMA.{}", v));
+    assert_eq!(n(&mut c, "PARAMETERS"), "2");
+    assert_eq!(scalar(&mut c, "SELECT PARAMETER_MODE + ':' + DATA_TYPE FROM INFORMATION_SCHEMA.PARAMETERS WHERE PARAMETER_NAME = '@b'"), "INOUT:varchar");
+    assert_eq!(n(&mut c, "REFERENTIAL_CONSTRAINTS"), "1");
+    assert_eq!(scalar(&mut c, "SELECT UNIQUE_CONSTRAINT_NAME + ':' + DELETE_RULE + ':' + UPDATE_RULE FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS"), "pk_p:CASCADE:NO ACTION");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE WHERE CONSTRAINT_NAME = 'fk_c_p' AND TABLE_NAME = 'p' AND COLUMN_NAME = 'id'"), "1");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM INFORMATION_SCHEMA.CONSTRAINT_TABLE_USAGE WHERE CONSTRAINT_NAME = 'pk_p'"), "1");
+    assert_eq!(scalar(&mut c, "SELECT CHECK_CLAUSE FROM INFORMATION_SCHEMA.CHECK_CONSTRAINTS WHERE CONSTRAINT_NAME = 'ck_n'").is_empty(), false);
+    assert_eq!(n(&mut c, "VIEW_TABLE_USAGE"), "1");
+    assert_eq!(n(&mut c, "VIEW_COLUMN_USAGE"), "2");
+    assert_eq!(scalar(&mut c, "SELECT DATA_TYPE FROM INFORMATION_SCHEMA.DOMAINS WHERE DOMAIN_NAME = 'd'"), "varchar");
+    assert_eq!(scalar(&mut c, "SELECT START_VALUE FROM INFORMATION_SCHEMA.SEQUENCES WHERE SEQUENCE_NAME = 'sq'"), "5");
+    // (nothing is granted here, and the table-valued functions' columns are not listed, but the views are there)
+    for v in ["ROUTINE_COLUMNS", "TABLE_PRIVILEGES", "COLUMN_PRIVILEGES"] {
+        assert_eq!(n(&mut c, v), "0", "{}", v);
+    }
+}

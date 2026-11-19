@@ -715,10 +715,10 @@ impl<'a> Engine<'a> {
                     let mut rows = vec![];
                     for d in self.srv.databases.values() {
                         for (k, (kind, desc, ext)) in [(0, "ROWS", "mdf"), (1, "LOG", "ldf")].iter().enumerate() {
-                            rows.push(vec![Value::Int(d.id), Value::Int(k as i32 + 1), sv(&format!("{}{}", d.name, if k == 0 { "" } else { "_log" })), sv(&format!("{}.{}", d.name, ext)), Value::Int(*kind), sv(desc), Value::Int(128), Value::Int(-1), Value::Int(0), sv("ONLINE"), Value::Int(if k == 0 { 1 } else { 0 }), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false)]);
+                            rows.push(vec![Value::Int(d.id), Value::Int(k as i32 + 1), sv(&format!("{}{}", d.name, if k == 0 { "" } else { "_log" })), sv(&format!("{}.{}", d.name, ext)), Value::Int(*kind), sv(desc), Value::Int(128), Value::Int(-1), Value::Int(0), sv("ONLINE"), Value::Int(if k == 0 { 1 } else { 0 }), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Int(0), Value::Null]);
                         }
                     }
-                    Some(rs(&[("database_id", DataType::Int), ("file_id", DataType::Int), ("name", nv()), ("physical_name", nv()), ("type", DataType::TinyInt), ("type_desc", nv()), ("size", DataType::Int), ("max_size", DataType::Int), ("growth", DataType::Int), ("state_desc", nv()), ("data_space_id", DataType::Int), ("is_media_read_only", DataType::Bit), ("is_read_only", DataType::Bit), ("is_sparse", DataType::Bit), ("is_percent_growth", DataType::Bit), ("is_name_reserved", DataType::Bit)], rows))
+                    Some(rs(&[("database_id", DataType::Int), ("file_id", DataType::Int), ("name", nv()), ("physical_name", nv()), ("type", DataType::TinyInt), ("type_desc", nv()), ("size", DataType::Int), ("max_size", DataType::Int), ("growth", DataType::Int), ("state_desc", nv()), ("data_space_id", DataType::Int), ("is_media_read_only", DataType::Bit), ("is_read_only", DataType::Bit), ("is_sparse", DataType::Bit), ("is_percent_growth", DataType::Bit), ("is_name_reserved", DataType::Bit), ("state", DataType::TinyInt), ("drop_lsn", DataType::Decimal(25, 0))], rows))
                 }
                 "dm_exec_connections" => {
                     let rows = self
@@ -1272,8 +1272,8 @@ impl<'a> Engine<'a> {
                     })
                 }
                 "database_files" => Some(rs(
-                    &[("file_id", DataType::Int), ("name", nv()), ("physical_name", nv()), ("type_desc", nv()), ("state_desc", nv()), ("size", DataType::Int), ("max_size", DataType::Int), ("growth", DataType::Int), ("type", DataType::TinyInt), ("data_space_id", DataType::Int), ("state", DataType::TinyInt), ("is_media_read_only", DataType::Bit), ("is_read_only", DataType::Bit), ("is_sparse", DataType::Bit), ("is_percent_growth", DataType::Bit), ("is_name_reserved", DataType::Bit)],
-                    vec![vec![Value::Int(1), sv(&dbname), sv(&format!("{}.mdf", dbname)), sv("ROWS"), sv("ONLINE"), Value::Int(128), Value::Int(-1), Value::Int(0), Value::Int(0), Value::Int(1), Value::Int(0), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false)]],
+                    &[("file_id", DataType::Int), ("name", nv()), ("physical_name", nv()), ("type_desc", nv()), ("state_desc", nv()), ("size", DataType::Int), ("max_size", DataType::Int), ("growth", DataType::Int), ("type", DataType::TinyInt), ("data_space_id", DataType::Int), ("state", DataType::TinyInt), ("is_media_read_only", DataType::Bit), ("is_read_only", DataType::Bit), ("is_sparse", DataType::Bit), ("is_percent_growth", DataType::Bit), ("is_name_reserved", DataType::Bit), ("drop_lsn", DataType::Decimal(25, 0))],
+                    vec![vec![Value::Int(1), sv(&dbname), sv(&format!("{}.mdf", dbname)), sv("ROWS"), sv("ONLINE"), Value::Int(128), Value::Int(-1), Value::Int(0), Value::Int(0), Value::Int(1), Value::Int(0), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Null]],
                 )),
                 "foreign_key_columns" => {
                     let mut rows = vec![];
@@ -1785,6 +1785,187 @@ impl<'a> Engine<'a> {
                         }
                     }
                     Some(rs(&[("CONSTRAINT_CATALOG", nv()), ("CONSTRAINT_SCHEMA", nv()), ("CONSTRAINT_NAME", nv()), ("TABLE_CATALOG", nv()), ("TABLE_SCHEMA", nv()), ("TABLE_NAME", nv()), ("COLUMN_NAME", nv()), ("ORDINAL_POSITION", DataType::Int)], rows))
+                }
+                // the rest of INFORMATION_SCHEMA (clients such as Beekeeper Studio and SSRS's designers read them)
+                "parameters" => {
+                    let mut rows = vec![];
+                    for o in db.objects.values() {
+                        let params: &[crate::ast::Param] = match o {
+                            Object::Proc(p) => &p.params[..],
+                            Object::Func(f) => &f.def.params[..],
+                            _ => continue,
+                        };
+                        for (i, p) in params.iter().enumerate() {
+                            let dt = p.ty.parts.last().and_then(|n| DataType::from_name(n, &p.ty.args, false).ok());
+                            let is_num = dt.as_ref().is_some_and(|d| d.is_numeric());
+                            let is_str = dt.as_ref().is_some_and(|d| d.is_string());
+                            let (_, _, pr, sc) = dt.as_ref().map(type_info).unwrap_or((0, 0, 0, 0));
+                            let nm = if p.name.starts_with('@') { p.name.clone() } else { format!("@{}", p.name) };
+                            rows.push(vec![
+                                cat.clone(), sv(o.schema()), sv(o.name()), Value::Int(i as i32 + 1), sv(if p.out { "INOUT" } else { "IN" }), sv("NO"), sv("NO"), sv(&nm),
+                                sv(&dt.as_ref().map(type_name).unwrap_or_else(|| p.ty.parts.last().cloned().unwrap_or_default())),
+                                if is_str { dt.as_ref().and_then(|d| d.length()).map(Value::Int).unwrap_or(Value::Null) } else { Value::Null },
+                                Value::Null,
+                                if is_str { cat.clone() } else { Value::Null }, if is_str { sv("sys") } else { Value::Null }, if is_str { sv(&db.collation_or_default()) } else { Value::Null },
+                                Value::Null, Value::Null, Value::Null,
+                                if is_num { Value::Int(pr) } else { Value::Null }, if is_num { Value::Int(10) } else { Value::Null }, if is_num { Value::Int(sc) } else { Value::Null },
+                                Value::Null, Value::Null, Value::Null, Value::Null, Value::Null, Value::Null, Value::Null, Value::Null, Value::Null,
+                            ]);
+                        }
+                    }
+                    Some(rs(&[
+                        ("SPECIFIC_CATALOG", nv()), ("SPECIFIC_SCHEMA", nv()), ("SPECIFIC_NAME", nv()), ("ORDINAL_POSITION", DataType::Int), ("PARAMETER_MODE", nv()), ("IS_RESULT", nv()), ("AS_LOCATOR", nv()), ("PARAMETER_NAME", nv()),
+                        ("DATA_TYPE", nv()), ("CHARACTER_MAXIMUM_LENGTH", DataType::Int), ("CHARACTER_OCTET_LENGTH", DataType::Int), ("COLLATION_CATALOG", nv()), ("COLLATION_SCHEMA", nv()), ("COLLATION_NAME", nv()),
+                        ("CHARACTER_SET_CATALOG", nv()), ("CHARACTER_SET_SCHEMA", nv()), ("CHARACTER_SET_NAME", nv()), ("NUMERIC_PRECISION", DataType::TinyInt), ("NUMERIC_PRECISION_RADIX", DataType::SmallInt), ("NUMERIC_SCALE", DataType::Int),
+                        ("DATETIME_PRECISION", DataType::SmallInt), ("INTERVAL_TYPE", nv()), ("INTERVAL_PRECISION", DataType::SmallInt), ("USER_DEFINED_TYPE_CATALOG", nv()), ("USER_DEFINED_TYPE_SCHEMA", nv()), ("USER_DEFINED_TYPE_NAME", nv()),
+                        ("SCOPE_CATALOG", nv()), ("SCOPE_SCHEMA", nv()), ("SCOPE_NAME", nv()),
+                    ], rows))
+                }
+                "referential_constraints" => {
+                    let mut rows = vec![];
+                    for o in db.objects.values() {
+                        if let Object::Table(t) = o {
+                            for f in &t.fks {
+                                let (usch, uname) = match db.objects.get(&f.ref_key) {
+                                    Some(Object::Table(p)) => {
+                                        let by_cols = |cols: &Vec<usize>| cols.len() == f.ref_cols.len() && cols.iter().zip(&f.ref_cols).all(|(&c, n)| p.columns.get(c).is_some_and(|x| x.name.eq_ignore_ascii_case(n)));
+                                        let name = p.pk.as_ref().filter(|k| by_cols(&k.cols)).map(|k| k.name.clone()).or_else(|| p.uniques.iter().find(|u| by_cols(&u.cols)).map(|u| u.name.clone()));
+                                        (Value::Str(p.schema.clone()), name.map(Value::Str).unwrap_or(Value::Null))
+                                    }
+                                    _ => (Value::Null, Value::Null),
+                                };
+                                let rule = |r: &str| sv(&if r.trim().is_empty() { "NO ACTION".to_string() } else { r.to_uppercase() });
+                                rows.push(vec![cat.clone(), sv(&t.schema), sv(&f.name), if matches!(uname, Value::Null) { Value::Null } else { cat.clone() }, usch, uname, sv("SIMPLE"), rule(&f.on_update), rule(&f.on_delete)]);
+                            }
+                        }
+                    }
+                    Some(rs(&[("CONSTRAINT_CATALOG", nv()), ("CONSTRAINT_SCHEMA", nv()), ("CONSTRAINT_NAME", nv()), ("UNIQUE_CONSTRAINT_CATALOG", nv()), ("UNIQUE_CONSTRAINT_SCHEMA", nv()), ("UNIQUE_CONSTRAINT_NAME", nv()), ("MATCH_OPTION", DataType::VarChar(7)), ("UPDATE_RULE", DataType::VarChar(11)), ("DELETE_RULE", DataType::VarChar(11))], rows))
+                }
+                "constraint_column_usage" | "constraint_table_usage" => {
+                    let by_column = lname == "constraint_column_usage";
+                    let mut rows = vec![];
+                    for o in db.objects.values() {
+                        if let Object::Table(t) = o {
+                            let mut add = |n: &str, cols: Vec<&str>| {
+                                if by_column {
+                                    for c in cols {
+                                        rows.push(vec![cat.clone(), sv(&t.schema), sv(&t.name), sv(c), cat.clone(), sv(&t.schema), sv(n)]);
+                                    }
+                                } else {
+                                    rows.push(vec![cat.clone(), sv(&t.schema), sv(&t.name), cat.clone(), sv(&t.schema), sv(n)]);
+                                }
+                            };
+                            let names = |cols: &Vec<usize>| cols.iter().filter_map(|&i| t.columns.get(i).map(|c| c.name.as_str())).collect::<Vec<_>>();
+                            if let Some(pk) = &t.pk {
+                                add(&pk.name, names(&pk.cols));
+                            }
+                            for u in t.uniques.iter().filter(|u| !u.is_index) {
+                                add(&u.name, names(&u.cols));
+                            }
+                            for c in &t.checks {
+                                add(&c.name, c.col.as_deref().into_iter().collect());
+                            }
+                            // (a foreign key is listed under the table and columns it refers to)
+                            for f in &t.fks {
+                                if let Some(Object::Table(p)) = db.objects.get(&f.ref_key) {
+                                    if by_column {
+                                        for c in &f.ref_cols {
+                                            rows.push(vec![cat.clone(), sv(&p.schema), sv(&p.name), sv(c), cat.clone(), sv(&t.schema), sv(&f.name)]);
+                                        }
+                                    } else {
+                                        rows.push(vec![cat.clone(), sv(&p.schema), sv(&p.name), cat.clone(), sv(&t.schema), sv(&f.name)]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let mut cols = vec![("TABLE_CATALOG", nv()), ("TABLE_SCHEMA", nv()), ("TABLE_NAME", nv())];
+                    if by_column {
+                        cols.push(("COLUMN_NAME", nv()));
+                    }
+                    cols.extend([("CONSTRAINT_CATALOG", nv()), ("CONSTRAINT_SCHEMA", nv()), ("CONSTRAINT_NAME", nv())]);
+                    Some(rs(&cols, rows))
+                }
+                "check_constraints" => {
+                    let mut rows = vec![];
+                    for o in db.objects.values() {
+                        if let Object::Table(t) = o {
+                            for c in &t.checks {
+                                rows.push(vec![cat.clone(), sv(&t.schema), sv(&c.name), sv(&c.text)]);
+                            }
+                        }
+                    }
+                    Some(rs(&[("CONSTRAINT_CATALOG", nv()), ("CONSTRAINT_SCHEMA", nv()), ("CONSTRAINT_NAME", nv()), ("CHECK_CLAUSE", DataType::NVarChar(MAX))], rows))
+                }
+                // the tables a view reads, and the columns of them it names (a column counts when its name is a word of the view's text)
+                "view_table_usage" | "view_column_usage" => {
+                    let by_column = lname == "view_column_usage";
+                    let mut rows = vec![];
+                    let words_of = |text: &str| -> std::collections::HashSet<String> { text.split(|ch: char| !(ch.is_alphanumeric() || ch == '_')).filter(|w| !w.is_empty()).map(|w| w.to_lowercase()).collect() };
+                    let mut seen = std::collections::HashSet::new();
+                    for d in self.dependency_rows() {
+                        let Some(Object::View(v)) = db.objects.get(&format!("{}.{}", d.referencing_schema, d.referencing_name).to_lowercase()) else { continue };
+                        let Some(Object::Table(t)) = db.objects.get(&format!("{}.{}", d.ref_schema, d.ref_name).to_lowercase()) else { continue };
+                        if !seen.insert((v.object_id, t.object_id)) {
+                            continue;
+                        }
+                        if by_column {
+                            let words = words_of(&v.text);
+                            for c in t.columns.iter().filter(|c| words.contains(&c.name.to_lowercase())) {
+                                rows.push(vec![cat.clone(), sv(&v.schema), sv(&v.name), cat.clone(), sv(&t.schema), sv(&t.name), sv(&c.name)]);
+                            }
+                        } else {
+                            rows.push(vec![cat.clone(), sv(&v.schema), sv(&v.name), cat.clone(), sv(&t.schema), sv(&t.name)]);
+                        }
+                    }
+                    let mut cols = vec![("VIEW_CATALOG", nv()), ("VIEW_SCHEMA", nv()), ("VIEW_NAME", nv()), ("TABLE_CATALOG", nv()), ("TABLE_SCHEMA", nv()), ("TABLE_NAME", nv())];
+                    if by_column {
+                        cols.push(("COLUMN_NAME", nv()));
+                    }
+                    Some(rs(&cols, rows))
+                }
+                // the columns of the table-valued functions are not listed
+                "routine_columns" => Some(rs(
+                    &[("TABLE_CATALOG", nv()), ("TABLE_SCHEMA", nv()), ("TABLE_NAME", nv()), ("COLUMN_NAME", nv()), ("ORDINAL_POSITION", DataType::Int), ("COLUMN_DEFAULT", DataType::NVarChar(MAX)), ("IS_NULLABLE", DataType::VarChar(3)), ("DATA_TYPE", nv()),
+                      ("CHARACTER_MAXIMUM_LENGTH", DataType::Int), ("CHARACTER_OCTET_LENGTH", DataType::Int), ("NUMERIC_PRECISION", DataType::TinyInt), ("NUMERIC_PRECISION_RADIX", DataType::SmallInt), ("NUMERIC_SCALE", DataType::Int), ("DATETIME_PRECISION", DataType::SmallInt)],
+                    vec![],
+                )),
+                "domains" => {
+                    let mut rows = vec![];
+                    for u in db.types.values() {
+                        if let crate::catalog::UserTypeKind::Alias(dt, _) = &u.kind {
+                            let is_num = dt.is_numeric();
+                            let is_str = dt.is_string();
+                            let (_, _, pr, sc) = type_info(dt);
+                            rows.push(vec![
+                                cat.clone(), sv(&u.schema), sv(&u.name), sv(&type_name(dt)),
+                                if is_str { dt.length().map(Value::Int).unwrap_or(Value::Null) } else { Value::Null }, Value::Null,
+                                if is_str { cat.clone() } else { Value::Null }, if is_str { sv("sys") } else { Value::Null }, if is_str { sv(&db.collation_or_default()) } else { Value::Null },
+                                Value::Null, Value::Null, Value::Null,
+                                if is_num { Value::Int(pr) } else { Value::Null }, if is_num { Value::Int(10) } else { Value::Null }, if is_num { Value::Int(sc) } else { Value::Null },
+                                Value::Null, Value::Null,
+                            ]);
+                        }
+                    }
+                    Some(rs(&[
+                        ("DOMAIN_CATALOG", nv()), ("DOMAIN_SCHEMA", nv()), ("DOMAIN_NAME", nv()), ("DATA_TYPE", nv()), ("CHARACTER_MAXIMUM_LENGTH", DataType::Int), ("CHARACTER_OCTET_LENGTH", DataType::Int),
+                        ("COLLATION_CATALOG", nv()), ("COLLATION_SCHEMA", nv()), ("COLLATION_NAME", nv()), ("CHARACTER_SET_CATALOG", nv()), ("CHARACTER_SET_SCHEMA", nv()), ("CHARACTER_SET_NAME", nv()),
+                        ("NUMERIC_PRECISION", DataType::TinyInt), ("NUMERIC_PRECISION_RADIX", DataType::SmallInt), ("NUMERIC_SCALE", DataType::Int), ("DATETIME_PRECISION", DataType::SmallInt), ("DOMAIN_DEFAULT", DataType::NVarChar(MAX)),
+                    ], rows))
+                }
+                // grants are not listed here (see sys.database_permissions)
+                "table_privileges" => Some(rs(&[("GRANTOR", nv()), ("GRANTEE", nv()), ("TABLE_CATALOG", nv()), ("TABLE_SCHEMA", nv()), ("TABLE_NAME", nv()), ("PRIVILEGE_TYPE", DataType::VarChar(10)), ("IS_GRANTABLE", DataType::VarChar(3))], vec![])),
+                "column_privileges" => Some(rs(&[("GRANTOR", nv()), ("GRANTEE", nv()), ("TABLE_CATALOG", nv()), ("TABLE_SCHEMA", nv()), ("TABLE_NAME", nv()), ("COLUMN_NAME", nv()), ("PRIVILEGE_TYPE", DataType::VarChar(10)), ("IS_GRANTABLE", DataType::VarChar(3))], vec![])),
+                "sequences" => {
+                    let mut rows = vec![];
+                    for o in db.objects.values() {
+                        if let Object::Seq(s) = o {
+                            let (_, _, pr, _) = type_info(&s.ty);
+                            rows.push(vec![cat.clone(), sv(&s.schema), sv(&s.name), sv(&type_name(&s.ty)), Value::Int(pr), Value::Int(10), Value::Int(0), Value::BigInt(s.start), Value::BigInt(s.min), Value::BigInt(s.max), Value::BigInt(s.inc), sv(if s.cycle { "YES" } else { "NO" })]);
+                        }
+                    }
+                    Some(rs(&[("SEQUENCE_CATALOG", nv()), ("SEQUENCE_SCHEMA", nv()), ("SEQUENCE_NAME", nv()), ("DATA_TYPE", nv()), ("NUMERIC_PRECISION", DataType::TinyInt), ("NUMERIC_PRECISION_RADIX", DataType::SmallInt), ("NUMERIC_SCALE", DataType::Int),
+                      ("START_VALUE", DataType::BigInt), ("MINIMUM_VALUE", DataType::BigInt), ("MAXIMUM_VALUE", DataType::BigInt), ("INCREMENT", DataType::BigInt), ("CYCLE_OPTION", DataType::VarChar(3))], rows))
                 }
                 _ => None,
             }

@@ -2018,6 +2018,9 @@ impl<'a> Engine<'a> {
                     _ => Value::Null,
                 }
             }
+            // the statement permissions of the current user as a bitmap (what the table designer asks): all of them for a member of
+            // sysadmin or db_owner, none otherwise
+            "PERMISSIONS" if a.is_empty() => Value::Int(if self.is_sysadmin() { 0x0FFF_FFFF } else { 0 }),
             "HAS_PERMS_BY_NAME" => {
                 need_range(name, &a, 3, 5)?;
                 let perm = s(&a[2]).to_uppercase();
