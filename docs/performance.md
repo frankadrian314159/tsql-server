@@ -397,7 +397,10 @@ copied whole out of the heap, each of its sixteen values (the strings are heap a
    (`tests/scan_columns.rs` compares 20 query shapes with and without it).
 2. **A query of nothing but aggregates over one table streams too.** `SELECT COUNT(*), SUM(x) FROM t WHERE ...` with no `GROUP BY` went to
    the general executor, which collects the rows. It is now one group of the streaming executor (no key; the one row of an empty input is
-   made at the end), and the scan can then prune: `COUNT(*)` over `lineitem` 1.2 -> 0.16 s. A join with no `GROUP BY` keeps the general
+   made at the end), and the scan can then prune: `COUNT(*)` over `lineitem` 1.2 -> 0.16 s. A subquery that is correlated (a column of its
+   `WHERE` is the outer query's) keeps the general executor too: run once for each outer row it is an index seek there, and the streaming scan read
+   the whole table for each row (TPC-C's consistency condition 6, 3,000 orders over 30,000 order lines, did not finish in minutes; now 0.1 s,
+   `tests/correlated_stream.rs`). A join with no `GROUP BY` keeps the general
    executor: it starts from the selective table and finds the rest by index, where the streaming join reads the big side whole (a first
    version streamed those too, TPC-H Q19 0.5 s against 1.2 s, and a test of join order caught that a selective join had lost its
    index nested loop).

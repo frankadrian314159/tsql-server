@@ -87,6 +87,9 @@ About 23,000 statements over several seeds are clean now.
 
 Fixed, each with a regression test (`tests/tpc_regressions.rs` unless noted):
 
+* **A correlated subquery over a table of 20,000 slots or more scanned the whole table for each outer row** (the streaming executor took it
+  and does not seek an index for what the outer row gives): TPC-C's initial consistency check (condition 6) never finished, found when a
+  benchmark that had run before hung. Such a subquery now runs in the general executor, which seeks (`tests/correlated_stream.rs`, not here).
 * **Uncorrelated subqueries were re-run for every outer row**, which made TPC-H Q18 take minutes. They are cached for
   the statement (see [performance.md](performance.md)).
 * **The common part of an OR of ANDs hid join conditions** (Q19 cross-joined 60,000 by 2,000 rows, 160 s). Such

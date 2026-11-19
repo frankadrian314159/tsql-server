@@ -457,6 +457,23 @@ impl<'a> Engine<'a> {
             for (c, d) in sc.cols.iter_mut().zip(denied.iter()) {
                 c.denied = d.clone();
             }
+            // a subquery that is correlated (a column of the WHERE is one of the outer query's) runs once per outer row: the general executor
+            // seeks the index its correlated equalities lead (a scan of the whole table for each row of a big outer table is what streaming does)
+            if outer.is_some() {
+                if let Some(w) = &sel.where_ {
+                    let mut correlated = false;
+                    crate::rewrite::astutil::walk_expr(w, &mut |x| {
+                        if let Expr::Col(parts) = x {
+                            if !matches!(sc.find_parts(parts), super::query::Found::One(_)) {
+                                correlated = true;
+                            }
+                        }
+                    });
+                    if correlated {
+                        return Ok(None);
+                    }
+                }
+            }
             // access path
             let pushed: Vec<Expr> = self.plan_pushdown(&sel.from, &sel.where_).into_iter().find(|(al, _)| al.eq_ignore_ascii_case(&a)).map(|(_, e)| e).unwrap_or_default();
             let ap = if guarded {
