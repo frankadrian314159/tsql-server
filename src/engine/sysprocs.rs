@@ -242,6 +242,54 @@ impl<'a> Engine<'a> {
                 self.emit_rowset(Rowset::from_rows(&["TABLE_QUALIFIER".into(), "TABLE_OWNER".into(), "TABLE_NAME".into(), "COLUMN_NAME".into(), "TYPE_NAME".into(), "ORDINAL_POSITION".into(), "IS_NULLABLE".into()], rows));
                 Ok(Some(Value::Int(0)))
             }
+            // the foreign keys that refer to a table or that a table has (SSMS asks for them when it opens a table's design)
+            "sp_fkeys" => {
+                let arg = |pos: usize, nm: &str| -> Option<String> {
+                    args.iter().enumerate().find(|(i, a)| a.0.as_deref().map(|n| n.trim_start_matches('@').eq_ignore_ascii_case(nm)).unwrap_or(a.0.is_none() && *i == pos)).and_then(|(_, a)| if a.1.is_null() { None } else { Some(convert::to_str(&a.1)) })
+                };
+                let (pk_name, pk_owner, fk_name, fk_owner) = (arg(0, "pktable_name"), arg(1, "pktable_owner"), arg(3, "fktable_name"), arg(4, "fktable_owner"));
+                if pk_name.is_none() && fk_name.is_none() {
+                    return Err(SqlError::new(15250, "Primary or foreign key table name must be given.").into());
+                }
+                let same = |want: &Option<String>, have: &str| want.as_ref().map(|w| w.eq_ignore_ascii_case(have)).unwrap_or(true);
+                let db = self.srv.databases.get(&self.ses.db.to_lowercase()).unwrap();
+                let rule = |r: &str| match r.trim().to_uppercase().as_str() {
+                    "CASCADE" => 0i32,
+                    "SET NULL" => 2,
+                    "SET DEFAULT" => 3,
+                    _ => 1,
+                };
+                let mut rows: Vec<Row> = vec![];
+                for o in db.objects.values() {
+                    let Object::Table(t) = o else { continue };
+                    if !same(&fk_name, &t.name) || !same(&fk_owner, &t.schema) {
+                        continue;
+                    }
+                    for f in &t.fks {
+                        let Some(Object::Table(p)) = db.objects.get(&f.ref_key) else { continue };
+                        if !same(&pk_name, &p.name) || !same(&pk_owner, &p.schema) {
+                            continue;
+                        }
+                        let by_cols = |cols: &Vec<usize>| cols.len() == f.ref_cols.len() && cols.iter().zip(&f.ref_cols).all(|(&c, n)| p.columns.get(c).is_some_and(|x| x.name.eq_ignore_ascii_case(n)));
+                        let pk_key = p.pk.as_ref().filter(|k| by_cols(&k.cols)).map(|k| k.name.clone()).or_else(|| p.uniques.iter().find(|u| by_cols(&u.cols)).map(|u| u.name.clone()));
+                        for (k, &ci) in f.cols.iter().enumerate() {
+                            rows.push(vec![
+                                Value::Str(db.name.clone()), Value::Str(p.schema.clone()), Value::Str(p.name.clone()), Value::Str(f.ref_cols.get(k).cloned().unwrap_or_default()),
+                                Value::Str(db.name.clone()), Value::Str(t.schema.clone()), Value::Str(t.name.clone()), Value::Str(t.columns[ci].name.clone()),
+                                Value::Int(k as i32 + 1), Value::Int(rule(&f.on_update)), Value::Int(rule(&f.on_delete)), Value::Str(f.name.clone()), pk_key.clone().map(Value::Str).unwrap_or(Value::Null), Value::Int(7),
+                            ]);
+                        }
+                    }
+                }
+                rows.sort_by(|x, y| format!("{:?}{:?}{:?}", x[6], x[5], x[8]).cmp(&format!("{:?}{:?}{:?}", y[6], y[5], y[8])));
+                let names: Vec<String> = ["PKTABLE_QUALIFIER", "PKTABLE_OWNER", "PKTABLE_NAME", "PKCOLUMN_NAME", "FKTABLE_QUALIFIER", "FKTABLE_OWNER", "FKTABLE_NAME", "FKCOLUMN_NAME", "KEY_SEQ", "UPDATE_RULE", "DELETE_RULE", "FK_NAME", "PK_NAME", "DEFERRABILITY"].iter().map(|n| n.to_string()).collect();
+                let mut rs = Rowset::from_rows(&names, rows);
+                for i in [8, 9, 10, 13] {
+                    rs.schema.cols[i].ty = Some(DataType::SmallInt);
+                }
+                self.emit_rowset(rs);
+                Ok(Some(Value::Int(0)))
+            }
             // the collations of the columns of a table, which bulk copy asks for before it sends rows
             "sp_tablecollations_100" | "sp_tablecollations" => {
                 let n = args.first().map(|a| convert::to_str(&a.1)).unwrap_or_default();

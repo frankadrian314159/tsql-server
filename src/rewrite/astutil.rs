@@ -134,12 +134,17 @@ pub fn shard_form(st: &Stmt) -> Stmt {
     }
 }
 
-/// The normalized id of a table name: `schema.table` in lower case (the schema defaults to dbo; a database prefix is
-/// ignored, as a cluster serves one database).
+/// The normalized id of a table name: `schema.table` in lower case (the schema defaults to dbo). A name that has a database
+/// (`db.schema.table`) has it first, `db.schema.table`, unless it is `master`: the cluster's first database, whose objects' ids
+/// have no database in them, as they had before a cluster could have others (so that its saved state still reads).
 pub fn table_id(name: &[String]) -> String {
     let table = name.last().map(|s| s.to_lowercase()).unwrap_or_default();
     let schema = if name.len() >= 2 { name[name.len() - 2].to_lowercase() } else { "dbo".to_string() };
-    format!("{}.{}", if schema.is_empty() { "dbo".to_string() } else { schema }, table)
+    let schema = if schema.is_empty() { "dbo".to_string() } else { schema };
+    match name.len().checked_sub(3).map(|i| name[i].to_lowercase()) {
+        Some(db) if !db.is_empty() && db != "master" => format!("{}.{}.{}", db, schema, table),
+        _ => format!("{}.{}", schema, table),
+    }
 }
 
 /// The ids of all tables that appear in table references of a query (found by walking its serialized form: a table

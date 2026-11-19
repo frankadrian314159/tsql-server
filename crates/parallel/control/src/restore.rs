@@ -13,8 +13,8 @@
 //! does not name is replicated when it has at most `REPLICATE_UPTO` rows and otherwise sharded on the first column of its
 //! primary key, as `CREATE TABLE` does.
 //!
-//! The objects go into the cluster's one database, whatever the statement names (a cluster has no `CREATE DATABASE`);
-//! `WITH REPLACE` first drops the cluster's objects that have the names of restored ones. Only a full backup can be restored,
+//! The objects go into the cluster's database of the name the statement gives (made on the control node and every shard when the
+//! cluster does not have it, see `dbname.rs`); `WITH REPLACE` first drops the database's objects that have the names of restored ones. Only a full backup can be restored,
 //! `WITH RECOVERY` (`NORECOVERY`, `STANDBY`, `STOPAT` and log or differential backups are refused).
 use crate::*;
 use tsql_server::catalog::{Object, Table};
@@ -54,7 +54,34 @@ enum Made {
 }
 
 impl ClusterSession {
+    /// `RESTORE DATABASE name`: the objects go into the cluster's database of that name, made (on the control node and every shard) when it
+    /// is not there; a restore that fails takes a database it made with it.
     pub(crate) async fn restore_database(&mut self, r: &RestoreStmt, events: &mut Vec<Event>) -> Result<(), SqlError> {
+        let target = r.db.clone().unwrap_or_else(|| self.cur_db.clone());
+        let exists = target.eq_ignore_ascii_case("master") || self.cluster.dbs.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|d| d.eq_ignore_ascii_case(&target));
+        let mut created = false;
+        if !exists {
+            if self.txn.borrow().is_some() {
+                return Err(SqlError::with(574, 16, 1, "RESTORE DATABASE cannot be used inside a user transaction."));
+            }
+            self.create_database(&Stmt::CreateDatabase(target.clone(), None), &target).await?;
+            created = true;
+        }
+        let previous = self.cur_db.clone();
+        let out = match self.use_database(&target) {
+            Ok(()) => self.restore_in_current_database(r, events).await,
+            Err(e) => Err(e),
+        };
+        let back = self.use_database(&previous);
+        if out.is_err() && created {
+            let drop = Stmt::Drop { what: "DATABASE".into(), names: vec![vec![target.clone()]], if_exists: true };
+            let _ = self.drop_database(&drop, &[vec![target]], true).await;
+        }
+        out?;
+        back
+    }
+
+    async fn restore_in_current_database(&mut self, r: &RestoreStmt, events: &mut Vec<Event>) -> Result<(), SqlError> {
         tsql_server::span!("ctl_restore");
         if self.txn.borrow().is_some() {
             return Err(SqlError::with(574, 16, 1, "RESTORE DATABASE cannot be used inside a user transaction."));
@@ -196,12 +223,12 @@ impl ClusterSession {
         if !clashes.is_empty() {
             if !replace {
                 let list: Vec<String> = clashes.iter().map(|(id, _)| id.clone()).collect();
-                return Err(SqlError::with(3159, 16, 1, format!("The cluster's database already has {}. Use RESTORE ... WITH REPLACE to drop them and restore the backup's.", list.join(", "))));
+                return Err(SqlError::with(3159, 16, 1, format!("The database already has {}. Use RESTORE ... WITH REPLACE to drop them and restore the backup's.", list.join(", "))));
             }
             // (views and procedures first: they may depend on the tables; then the tables, the last made first, with the foreign
             // keys between them forgotten so that the order does not matter)
             clashes.sort_by_key(|(_, kind)| kind == "Table");
-            let ids: Vec<String> = clashes.iter().filter(|(_, k)| k == "Table").map(|(id, _)| id.clone()).collect();
+            let ids: Vec<String> = clashes.iter().filter(|(_, k)| k == "Table").map(|(id, _)| self.qid(&id.split_once('.').map(|(s, n)| vec![s.to_string(), n.to_string()]).unwrap_or_else(|| vec![id.clone()]))).collect();
             self.cluster.fks.lock().unwrap_or_else(|x| x.into_inner()).retain(|f| !ids.contains(&f.child));
             let tables_from = clashes.iter().position(|(_, k)| k == "Table").unwrap_or(clashes.len());
             clashes[tables_from..].reverse();
@@ -228,7 +255,7 @@ impl ClusterSession {
             Ok(x) => x,
             Err(e) => {
                 // (the foreign keys between the restored tables go first, so that the tables can be dropped in any order)
-                let ids: Vec<String> = made.iter().filter_map(|m| if let Made::Table(n) = m { Some(table_id(n)) } else { None }).collect();
+                let ids: Vec<String> = made.iter().filter_map(|m| if let Made::Table(n) = m { Some(self.qid(n)) } else { None }).collect();
                 self.cluster.fks.lock().unwrap_or_else(|x| x.into_inner()).retain(|f| !ids.contains(&f.child));
                 for m in made.iter().rev() {
                     let (what, name) = match m {
@@ -271,7 +298,8 @@ impl ClusterSession {
             if merge::check(&self.mirror.execute_stmts(std::slice::from_ref(&st))).is_ok() {
                 let shards = self.all_shards();
                 let clients: Vec<ShardClient> = shards.iter().map(|&i| self.cluster.shard(i)).collect();
-                let futs: Vec<_> = clients.iter().map(|c| c.run(self.id, Work::Stmts(vec![st.clone()]))).collect();
+                let work = self.db_work(st.clone());
+                let futs: Vec<_> = clients.iter().map(|c| c.run(self.id, work.clone())).collect();
                 for r in join_all(futs).await {
                     if let Err(e) = r {
                         if e.number != 2714 {
@@ -280,7 +308,7 @@ impl ClusterSession {
                     }
                 }
                 // (logged, so that a control node started again from its state file has the schema before the tables made in it)
-                self.cluster.log_schema(&st);
+                self.log_schema(&st);
             }
         }
         // the tables, with what must be there before the rows
@@ -294,7 +322,9 @@ impl ClusterSession {
             };
             let s = script::table_sharded(t, shard_at, missing_functions);
             let name: Name = vec![t.schema.clone(), t.name.clone()];
-            let id = table_id(&name);
+            // (the rows of the backup come by the id the backup gives the table; the cluster's own id has the database in it)
+            let backup_id = table_id(&name);
+            let id = self.qid(&name);
             self.create_dist = Some(choice.clone());
             let r = self.run_sql(&s.create).await;
             self.create_dist = None;
@@ -320,7 +350,8 @@ impl ClusterSession {
                     (Some((pos, class)), t.columns[at].name.clone())
                 }
             };
-            targets.insert(id.clone(), Target { id, shard_name: format!("{}.{}", t.schema, t.name), keep, key, key_name, rows: 0 });
+            let shard_name = if self.cur_db.eq_ignore_ascii_case("master") { format!("{}.{}", t.schema, t.name) } else { format!("{}.{}.{}", self.cur_db, t.schema, t.name) };
+            targets.insert(backup_id, Target { id, shard_name, keep, key, key_name, rows: 0 });
             scripts.push((*t, s));
         }
         // the foreign keys, while the tables are empty (so the order of the tables does not matter)
@@ -344,8 +375,8 @@ impl ClusterSession {
             for x in &s.indexes {
                 self.run_sql(x).await?;
             }
-            let id = table_id(&[t.schema.clone(), t.name.clone()]);
-            let rows = targets.get(&id).map(|x| x.rows).unwrap_or(0);
+            let id = self.qid(&vec![t.schema.clone(), t.name.clone()]);
+            let rows = targets.get(&table_id(&[t.schema.clone(), t.name.clone()])).map(|x| x.rows).unwrap_or(0);
             self.bump(&id);
             if let Some(dt) = self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&id) {
                 dt.rows = Some((dt.version, rows));

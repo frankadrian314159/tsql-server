@@ -71,6 +71,13 @@ impl ClusterSession {
     /// Whether a batch needs the cluster (else the engine runs it itself).
     pub fn wants(&self, sql: &str) -> bool {
         let parsed = tsql_server::parser::parse(sql).ok();
+        // a system procedure that reads the catalog (`EXEC sp_fkeys null, null, null, N'Person', N'Person', N'advw'`, which SSMS runs for a
+        // table's relationships) is the engine's: the names it is given are values, and the engine holds the schema of every table
+        if let Some(stmts) = &parsed {
+            if !stmts.is_empty() && stmts.iter().all(|s| matches!(s, Stmt::Exec(ex) if self.is_catalog_proc(ex))) {
+                return false;
+            }
+        }
         let understood = parsed.as_ref().is_some_and(|stmts| stmts.iter().any(|s| self.stmt_wants(s)));
         // a parameterized call (what drivers send, and SSMS): `DECLARE @rc; EXEC @rc = sp_executesql N'text', N'declaration', @p = N'value'; SELECT @rc`.
         // Only its text can name a table: a parameter value that is the name of one (SSMS passes the name of the table it is asking about) is
@@ -90,6 +97,12 @@ impl ClusterSession {
         // mentions one must not be run there by mistake: if it is not understood, the cluster session says it is not
         // supported (an error) instead of the engine answering from an empty table.
         understood || self.mentions_distributed_table(sql)
+    }
+
+    /// Whether an `EXEC` is of a system procedure (`sp_...`, `xp_...`) other than `sp_executesql`, and not one the cluster runs itself.
+    fn is_catalog_proc(&self, ex: &ExecStmt) -> bool {
+        let Some(n) = ex.name.last().map(|n| n.to_lowercase()) else { return false };
+        (n.starts_with("sp_") || n.starts_with("xp_")) && n != "sp_executesql" && !ex.name_is_var && !self.cluster.proc_routes.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&self.qid(&ex.name))
     }
 
     fn mentions_distributed_table(&self, sql: &str) -> bool {
@@ -118,10 +131,20 @@ impl ClusterSession {
                         _ => false,
                     }
             }
+            // a database is made and dropped on every shard too (see dbname.rs)
+            Stmt::CreateDatabase(..) => true,
+            Stmt::Drop { what, .. } if what.eq_ignore_ascii_case("DATABASE") => true,
             Stmt::Drop { what, .. } if what.eq_ignore_ascii_case("VIEW") => true,
             Stmt::CreateView { .. } => true,
             Stmt::Drop { what, names, .. } => what.eq_ignore_ascii_case("TABLE") && names.iter().any(|n| !is_temp_name(n) || self.table_by_id(&table_id(n)).is_some()),
-            Stmt::Query(q) => referenced_tables(q).iter().any(|t| self.table_by_id(t).is_some() || self.is_view(t)),
+            Stmt::Query(q) => {
+                // (the tables a client names are those of the database it is in)
+                let q = match self.qualify(st) {
+                    Stmt::Query(q2) => q2,
+                    _ => q.clone(),
+                };
+                referenced_tables(&q).iter().any(|t| self.table_by_id(t).is_some() || self.is_view(t))
+            }
             Stmt::Exec(ex) => match self.executesql_text(ex) {
                 Some(inner) => self.wants(&inner),
                 None => false,
@@ -129,7 +152,7 @@ impl ClusterSession {
             // a restore puts the backup's tables on the shards (see restore.rs); a backup of the cluster's database is refused there
             // (the engine here holds none of its rows). The other RESTOREs (HEADERONLY, VERIFYONLY) only read the file.
             Stmt::Restore(r) => r.kind == RestoreKind::Database,
-            Stmt::Backup(b) => b.db.eq_ignore_ascii_case(&self.mirror.current_database()),
+            Stmt::Backup(b) => b.db.eq_ignore_ascii_case(&self.cur_db),
             Stmt::Declare(_) | Stmt::Set { .. } => false,
             _ => false,
         }
@@ -447,6 +470,10 @@ impl ControlInterceptor {
 }
 
 impl Interceptor for ControlInterceptor {
+    fn set_database(&mut self, db: &str) {
+        self.session.set_current_database(db);
+    }
+
     fn temps_wanted(&mut self, sql: &str) -> Vec<String> {
         if self.locals.is_empty() || !self.session.wants(sql) {
             return vec![];

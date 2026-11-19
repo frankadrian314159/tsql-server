@@ -78,6 +78,7 @@ impl Cluster {
         };
         let n = shards.len();
         let slots = slots.unwrap_or_else(|| (0..SLOTS).map(|i| (i % n) as u32).collect());
+        let (dbs, logged_db) = crate::dbname::databases_of_log(&log);
         let mirror = Server::new();
         {
             // the mirror learns the schema again
@@ -120,6 +121,8 @@ impl Cluster {
             deadlock_check_ms: AtomicU64::new(200),
             victims: Mutex::new(Default::default()),
             deadlocks: AtomicU64::new(0),
+            dbs: Mutex::new(dbs),
+            logged_db: Mutex::new(logged_db),
         });
         cluster.start_deadlock_monitor();
         if attach {
@@ -135,7 +138,35 @@ impl Cluster {
 
     /// Record a successful CREATE / DROP of a table or index (so that a new shard can be given the schema) and save.
     pub(crate) fn log_schema(&self, st: &Stmt) {
-        self.schema_log.lock().unwrap_or_else(|e| e.into_inner()).push(st.clone());
+        self.log_schema_in("master", st);
+    }
+
+    /// As [`Cluster::log_schema`] for a statement made in database `db`: the log says `USE db` first when the database is not the one
+    /// of the statement before (a log is replayed on the control node's engine and on a new shard, statement by statement).
+    pub(crate) fn log_schema_in(&self, db: &str, st: &Stmt) {
+        {
+            let mut log = self.schema_log.lock().unwrap_or_else(|e| e.into_inner());
+            let mut last = self.logged_db.lock().unwrap_or_else(|e| e.into_inner());
+            // (these two name their databases themselves)
+            if !matches!(st, Stmt::CreateDatabase(..)) && !matches!(st, Stmt::Drop { what, .. } if what.eq_ignore_ascii_case("DATABASE")) && !last.eq_ignore_ascii_case(db) {
+                log.push(Stmt::Use(db.to_string()));
+                *last = db.to_string();
+            }
+            log.push(st.clone());
+            match st {
+                Stmt::CreateDatabase(name, _) => self.dbs.lock().unwrap_or_else(|e| e.into_inner()).push(name.clone()),
+                Stmt::Drop { what, names, .. } if what.eq_ignore_ascii_case("DATABASE") => {
+                    let mut dbs = self.dbs.lock().unwrap_or_else(|e| e.into_inner());
+                    dbs.retain(|d| !names.iter().any(|n| n.last().is_some_and(|x| x.eq_ignore_ascii_case(d))));
+                    // (the log goes back to `master` for what follows: a dropped database cannot be `USE`d)
+                    if names.iter().any(|n| n.last().is_some_and(|x| x.eq_ignore_ascii_case(&last))) {
+                        *last = "master".into();
+                        log.push(Stmt::Use("master".into()));
+                    }
+                }
+                _ => {}
+            }
+        }
         self.save_state();
     }
 

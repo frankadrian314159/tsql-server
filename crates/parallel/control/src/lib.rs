@@ -25,6 +25,7 @@ pub use tsql_server::rewrite::astutil;
 pub mod advisor;
 pub mod autoscale;
 pub mod client;
+pub mod dbname;
 pub mod deadlock;
 pub use tsql_server::rewrite::decorrelate;
 pub mod fk;
@@ -207,6 +208,10 @@ pub struct Cluster {
     /// sessions chosen as deadlock victims whose statement has not yet come back with the error
     victims: Mutex<std::collections::HashSet<u64>>,
     deadlocks: AtomicU64,
+    /// the databases the cluster has besides `master` (`CREATE DATABASE`), in the case they were made in; see `dbname.rs`
+    dbs: Mutex<Vec<String>>,
+    /// the database the last statement of the schema log was made in (the log says `USE` when it changes)
+    logged_db: Mutex<String>,
 }
 
 pub type FaultHook = Arc<dyn Fn(&str) -> bool + Send + Sync>;
@@ -265,6 +270,8 @@ impl Cluster {
             deadlock_check_ms: AtomicU64::new(200),
             victims: Mutex::new(Default::default()),
             deadlocks: AtomicU64::new(0),
+            dbs: Default::default(),
+            logged_db: Mutex::new("master".into()),
         });
         cluster.start_deadlock_monitor();
         Ok(cluster)
@@ -390,7 +397,7 @@ impl Cluster {
     }
 
     pub fn session(self: &Arc<Self>) -> ClusterSession {
-        ClusterSession { cluster: self.clone(), id: self.next_session.fetch_add(1, Ordering::Relaxed), mirror: self.mirror.connect_internal(), plan: vec![], temp_counter: 0, own_temps: vec![], txn: std::cell::RefCell::new(None), stmt_shards: std::cell::Cell::new(0), commit_seq: 0, vars: HashMap::new(), local_tables: HashMap::new(), tvars: HashMap::new(), identity_insert: Default::default(), last_identity: None, create_dist: None }
+        ClusterSession { cluster: self.clone(), id: self.next_session.fetch_add(1, Ordering::Relaxed), mirror: self.mirror.connect_internal(), plan: vec![], temp_counter: 0, own_temps: vec![], txn: std::cell::RefCell::new(None), stmt_shards: std::cell::Cell::new(0), commit_seq: 0, vars: HashMap::new(), local_tables: HashMap::new(), tvars: HashMap::new(), identity_insert: Default::default(), last_identity: None, create_dist: None, cur_db: "master".into() }
     }
 
     pub fn shard_status(&self) -> Vec<Result<ShardStatus, SqlError>> {
@@ -432,6 +439,9 @@ pub struct ClusterSession {
     /// rows sent to the shards as a temporary table (see `nested.rs`). (The engine keeps variables for one batch only, so the
     /// session keeps these itself.)
     tvars: HashMap<String, ResultSet>,
+    /// the database the session is in (`USE`; the front end tells it before each batch): the tables its statements name are those
+    /// of this database, see `dbname.rs`
+    cur_db: String,
 }
 
 /// A transaction of a control session: the shards that have begun it, and what it has changed.
@@ -952,10 +962,12 @@ impl ClusterSession {
     async fn broadcast(&mut self, st: &Stmt) -> Result<(), SqlError> {
         // (the mirror takes the rows of a graph table as the shards do, with the `$graph_id` they were given, so it makes the table in their form)
         let for_mirror = if matches!(st, Stmt::CreateTable { defs, .. } if defs.iter().any(|d| matches!(d, TableDef::Graph { .. }))) { shard_form(st) } else { st.clone() };
+        self.sync_mirror_db()?;
         merge::check(&self.mirror.execute_stmts(std::slice::from_ref(&for_mirror)))?;
         let shards = self.all_shards();
         let on_shards = shard_form(st);
-        self.fan_run(&shards, |_| Work::Stmts(vec![on_shards.clone()])).await?;
+        let work = self.db_work(on_shards);
+        self.fan_run(&shards, |_| work.clone()).await?;
         self.plan.push(format!("broadcast {} to {} shards", stmt_kind(st), shards.len()));
         Ok(())
     }
@@ -964,6 +976,10 @@ impl ClusterSession {
 
     async fn exec_stmt(&mut self, st: &Stmt, events: &mut Vec<Event>) -> Result<(), SqlError> {
         tsql_server::span!("ctl_exec_stmt");
+        // (the tables the statement names are in the database the session is in: see `dbname.rs`)
+        let qualified = self.qualify(st);
+        let st = &qualified;
+        self.sync_mirror_db()?;
         match st {
             Stmt::BeginTran(_) => {
                 let mut t = self.txn.borrow_mut();
@@ -1015,11 +1031,14 @@ impl ClusterSession {
                 r
             }
             Stmt::AlterTable { name, action } => self.alter_table(st, name, action).await,
+            Stmt::Use(db) => self.use_database(db),
+            Stmt::CreateDatabase(name, _) => self.create_database(st, name).await,
+            Stmt::Drop { what, names, if_exists } if what.eq_ignore_ascii_case("DATABASE") => self.drop_database(st, names, *if_exists).await,
             Stmt::CreateProc { name, .. } => {
                 // (a procedure is made on every shard, which runs it; a changed one must be declared again)
                 self.broadcast(st).await?;
                 self.cluster.proc_routes.lock().unwrap_or_else(|e| e.into_inner()).remove(&table_id(name));
-                self.cluster.log_schema(st);
+                self.log_schema(st);
                 Ok(())
             }
             Stmt::Drop { what, names, .. } if what.eq_ignore_ascii_case("PROCEDURE") || what.eq_ignore_ascii_case("PROC") => {
@@ -1027,7 +1046,7 @@ impl ClusterSession {
                 for n in names {
                     self.cluster.proc_routes.lock().unwrap_or_else(|e| e.into_inner()).remove(&table_id(n));
                 }
-                self.cluster.log_schema(st);
+                self.log_schema(st);
                 Ok(())
             }
             Stmt::CreateView { name, alter, or_alter, .. } => {
@@ -1043,7 +1062,7 @@ impl ClusterSession {
                 merge::check(&self.mirror.execute_stmts(std::slice::from_ref(st)))?;
                 // ... and the control node keeps it: the shards hold no views
                 self.cluster.views.lock().unwrap_or_else(|e| e.into_inner()).insert(id, st.clone());
-                self.cluster.log_schema(st);
+                self.log_schema(st);
                 Ok(())
             }
             Stmt::Drop { what, names, if_exists } if what.eq_ignore_ascii_case("VIEW") => {
@@ -1059,7 +1078,7 @@ impl ClusterSession {
                     v.remove(&table_id(n));
                 }
                 drop(v);
-                self.cluster.log_schema(st);
+                self.log_schema(st);
                 Ok(())
             }
             Stmt::Drop { what, names, .. } if what.eq_ignore_ascii_case("TABLE") => {
@@ -1088,7 +1107,7 @@ impl ClusterSession {
                     let ids: Vec<String> = names.iter().map(|n| table_id(n)).collect();
                     self.cluster.fks.lock().unwrap_or_else(|e| e.into_inner()).retain(|f| !ids.contains(&f.child) && !ids.contains(&f.parent));
                 }
-                self.cluster.log_schema(st);
+                self.log_schema(st);
                 Ok(())
             }
             Stmt::CreateIndex { table, unique, cols, xml, spatial, .. } => {
@@ -1102,12 +1121,12 @@ impl ClusterSession {
                     }
                 }
                 self.broadcast(st).await?;
-                self.cluster.log_schema(st);
+                self.log_schema(st);
                 Ok(())
             }
             Stmt::DropIndex { .. } | Stmt::AlterIndex { .. } => {
                 self.broadcast(st).await?;
-                self.cluster.log_schema(st);
+                self.log_schema(st);
                 Ok(())
             }
             Stmt::SetOpts(opts) => {
@@ -1254,7 +1273,7 @@ impl ClusterSession {
         let id = table_id(name);
         self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), DistTable { id, name: name.clone(), cols, dist, version: 0, loaded: None, rows: None, identity: identity.map(|(col, next, inc)| Identity { col, next, inc }), indexes: vec![], graph: graph_meta, edge_cons });
         self.cluster.fks.lock().unwrap_or_else(|e| e.into_inner()).extend(fks);
-        self.cluster.log_schema(st);
+        self.log_schema(st);
         Ok(())
     }
 
@@ -1430,7 +1449,7 @@ impl ClusterSession {
                 e.rows = None;
             }
         }
-        self.cluster.log_schema(st);
+        self.log_schema(st);
         Ok(())
     }
 
@@ -1558,6 +1577,14 @@ impl ClusterSession {
     }
 
     async fn distribute(&mut self, cmd: DistCmd) -> Result<(), SqlError> {
+        // (the table or procedure is the one of the database the session is in)
+        let cmd = match cmd {
+            DistCmd::By(n, c) => DistCmd::By(self.qn(&n), c),
+            DistCmd::Replicated(n) => DistCmd::Replicated(self.qn(&n)),
+            DistCmd::Index(n, c) => DistCmd::Index(self.qn(&n), c),
+            DistCmd::Proc(n, p) => DistCmd::Proc(self.qn(&n), p),
+        };
+        self.sync_mirror_db()?;
         if let DistCmd::Index(n, c) = cmd {
             return self.distribute_index(n, c).await;
         }

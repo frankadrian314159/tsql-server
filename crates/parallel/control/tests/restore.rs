@@ -89,7 +89,7 @@ BACKUP DATABASE shop TO DISK = '{}';",
 
 /// The rows of `table` on each shard.
 fn shard_counts(h: &Harness, table: &str) -> Vec<i64> {
-    h.shards.iter().map(|s| count(&mut s.server.connect(), &format!("SELECT COUNT(*) FROM {}", table))).collect()
+    h.shards.iter().map(|s| count(&mut s.server.connect(), &format!("SELECT COUNT(*) FROM shop.dbo.{}", table))).collect()
 }
 
 const SAME: [&str; 8] = [
@@ -113,6 +113,7 @@ fn a_backup_is_restored_into_the_shards_and_answers_as_the_source_does() {
     let mut s = h.cluster.session();
     let r = s.execute(&format!("RESTORE DATABASE shop FROM DISK = '{}' WITH DISTRIBUTION = N'dbo.customers BY id'", path));
     ok(&r, "the restore");
+    ok(&s.execute("USE shop"), "USE shop");
     let said = messages(&r).join("\n");
     assert!(said.contains("10254 row(s) in 3 table(s)") && said.contains("2 sharded and 1 replicated"), "{}", said);
 
@@ -123,8 +124,8 @@ fn a_backup_is_restored_into_the_shards_and_answers_as_the_source_does() {
     assert_eq!(shard_counts(&h, "customers").iter().sum::<i64>(), 200);
     assert_eq!(shard_counts(&h, "regions"), vec![4, 4, 4]);
     let mut mirror = h.cluster.mirror_server().connect_internal();
-    assert_eq!(count(&mut mirror, "SELECT COUNT(*) FROM orders"), 0, "the control node's engine holds the schema only");
-    assert!(!matches!(mirror.query("SELECT OBJECT_ID('dbo.p_count')").unwrap()[0][0], Value::Null), "the procedure is there");
+    assert_eq!(count(&mut mirror, "SELECT COUNT(*) FROM shop.dbo.orders"), 0, "the control node's engine holds the schema only");
+    assert!(!matches!(mirror.query("SELECT OBJECT_ID('shop.dbo.p_count')").unwrap()[0][0], Value::Null), "the procedure is there");
 
     // the same answers as the database the backup was taken of
     for q in SAME {
@@ -159,6 +160,7 @@ fn what_a_cluster_cannot_hold_is_refused_unless_the_rest_is_wanted() {
     // the rest, saying what was left out
     let r = s.execute(&format!("{} WITH CONTINUE_AFTER_ERROR", restore));
     ok(&r, "the restore without the function");
+    ok(&s.execute("USE shop"), "USE shop");
     assert!(messages(&r).iter().any(|m| m.starts_with("Not restored: the function dbo.twice")), "{:?}", messages(&r));
     assert_eq!(rows_of(&s.execute("SELECT COUNT(*) FROM orders")), vec![vec!["10050".to_string()]]);
     // the names are taken now: REPLACE drops the cluster's objects first, and the rows are not doubled
@@ -191,6 +193,7 @@ GO";
     assert_eq!(count(&mut h.cluster.mirror_server().connect_internal(), "SELECT COUNT(*) FROM sys.tables"), 0);
     let r = s.execute(&format!("{}, CONTINUE_AFTER_ERROR", restore));
     ok(&r, "the restore");
+    ok(&s.execute("USE shop"), "USE shop");
     let said = messages(&r).join("
 ");
     assert!(said.contains("the uniqueness of the unique index ux_email of [dbo].[people]"), "{}", said);
@@ -224,6 +227,7 @@ GO");
     // a control node started again from the state file knows the schema, the table made in it and the rows on the shards
     let cluster = Cluster::open(&state, &cfg).unwrap();
     let mut s = cluster.session();
+    ok(&s.execute("USE shop"), "USE shop");
     assert_eq!(rows_of(&s.execute("SELECT COUNT(*) FROM sys.tables WHERE name = 'staff'")), vec![vec!["1".to_string()]]);
     assert_eq!(rows_of(&s.execute("SELECT COUNT(*) FROM hr.staff")), vec![vec!["2".to_string()]]);
     let _ = std::fs::remove_file(&path);

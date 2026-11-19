@@ -67,7 +67,7 @@ objects in schemas with a different owner.
 `EXECUTE AS USER = 'u'` / `EXECUTE AS LOGIN = 'l'` and `REVERT` (allowed for `sysadmin` and `db_owner`).
 `USER_NAME()`, `SUSER_SNAME()`, `ORIGINAL_LOGIN()`, `IS_MEMBER()`, `IS_SRVROLEMEMBER()` and
 `HAS_PERMS_BY_NAME()` report the effective identity. Catalog views: `sys.server_principals`,
-`sys.database_principals`, `sys.database_permissions`, `sys.database_role_members`.
+`sys.database_principals`, `sys.database_permissions`, `sys.database_role_members`. (`sys.database_permissions` lists each user's `CONNECT`, which SQL Server grants when a user is made, besides the grants; `type` and `state` carry SQL Server's abbreviations, as SSMS's Users node reads them. A database role's owner is `dbo`.)
 
 ## Column-level permissions
 

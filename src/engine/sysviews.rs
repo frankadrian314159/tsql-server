@@ -252,6 +252,12 @@ impl<'a> Engine<'a> {
                         ]);
                         cols.extend([("ledger_view_type", DataType::TinyInt), ("ledger_view_type_desc", nv()), ("ledger_view_id", DataType::Int), ("is_dropped_ledger_view", DataType::Bit)]);
                     }
+                    if lname == "procedures" {
+                        for r in rows.iter_mut() {
+                            r.extend([Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false)]);
+                        }
+                        cols.extend([("is_auto_executed", DataType::Bit), ("is_execution_replicated", DataType::Bit), ("is_repl_serializable_only", DataType::Bit), ("skips_repl_constraints", DataType::Bit)]);
+                    }
                     if lname == "tables" {
                         for r in rows.iter_mut() {
                             let (node, edge) = match r.get(1) {
@@ -371,10 +377,11 @@ impl<'a> Engine<'a> {
                             let dt = p.ty.parts.last().and_then(|n| DataType::from_name(n, &p.ty.args, false).ok());
                             let (st, ml, pr, sc) = dt.as_ref().map(type_info).unwrap_or((0, 0, 0, 0));
                             let nm = if p.name.starts_with('@') { p.name.clone() } else { format!("@{}", p.name) };
-                            rows.push(vec![Value::Int(oid), sv(&nm), Value::Int(i as i32 + 1), Value::Int(st), Value::Int(st), Value::Int(ml), Value::Int(pr), Value::Int(sc), Value::Bit(p.out), Value::Bit(p.default.is_some()), Value::Bit(p.readonly)]);
+                            rows.push(vec![Value::Int(oid), sv(&nm), Value::Int(i as i32 + 1), Value::Int(st), Value::Int(st), Value::Int(ml), Value::Int(pr), Value::Int(sc), Value::Bit(p.out), Value::Bit(p.default.is_some()), Value::Bit(p.readonly), Value::Null, Value::Bit(false), Value::Bit(false), Value::Int(0), Value::Bit(true)]);
                         }
                     }
-                    Some(rs(&[("object_id", DataType::Int), ("name", nv()), ("parameter_id", DataType::Int), ("system_type_id", DataType::TinyInt), ("user_type_id", DataType::Int), ("max_length", DataType::SmallInt), ("precision", DataType::TinyInt), ("scale", DataType::TinyInt), ("is_output", DataType::Bit), ("has_default_value", DataType::Bit), ("is_readonly", DataType::Bit)], rows))
+                    // (default_value is filled in for CLR parameters only, as in SQL Server: NULL for a T-SQL procedure's)
+                    Some(rs(&[("object_id", DataType::Int), ("name", nv()), ("parameter_id", DataType::Int), ("system_type_id", DataType::TinyInt), ("user_type_id", DataType::Int), ("max_length", DataType::SmallInt), ("precision", DataType::TinyInt), ("scale", DataType::TinyInt), ("is_output", DataType::Bit), ("has_default_value", DataType::Bit), ("is_readonly", DataType::Bit), ("default_value", DataType::Variant), ("is_cursor_ref", DataType::Bit), ("is_xml_document", DataType::Bit), ("xml_collection_id", DataType::Int), ("is_nullable", DataType::Bit)], rows))
                 }
                 "xml_schema_collections" => {
                     let rows = db.xml_schemas.iter().map(|x| vec![Value::Int(x.id), Value::Int(db.schema_id(&x.schema)), Value::Null, sv(&x.name), Value::DateTime(x.created, DtKind::DateTime), Value::DateTime(x.created, DtKind::DateTime)]).collect();
@@ -411,6 +418,16 @@ impl<'a> Engine<'a> {
                         }
                     }
                     Some(rs(&[("object_id", DataType::Int), ("unique_index_id", DataType::Int), ("fulltext_catalog_id", DataType::Int), ("is_enabled", DataType::Bit), ("change_tracking_state", DataType::Char(1)), ("change_tracking_state_desc", nv()), ("has_crawl_completed", DataType::Bit), ("crawl_type", DataType::Char(1)), ("crawl_type_desc", nv()), ("crawl_start_date", DataType::DateTime), ("crawl_end_date", DataType::DateTime), ("incremental_timestamp", DataType::Binary(8)), ("stoplist_id", DataType::Int), ("property_list_id", DataType::Int), ("data_space_id", DataType::Int)], rows))
+                }
+                // the languages full-text search names a column's by (the ones SQL Server ships word breakers for, the common ones)
+                "fulltext_languages" => {
+                    const LANGS: [(i32, &str); 28] = [
+                        (0, "Neutral"), (1033, "English"), (2057, "British English"), (1031, "German"), (1036, "French"), (3082, "Spanish"), (1040, "Italian"), (1043, "Dutch"),
+                        (1046, "Brazilian"), (2070, "Portuguese"), (1053, "Swedish"), (1049, "Russian"), (1041, "Japanese"), (2052, "Simplified Chinese"), (1028, "Traditional Chinese"),
+                        (1042, "Korean"), (1055, "Turkish"), (1045, "Polish"), (1030, "Danish"), (1035, "Finnish"), (1044, "Norwegian"), (1038, "Hungarian"), (1029, "Czech"),
+                        (1032, "Greek"), (1037, "Hebrew"), (1054, "Thai"), (1025, "Arabic"), (1081, "Hindi"),
+                    ];
+                    Some(rs(&[("lcid", DataType::Int), ("name", nv())], LANGS.iter().map(|(l, n)| vec![Value::Int(*l), sv(n)]).collect()))
                 }
                 "fulltext_index_columns" => {
                     let mut rows = vec![];
@@ -768,6 +785,12 @@ impl<'a> Engine<'a> {
                 "partition_schemes" => Some(rs(&[("name", nv()), ("data_space_id", DataType::Int), ("type", DataType::Char(2)), ("type_desc", nv()), ("is_default", DataType::Bit), ("is_system", DataType::Bit), ("function_id", DataType::Int)], vec![])),
                 "destination_data_spaces" => Some(rs(&[("partition_scheme_id", DataType::Int), ("destination_id", DataType::Int), ("data_space_id", DataType::Int)], vec![])),
                 "partition_range_values" => Some(rs(&[("function_id", DataType::Int), ("boundary_id", DataType::Int), ("parameter_id", DataType::Int), ("value", DataType::Variant)], vec![])),
+                // full-text stoplists and search property lists: none (the designer joins them to the full-text index)
+                "fulltext_stoplists" => Some(rs(&[("stoplist_id", DataType::Int), ("name", nv()), ("create_date", DataType::DateTime), ("modify_date", DataType::DateTime), ("principal_id", DataType::Int)], vec![])),
+                "registered_search_property_lists" => Some(rs(&[("property_list_id", DataType::Int), ("name", nv()), ("create_date", DataType::DateTime), ("modify_date", DataType::DateTime), ("principal_id", DataType::Int)], vec![])),
+                // numbered procedures (`proc;2`) are not supported: none
+                "numbered_procedures" => Some(rs(&[("object_id", DataType::Int), ("procedure_number", DataType::SmallInt), ("definition", DataType::NVarChar(MAX))], vec![])),
+                "numbered_procedure_parameters" => Some(rs(&[("object_id", DataType::Int), ("procedure_number", DataType::SmallInt), ("name", nv()), ("parameter_id", DataType::Int), ("system_type_id", DataType::TinyInt), ("user_type_id", DataType::Int), ("max_length", DataType::SmallInt), ("precision", DataType::TinyInt), ("scale", DataType::TinyInt), ("is_output", DataType::Bit)], vec![])),
                 "partition_parameters" => Some(rs(&[("function_id", DataType::Int), ("parameter_id", DataType::Int), ("system_type_id", DataType::TinyInt), ("max_length", DataType::SmallInt), ("precision", DataType::TinyInt), ("scale", DataType::TinyInt), ("collation_name", nv()), ("user_type_id", DataType::Int)], vec![])),
                 "partition_functions" => Some(rs(&[("name", nv()), ("function_id", DataType::Int), ("type", DataType::Char(2)), ("type_desc", nv()), ("fanout", DataType::Int), ("boundary_value_on_right", DataType::Bit), ("is_system", DataType::Bit), ("create_date", DataType::DateTime), ("modify_date", DataType::DateTime)], vec![])),
                 "allocation_units" => Some(rs(&[("allocation_unit_id", DataType::BigInt), ("type", DataType::TinyInt), ("type_desc", nv()), ("container_id", DataType::BigInt), ("data_space_id", DataType::Int), ("total_pages", DataType::BigInt), ("used_pages", DataType::BigInt), ("data_pages", DataType::BigInt)], vec![])),
@@ -843,6 +866,29 @@ impl<'a> Engine<'a> {
                         .collect();
                     Some(rs(&[("name", nv()), ("id", DataType::Int), ("xtype", DataType::Char(2)), ("uid", DataType::SmallInt), ("info", DataType::SmallInt), ("parent_obj", DataType::Int), ("crdate", DataType::DateTime), ("type", DataType::Char(2)), ("status", DataType::Int), ("category", DataType::Int), ("base_schema_ver", DataType::Int), ("replinfo", DataType::Int), ("schema_ver", DataType::Int), ("stats_schema_ver", DataType::Int), ("ftcatid", DataType::SmallInt), ("userstat", DataType::SmallInt), ("sysstat", DataType::SmallInt), ("indexdel", DataType::SmallInt), ("version", DataType::Int), ("deltrig", DataType::Int), ("instrig", DataType::Int), ("updtrig", DataType::Int), ("seltrig", DataType::Int), ("cache", DataType::Int)], rows))
                 }
+                // the text of views, procedures, functions and triggers, in pieces of 4000 characters (the view designer reads a view's)
+                "syscomments" => {
+                    let mut rows = vec![];
+                    let mut add = |id: i32, text: &str| {
+                        let chars: Vec<char> = text.chars().collect();
+                        let pieces: Vec<String> = if chars.is_empty() { vec![String::new()] } else { chars.chunks(4000).map(|c| c.iter().collect()).collect() };
+                        for (k, p) in pieces.into_iter().enumerate() {
+                            rows.push(vec![Value::Int(id), Value::Int(1), Value::Int(k as i32 + 1), Value::Int(0), Value::Bin(vec![]), Value::Int(2), Value::Int(0), Value::Bit(false), Value::Bit(false), sv(&p)]);
+                        }
+                    };
+                    for o in db.objects.values() {
+                        match o {
+                            Object::View(v) => add(v.object_id, &v.text),
+                            Object::Proc(p) => add(p.object_id, &p.text),
+                            Object::Func(f) => add(f.object_id, &f.def.text),
+                            _ => {}
+                        }
+                    }
+                    for (_, trg) in db.triggers.values() {
+                        add(trg.object_id, &trg.text);
+                    }
+                    Some(rs(&[("id", DataType::Int), ("number", DataType::SmallInt), ("colid", DataType::SmallInt), ("status", DataType::SmallInt), ("ctext", DataType::VarBinary(8000)), ("texttype", DataType::SmallInt), ("language", DataType::SmallInt), ("encrypted", DataType::Bit), ("compressed", DataType::Bit), ("text", DataType::NVarChar(4000))], rows))
+                }
                 "sysusers" => {
                     let rows = db
                         .security
@@ -892,6 +938,15 @@ impl<'a> Engine<'a> {
                 "credentials" => Some(rs(&[("credential_id", DataType::Int), ("name", nv()), ("credential_identity", nv()), ("create_date", DataType::DateTime), ("modify_date", DataType::DateTime), ("target_type", nv()), ("target_id", DataType::Int)], vec![])),
                 "linked_logins" => Some(rs(&[("server_id", DataType::Int), ("local_principal_id", DataType::Int), ("uses_self_credential", DataType::Bit), ("remote_name", nv()), ("modify_date", DataType::DateTime)], vec![])),
                 "backup_devices" => Some(rs(&[("name", nv()), ("type", DataType::TinyInt), ("type_desc", nv()), ("physical_name", nv())], vec![])),
+                // one row per database: its recovery bookkeeping (no log backup has been taken, so no LSN) and its FILESTREAM settings (off)
+                "database_recovery_status" => {
+                    let rows = self.srv.databases.values().map(|d| vec![Value::Int(d.id), Value::Guid(uuid::Uuid::from_u128(d.id as u128 + 1)), Value::Guid(uuid::Uuid::from_u128(d.id as u128 + 1)), Value::Null, Value::Null, Value::Null, Value::Null]).collect();
+                    Some(rs(&[("database_id", DataType::Int), ("database_guid", DataType::Guid), ("family_guid", DataType::Guid), ("last_log_backup_lsn", DataType::Decimal(25, 0)), ("recovery_fork_guid", DataType::Guid), ("first_recovery_fork_guid", DataType::Guid), ("fork_point_lsn", DataType::Decimal(25, 0))], rows))
+                }
+                "database_filestream_options" => {
+                    let rows = self.srv.databases.values().map(|d| vec![Value::Int(d.id), Value::Int(0), sv("OFF"), Value::Null]).collect();
+                    Some(rs(&[("database_id", DataType::Int), ("non_transacted_access", DataType::TinyInt), ("non_transacted_access_desc", nv()), ("directory_name", nv())], rows))
+                }
                 "change_tracking_databases" => Some(rs(&[("database_id", DataType::Int), ("is_auto_cleanup_on", DataType::TinyInt), ("retention_period", DataType::Int), ("retention_period_units", DataType::TinyInt), ("retention_period_units_desc", nv())], vec![])),
                 "service_broker_endpoints" => Some(rs(&[("name", nv()), ("endpoint_id", DataType::Int), ("principal_id", DataType::Int), ("protocol", DataType::TinyInt), ("protocol_desc", nv()), ("type", DataType::TinyInt), ("type_desc", nv()), ("state", DataType::TinyInt), ("state_desc", nv()), ("is_admin_endpoint", DataType::Bit), ("port", DataType::Int), ("is_dynamic_port", DataType::Bit), ("ip_address", nv())], vec![])),
                 "sysdatabases" => {
@@ -1437,7 +1492,7 @@ impl<'a> Engine<'a> {
                         .map(|p| {
                             vec![
                                 sv(&p.name), Value::Int(p.id), sv(if p.is_role { "R" } else { "S" }), sv(&p.default_schema),
-                                sv(if p.is_role { "DATABASE_ROLE" } else { "SQL_USER" }), date(db.created), date(db.created), Value::Null, Value::Bin(p.name.to_lowercase().into_bytes()),
+                                sv(if p.is_role { "DATABASE_ROLE" } else { "SQL_USER" }), date(db.created), date(db.created), if p.is_role { Value::Int(1) } else { Value::Null }, Value::Bin(p.name.to_lowercase().into_bytes()),
                                 Value::Bit(p.is_role && p.id < 16384 && p.id > 0 && p.name.starts_with("db_")), Value::Int(if p.is_role { 0 } else { 1 }), sv(if p.is_role { "NONE" } else { "INSTANCE" }),
                                 Value::Null, Value::Null, Value::Bit(false),
                             ]
@@ -1577,21 +1632,34 @@ impl<'a> Engine<'a> {
                     Some(rs(&[("object_id", DataType::Int), ("type_desc", nv())], rows))
                 }
                 "database_permissions" => {
-                    let rows = db
+                    // the abbreviation SQL Server keeps for each permission (`type`)
+                    let code = |p: &str| match p.to_uppercase().as_str() {
+                        "SELECT" => "SL", "INSERT" => "IN", "UPDATE" => "UP", "DELETE" => "DL", "EXECUTE" => "EX", "REFERENCES" => "RF", "ALTER" => "AL", "CONTROL" => "CL",
+                        "CONNECT" => "CO", "VIEW DEFINITION" => "VW", "TAKE OWNERSHIP" => "TO", "CREATE TABLE" => "CRTB", "CREATE VIEW" => "CRVW", "CREATE PROCEDURE" => "CRPR",
+                        "CREATE FUNCTION" => "CRFN", "CREATE SCHEMA" => "CRSC", "CREATE ROLE" => "CRRL", "CREATE DEFAULT" => "CRDF", "CREATE RULE" => "CRRU", "CREATE TYPE" => "CRTY",
+                        "VIEW ANY DEFINITION" => "VWAD", "BACKUP DATABASE" => "BADB", "BACKUP LOG" => "BALO", "SHOWPLAN" => "SPLN", "UNMASK" => "UMSK",
+                        _ => "",
+                    };
+                    let mut rows: Vec<Row> = db
                         .security
                         .perms
                         .iter()
                         .map(|e| {
                             let pid = db.security.principals.get(&e.grantee).map(|p| p.id).unwrap_or(0);
-                            let (class, major) = match &e.target {
-                                crate::security::PermTarget::Database => ("DATABASE", 0),
-                                crate::security::PermTarget::Schema(s) => ("SCHEMA", sid(s)),
-                                crate::security::PermTarget::Object(k) | crate::security::PermTarget::Column(k, _) => ("OBJECT_OR_COLUMN", db.objects.get(k).map(|o| o.object_id()).unwrap_or(0)),
+                            let (class, class_desc, major) = match &e.target {
+                                crate::security::PermTarget::Database => (0, "DATABASE", 0),
+                                crate::security::PermTarget::Schema(s) => (3, "SCHEMA", sid(s)),
+                                crate::security::PermTarget::Object(k) | crate::security::PermTarget::Column(k, _) => (1, "OBJECT_OR_COLUMN", db.objects.get(k).map(|o| o.object_id()).unwrap_or(0)),
                             };
-                            vec![sv(class), Value::Int(major), Value::Int(pid), sv(&e.perm), sv(if e.state == crate::security::PermState::Grant { "GRANT" } else { "DENY" })]
+                            let granted = e.state == crate::security::PermState::Grant;
+                            vec![Value::Int(class), sv(class_desc), Value::Int(major), Value::Int(0), Value::Int(pid), Value::Int(1), sv(code(&e.perm)), sv(&e.perm), sv(if granted { "G" } else { "D" }), sv(if granted { "GRANT" } else { "DENY" })]
                         })
                         .collect();
-                    Some(rs(&[("class_desc", nv()), ("major_id", DataType::Int), ("grantee_principal_id", DataType::Int), ("permission_name", nv()), ("state_desc", nv())], rows))
+                    // (every user may connect to the database it is in, as SQL Server grants it when the user is made)
+                    for p in db.security.principals.values().filter(|p| !p.is_role) {
+                        rows.push(vec![Value::Int(0), sv("DATABASE"), Value::Int(0), Value::Int(0), Value::Int(p.id), Value::Int(1), sv("CO"), sv("CONNECT"), sv("G"), sv("GRANT")]);
+                    }
+                    Some(rs(&[("class", DataType::TinyInt), ("class_desc", nv()), ("major_id", DataType::Int), ("minor_id", DataType::Int), ("grantee_principal_id", DataType::Int), ("grantor_principal_id", DataType::Int), ("type", DataType::Char(4)), ("permission_name", nv()), ("state", DataType::Char(1)), ("state_desc", nv())], rows))
                 }
                 "database_role_members" => {
                     let rows = db
@@ -1628,10 +1696,10 @@ impl<'a> Engine<'a> {
                         .into_iter()
                         .map(|s| {
                             let dbid = self.srv.databases.get(&s.db.to_lowercase()).map(|d| d.id).unwrap_or(1);
-                            vec![Value::Int(s.spid), sv(&s.login), sv(&s.host), sv(&s.app), Value::Int(dbid), Value::Int(s.isolation), sv(s.status), date(s.login_time), date(s.last_batch), Value::BigInt(s.batches as i64)]
+                            vec![Value::Int(s.spid), sv(&s.login), sv(&s.host), sv(&s.app), Value::Int(dbid), Value::Int(s.isolation), sv(s.status), date(s.login_time), date(s.last_batch), Value::BigInt(s.batches as i64), Value::Int(1)]
                         })
                         .collect();
-                    Some(rs(&[("session_id", DataType::SmallInt), ("login_name", nv()), ("host_name", nv()), ("program_name", nv()), ("database_id", DataType::SmallInt), ("transaction_isolation_level", DataType::SmallInt), ("status", nv()), ("login_time", DataType::DateTime), ("last_request_start_time", DataType::DateTime), ("batch_count", DataType::BigInt)], rows))
+                    Some(rs(&[("session_id", DataType::SmallInt), ("login_name", nv()), ("host_name", nv()), ("program_name", nv()), ("database_id", DataType::SmallInt), ("transaction_isolation_level", DataType::SmallInt), ("status", nv()), ("login_time", DataType::DateTime), ("last_request_start_time", DataType::DateTime), ("batch_count", DataType::BigInt), ("authenticating_database_id", DataType::Int)], rows))
                 }
                 "dm_exec_requests" => {
                     let rows = self.srv.core.session_list().into_iter().filter(|s| s.status == "running").map(|s| vec![Value::Int(s.spid), sv(s.status), sv(&s.command), date(s.last_batch)]).collect();
@@ -1690,6 +1758,17 @@ impl<'a> Engine<'a> {
                     for (n, id) in [("Agent XPs", 16384), ("Database Mail XPs", 16386)] {
                         if !rows.iter().any(|r| matches!(&r[0], Value::Str(x) if x.eq_ignore_ascii_case(n))) {
                             rows.push(vec![sv(n), Value::BigInt(0), Value::BigInt(0), Value::BigInt(1), Value::BigInt(0), Value::Bit(true), Value::Bit(true), sv("Enable or disable the feature"), Value::Int(id)]);
+                        }
+                    }
+                    // the options SMO reads when it scripts a table (by number: 115, 124, 1126, 1127, 1555), which have their defaults here
+                    for (n, id, v, lo, hi, adv, d) in [
+                        ("nested triggers", 115, 1i64, 0i64, 1i64, false, "Allow triggers to be invoked within triggers"),
+                        ("default full-text language", 1126, 1033, 0, 2147483647, true, "default full-text language"),
+                        ("two digit year cutoff", 1127, 2049, 1753, 9999, true, "two digit year cutoff for century"),
+                        ("transform noise words", 1555, 0, 0, 1, true, "Transform noise words for full-text query"),
+                    ] {
+                        if !rows.iter().any(|r| matches!(&r[0], Value::Str(x) if x.eq_ignore_ascii_case(n)) || matches!(r.last(), Some(Value::Int(i)) if *i == id)) {
+                            rows.push(vec![sv(n), Value::BigInt(v), Value::BigInt(lo), Value::BigInt(hi), Value::BigInt(v), Value::Bit(true), Value::Bit(adv), sv(d), Value::Int(id)]);
                         }
                     }
                     Some(rs(&[("name", nv()), ("value", DataType::BigInt), ("minimum", DataType::BigInt), ("maximum", DataType::BigInt), ("value_in_use", DataType::BigInt), ("is_dynamic", DataType::Bit), ("is_advanced", DataType::Bit), ("description", nv()), ("configuration_id", DataType::Int)], rows))

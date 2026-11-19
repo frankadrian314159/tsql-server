@@ -186,6 +186,10 @@ Policy Management) each run a catalog query; one that names a column or view the
 The columns of a view are found by running its query for no rows (once per connection and view text). `msdb.dbo.syspolicy_configuration`
 exists with a new server's values; Policy-Based Management is not implemented (no policies). The Memory Optimization Advisor opens but cannot
 continue: there is no In-Memory OLTP.
+The View Designer reads a view's text from `syscomments` (in pieces of 4000 characters, as SQL Server keeps it) and the table designer
+reads a table's relationships with `EXEC sp_fkeys`; a designer that gets an error for one of them asks again, so that the cursor
+flickers and nothing appears. On a cluster a system procedure (`sp_...`, `xp_...`) that is given the name of a table is the engine's, not
+the cluster's: the name is a value, and the engine holds the schema of every table.
 
 ## Not supported
 

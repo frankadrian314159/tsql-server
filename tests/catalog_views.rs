@@ -456,3 +456,156 @@ fn sysobjects_has_the_columns_the_designer_filters_on() {
     assert_eq!(scalar(&mut c, "select count(*) from sysobjects o where OBJECTPROPERTY(o.id, N'IsDefault') = 1 and o.name not like N'#%%' and o.category & 0x0800 = 0 and OBJECTPROPERTY(o.id, N'IsMSShipped') = 0"), "0");
     assert_eq!(scalar(&mut c, "select count(*) from sysobjects o where o.xtype = 'U' and o.status = 0 and o.base_schema_ver = 0"), "1");
 }
+
+#[test]
+fn what_the_view_designer_asks_in_a_database_other_than_master_runs() {
+    let mut c = conn();
+    // the contained-authentication probe, run when the database is not master
+    assert_eq!(scalar(&mut c, "select case when authenticating_database_id = 1 then 0 else 1 end from sys.dm_exec_sessions where session_id = @@SPID"), "0");
+    // the full-text index of a table joined to its stoplist and search property list
+    exec(&mut c, "CREATE TABLE dbo.t (a int NOT NULL CONSTRAINT pk_t PRIMARY KEY, b nvarchar(50))");
+    assert_eq!(
+        scalar(
+            &mut c,
+            "SELECT COUNT(*) FROM sys.tables AS tbl INNER JOIN sys.fulltext_indexes AS fti ON fti.object_id = tbl.object_id \
+             LEFT OUTER JOIN sys.fulltext_stoplists AS sl ON sl.stoplist_id = fti.stoplist_id \
+             LEFT OUTER JOIN sys.registered_search_property_lists AS spl ON spl.property_list_id = fti.property_list_id WHERE tbl.name = 't'"
+        ),
+        "0"
+    );
+}
+
+#[test]
+fn syscomments_has_the_text_of_views_and_procedures() {
+    // the view designer reads the text of a view from it, by schema, name and colid
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE dbo.t (a int)");
+    exec(&mut c, "CREATE VIEW dbo.v AS SELECT a FROM dbo.t");
+    exec(&mut c, "CREATE PROCEDURE dbo.p AS SELECT 1");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM (sys.schemas ss INNER JOIN sys.objects so ON ss.schema_id = so.schema_id) INNER JOIN syscomments sc ON so.object_id = sc.id WHERE (so.type = N'V') AND (ss.name = N'dbo') AND (so.name = N'v')"), "1");
+    assert!(scalar(&mut c, "SELECT sc.text FROM sys.objects so INNER JOIN syscomments sc ON so.object_id = sc.id WHERE so.name = N'v' ORDER BY sc.colid").contains("SELECT a FROM dbo.t"));
+    assert_eq!(scalar(&mut c, "SELECT DATALENGTH(sc.text) FROM sys.objects so INNER JOIN syscomments sc ON so.object_id = sc.id WHERE so.name = N'p'"), format!("{}", "CREATE PROCEDURE dbo.p AS SELECT 1".len() * 2));
+    assert_eq!(scalar(&mut c, "SELECT sc.texttype FROM sys.objects so INNER JOIN syscomments sc ON so.object_id = sc.id WHERE so.name = N'v'"), "2");
+}
+
+#[test]
+fn sp_fkeys_lists_the_foreign_keys_of_and_to_a_table() {
+    // SSMS asks `EXEC sp_fkeys null, null, null, N'table', N'schema', N'db'` (the keys the table has) when it opens a table's design
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE dbo.p (id INT NOT NULL CONSTRAINT pk_p PRIMARY KEY, n INT)");
+    exec(&mut c, "CREATE TABLE dbo.c (id INT PRIMARY KEY, pid INT CONSTRAINT fk_c_p REFERENCES dbo.p (id) ON DELETE CASCADE)");
+    assert_eq!(rows(&mut c, "EXEC sp_fkeys null, null, null, N'c', N'dbo', N'master'").iter().map(|r| format!("{}.{}.{}->{}.{}:{}:{}:{}", r[1], r[2], r[3], r[5], r[6], r[7], r[11], r[10])).collect::<Vec<_>>(), vec!["dbo.p.id->dbo.c:pid:fk_c_p:0".to_string()]);
+    assert_eq!(rows(&mut c, "EXEC sp_fkeys @pktable_name = N'p'").len(), 1);
+    assert_eq!(rows(&mut c, "EXEC sp_fkeys N'c'").len(), 0);
+    assert_eq!(rows(&mut c, "EXEC sp_fkeys N'p'")[0][12], "pk_p");
+}
+
+#[test]
+fn what_ssms_asks_when_a_procedure_is_modified_runs() {
+    // numbered procedures (proc;2) are not supported: the query for them finds none
+    let mut c = conn();
+    exec(&mut c, "CREATE PROCEDURE dbo.p @a int AS SELECT @a");
+    assert_eq!(
+        scalar(&mut c, "SELECT COUNT(*) FROM sys.all_objects AS sp INNER JOIN sys.numbered_procedures AS nsp ON nsp.object_id = sp.object_id WHERE (sp.type = N'P' OR sp.type = N'RF' OR sp.type = N'PC') AND sp.name = N'p' AND SCHEMA_NAME(sp.schema_id) = N'dbo'"),
+        "0"
+    );
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.numbered_procedure_parameters"), "0");
+}
+
+#[test]
+fn the_properties_ssms_reads_of_a_procedure_to_script_it_are_there() {
+    let mut c = conn();
+    exec(&mut c, "CREATE PROCEDURE dbo.p @a int AS SELECT @a");
+    let q = "SELECT sp.name, ISNULL(ssp.name, N'') AS [Owner], CAST(ISNULL(OBJECTPROPERTYEX(sp.object_id,N'ExecIsAnsiNullsOn'),0) AS bit), CAST(ISNULL(OBJECTPROPERTYEX(sp.object_id,N'ExecIsQuotedIdentOn'),0) AS bit), \
+        CAST(ISNULL(OBJECTPROPERTYEX(sp.object_id, N'IsSchemaBound'),0) AS bit), CAST(CASE WHEN ISNULL(smsp.definition, ssmsp.definition) IS NULL THEN 1 ELSE 0 END AS bit), CAST(ISNULL(smsp.is_recompiled, ssmsp.is_recompiled) AS bit), \
+        case when amsp.object_id is null then N'' else asmblsp.name end, case when amsp.object_id is null then N'' else amsp.assembly_class end, case when amsp.object_id is null then N'' else amsp.assembly_method end, \
+        case when amsp.object_id is null then case isnull(smsp.execute_as_principal_id, -1) when -1 then 1 when -2 then 2 else 3 end else case isnull(amsp.execute_as_principal_id, -1) when -1 then 1 when -2 then 2 else 3 end end, \
+        case when amsp.object_id is null then ISNULL(user_name(smsp.execute_as_principal_id),N'') else ISNULL(user_name(amsp.execute_as_principal_id), N'') end, CAST(ISNULL(spp.is_auto_executed,0) AS bit), \
+        CASE WHEN sp.type = N'P' THEN 1 WHEN sp.type = N'PC' THEN 2 ELSE 1 END, CAST(CASE sp.type WHEN N'RF' THEN 1 ELSE 0 END AS bit), ISNULL(sm.uses_native_compilation,0) \
+        FROM sys.all_objects AS sp LEFT OUTER JOIN sys.database_principals AS ssp ON ssp.principal_id = ISNULL(sp.principal_id, (OBJECTPROPERTY(sp.object_id, 'OwnerId'))) \
+        LEFT OUTER JOIN sys.sql_modules AS smsp ON smsp.object_id = sp.object_id LEFT OUTER JOIN sys.system_sql_modules AS ssmsp ON ssmsp.object_id = sp.object_id \
+        LEFT OUTER JOIN sys.assembly_modules AS amsp ON amsp.object_id = sp.object_id LEFT OUTER JOIN sys.assemblies AS asmblsp ON asmblsp.assembly_id = amsp.assembly_id \
+        LEFT OUTER JOIN sys.procedures AS spp ON spp.object_id = sp.object_id LEFT OUTER JOIN sys.all_sql_modules AS sm ON sm.object_id = sp.object_id \
+        WHERE (sp.type = N'P' OR sp.type = N'RF' OR sp.type = N'PC') AND sp.name = N'p' AND SCHEMA_NAME(sp.schema_id) = N'dbo'";
+    assert_eq!(rows(&mut c, q).len(), 1);
+}
+
+#[test]
+fn the_parameter_query_of_scripting_a_procedure_runs() {
+    let mut c = conn();
+    exec(&mut c, "CREATE PROCEDURE dbo.p @a int, @b varchar(10) = 'x' OUTPUT AS SELECT @a");
+    assert_eq!(
+        rows(&mut c, "SELECT param.parameter_id AS [ID], param.name AS [Name], param.default_value AS [DefaultValue], param.is_output AS [IsOutputParameter], param.is_readonly AS [IsReadOnly], usrt.name AS [DataType] \
+                      FROM sys.all_objects AS sp INNER JOIN sys.all_parameters AS param ON param.object_id = sp.object_id LEFT OUTER JOIN sys.types AS usrt ON usrt.user_type_id = param.user_type_id \
+                      WHERE sp.type = N'P' AND sp.name = N'p' ORDER BY [ID] ASC")
+            .iter()
+            .map(|r| format!("{}:{}:{}:{}", r[0], r[1], r[3], r[5]))
+            .collect::<Vec<_>>(),
+        vec!["1:@a:0:int".to_string(), "2:@b:1:varchar".to_string()]
+    );
+}
+
+#[test]
+fn the_fulltext_column_query_of_scripting_a_table_runs() {
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE dbo.t (a int NOT NULL CONSTRAINT pk_t PRIMARY KEY, b nvarchar(50))");
+    assert_eq!(scalar(&mut c, "SELECT name FROM sys.fulltext_languages WHERE lcid = 1033"), "English");
+    assert_eq!(
+        scalar(
+            &mut c,
+            "SELECT COUNT(*) FROM sys.tables AS tbl INNER JOIN sys.fulltext_indexes AS fti ON fti.object_id = tbl.object_id INNER JOIN sys.fulltext_index_columns AS icol ON icol.object_id = fti.object_id \
+             INNER JOIN sys.columns AS col ON col.object_id = icol.object_id AND col.column_id = icol.column_id LEFT OUTER JOIN sys.columns AS col2 ON col2.column_id = icol.type_column_id AND col2.object_id = icol.object_id \
+             INNER JOIN sys.fulltext_languages AS sl ON sl.lcid = icol.language_id WHERE tbl.name = 't'"
+        ),
+        "0"
+    );
+}
+
+#[test]
+fn the_database_properties_ssms_reads_to_script_a_table_are_there() {
+    let mut c = conn();
+    assert_eq!(
+        scalar(
+            &mut c,
+            "SELECT COUNT(*) FROM master.sys.databases AS dtb LEFT OUTER JOIN sys.database_recovery_status AS drs ON drs.database_id = dtb.database_id \
+             LEFT OUTER JOIN sys.change_tracking_databases AS ctb ON ctb.database_id = dtb.database_id LEFT OUTER JOIN sys.database_filestream_options AS fsopt ON fsopt.database_id = dtb.database_id \
+             WHERE dtb.name = N'master' AND drs.last_log_backup_lsn IS NULL AND ISNULL(fsopt.non_transacted_access, 0) = 0 AND ctb.retention_period IS NULL"
+        ),
+        "1"
+    );
+}
+
+#[test]
+fn smo_finds_every_configuration_row_it_reads_to_script_a_table() {
+    // SMO reads the rows for these five options by position: a missing one is "There is no row at position 1"
+    let mut c = conn();
+    assert_eq!(
+        rows(&mut c, "select cfg.configuration_id from sys.configurations as cfg where cfg.configuration_id in (115, 124, 1126, 1127, 1555) order by cfg.configuration_id asc").iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+        vec!["115", "124", "1126", "1127", "1555"]
+    );
+    assert_eq!(scalar(&mut c, "select name from sys.fulltext_languages as fl where fl.lcid = (select value_in_use from sys.configurations where configuration_id = 1126)"), "English");
+}
+
+#[test]
+fn a_database_role_has_an_owner_for_the_script_role_query() {
+    // SSMS's Script Role joins the role to its owner (dbo owns the fixed roles and the roles made here): no row is "Object reference not set"
+    let mut c = conn();
+    exec(&mut c, "CREATE ROLE auditors");
+    assert_eq!(
+        rows(&mut c, "SELECT rl.name, ou.name FROM sys.database_principals AS rl INNER JOIN sys.database_principals AS ou ON ou.principal_id = rl.owning_principal_id WHERE (rl.type = 'R') AND rl.name IN (N'db_datareader', N'auditors') ORDER BY rl.name"),
+        vec![vec!["auditors".to_string(), "dbo".into()], vec!["db_datareader".to_string(), "dbo".into()]]
+    );
+}
+
+#[test]
+fn the_users_node_of_ssms_sees_that_each_user_may_connect() {
+    let mut c = conn();
+    exec(&mut c, "CREATE USER bob WITHOUT LOGIN");
+    exec(&mut c, "CREATE TABLE dbo.t (a int)");
+    exec(&mut c, "GRANT SELECT ON dbo.t TO bob");
+    assert_eq!(
+        rows(&mut c, "SELECT u.name, CAST(CASE dp.state WHEN N'G' THEN 1 WHEN 'W' THEN 1 ELSE 0 END AS bit) FROM sys.database_principals AS u LEFT OUTER JOIN sys.database_permissions AS dp ON dp.grantee_principal_id = u.principal_id AND dp.type = N'CO' WHERE u.type in ('U', 'S', 'G', 'C', 'K', 'E', 'X') AND u.name = N'bob'"),
+        vec![vec!["bob".to_string(), "1".into()]]
+    );
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.database_permissions WHERE grantee_principal_id = USER_ID('bob') AND type = 'SL' AND state = 'G' AND class = 1"), "1");
+}

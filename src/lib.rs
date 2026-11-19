@@ -76,6 +76,9 @@ pub trait Interceptor: Send {
     fn temps_wanted(&mut self, _sql: &str) -> Vec<String> {
         vec![]
     }
+    /// The database the connection is in, told before each batch is handled (a `USE` that the engine ran changes it): a cluster's
+    /// control node names the tables of the batch by it. Nothing by default.
+    fn set_database(&mut self, _db: &str) {}
     /// A temporary table of the session handed over (see [`Interceptor::temps_wanted`]): `create` is its `CREATE TABLE`, `rows` its rows.
     fn adopt_temp(&mut self, _name: &str, _create: &str, _rows: Vec<Vec<Value>>) -> Result<(), SqlError> {
         Ok(())
@@ -502,9 +505,17 @@ impl Connection {
         Some(Connection { server: self.server.clone(), session: self.session.fork(), interceptor: None })
     }
 
+    /// Tell the interceptor which database the connection is in (see [`Interceptor::set_database`]).
+    fn sync_interceptor_db(&mut self) {
+        if let Some(i) = self.interceptor.as_mut() {
+            i.set_database(&self.session.db);
+        }
+    }
+
     /// Give the interceptor the temporary tables of this session that the batch needs it to take over (see [`Interceptor::temps_wanted`]):
     /// the table is read, dropped here, and made by the interceptor from what was read. An error is returned for the batch.
     fn hand_over_temps(&mut self, sql: &str) -> Option<SqlError> {
+        self.sync_interceptor_db();
         let names = self.interceptor.as_mut()?.temps_wanted(sql);
         for n in names {
             let (create, rows) = {
@@ -592,6 +603,7 @@ impl Connection {
     /// Execute statements that are already parsed as one batch (a driver that builds statements itself, like the bulk load
     /// of the TDS listener, avoids the text).
     pub fn execute_stmts(&mut self, stmts: &[crate::ast::Stmt]) -> BatchResult {
+        self.sync_interceptor_db();
         if let Some(i) = self.interceptor.as_mut() {
             let mut events = vec![];
             let handled = i.handle_stmts(stmts, &mut |item| {

@@ -282,7 +282,7 @@ fn permission_functions() {
     assert_eq!(scalar(&mut sa, "SELECT IS_SRVROLEMEMBER('sysadmin')"), "1");
     assert_eq!(rows(&mut sa, "SELECT name FROM sys.database_principals WHERE name IN ('ann','bob') ORDER BY name"), vec![vec!["ann"], vec!["bob"]]);
     assert_eq!(rows(&mut sa, "SELECT name FROM sys.server_principals WHERE name = 'ann'"), vec![vec!["ann"]]);
-    assert_eq!(rows(&mut sa, "SELECT permission_name, state_desc FROM sys.database_permissions p JOIN sys.database_principals u ON p.grantee_principal_id = u.principal_id WHERE u.name = 'ann'"), vec![vec!["SELECT", "GRANT"]]);
+    assert_eq!(rows(&mut sa, "SELECT permission_name, state_desc FROM sys.database_permissions p JOIN sys.database_principals u ON p.grantee_principal_id = u.principal_id WHERE u.name = 'ann' ORDER BY permission_name"), vec![vec!["CONNECT", "GRANT"], vec!["SELECT", "GRANT"]]);
 }
 
 fn code(c: &mut Connection, sql: &str) -> i32 {

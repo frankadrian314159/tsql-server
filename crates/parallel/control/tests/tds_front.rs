@@ -184,3 +184,55 @@ fn a_temporary_table_is_the_engines_own_until_a_statement_needs_it_with_the_clus
     // the session's temporary tables are not left behind when it ends
     drop(f.rt);
 }
+
+#[test]
+fn a_client_makes_a_database_uses_it_and_the_catalog_shows_it() {
+    let f = start(3);
+    f.rt.block_on(async {
+        let mut c = login(&f.listener).await;
+        run(&mut c, "CREATE DATABASE shop").await;
+        run(&mut c, "USE shop").await;
+        run(&mut c, "CREATE TABLE items (id INT PRIMARY KEY, name VARCHAR(20), qty INT)").await;
+        let values: Vec<String> = (1..=40).map(|i| format!("({}, 'i{}', {})", i, i, i % 5)).collect();
+        run(&mut c, &format!("INSERT INTO items VALUES {}", values.join(", "))).await;
+        // the connection is in the database, the rows are the database's, and the engine's catalog knows both
+        assert!(strings(&mut c, "SELECT DB_NAME()").await[0][0].contains("shop"));
+        assert!(strings(&mut c, "SELECT COUNT(*) FROM items").await[0][0].contains("40"));
+        assert!(strings(&mut c, "SELECT COUNT(*) FROM sys.tables WHERE name = 'items'").await[0][0].contains('1'));
+        assert!(strings(&mut c, "SELECT COUNT(*) FROM sys.databases WHERE name = 'shop'").await[0][0].contains('1'));
+        // parameters name the same table
+        let rows = c.query("SELECT name FROM items WHERE id = @P1", &[&7i32]).await.unwrap().into_first_result().await.unwrap();
+        assert_eq!(rows[0].get::<&str, _>("name"), Some("i7"));
+        // master has no such table, but the database's can be named from it
+        run(&mut c, "USE master").await;
+        assert!(c.simple_query("SELECT COUNT(*) FROM items").await.is_err());
+        assert!(strings(&mut c, "SELECT COUNT(*) FROM shop.dbo.items").await[0][0].contains("40"));
+        assert!(strings(&mut c, "SELECT COUNT(*) FROM sys.tables WHERE name = 'items'").await[0][0].contains('0'));
+        // and the database goes with its table
+        run(&mut c, "DROP DATABASE shop").await;
+        assert!(strings(&mut c, "SELECT COUNT(*) FROM sys.databases WHERE name = 'shop'").await[0][0].contains('0'));
+        let after = c.simple_query("SELECT COUNT(*) FROM shop.dbo.items").await;
+        let after = match after {
+            Ok(st) => st.into_first_result().await.map(|r| format!("{:?}", r.iter().map(|x| x.cells().map(|(_, v)| format!("{:?}", v)).collect::<Vec<_>>()).collect::<Vec<_>>())),
+            Err(e) => Err(e),
+        };
+        assert!(after.is_err(), "the dropped database's table is still readable: {:?}", after);
+    });
+}
+
+#[test]
+fn a_system_procedure_given_the_name_of_a_table_is_the_engines_not_the_clusters() {
+    // SSMS runs `EXEC sp_fkeys null, null, null, N'table', N'schema', N'db'` for a table's relationships: the name is a value
+    let f = start(3);
+    f.rt.block_on(async {
+        let mut c = login(&f.listener).await;
+        run(&mut c, "CREATE TABLE people (id INT PRIMARY KEY, name VARCHAR(20))").await;
+        run(&mut c, "CREATE TABLE pets (id INT PRIMARY KEY, owner INT REFERENCES people (id))").await;
+        let r = c.simple_query("EXEC sp_fkeys null, null, null, N'people', N'dbo', N'master'").await;
+        assert!(r.is_ok(), "sp_fkeys: {:?}", r.err());
+        let rows = r.unwrap().into_first_result().await;
+        assert!(rows.is_ok(), "sp_fkeys result: {:?}", rows.err());
+        let r = c.simple_query("EXEC sp_columns N'people'").await.unwrap().into_first_result().await.unwrap();
+        assert_eq!(r.len(), 2);
+    });
+}

@@ -265,7 +265,7 @@ fn errors_come_back_as_the_engine_gives_them() {
     let a = p.cl.execute("SELECT * FROM nothing_here");
     assert_eq!(a.first_error().map(|e| e.number), Some(208));
     // what is not supported says so
-    for sql in ["CREATE DATABASE other", "UPDATE TOP (1) t SET v = 'x'", "DELETE FROM t OUTPUT deleted.id WHERE id = 1"] {
+    for sql in ["UPDATE TOP (1) t SET v = 'x'", "DELETE FROM t OUTPUT deleted.id WHERE id = 1"] {
         let a = p.cl.execute(sql);
         assert_eq!(a.first_error().map(|e| e.number), Some(50100), "{}: {:?}", sql, a.first_error());
     }

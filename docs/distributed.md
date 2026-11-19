@@ -389,14 +389,34 @@ to this server's format in a temporary file, as a single-node restore does).
   security policies and DDL triggers. `WITH CONTINUE_AFTER_ERROR` restores the rest and says what it left out (as messages
   beginning `Not restored:`), including views and procedures that could not be made without what was left out. Never restored,
   with a message: user-defined types (columns keep their base types), the database's users, roles and permissions (the
-  cluster's database keeps its own), disabled foreign keys (the cluster enforces every foreign key it knows), and XML, spatial
+  database keeps its own), disabled foreign keys (the cluster enforces every foreign key it knows), and XML, spatial
   and full-text indexes (declarations here, which change no answer).
-* **One database.** The objects go into the cluster's database whatever the statement names. If any of their names is taken,
-  the restore is error 3159; `WITH REPLACE` drops the cluster's objects of those names first. A failure drops everything the
-  restore made. Only a full backup restores, `WITH RECOVERY`: `NORECOVERY`, `STANDBY`, `STOPAT`, and log and differential backups
+* **The database.** The objects go into the cluster's database of the name the statement gives (`RESTORE DATABASE advw ...` makes
+  `advw` on the control node and on every shard if the cluster does not have it; see *Databases*), and the session is in the database
+  it was in. If any of the names in it is taken, the restore is error 3159; `WITH REPLACE` drops the objects of those names first. A
+  failure drops everything the restore made, and the database too when the restore made it. Only a full backup restores, `WITH RECOVERY`: `NORECOVERY`, `STANDBY`, `STOPAT`, and log and differential backups
   are refused, as is a restore inside a transaction (574). While it runs, other sessions can see the tables filling.
 * **`BACKUP DATABASE` of the cluster's database is refused** (error 50100): the control node's engine holds none of its rows, so the
   backup would be empty.
+
+## Databases
+
+A cluster has the databases `CREATE DATABASE` makes, besides `master`. `CREATE DATABASE name` is made on the control node's engine and on
+every shard (so `sys.databases` and SSMS's Databases node list it), `DROP DATABASE name` drops it from all of them with the tables, views
+and procedures the cluster holds in it (a database that a session is in cannot be dropped: 3702), and `USE name` is the engine's own: the
+control node is told which database a client is in before each batch.
+
+A table is named by its database, schema and name, and a table of another database is named in full (`shop.dbo.items`). A statement of a
+session in a database other than `master` has the tables it names given the database before the cluster plans it, so everything after
+that (the plan, the SQL the shards run, the catalog's ids) names a table in full; `CREATE SCHEMA`, `CREATE VIEW` and `CREATE PROCEDURE`,
+which are about the whole database, are sent to the shards behind a `USE`. The id of a table has the database in it (`shop.dbo.items`),
+except that of a table of `master`, which has none (`dbo.items`), so a state file of a control node made before databases existed reads
+as it was: its tables are in `master`. The log of the schema that a control node (or a new shard) replays says `USE` when the database
+changes, and the `CREATE DATABASE`s are in it.
+
+What is the same in every database: the shards, the slots and the sharding of each table. What differs from SQL Server: a cluster has
+no cross-database transactions beyond what a transaction already does (every table is reached through its shards), and a database has no
+settings of its own (files, collation, recovery model): `CREATE DATABASE` ignores them.
 
 ## Temporary tables of a client
 
@@ -480,7 +500,7 @@ generated rows.
   (the client sees an error and retries). Membership changes go through the shard's leader one voter at a time.
 * **Refused** (error 50100 says so): `UNIQUE` constraints or unique indexes that do not contain the shard key, stored
   functions and triggers (they would need an interpreter next to the data; a procedure is made on every shard and can be
-  declared to run on one, see *Procedures that run on one shard*), `CREATE DATABASE`/`USE`, temporal
+  declared to run on one, see *Procedures that run on one shard*), temporal
   tables, DML with joins (`UPDATE ... FROM`), `OUTPUT` or `TOP` in DML, `INSERT ... DEFAULT VALUES`/`EXEC`, correlated
   subqueries in DML, schema changes inside a transaction, the T-SQL `BULK INSERT` statement (`INSERT BULK`, the protocol's bulk
   load, works), `BACKUP` of the cluster's database, and restoring anything but a full backup (see *Restoring a backup into a
