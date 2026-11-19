@@ -208,7 +208,7 @@ fn the_statements_ssms_runs_when_it_connects_all_work() {
     exec(&mut c, "CREATE TRIGGER tr_tl2 ON tl2 AFTER INSERT AS BEGIN SET NOCOUNT ON END");
     assert_eq!(rows(&mut c, "SELECT (SELECT COUNT(*) FROM sys.foreign_keys f WHERE f.parent_object_id = OBJECT_ID('tl2') AND f.is_disabled = 0 AND f.is_not_trusted = 0 AND f.delete_referential_action = 1 AND f.key_index_id = 1 AND f.create_date IS NOT NULL), (SELECT COUNT(*) FROM sys.check_constraints k WHERE k.parent_object_id = OBJECT_ID('tl2') AND k.is_system_named = 0 AND k.create_date IS NOT NULL), (SELECT COUNT(*) FROM sys.default_constraints k WHERE k.parent_object_id = OBJECT_ID('tl2') AND k.create_date IS NOT NULL), (SELECT COUNT(*) FROM sys.key_constraints k WHERE k.parent_object_id = OBJECT_ID('tl2') AND k.create_date IS NOT NULL AND k.unique_index_id >= 1), (SELECT COUNT(*) FROM sys.triggers t JOIN sys.sql_modules m ON m.object_id = t.object_id WHERE t.parent_id = OBJECT_ID('tl2') AND t.create_date IS NOT NULL AND m.uses_ansi_nulls = 1), (SELECT COUNT(*) FROM sys.system_sql_modules), (SELECT COUNT(*) FROM sys.all_columns WHERE object_id = OBJECT_ID('tl2') AND is_dropped_ledger_column = 1), (SELECT value_in_use FROM sys.configurations WHERE configuration_id = 16384)"), vec![vec!["1".to_string(), "1".into(), "1".into(), "2".into(), "1".into(), "0".into(), "0".into(), "0".into()]]);
     // the server information SSMS reads before it shows the rows of a table: registry values (NULL here), the cluster and statistics views
-    assert_eq!(rows(&mut c, "DECLARE @n INT; EXEC master.dbo.xp_instance_regread N'HKEY_LOCAL_MACHINE', N'SOFTWARE\\x', N'NumErrorLogs', @n OUTPUT; SELECT ISNULL(@n, -1), @@MAX_PRECISION, ISNULL(suser_sname(sid_binary(N'nobody')), N'none'), (SELECT COUNT(*) FROM sys.dm_hadr_cluster), (SELECT COUNT(*) FROM sys.stats), (SELECT COUNT(*) FROM sys.dm_hadr_cluster_members)"), vec![vec!["-1".to_string(), "38".into(), "none".into(), "0".into(), "0".into(), "0".into()]]);
+    assert_eq!(rows(&mut c, "DECLARE @n INT; EXEC master.dbo.xp_instance_regread N'HKEY_LOCAL_MACHINE', N'SOFTWARE\\x', N'NumErrorLogs', @n OUTPUT; SELECT ISNULL(@n, -1), @@MAX_PRECISION, ISNULL(suser_sname(sid_binary(N'nobody')), N'none'), (SELECT COUNT(*) FROM sys.dm_hadr_cluster), (SELECT COUNT(*) FROM sys.stats), (SELECT COUNT(*) FROM sys.dm_hadr_cluster_members)"), vec![vec!["-1".to_string(), "38".into(), "none".into(), "0".into(), "5".into(), "0".into()]]);
     // View Dependencies: the references of views, procedures, functions and triggers, and the collation DATABASE_DEFAULT of its temporary tables
     exec(&mut c, "CREATE TABLE dep_a (x INT)");
     exec(&mut c, "CREATE VIEW dep_v AS SELECT x FROM dep_a");
@@ -337,4 +337,122 @@ fn the_information_schema_views_clients_read_are_all_there() {
     for v in ["ROUTINE_COLUMNS", "TABLE_PRIVILEGES", "COLUMN_PRIVILEGES"] {
         assert_eq!(n(&mut c, v), "0", "{}", v);
     }
+}
+
+#[test]
+fn the_partition_catalog_the_table_designer_reads_is_there() {
+    let mut c = conn();
+    assert_eq!(
+        scalar(&mut c, "SELECT COUNT(*) FROM sys.partition_functions func LEFT OUTER JOIN (sys.partition_parameters para JOIN sys.types tp ON tp.user_type_id = para.system_type_id) ON para.function_id = func.function_id"),
+        "0"
+    );
+    assert_eq!(
+        scalar(&mut c, "SELECT COUNT(*) FROM sys.partition_schemes sch INNER JOIN (sys.destination_data_spaces dest INNER JOIN sys.filegroups fg ON fg.data_space_id = dest.data_space_id) ON dest.partition_scheme_id = sch.data_space_id"),
+        "0"
+    );
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.partition_range_values"), "0");
+}
+
+#[test]
+fn the_column_query_of_the_table_designer_runs() {
+    // COL_NAME of a NULL column id (a column that is not full-text) is NULL, not an error
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE dbo.t (a int IDENTITY(1,1) PRIMARY KEY, b nvarchar(10) DEFAULT 'x')");
+    assert_eq!(scalar(&mut c, "SELECT ISNULL(col_name(OBJECT_ID('dbo.t'), NULL), 'none')"), "none");
+    assert_eq!(
+        scalar(
+            &mut c,
+            "SELECT COUNT(*) FROM (select col.name, col_name(col.object_id, ftc.type_column_id) FT_type_column, CONVERT(nvarchar(40), idc.seed_value) AS seed from sys.columns col \
+             left outer join sys.identity_columns idc on idc.object_id = col.object_id and idc.column_id = col.column_id \
+             left outer join sys.fulltext_index_columns ftc on ftc.object_id = col.object_id and ftc.column_id = col.column_id \
+             where col.object_id = object_id(N'dbo.t')) x"
+        ),
+        "2"
+    );
+}
+
+#[test]
+fn constraints_are_objects_with_the_ids_their_own_views_give() {
+    // the table designer asks `select id from sysobjects where id = object_id(N'DF_...')` for each default
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE dbo.t (a int NOT NULL CONSTRAINT pk_t PRIMARY KEY, b int CONSTRAINT df_t_b DEFAULT 5, c int CONSTRAINT uq_t_c UNIQUE, d int CONSTRAINT ck_t_d CHECK (d > 0))");
+    exec(&mut c, "CREATE TABLE dbo.u (a int CONSTRAINT fk_u_t FOREIGN KEY REFERENCES dbo.t (a))");
+    for (name, view, kind) in [("df_t_b", "sys.default_constraints", "D"), ("pk_t", "sys.key_constraints", "PK"), ("uq_t_c", "sys.key_constraints", "UQ"), ("ck_t_d", "sys.check_constraints", "C"), ("fk_u_t", "sys.foreign_keys", "F")] {
+        let own = scalar(&mut c, &format!("SELECT object_id FROM {} WHERE name = '{}'", view, name));
+        assert_eq!(scalar(&mut c, &format!("SELECT OBJECT_ID(N'{}')", name)), own, "{}", name);
+        assert_eq!(scalar(&mut c, &format!("SELECT OBJECT_ID(N'dbo.{}')", name)), own, "dbo.{}", name);
+        assert_eq!(scalar(&mut c, &format!("SELECT id FROM sysobjects WHERE id = OBJECT_ID(N'{}')", name)), own, "sysobjects {}", name);
+        assert_eq!(scalar(&mut c, &format!("SELECT type FROM sys.objects WHERE object_id = {}", own)).trim(), kind, "sys.objects {}", name);
+    }
+    assert_eq!(scalar(&mut c, "SELECT ISNULL(OBJECT_ID(N'nope'), -1)"), "-1");
+    // the properties of a constraint object (the table designer reads IsDefaultCnst of each column's default)
+    assert_eq!(scalar(&mut c, "SELECT OBJECTPROPERTY(OBJECT_ID(N'df_t_b'), N'IsDefaultCnst')"), "1");
+    assert_eq!(scalar(&mut c, "SELECT OBJECTPROPERTY(OBJECT_ID(N'pk_t'), N'IsDefaultCnst')"), "0");
+    assert_eq!(scalar(&mut c, "SELECT OBJECTPROPERTY(OBJECT_ID(N'pk_t'), N'IsPrimaryKey')"), "1");
+    assert_eq!(scalar(&mut c, "SELECT OBJECTPROPERTY(OBJECT_ID(N'fk_u_t'), N'IsForeignKey')"), "1");
+}
+
+#[test]
+fn every_index_has_statistics_and_check_definitions_are_parenthesized() {
+    // the index query of the table designer left-joins sys.stats: SQL Server has a row for each index (no_recompute 0, not NULL)
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE dbo.t (a int NOT NULL CONSTRAINT pk_t PRIMARY KEY, b int CONSTRAINT ck_b CHECK (b > 0))");
+    exec(&mut c, "CREATE INDEX ix_b ON dbo.t (b)");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.indexes ind LEFT OUTER JOIN sys.stats sta ON sta.object_id = ind.object_id AND sta.stats_id = ind.index_id WHERE ind.object_id = OBJECT_ID('dbo.t') AND sta.no_recompute = 0"), "2");
+    assert_eq!(scalar(&mut c, "SELECT definition FROM sys.check_constraints WHERE name = 'ck_b'"), "(b > 0)");
+}
+
+#[test]
+fn the_xml_index_query_of_the_table_designer_runs() {
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE dbo.t (a int NOT NULL PRIMARY KEY, x xml)");
+    assert_eq!(
+        scalar(
+            &mut c,
+            "select COUNT(*) from (sys.xml_indexes IndA left outer join sys.xml_indexes IndB on IndB.object_id = IndA.object_id and IndB.index_id = IndA.using_xml_index_id) \
+             inner join (sys.internal_tables IntT inner join sys.stats st on IntT.internal_type = 202 and st.object_id = IntT.object_id) on IntT.parent_id = IndA.object_id and st.name = IndA.name \
+             inner join sys.index_columns ind_col on ind_col.object_id = IndA.object_id and ind_col.index_id = IndA.index_id \
+             where IndA.fill_factor = 0 and IndA.is_padded = 0 and IndA.is_disabled = 0 and IndA.is_hypothetical = 0 and IndA.allow_row_locks = 1 and IndA.allow_page_locks = 1 and IndA.object_id = object_id(N'dbo.t')"
+        ),
+        "0"
+    );
+}
+
+#[test]
+fn the_spatial_index_query_of_the_table_designer_runs() {
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE dbo.t (a int NOT NULL PRIMARY KEY, g geometry)");
+    assert_eq!(
+        scalar(
+            &mut c,
+            "select COUNT(*) from (sys.spatial_indexes IndA left outer join sys.spatial_index_tessellations IndB on IndB.object_id = IndA.object_id and IndB.index_id = IndA.index_id) \
+             inner join (sys.internal_tables IntT inner join sys.stats st on st.object_id = IntT.object_id and st.stats_id = 1) on IntT.parent_id = IndA.object_id and IntT.parent_minor_id = IndA.index_id \
+             where IndA.fill_factor = 0 and IndA.is_padded = 0 and IndA.is_disabled = 0 and IndA.is_hypothetical = 0 and IndA.allow_row_locks = 1 and IndA.allow_page_locks = 1 and IndA.object_id = object_id(N'dbo.t') \
+             and isnull(IndB.level_1_grid, 16) = 16 and IndB.cells_per_object IS NULL"
+        ),
+        "0"
+    );
+}
+
+#[test]
+fn the_fulltext_index_query_of_the_table_designer_runs() {
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE dbo.t (a int NOT NULL CONSTRAINT pk_t PRIMARY KEY, b nvarchar(50))");
+    assert_eq!(
+        scalar(
+            &mut c,
+            "select count(*) from (select FtInd.unique_index_id, Ind.name as Index_Name, FtInd.fulltext_catalog_id, FtCat.name as Catalog_Name, FtInd.is_enabled, FtInd.change_tracking_state, FtInd.has_crawl_completed, FtInd.crawl_type, cast(0 as int) a, cast(0 as int) b, FtInd.crawl_start_date, FtInd.crawl_end_date, FtInd.incremental_timestamp \
+             from sys.fulltext_indexes FtInd left outer join sys.fulltext_catalogs FtCat on FtCat.fulltext_catalog_id = FtInd.fulltext_catalog_id inner join sys.indexes Ind on Ind.object_id = FtInd.object_id and Ind.index_id = FtInd.unique_index_id where FtInd.object_id = object_id(N'dbo.t')) x"
+        ),
+        "0"
+    );
+}
+
+#[test]
+fn sysobjects_has_the_columns_the_designer_filters_on() {
+    // the bound defaults and rules of the table designer: OBJECTPROPERTY(id, 'IsDefault') and the category bit of system objects
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE dbo.t (a int)");
+    assert_eq!(scalar(&mut c, "select count(*) from sysobjects o where OBJECTPROPERTY(o.id, N'IsDefault') = 1 and o.name not like N'#%%' and o.category & 0x0800 = 0 and OBJECTPROPERTY(o.id, N'IsMSShipped') = 0"), "0");
+    assert_eq!(scalar(&mut c, "select count(*) from sysobjects o where o.xtype = 'U' and o.status = 0 and o.base_schema_ver = 0"), "1");
 }

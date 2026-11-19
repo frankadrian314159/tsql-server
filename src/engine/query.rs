@@ -1005,6 +1005,14 @@ impl<'a> Engine<'a> {
                         Expr::Cast { ty: tr, try_: _, .. } => {
                             ty = self.resolve_type_cast(tr).ok();
                         }
+                        // the system variables that are not ints in SQL Server (the table designer reads @@MAX_PRECISION as a byte)
+                        Expr::SysVar(v) => {
+                            ty = match v.to_uppercase().trim_start_matches('@') {
+                                "MAX_PRECISION" | "DATEFIRST" => Some(DataType::TinyInt),
+                                "LANGID" => Some(DataType::SmallInt),
+                                _ => None,
+                            };
+                        }
                         // ISNULL(column, value) has the type of the column (a tinyint column gives a tinyint, a bit column a bit, whatever the
                         // replacement is, and also when the column is NULL): a client that reads a byte or a boolean fails on an int
                         Expr::Func(fc) if fc.name == "ISNULL" && fc.args.len() == 2 => {

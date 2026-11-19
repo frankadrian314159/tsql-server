@@ -12,6 +12,44 @@ pub struct DependencyRow {
     pub ref_id: Option<i32>,
 }
 
+/// A constraint of a table as an object of the catalog (`sys.objects`, `sysobjects`, `OBJECT_ID`): the ids are those the
+/// views of each kind (`sys.key_constraints`, `foreign_keys`, `check_constraints`, `default_constraints`) give.
+pub struct ConstraintObject {
+    pub name: String,
+    pub id: i32,
+    pub schema: String,
+    pub parent: i32,
+    pub code: &'static str,
+    pub desc: &'static str,
+}
+
+pub fn constraint_objects(db: &crate::catalog::Database) -> Vec<ConstraintObject> {
+    let mut out = vec![];
+    for o in db.objects.values() {
+        if let Object::Table(t) = o {
+            let mut add = |name: &str, id: i32, code: &'static str, desc: &'static str| out.push(ConstraintObject { name: name.to_string(), id, schema: t.schema.clone(), parent: t.object_id, code, desc });
+            if let Some(pk) = &t.pk {
+                add(&pk.name, t.object_id * 1000 + 900, "PK", "PRIMARY_KEY_CONSTRAINT");
+            }
+            for (n, u) in t.uniques.iter().filter(|u| !u.is_index).enumerate() {
+                add(&u.name, t.object_id * 1000 + 901 + n as i32, "UQ", "UNIQUE_CONSTRAINT");
+            }
+            for (k, f) in t.fks.iter().enumerate() {
+                add(&f.name, t.object_id * 1000 + 1 + k as i32, "F", "FOREIGN_KEY_CONSTRAINT");
+            }
+            for (k, ck) in t.checks.iter().enumerate() {
+                add(&ck.name, t.object_id * 1000 + 700 + k as i32, "C", "CHECK_CONSTRAINT");
+            }
+            for (i, c) in t.columns.iter().enumerate() {
+                if let Some(dn) = &c.default_name {
+                    add(dn, t.object_id * 1000 + 500 + i as i32, "D", "DEFAULT_CONSTRAINT");
+                }
+            }
+        }
+    }
+    out
+}
+
 fn rs(cols: &[(&str, DataType)], rows: Vec<Row>) -> Rowset {
     Rowset::new(Schema::new(cols.iter().map(|(n, t)| ColMeta { qual: None, name: n.to_string(), ty: Some(t.clone()), denied: None, hidden: false, coll: None, mask: None }).collect()), rows)
 }
@@ -189,24 +227,8 @@ impl<'a> Engine<'a> {
                         rows.push(vec![sv(o.name()), Value::Int(o.object_id()), Value::Int(sid(o.schema())), Value::Int(parent), sv(o.type_code()), sv(o.type_desc()), date(db.created), date(db.created), Value::Bit(false), Value::Null]);
                     }
                     if lname == "objects" || lname == "all_objects" {
-                        for o in db.objects.values() {
-                            if let Object::Table(t) = o {
-                                let mut add = |n: &str, code: &str, desc: &str| {
-                                    rows.push(vec![sv(n), Value::Int(t.object_id * 10 + rows.len() as i32 % 9 + 1), Value::Int(sid(&t.schema)), Value::Int(t.object_id), sv(code), sv(desc), date(db.created), date(db.created), Value::Bit(false), Value::Null]);
-                                };
-                                if let Some(pk) = &t.pk {
-                                    add(&pk.name, "PK", "PRIMARY_KEY_CONSTRAINT");
-                                }
-                                for u in t.uniques.iter().filter(|u| !u.is_index) {
-                                    add(&u.name, "UQ", "UNIQUE_CONSTRAINT");
-                                }
-                                for f in &t.fks {
-                                    add(&f.name, "F", "FOREIGN_KEY_CONSTRAINT");
-                                }
-                                for ck in &t.checks {
-                                    add(&ck.name, "C", "CHECK_CONSTRAINT");
-                                }
-                            }
+                        for c in constraint_objects(db) {
+                            rows.push(vec![sv(&c.name), Value::Int(c.id), Value::Int(sid(&c.schema)), Value::Int(c.parent), sv(c.code), sv(c.desc), date(db.created), date(db.created), Value::Bit(false), Value::Null]);
                         }
                     }
                     for (tn, (tk, trg)) in &db.triggers {
@@ -384,11 +406,11 @@ impl<'a> Engine<'a> {
                                     "OFF" => ("O", "OFF"),
                                     _ => ("A", "AUTO"),
                                 };
-                                rows.push(vec![Value::Int(t.object_id), Value::Int(key), cat, Value::Bit(f.enabled), sv(st), sv(sd), Value::Bit(true), Value::Null]);
+                                rows.push(vec![Value::Int(t.object_id), Value::Int(key), cat, Value::Bit(f.enabled), sv(st), sv(sd), Value::Bit(true), Value::Null, sv(""), Value::Null, Value::Null, Value::Null, Value::Int(0), Value::Null, Value::Int(1)]);
                             }
                         }
                     }
-                    Some(rs(&[("object_id", DataType::Int), ("unique_index_id", DataType::Int), ("fulltext_catalog_id", DataType::Int), ("is_enabled", DataType::Bit), ("change_tracking_state", DataType::Char(1)), ("change_tracking_state_desc", nv()), ("has_crawl_completed", DataType::Bit), ("crawl_type", DataType::Char(1))], rows))
+                    Some(rs(&[("object_id", DataType::Int), ("unique_index_id", DataType::Int), ("fulltext_catalog_id", DataType::Int), ("is_enabled", DataType::Bit), ("change_tracking_state", DataType::Char(1)), ("change_tracking_state_desc", nv()), ("has_crawl_completed", DataType::Bit), ("crawl_type", DataType::Char(1)), ("crawl_type_desc", nv()), ("crawl_start_date", DataType::DateTime), ("crawl_end_date", DataType::DateTime), ("incremental_timestamp", DataType::Binary(8)), ("stoplist_id", DataType::Int), ("property_list_id", DataType::Int), ("data_space_id", DataType::Int)], rows))
                 }
                 "fulltext_index_columns" => {
                     let mut rows = vec![];
@@ -744,6 +766,9 @@ impl<'a> Engine<'a> {
                 "asymmetric_keys" => Some(rs(&[("name", nv()), ("principal_id", DataType::Int), ("asymmetric_key_id", DataType::Int), ("pvt_key_encryption_type", DataType::Char(2)), ("pvt_key_encryption_type_desc", nv()), ("thumbprint", DataType::VarBinary(85)), ("algorithm", DataType::Char(2)), ("algorithm_desc", nv()), ("key_length", DataType::Int), ("sid", DataType::VarBinary(85)), ("string_sid", nv()), ("public_key", DataType::VarBinary(85)), ("attested_by", nv()), ("provider_type", DataType::Char(4)), ("cryptographic_provider_guid", DataType::Guid), ("cryptographic_provider_algid", DataType::Int)], vec![])),
                 "certificates" => Some(rs(&[("name", nv()), ("certificate_id", DataType::Int), ("principal_id", DataType::Int), ("pvt_key_encryption_type", DataType::Char(2)), ("pvt_key_encryption_type_desc", nv()), ("is_active_for_begin_dialog", DataType::Bit), ("issuer_name", nv()), ("cert_serial_number", nv()), ("sid", DataType::VarBinary(85)), ("string_sid", nv()), ("subject", nv()), ("expiry_date", DataType::DateTime), ("start_date", DataType::DateTime), ("thumbprint", DataType::VarBinary(85)), ("attested_by", nv()), ("pvt_key_last_backup_date", DataType::DateTime), ("key_length", DataType::Int)], vec![])),
                 "partition_schemes" => Some(rs(&[("name", nv()), ("data_space_id", DataType::Int), ("type", DataType::Char(2)), ("type_desc", nv()), ("is_default", DataType::Bit), ("is_system", DataType::Bit), ("function_id", DataType::Int)], vec![])),
+                "destination_data_spaces" => Some(rs(&[("partition_scheme_id", DataType::Int), ("destination_id", DataType::Int), ("data_space_id", DataType::Int)], vec![])),
+                "partition_range_values" => Some(rs(&[("function_id", DataType::Int), ("boundary_id", DataType::Int), ("parameter_id", DataType::Int), ("value", DataType::Variant)], vec![])),
+                "partition_parameters" => Some(rs(&[("function_id", DataType::Int), ("parameter_id", DataType::Int), ("system_type_id", DataType::TinyInt), ("max_length", DataType::SmallInt), ("precision", DataType::TinyInt), ("scale", DataType::TinyInt), ("collation_name", nv()), ("user_type_id", DataType::Int)], vec![])),
                 "partition_functions" => Some(rs(&[("name", nv()), ("function_id", DataType::Int), ("type", DataType::Char(2)), ("type_desc", nv()), ("fanout", DataType::Int), ("boundary_value_on_right", DataType::Bit), ("is_system", DataType::Bit), ("create_date", DataType::DateTime), ("modify_date", DataType::DateTime)], vec![])),
                 "allocation_units" => Some(rs(&[("allocation_unit_id", DataType::BigInt), ("type", DataType::TinyInt), ("type_desc", nv()), ("container_id", DataType::BigInt), ("data_space_id", DataType::Int), ("total_pages", DataType::BigInt), ("used_pages", DataType::BigInt), ("data_pages", DataType::BigInt)], vec![])),
                 "syslanguages" => Some(rs(
@@ -813,9 +838,10 @@ impl<'a> Engine<'a> {
                     let rows = db
                         .objects
                         .values()
-                        .map(|o| vec![sv(o.name()), Value::Int(o.object_id()), sv(o.type_code()), Value::Int(sid(o.schema())), Value::Int(0), Value::Int(0), date(db.created), sv(o.type_code())])
+                        .map(|o| vec![sv(o.name()), Value::Int(o.object_id()), sv(o.type_code()), Value::Int(sid(o.schema())), Value::Int(0), Value::Int(0), date(db.created), sv(o.type_code()), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0)])
+                        .chain(constraint_objects(db).into_iter().map(|c| vec![sv(&c.name), Value::Int(c.id), sv(c.code), Value::Int(sid(&c.schema)), Value::Int(0), Value::Int(c.parent), date(db.created), sv(c.code), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0)]))
                         .collect();
-                    Some(rs(&[("name", nv()), ("id", DataType::Int), ("xtype", DataType::Char(2)), ("uid", DataType::SmallInt), ("info", DataType::SmallInt), ("parent_obj", DataType::Int), ("crdate", DataType::DateTime), ("type", DataType::Char(2))], rows))
+                    Some(rs(&[("name", nv()), ("id", DataType::Int), ("xtype", DataType::Char(2)), ("uid", DataType::SmallInt), ("info", DataType::SmallInt), ("parent_obj", DataType::Int), ("crdate", DataType::DateTime), ("type", DataType::Char(2)), ("status", DataType::Int), ("category", DataType::Int), ("base_schema_ver", DataType::Int), ("replinfo", DataType::Int), ("schema_ver", DataType::Int), ("stats_schema_ver", DataType::Int), ("ftcatid", DataType::SmallInt), ("userstat", DataType::SmallInt), ("sysstat", DataType::SmallInt), ("indexdel", DataType::SmallInt), ("version", DataType::Int), ("deltrig", DataType::Int), ("instrig", DataType::Int), ("updtrig", DataType::Int), ("seltrig", DataType::Int), ("cache", DataType::Int)], rows))
                 }
                 "sysusers" => {
                     let rows = db
@@ -830,7 +856,16 @@ impl<'a> Engine<'a> {
                 "dm_hadr_cluster" => Some(rs(&[("cluster_name", nv()), ("quorum_type", DataType::TinyInt), ("quorum_type_desc", nv()), ("quorum_state", DataType::TinyInt), ("quorum_state_desc", nv())], vec![])),
                 "dm_hadr_cluster_members" => Some(rs(&[("member_name", nv()), ("member_type", DataType::TinyInt), ("member_type_desc", nv()), ("member_state", DataType::TinyInt), ("member_state_desc", nv()), ("number_of_quorum_votes", DataType::TinyInt)], vec![])),
                 // the statistics of the tables: the optimizer keeps its own, which are not objects of the catalog
-                "stats" => Some(rs(&[("object_id", DataType::Int), ("name", nv()), ("stats_id", DataType::Int), ("auto_created", DataType::Bit), ("user_created", DataType::Bit), ("no_recompute", DataType::Bit), ("has_filter", DataType::Bit), ("filter_definition", nv()), ("is_temporary", DataType::Bit), ("is_incremental", DataType::Bit), ("has_persisted_sample", DataType::Bit), ("stats_generation_method", DataType::Int), ("stats_generation_method_desc", nv())], vec![])),
+                // each index has its statistics (the optimizer's own are not listed), as SQL Server has
+                "stats" => {
+                    let ix: Vec<Row> = self.sysview("sys", "indexes").map(|r| r.rows.iter().cloned().collect()).unwrap_or_default();
+                    let rows = ix
+                        .into_iter()
+                        .filter(|r| !matches!(r.get(1), Some(Value::Null) | None))
+                        .map(|r| vec![r[0].clone(), r[1].clone(), r[2].clone(), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Null, Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Int(0), sv("")])
+                        .collect();
+                    Some(rs(&[("object_id", DataType::Int), ("name", nv()), ("stats_id", DataType::Int), ("auto_created", DataType::Bit), ("user_created", DataType::Bit), ("no_recompute", DataType::Bit), ("has_filter", DataType::Bit), ("filter_definition", nv()), ("is_temporary", DataType::Bit), ("is_incremental", DataType::Bit), ("has_persisted_sample", DataType::Bit), ("stats_generation_method", DataType::Int), ("stats_generation_method_desc", nv())], rows))
+                }
                 "stats_columns" => Some(rs(&[("object_id", DataType::Int), ("stats_id", DataType::Int), ("stats_column_id", DataType::Int), ("column_id", DataType::Int)], vec![])),
                 "data_spaces" | "filegroups" => {
                     let mut cols = vec![("name", nv()), ("data_space_id", DataType::Int), ("type", nv()), ("type_desc", nv()), ("is_default", DataType::Bit), ("is_system", DataType::Bit)];
@@ -1008,11 +1043,11 @@ impl<'a> Engine<'a> {
                         if let Object::Table(t) = o {
                             for (k, x) in t.spatial_indexes.iter().enumerate() {
                                 let scheme = format!("{}_{}", if x.geography { "GEOGRAPHY" } else { "GEOMETRY" }, if x.auto { "AUTO_GRID" } else { "GRID" });
-                                rows.push(vec![Value::Int(t.object_id), sv(&x.name), Value::Int(257_000 + k as i32), Value::Int(4), sv("SPATIAL"), Value::Int(if x.geography { 2 } else { 1 }), sv(if x.geography { "GEOGRAPHY" } else { "GEOMETRY" }), Value::Int(if x.auto { 3 } else { if x.geography { 2 } else { 1 } }), sv(&scheme)]);
+                                rows.push(vec![Value::Int(t.object_id), sv(&x.name), Value::Int(257_000 + k as i32), Value::Int(4), sv("SPATIAL"), Value::Int(if x.geography { 2 } else { 1 }), sv(if x.geography { "GEOGRAPHY" } else { "GEOMETRY" }), Value::Int(if x.auto { 3 } else { if x.geography { 2 } else { 1 } }), sv(&scheme), Value::Int(0), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(true), Value::Bit(true), Value::Bit(false), Value::Int(1), Value::Bit(false), Value::Null]);
                             }
                         }
                     }
-                    Some(rs(&[("object_id", DataType::Int), ("name", nv()), ("index_id", DataType::Int), ("type", DataType::TinyInt), ("type_desc", nv()), ("spatial_index_type", DataType::TinyInt), ("spatial_index_type_desc", nv()), ("tessellation_scheme_id", DataType::TinyInt), ("tessellation_scheme", nv())], rows))
+                    Some(rs(&[("object_id", DataType::Int), ("name", nv()), ("index_id", DataType::Int), ("type", DataType::TinyInt), ("type_desc", nv()), ("spatial_index_type", DataType::TinyInt), ("spatial_index_type_desc", nv()), ("tessellation_scheme_id", DataType::TinyInt), ("tessellation_scheme", nv()), ("fill_factor", DataType::TinyInt), ("is_padded", DataType::Bit), ("is_disabled", DataType::Bit), ("is_hypothetical", DataType::Bit), ("allow_row_locks", DataType::Bit), ("allow_page_locks", DataType::Bit), ("ignore_dup_key", DataType::Bit), ("data_space_id", DataType::Int), ("has_filter", DataType::Bit), ("filter_definition", nv())], rows))
                 }
                 "spatial_index_tessellations" => {
                     let mut rows = vec![];
@@ -1066,6 +1101,15 @@ impl<'a> Engine<'a> {
                                     using,
                                     st,
                                     sd,
+                                    Value::Int(0),
+                                    Value::Bit(false),
+                                    Value::Bit(false),
+                                    Value::Bit(true),
+                                    Value::Bit(true),
+                                    Value::Bit(false),
+                                    Value::Int(1),
+                                    Value::Bit(false),
+                                    Value::Null,
                                 ]);
                             }
                         }
@@ -1086,6 +1130,15 @@ impl<'a> Engine<'a> {
                             ("using_xml_index_id", DataType::Int),
                             ("secondary_type", DataType::Char(1)),
                             ("secondary_type_desc", nv()),
+                            ("fill_factor", DataType::TinyInt),
+                            ("is_padded", DataType::Bit),
+                            ("is_hypothetical", DataType::Bit),
+                            ("allow_row_locks", DataType::Bit),
+                            ("allow_page_locks", DataType::Bit),
+                            ("ignore_dup_key", DataType::Bit),
+                            ("data_space_id", DataType::Int),
+                            ("has_filter", DataType::Bit),
+                            ("filter_definition", nv()),
                         ],
                         rows,
                     ))
@@ -1325,7 +1378,7 @@ impl<'a> Engine<'a> {
                         if let Object::Table(t) = o {
                             for (k, c) in t.checks.iter().enumerate() {
                                 let col = c.col.as_ref().and_then(|n| t.columns.iter().position(|x| x.name.eq_ignore_ascii_case(n))).map(|i| i as i32 + 1).unwrap_or(0);
-                                rows.push(vec![sv(&c.name), Value::Int(t.object_id), Value::Bit(!c.enabled), Value::Int(t.object_id * 1000 + 700 + k as i32), sv(&c.text), Value::Int(col), sv("C"), sv("CHECK_CONSTRAINT"), Value::Int(sid(&t.schema)), date(db.created), date(db.created), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Null]);
+                                rows.push(vec![sv(&c.name), Value::Int(t.object_id), Value::Bit(!c.enabled), Value::Int(t.object_id * 1000 + 700 + k as i32), sv(&format!("({})", c.text)), Value::Int(col), sv("C"), sv("CHECK_CONSTRAINT"), Value::Int(sid(&t.schema)), date(db.created), date(db.created), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Null]);
                             }
                         }
                     }
@@ -1891,7 +1944,7 @@ impl<'a> Engine<'a> {
                     for o in db.objects.values() {
                         if let Object::Table(t) = o {
                             for c in &t.checks {
-                                rows.push(vec![cat.clone(), sv(&t.schema), sv(&c.name), sv(&c.text)]);
+                                rows.push(vec![cat.clone(), sv(&t.schema), sv(&c.name), sv(&format!("({})", c.text))]);
                             }
                         }
                     }

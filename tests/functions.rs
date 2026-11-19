@@ -350,3 +350,16 @@ fn an_ambiguous_column_in_a_join_is_reported_before_the_rows_are_joined() {
     exec(&mut c, "INSERT INTO amb2 VALUES (1, 1)");
     assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM amb a, amb2 b WHERE id = 7"), "1");
 }
+
+#[test]
+fn the_system_variables_that_are_not_ints_are_typed_so() {
+    // the table designer of SSMS reads @@MAX_PRECISION as a byte: the column of a result has the type (seen through SELECT INTO)
+    let mut c = conn();
+    exec(&mut c, "SELECT @@MAX_PRECISION AS a, @@DATEFIRST AS b, @@LANGID AS c, @@MAX_CONNECTIONS AS d INTO dbo.sv");
+    let ty = |c: &mut tsql_server::Connection, col: &str| scalar(c, &format!("SELECT TYPE_NAME(system_type_id) FROM sys.columns WHERE object_id = OBJECT_ID('dbo.sv') AND name = '{}'", col));
+    assert_eq!(ty(&mut c, "a"), "tinyint");
+    assert_eq!(ty(&mut c, "b"), "tinyint");
+    assert_eq!(ty(&mut c, "c"), "smallint");
+    assert_eq!(ty(&mut c, "d"), "int");
+    assert_eq!(scalar(&mut c, "SELECT @@MAX_PRECISION"), "38");
+}

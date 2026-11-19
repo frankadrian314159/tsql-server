@@ -1915,6 +1915,13 @@ impl<'a> Engine<'a> {
                             .or_else(|| self.srv.databases.get(d).and_then(|db| db.triggers.get(k)).map(|(_, t)| (t.object_id, "TR".to_string()))),
                         _ => self.table_ref(&loc).map(|t| (t.object_id, "U".to_string())),
                     };
+                    // a constraint is an object too (the table designer asks for a default by its name)
+                    let found = found.or_else(|| {
+                        let db = self.srv.databases.get(&self.ses.db.to_lowercase())?;
+                        let n = parts.last()?;
+                        let sch = if parts.len() >= 2 { Some(parts[parts.len() - 2].as_str()) } else { None };
+                        super::sysviews::constraint_objects(db).into_iter().find(|c| c.name.eq_ignore_ascii_case(n) && sch.map_or(true, |s| c.schema.eq_ignore_ascii_case(s))).map(|c| (c.id, c.code.to_string()))
+                    });
                     match found {
                         Some((id, tc)) if want.as_ref().map(|w| *w == tc || (w == "FN" && matches!(tc.as_str(), "FN" | "IF" | "TF"))).unwrap_or(true) => Value::Int(id),
                         _ => Value::Null,
@@ -2170,6 +2177,10 @@ impl<'a> Engine<'a> {
             }
             "COL_NAME" => {
                 need(name, &a, 2)?;
+                // (NULL for the table or the column gives NULL: the table designer asks for the column a full-text column's type is in, which most do not have)
+                if a[0].is_null() || a[1].is_null() {
+                    return Ok(Some(Value::Null));
+                }
                 let id = int(&a[0])? as i32;
                 let cid = int(&a[1])? as usize;
                 let mut r = Value::Null;
@@ -2212,6 +2223,21 @@ impl<'a> Engine<'a> {
                                 "istablefunction" => matches!(o.type_code(), "IF" | "TF") as i32,
                                 "hasidentity" | "tablehasidentity" => if let Object::Table(t) = o { t.identity_col().is_some() as i32 } else { 0 },
                                 "tablehasprimarykey" => if let Object::Table(t) = o { t.pk.is_some() as i32 } else { 0 },
+                                _ => 0,
+                            });
+                        }
+                    }
+                    // a constraint is an object too: the table designer reads IsDefaultCnst of a column's default
+                    if r.is_null() {
+                        if let Some(c) = super::sysviews::constraint_objects(db).into_iter().find(|c| c.id == id) {
+                            r = Value::Int(match prop.as_str() {
+                                "isdefaultcnst" => (c.code == "D") as i32,
+                                "isprimarykey" => (c.code == "PK") as i32,
+                                "isuniquecnst" => (c.code == "UQ") as i32,
+                                "isforeignkey" => (c.code == "F") as i32,
+                                "ischeckcnst" => (c.code == "C") as i32,
+                                "isconstraint" => 1,
+                                "ismsshipped" => 0,
                                 _ => 0,
                             });
                         }
