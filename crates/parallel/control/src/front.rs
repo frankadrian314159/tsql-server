@@ -15,6 +15,28 @@ use crate::*;
 use std::collections::HashMap;
 use tsql_server::{Interceptor, Streamed};
 
+/// Whether any batch or stored module this process has seen mentions `XACT_STATE`. Until one does, a statement in a transaction needs no
+/// substitution of its value (which costs a round trip through JSON for every statement of a transaction).
+static XACT_STATE_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Note that `text` mentions `XACT_STATE` (case apart), if it does.
+pub(crate) fn note_xact_state(text: &str) {
+    if XACT_STATE_SEEN.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let pat = b"xact_state";
+    if text.as_bytes().windows(pat.len()).any(|w| w.eq_ignore_ascii_case(pat)) {
+        XACT_STATE_SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// As [`note_xact_state`] for a schema log (the procedures, functions and triggers it holds).
+pub(crate) fn note_xact_state_in_log(log: &[Stmt]) {
+    if let Ok(j) = serde_json::to_string(log) {
+        note_xact_state(&j);
+    }
+}
+
 /// The words of a batch that can name a table: not those of comments, and not variables (`@ErrorLog` is not the table `ErrorLog`). The
 /// contents of string literals are left out when `literals` is false: in a batch that runs no dynamic SQL a table's name in a string
 /// (`WHERE name = 'orders'`) is a value.
@@ -199,7 +221,7 @@ impl ClusterSession {
 
     /// `st` with the variables of the session replaced by their values.
     pub(crate) fn bind_vars(&self, st: &Stmt) -> Result<Stmt, SqlError> {
-        let xact_read = self.txn.borrow().is_some() && matches!(st, Stmt::Query(_) | Stmt::Set { .. } | Stmt::If { .. } | Stmt::While { .. } | Stmt::Print(_));
+        let xact_read = XACT_STATE_SEEN.load(std::sync::atomic::Ordering::Relaxed) && self.txn.borrow().is_some() && matches!(st, Stmt::Query(_) | Stmt::Set { .. } | Stmt::If { .. } | Stmt::While { .. } | Stmt::Print(_));
         if self.vars.is_empty() && self.last_identity.is_none() && self.catch_stack.is_empty() && self.eventdata.is_empty() && !xact_read {
             return Ok(st.clone());
         }

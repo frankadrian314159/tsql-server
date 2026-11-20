@@ -82,6 +82,7 @@ impl Cluster {
         let funcs_init = crate::funcs::functions_of_log(&log);
         let triggers_init = crate::triggers::triggers_of_log(&log);
         let log_for_ddl = log.clone();
+        crate::front::note_xact_state_in_log(&log);
         let mirror = Server::new();
         {
             // the mirror learns the schema again

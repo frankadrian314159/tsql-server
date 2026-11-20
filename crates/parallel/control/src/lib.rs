@@ -773,6 +773,7 @@ impl ClusterSession {
         tsql_server::span!("ctl_execute");
         self.plan.clear();
         self.batch_text = sql.to_string();
+        front::note_xact_state(sql);
         let cl = self.cluster.clone();
         let mut events = vec![];
         // ADVISE DISTRIBUTION [RESET]: what the queries had to move or gather so far, and the distribution that would have spared it
