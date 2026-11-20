@@ -29,6 +29,8 @@ pub mod spill;
 pub mod stats;
 pub mod admin;
 pub mod backup;
+pub mod backuphist;
+pub mod bakheader;
 pub mod bakexport;
 pub mod bakimport;
 pub mod par;
@@ -218,6 +220,8 @@ pub struct SessionState {
     /// view's text so that an altered view is found again. See `Engine::prime_view_columns`.
     pub view_cols: HashMap<i32, (String, Vec<(String, Option<DataType>, bool)>)>,
     pub imp_stack: Vec<(String, Option<String>)>,
+    /// The server itself is running a statement of its own (the backup history of msdb): it has every right.
+    pub system_ctx: bool,
     pub plan: Vec<String>,
     pub order_hint: Option<optimizer::OrderHint>,
     pub ordered_used: bool,
@@ -344,6 +348,7 @@ impl SessionState {
             pushdown: vec![],
             view_cols: HashMap::new(),
             imp_stack: vec![],
+            system_ctx: false,
             plan: vec![],
             order_hint: None,
             ordered_used: false,
@@ -1869,11 +1874,31 @@ impl<'a> Engine<'a> {
     }
 
     pub fn find_func(&self, schema: Option<&str>, name: &str) -> Option<FuncDef> {
-        let db = self.srv.databases.get(&self.ses.db.to_lowercase())?;
+        self.find_func_at(None, schema, name)
+    }
+
+    /// A function of the session's database, or of `db` when the call names one (`db.schema.f(...)`).
+    pub fn find_func_at(&self, db: Option<&str>, schema: Option<&str>, name: &str) -> Option<FuncDef> {
+        let dbk = db.map(|d| d.to_lowercase()).unwrap_or_else(|| self.ses.db.to_lowercase());
+        let db = self.srv.databases.get(&dbk)?;
         let key = obj_key(schema.unwrap_or("dbo"), name);
         match db.objects.get(&key) {
             Some(Object::Func(f)) => Some(f.clone()),
             _ => None,
+        }
+    }
+
+    /// The session's database for the length of a call of a function that is in another one (the body of a function runs in the
+    /// database the function is in): returns what to give back to `leave_function_db`.
+    pub fn enter_function_db(&mut self, db: Option<&str>) -> Option<String> {
+        let d = db?;
+        let shown = self.srv.databases.get(&d.to_lowercase()).map(|x| x.name.clone()).unwrap_or_else(|| d.to_string());
+        Some(std::mem::replace(&mut self.ses.db, shown))
+    }
+
+    pub fn leave_function_db(&mut self, saved: Option<String>) {
+        if let Some(s) = saved {
+            self.ses.db = s;
         }
     }
 

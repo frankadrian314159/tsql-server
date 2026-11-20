@@ -337,7 +337,9 @@ pub struct ColumnDef {
     pub default_name: Option<String>,
     pub computed: Option<Expr>,
     pub computed_text: Option<String>,
+    #[serde(with = "double_option")]
     pub pk: Option<Option<String>>,
+    #[serde(with = "double_option")]
     pub unique: Option<Option<String>>,
     pub checks: Vec<(Option<String>, Expr, String)>,
     pub fk: Option<ForeignKeyDef>,
@@ -543,7 +545,9 @@ pub enum Stmt {
     CreateFunction(Box<CreateFunction>),
     CreateTrigger { name: Name, table: Name, events: Vec<String>, instead: bool, body: Rc<Vec<Stmt>>, or_alter: bool, text: String },
     CreateSchema(String, Option<String>),
-    CreateDatabase(String, Option<String>),
+    /// name, collation and the FILENAMEs of its files (data and log) as written; the files are skipped by serde, so the saved state
+    /// of a cluster (which holds its schema log, positionally) keeps the layout it had and never keeps a path
+    CreateDatabase(String, Option<String>, #[serde(skip)] Vec<String>),
     CreateType { name: Name, base: Option<TypeRef>, nullable: Option<bool>, table: Option<Vec<TableDef>> },
     CreateSequence { name: Name, opts: SequenceOpts },
     /// CREATE SYNONYM name FOR target
@@ -636,9 +640,11 @@ pub enum RestoreKind {
     Log,
     VerifyOnly,
     HeaderOnly,
+    FileListOnly,
+    LabelOnly,
 }
 
-/// `RESTORE DATABASE|LOG db FROM DISK = 'file' [WITH ...]`, `RESTORE VERIFYONLY|HEADERONLY FROM DISK = 'file'`.
+/// `RESTORE DATABASE|LOG db FROM DISK = 'file' [WITH ...]`, `RESTORE VERIFYONLY|HEADERONLY|FILELISTONLY|LABELONLY FROM DISK = 'file'`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RestoreStmt {
     pub kind: RestoreKind,
@@ -701,7 +707,7 @@ pub struct TriggerAdmin {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AuditStmt {
     CreateAudit { name: String, target: crate::audit::AuditTarget, opts: Vec<(String, String)>, filter: Option<(String, Expr)>, state_on: bool },
-    AlterAudit { name: String, target: Option<crate::audit::AuditTarget>, opts: Vec<(String, String)>, filter: Option<Option<(String, Expr)>>, state: Option<bool> },
+    AlterAudit { name: String, target: Option<crate::audit::AuditTarget>, opts: Vec<(String, String)>, #[serde(with = "double_option")] filter: Option<Option<(String, Expr)>>, state: Option<bool> },
     DropAudit { name: String },
     CreateSpec { server: bool, name: String, audit: String, items: Vec<crate::audit::AuditItem>, state_on: bool },
     AlterSpec { server: bool, name: String, add: Vec<crate::audit::AuditItem>, drop: Vec<crate::audit::AuditItem>, state: Option<bool> },
@@ -791,6 +797,34 @@ impl Expr {
         match self {
             Expr::Or(..) | Expr::And(..) | Expr::Paren(..) => self.factor_common(),
             other => other,
+        }
+    }
+}
+
+/// `Option<Option<T>>` for the serialized forms people read (JSON). `Some(None)` (`PRIMARY KEY` with no name, a filter that is cleared)
+/// is `null` as a plain `Option<Option<T>>`, and `null` is read back as `None`: a statement that was written to JSON and read back
+/// (as the cluster's control node does to name the tables in full) lost its primary and unique keys. Here `None` is `null` and
+/// `Some(x)` is `[x]`. The compact binary forms (the log, the saved state of a cluster) are as they were.
+pub mod double_option {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<T: Serialize, S: Serializer>(v: &Option<Option<T>>, s: S) -> Result<S::Ok, S::Error> {
+        if s.is_human_readable() {
+            match v {
+                None => s.serialize_none(),
+                Some(inner) => s.serialize_some(&[inner]),
+            }
+        } else {
+            v.serialize(s)
+        }
+    }
+
+    pub fn deserialize<'de, T: Deserialize<'de>, D: Deserializer<'de>>(d: D) -> Result<Option<Option<T>>, D::Error> {
+        if d.is_human_readable() {
+            let v: Option<Vec<Option<T>>> = Option::deserialize(d)?;
+            Ok(v.map(|mut x| if x.is_empty() { None } else { x.remove(0) }))
+        } else {
+            Option::<Option<T>>::deserialize(d)
         }
     }
 }

@@ -216,3 +216,73 @@ fn read_only_transactions_leave_no_trace_and_a_waiting_writer_is_woken_when_the_
     exec(&mut a, "COMMIT");
     assert_eq!(t.join().unwrap(), "12");
 }
+
+#[test]
+fn create_database_accepts_the_full_script_ssms_generates() {
+    let mut c = conn();
+    exec(
+        &mut c,
+        "CREATE DATABASE [X]\r\n CONTAINMENT = NONE\r\n ON  PRIMARY \r\n( NAME = N'X', FILENAME = N'C:/tmp/xdata' , SIZE = 1024KB , FILEGROWTH = 10%), \r\n FILEGROUP [X2] \r\n( NAME = N'X2', FILENAME = N'C:/tmp/xdata2' , SIZE = 1024KB , FILEGROWTH = 10%)\r\n LOG ON \r\n( NAME = N'X_log', FILENAME = N'C:/tmp/xlog' , SIZE = 1024KB , FILEGROWTH = 10%)\r\n WITH LEDGER = OFF",
+    );
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.databases WHERE name = 'X'"), "1");
+}
+
+#[test]
+fn alter_database_set_accepts_what_ssms_new_database_sends() {
+    let mut c = conn();
+    exec(&mut c, "CREATE DATABASE nd");
+    for sql in [
+        "ALTER DATABASE [nd] SET AUTO_CREATE_STATISTICS ON(INCREMENTAL = OFF)",
+        "ALTER DATABASE [nd] SET PAGE_VERIFY CHECKSUM",
+        "ALTER DATABASE [nd] SET TARGET_RECOVERY_TIME = 60 SECONDS",
+        "ALTER DATABASE [nd] SET RECOVERY SIMPLE",
+        "ALTER DATABASE [nd] SET CURSOR_DEFAULT  GLOBAL ",
+        "ALTER DATABASE [nd] SET CURSOR_CLOSE_ON_COMMIT OFF",
+        "ALTER DATABASE [nd] SET ANSI_NULLS ON, QUOTED_IDENTIFIER ON",
+    ] {
+        exec(&mut c, sql);
+    }
+}
+
+#[test]
+fn deleting_backup_history_succeeds_when_dropping_a_database_from_ssms() {
+    let mut c = conn();
+    exec(&mut c, "CREATE DATABASE gone");
+    exec(&mut c, "EXEC msdb.dbo.sp_delete_database_backuphistory @database_name = N'gone'");
+    exec(&mut c, "DROP DATABASE gone");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.databases WHERE name = 'gone'"), "0");
+}
+
+#[test]
+fn sysprocesses_counts_the_connections_of_a_database() {
+    let mut c = conn();
+    exec(&mut c, "CREATE DATABASE busy");
+    assert_eq!(scalar(&mut c, "SELECT (SELECT COUNT(*) FROM master.dbo.sysprocesses p WHERE dtb.database_id = p.dbid) FROM master.sys.databases AS dtb WHERE dtb.name = N'busy'"), "0");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM master.dbo.sysprocesses WHERE spid = @@SPID"), "1");
+    exec(&mut c, "ALTER DATABASE [busy] SET SINGLE_USER WITH ROLLBACK IMMEDIATE");
+    exec(&mut c, "DROP DATABASE busy");
+}
+
+#[test]
+fn create_database_checks_its_file_paths_as_sql_server_does() {
+    let mut c = conn();
+    let dir = std::env::temp_dir().join("tsql_createdb_files");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = dir.display().to_string().replace(char::from(92), "/");
+    // a folder where a file name belongs
+    let e = c.execute(&format!("CREATE DATABASE f1 ON PRIMARY (NAME = N'f1', FILENAME = N'{d}') LOG ON (NAME = N'f1_log', FILENAME = N'{d}/f1.ldf')")).first_error().expect("an error").to_string();
+    assert!(e.contains("already exists"), "{e}");
+    // a folder that is not there
+    let e = c.execute(&format!("CREATE DATABASE f2 ON (NAME = N'f2', FILENAME = N'{d}/nope/f2.mdf')")).first_error().expect("an error").to_string();
+    assert!(e.contains("Directory lookup"), "{e}");
+    // a file that is there
+    std::fs::write(dir.join("f3.mdf"), b"x").unwrap();
+    let e = c.execute(&format!("CREATE DATABASE f3 ON (NAME = N'f3', FILENAME = N'{d}/f3.mdf')")).first_error().expect("an error").to_string();
+    assert!(e.contains("already exists"), "{e}");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.databases WHERE name IN ('f1','f2','f3')"), "0");
+    // free names in an existing folder are fine
+    exec(&mut c, &format!("CREATE DATABASE f4 ON (NAME = N'f4', FILENAME = N'{d}/f4.mdf') LOG ON (NAME = N'f4_log', FILENAME = N'{d}/f4.ldf')"));
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.databases WHERE name = 'f4'"), "1");
+    let _ = std::fs::remove_dir_all(&dir);
+}

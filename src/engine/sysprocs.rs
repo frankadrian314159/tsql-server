@@ -330,6 +330,46 @@ impl<'a> Engine<'a> {
                 self.emit_rowset(Rowset::from_rows(&["attribute_id".into(), "attribute_name".into(), "attribute_value".into()], rows));
                 Ok(Some(Value::Int(0)))
             }
+            // the folder picker (SMO's Locate Folder / file dialogs) asks the server for its drives and folders
+            "xp_fixeddrives" => {
+                let rows: Vec<Row> = fixed_drives().into_iter().map(|(d, mb)| vec![Value::Str(d), Value::Int(mb)]).collect();
+                self.emit_rowset(Rowset::from_rows(&["drive".into(), "MB free".into()], rows));
+                Ok(Some(Value::Int(0)))
+            }
+            "xp_subdirs" | "xp_dirtree" => {
+                let path = args.first().map(|a| convert::to_str(&a.1)).unwrap_or_default();
+                let with_files = name == "xp_dirtree" && args.get(2).map(|a| convert::to_str(&a.1).trim() == "1").unwrap_or(false);
+                let mut entries: Vec<(String, bool)> = std::fs::read_dir(&path).map(|rd| rd.flatten().filter_map(|e| { let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false); if is_dir || with_files { Some((e.file_name().to_string_lossy().to_string(), is_dir)) } else { None } }).collect()).unwrap_or_default();
+                entries.sort();
+                let (cols, rows): (Vec<String>, Vec<Row>) = if name == "xp_subdirs" {
+                    (vec!["subdirectory".into()], entries.into_iter().map(|(n, _)| vec![Value::Str(n)]).collect())
+                } else {
+                    (vec!["subdirectory".into(), "depth".into(), "file".into()], entries.into_iter().map(|(n, d)| vec![Value::Str(n), Value::Int(1), Value::Int(if d { 0 } else { 1 })]).collect())
+                };
+                self.emit_rowset(Rowset::from_rows(&cols, rows));
+                Ok(Some(Value::Int(0)))
+            }
+            "xp_fileexist" => {
+                let path = args.first().map(|a| convert::to_str(&a.1)).unwrap_or_default();
+                let p = std::path::Path::new(&path);
+                let (is_dir, exists) = (p.is_dir(), p.exists());
+                let parent = p.parent().map(|x| x.as_os_str().is_empty() || x.is_dir()).unwrap_or(true);
+                self.emit_rowset(Rowset::from_rows(&["File Exists".into(), "File is a Directory".into(), "Parent Directory Exists".into()], vec![vec![Value::Int((exists && !is_dir) as i32), Value::Int(is_dir as i32), Value::Int(parent as i32)]]));
+                Ok(Some(Value::Int(0)))
+            }
+            // SSMS's Delete dialog clears the backup history of a database it drops; this server keeps none
+            "sp_delete_database_backuphistory" => {
+                let db = args.first().map(|a| convert::to_str(&a.1)).unwrap_or_default();
+                self.delete_database_backup_history(&db)?;
+                Ok(Some(Value::Int(0)))
+            }
+            "sp_delete_backuphistory" => {
+                let when = args.first().map(|a| a.1.clone()).unwrap_or(Value::Null);
+                if let Ok(Value::DateTime(d, _)) = convert::cast(&when, &DataType::DateTime, None) {
+                    self.delete_backup_history_before(d)?;
+                }
+                Ok(Some(Value::Int(0)))
+            }
             "xp_msver" => {
                 let ver = funcs::VERSION_STRING.lines().next().unwrap_or("").to_string();
                 let rows: Vec<Row> = vec![
@@ -397,5 +437,28 @@ impl<'a> Engine<'a> {
             }
             _ => Ok(None),
         }
+    }
+}
+
+/// The drives the server can see with their free space in MB (Windows letters; on other systems the root).
+pub(crate) fn fixed_drives() -> Vec<(String, i32)> {
+    #[cfg(windows)]
+    {
+        extern "system" {
+            fn GetDiskFreeSpaceExW(dir: *const u16, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32;
+        }
+        let mut v = vec![];
+        for c in b'A'..=b'Z' {
+            let root: Vec<u16> = format!("{}:\\", c as char).encode_utf16().chain(std::iter::once(0)).collect();
+            let (mut a, mut t, mut f) = (0u64, 0u64, 0u64);
+            if unsafe { GetDiskFreeSpaceExW(root.as_ptr(), &mut a, &mut t, &mut f) } != 0 {
+                v.push(((c as char).to_string(), (a / (1024 * 1024)).min(i32::MAX as u64) as i32));
+            }
+        }
+        v
+    }
+    #[cfg(not(windows))]
+    {
+        vec![("/".to_string(), 0)]
     }
 }

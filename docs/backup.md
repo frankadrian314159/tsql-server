@@ -10,6 +10,8 @@ RESTORE LOG shop FROM DISK = 'C:\backups\shop_1.trn' WITH STOPAT = '2026-11-09 1
 RESTORE VERIFYONLY FROM DISK = '...';     -- checks every checksum
 BACKUP DATABASE shop TO DISK = 'shop_mssql.bak' WITH SQL_SERVER_FORMAT;   -- a backup in the form of a SQL Server .bak
 RESTORE HEADERONLY FROM DISK = '...';     -- name, type, database, times, recovery model
+RESTORE FILELISTONLY FROM DISK = '...';   -- the files of the database (data and log)
+RESTORE LABELONLY FROM DISK = '...';      -- the media label
 
 ALTER DATABASE shop SET RECOVERY FULL | SIMPLE;   -- BULK_LOGGED is treated as FULL
 SELECT name, state_desc, recovery_model_desc FROM sys.databases;
@@ -68,6 +70,29 @@ any other change.
 
 In a cluster, `RESTORE DATABASE` sent to the control node puts the tables on the shards and sends them the rows as the backup is read;
 see [distributed.md](distributed.md#restoring-a-backup-into-a-cluster).
+
+### What the three read-only forms return
+
+`RESTORE HEADERONLY`, `FILELISTONLY` and `LABELONLY` answer with SQL Server's columns, in its order (56, 22 and 13 of them), because SSMS's Restore
+dialog reads them by name to list the backup sets of a file and the files to restore. They work for this server's backups and for those SQL Server
+wrote. What a backup does not say is a stand-in: the log sequence numbers are the commit timestamps the backup spans (0 for a SQL Server backup),
+the collation is the default one, and the files are named after the database (`<db>.mdf`, `<db>_log.ldf`), which the restore does not use.
+`FILE = n` and `WITH NOUNLOAD` are accepted; a file holds one backup set.
+
+The statement SSMS writes for Restore Files and Filegroups is accepted: `RESTORE DATABASE db FILE = 'x', FILEGROUP = 'y' FROM DISK = '...' WITH FILE = 1, MOVE 'logical' TO 'path', ...`. The files are not separate here, so the whole database is restored, into the name `db`, and the `FILE`/`FILEGROUP` list and the `MOVE` targets are read and ignored.
+
+## Backup history
+
+Each backup and each restore that succeeds is written to the history tables of `msdb`, as in SQL Server: `msdb.dbo.backupset` (one row per
+backup: name, description, type `D` full, `I` differential or `L` log, start and finish, size, the database, the user, the recovery model,
+`is_copy_only`, the log sequence numbers that stand in for the commit timestamps the backup spans), `backupmediaset` and `backupmediafamily`
+(the file it was written to), `backupfile` (the database's data and log file), and `restorehistory` and `restorefile` (the restores). The
+tables are real tables of `msdb`, made the first time a backup is taken (until then they read as empty), so they are stored, logged and
+recovered with everything else, survive a restart, are part of a backup of `msdb`, and can be queried, joined and trimmed like any table.
+SSMS's Restore dialog and its Databases node read them; `msdb.dbo.sp_delete_database_backuphistory @database_name` and
+`sp_delete_backuphistory @oldest_date` delete from them. The history is written as the server, so a database owner who may back up but has
+no rights in `msdb` still leaves a row. A failure to write the history does not fail the backup. A cluster keeps no history (its `BACKUP`
+is refused, and its `RESTORE` runs through the control node).
 
 ## Format and limits
 

@@ -222,6 +222,11 @@ impl ClusterSession {
                 });
                 merge::check(&self.mirror.execute_stmts(&[Stmt::Query(Box::new(create))]))?;
                 made.push(temp.clone());
+                // (a copy of an IDENTITY column carries the numbers the rows were given: when the copy has the property, it takes them)
+                let ident_copy = t.identity.as_ref().is_some_and(|i| names.iter().any(|n| n.eq_ignore_ascii_case(&t.cols[i.col].name)));
+                if ident_copy {
+                    let _ = self.mirror.execute_stmts(&[Stmt::SetOpts(vec![SetOpt::IdentityInsert(vec![temp.clone()], true)])]);
+                }
                 let scan = simple_query(Select {
                     distinct: false,
                     top: None,

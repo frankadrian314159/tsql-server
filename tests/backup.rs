@@ -242,8 +242,8 @@ fn verification_and_header_information() {
     let h = rows(&mut c, &format!("RESTORE HEADERONLY FROM DISK = '{}'", f));
     assert_eq!(h[0][0], "nightly");
     assert_eq!(h[0][2], "1");
-    assert_eq!(h[0][4], "shop");
-    assert_eq!(h[0][9], "FULL");
+    assert_eq!(h[0][9], "shop");
+    assert_eq!(h[0][46], "FULL");
     // damage: one flipped byte, a truncated file, something else entirely
     let mut bytes = std::fs::read(e.bak.join("v.bak")).unwrap();
     let mid = bytes.len() / 2;
@@ -435,4 +435,102 @@ fn a_differential_needs_its_own_full_backup_as_the_base() {
     assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM d2.dbo.t"), "3");
     assert_eq!(err(&mut c, &format!("BACKUP LOG d2 TO DISK = '{}' WITH DIFFERENTIAL", e.file("x.trn"))).number, 155);
     assert_eq!(err(&mut c, &format!("BACKUP DATABASE d2 TO DISK = '{}' WITH DIFFERENTIAL, COPY_ONLY", e.file("y.dif"))).number, 155);
+}
+
+#[test]
+fn backups_and_restores_leave_their_history_in_msdb() {
+    let e = env();
+    let mut c = e.server.connect();
+    sales(&mut c);
+    let full = e.file("shop_full.bak");
+    exec(&mut c, &format!("BACKUP DATABASE shop TO DISK = '{full}' WITH NAME = 'weekly', DESCRIPTION = 'the week'"));
+    exec(&mut c, &format!("BACKUP DATABASE shop TO DISK = '{}' WITH DIFFERENTIAL", e.file("shop_diff.bak")));
+    exec(&mut c, &format!("BACKUP LOG shop TO DISK = '{}'", e.file("shop_log.trn")));
+    // what the Restore dialog and the Databases node read
+    assert_eq!(
+        rows(&mut c, "SELECT database_name, type, name, recovery_model, is_copy_only FROM msdb.dbo.backupset ORDER BY backup_set_id"),
+        vec![
+            vec!["shop".to_string(), "D".into(), "weekly".into(), "FULL".into(), "0".into()],
+            vec!["shop".to_string(), "I".into(), "NULL".into(), "FULL".into(), "0".into()],
+            vec!["shop".to_string(), "L".into(), "NULL".into(), "FULL".into(), "0".into()],
+        ]
+    );
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM msdb.dbo.backupset bs JOIN msdb.dbo.backupmediafamily mf ON mf.media_set_id = bs.media_set_id WHERE mf.physical_device_name LIKE '%shop_full.bak'"), "1");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM msdb..backupfile"), "6");
+    assert_eq!(scalar(&mut c, "SELECT backup_size FROM msdb.dbo.backupset WHERE type = 'D'").parse::<i64>().unwrap() > 0, true);
+    // the last backup of each kind (the Databases node of SSMS)
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM (SELECT database_name, [type], MAX(backup_finish_date) d FROM msdb..backupset WHERE [type] = 'D' OR [type] = 'L' OR [type] = 'I' GROUP BY database_name, [type]) t"), "3");
+    // a restore is in the history too
+    exec(&mut c, &format!("RESTORE DATABASE shop2 FROM DISK = '{full}' WITH RECOVERY"));
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM msdb.dbo.restorehistory WHERE destination_database_name = 'shop2' AND backup_set_id > 0"), "1");
+    // deleting the history of a database
+    exec(&mut c, "EXEC msdb.dbo.sp_delete_database_backuphistory @database_name = N'shop'");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM msdb.dbo.backupset"), "0");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM msdb.dbo.backupfile"), "0");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM msdb.dbo.backupmediafamily"), "0");
+}
+
+#[test]
+fn the_backup_history_survives_a_restart_and_a_non_admin_owner_may_take_backups() {
+    let e = env();
+    {
+        let mut c = e.server.connect();
+        sales(&mut c);
+        exec(&mut c, &format!("BACKUP DATABASE shop TO DISK = '{}'", e.file("a.bak")));
+    }
+    let data = e.data.clone();
+    drop(e.server);
+    let server = Server::open(&data).unwrap();
+    let mut c = server.connect();
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM msdb.dbo.backupset WHERE database_name = 'shop'"), "1");
+    // a database owner with no rights in msdb takes a backup and the history gets it
+    script(&mut c, "CREATE LOGIN op WITH PASSWORD = 'Str0ng!pw1'; USE shop; CREATE USER op FOR LOGIN op; ALTER ROLE db_owner ADD MEMBER op;");
+    let mut o = server.connect_as("op", "Str0ng!pw1").unwrap();
+    exec(&mut o, &format!("BACKUP DATABASE shop TO DISK = '{}'", format!("{}", data.parent().unwrap().join("bak").join("b.bak").to_string_lossy().replace('\'', "''"))));
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM msdb.dbo.backupset WHERE database_name = 'shop'"), "2");
+    assert_eq!(scalar(&mut c, "SELECT TOP 1 user_name FROM msdb.dbo.backupset ORDER BY backup_set_id DESC"), "op");
+}
+
+#[test]
+fn headeronly_filelistonly_and_labelonly_answer_with_sql_servers_columns() {
+    let e = env();
+    let mut c = e.server.connect();
+    sales(&mut c);
+    let f = e.file("h.bak");
+    exec(&mut c, &format!("BACKUP DATABASE shop TO DISK = '{f}' WITH NAME = 'nightly', DESCRIPTION = 'test run'"));
+    let r = exec(&mut c, &format!("RESTORE HEADERONLY FROM DISK = '{f}' WITH NOUNLOAD"));
+    let rs = r.resultsets();
+    let names: Vec<&str> = rs[0].columns.iter().map(|c| c.as_str()).collect();
+    assert_eq!(names.len(), 56);
+    for n in ["BackupName", "BackupType", "Position", "DeviceType", "DatabaseName", "BackupSize", "FirstLSN", "LastLSN", "CheckpointLSN", "DatabaseBackupLSN", "BackupStartDate", "BackupFinishDate", "CompatibilityLevel", "SoftwareVersionMajor", "Collation", "FamilyGUID", "IsCopyOnly", "RecoveryModel", "BackupTypeDescription", "BackupSetGUID", "CompressedBackupSize"] {
+        assert!(names.contains(&n), "{n}");
+    }
+    let at = |n: &str| names.iter().position(|x| *x == n).unwrap();
+    assert_eq!(rs[0].rows[0][at("BackupTypeDescription")].to_string(), "Database");
+    assert_eq!(rs[0].rows[0][at("Position")].to_string(), "1");
+    // the files
+    let r = exec(&mut c, &format!("RESTORE FILELISTONLY FROM DISK = '{f}'"));
+    let rs = r.resultsets();
+    assert_eq!(rs[0].columns.len(), 22);
+    assert_eq!(rs[0].rows.len(), 2);
+    assert_eq!(rs[0].rows[0][0].to_string(), "shop");
+    assert_eq!(rs[0].rows[0][2].to_string(), "D");
+    assert_eq!(rs[0].rows[1][2].to_string(), "L");
+    // the label
+    let r = exec(&mut c, &format!("RESTORE LABELONLY FROM DISK = '{f}'"));
+    let rs = r.resultsets();
+    assert_eq!(rs[0].columns.len(), 13);
+    assert_eq!(rs[0].rows[0][8].to_string(), "Microsoft SQL Server");
+}
+
+#[test]
+fn restore_of_files_as_ssms_writes_it_restores_the_database() {
+    let e = env();
+    let mut c = e.server.connect();
+    sales(&mut c);
+    let f = e.file("files.bak");
+    exec(&mut c, &format!("BACKUP DATABASE shop TO DISK = '{f}'"));
+    // the statement of the Restore Files and Filegroups dialog
+    exec(&mut c, &format!("RESTORE DATABASE [shop3] FILE = N'shop', FILEGROUP = N'PRIMARY' FROM DISK = N'{f}' WITH FILE = 1, MOVE N'shop' TO N'C:/x/shop3.mdf', MOVE N'shop_log' TO N'C:/x/shop3.ldf', NOUNLOAD, STATS = 10"));
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM shop3.dbo.cust"), scalar(&mut c, "SELECT COUNT(*) FROM shop.dbo.cust"));
 }

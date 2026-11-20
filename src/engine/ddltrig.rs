@@ -150,7 +150,7 @@ impl<'a> Engine<'a> {
             Stmt::CreateSequence { name, .. } => vec![simple("CREATE_SEQUENCE", "SEQUENCE", name)],
             Stmt::CreateSynonym { name, .. } => vec![simple("CREATE_SYNONYM", "SYNONYM", name)],
             Stmt::AlterSequence { name, .. } => vec![simple("ALTER_SEQUENCE", "SEQUENCE", name)],
-            Stmt::CreateDatabase(n, _) => vec![DdlEvent { name: "CREATE_DATABASE", object_type: "DATABASE", schema: String::new(), object: n.clone(), database: n.clone(), server_only: true }],
+            Stmt::CreateDatabase(n, _, _) => vec![DdlEvent { name: "CREATE_DATABASE", object_type: "DATABASE", schema: String::new(), object: n.clone(), database: n.clone(), server_only: true }],
             Stmt::AlterDatabase { db: d, .. } => vec![DdlEvent { name: "ALTER_DATABASE", object_type: "DATABASE", schema: String::new(), object: d.clone(), database: d.clone(), server_only: false }],
             Stmt::Drop { what, names, .. } => {
                 let (name, ty, server_only): (&'static str, &'static str, bool) = match what.as_str() {

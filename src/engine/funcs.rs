@@ -2593,6 +2593,42 @@ impl<'a> Engine<'a> {
                     }).collect();
                     return Ok(Rowset::new(Schema::new(cols), rows));
                 }
+                // the folders and files of the server machine (SSMS's folder and file pickers list them one level at a time)
+                "DM_OS_ENUMERATE_FILESYSTEM" => {
+                    let cm = |n: &str, ty| ColMeta { qual: None, name: n.into(), ty: Some(ty), denied: None, hidden: false, coll: None, mask: None };
+                    let cols = vec![cm("full_filesystem_path", DataType::NVarChar(512)), cm("parent_directory", DataType::NVarChar(512)), cm("file_or_directory_name", DataType::NVarChar(255)), cm("extension", DataType::NVarChar(255)), cm("is_directory", DataType::Bit), cm("is_read_only", DataType::Bit), cm("is_system", DataType::Bit), cm("level", DataType::Int), cm("size_in_bytes", DataType::BigInt)];
+                    if !self.is_sysadmin() {
+                        return Err(SqlError::with(300, 14, 1, "VIEW SERVER STATE permission was denied on object 'server', database 'master'."));
+                    }
+                    if args.first().map(|v| v.is_null()).unwrap_or(true) {
+                        return Ok(Rowset::new(Schema::new(cols), vec![]));
+                    }
+                    let dir = s(&args[0]);
+                    let pat = args.get(1).filter(|v| !v.is_null()).map(s).unwrap_or_else(|| "*".to_string());
+                    let re = regex::Regex::new(&format!("(?is)^{}$", regex::escape(&pat).replace(r"\*", ".*").replace(r"\?", "."))).map_err(|_| SqlError::new(8, "Invalid search pattern."))?;
+                    let mut found: Vec<(String, bool, u64, bool)> = std::fs::read_dir(&dir).map(|rd| rd.flatten().filter_map(|e| {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        if !re.is_match(&name) { return None; }
+                        let md = e.metadata().ok()?;
+                        Some((name, md.is_dir(), md.len(), md.permissions().readonly()))
+                    }).collect()).unwrap_or_default();
+                    found.sort();
+                    let rows: Vec<Row> = found.into_iter().map(|(name, is_dir, len, ro)| {
+                        let full = std::path::Path::new(&dir).join(&name).to_string_lossy().to_string();
+                        let ext = std::path::Path::new(&name).extension().map(|x| format!(".{}", x.to_string_lossy())).unwrap_or_default();
+                        vec![Value::Str(full), Value::Str(dir.clone()), Value::Str(name), Value::Str(ext), Value::Bit(is_dir), Value::Bit(ro), Value::Bit(false), Value::Int(0), Value::BigInt(if is_dir { 0 } else { len as i64 })]
+                    }).collect();
+                    return Ok(Rowset::new(Schema::new(cols), rows));
+                }
+                "DM_OS_FILE_EXISTS" => {
+                    let cm = |n: &str| ColMeta { qual: None, name: n.into(), ty: Some(DataType::Bit), denied: None, hidden: false, coll: None, mask: None };
+                    let cols = vec![cm("file_exists"), cm("file_is_a_directory"), cm("parent_directory_exists")];
+                    let path = args.first().filter(|v| !v.is_null()).map(s).unwrap_or_default();
+                    let p = std::path::Path::new(&path);
+                    let (is_dir, exists) = (p.is_dir(), p.exists());
+                    let parent = p.parent().map(|x| x.as_os_str().is_empty() || x.is_dir()).unwrap_or(false);
+                    return Ok(Rowset::new(Schema::new(cols), vec![vec![Value::Bit(exists && !is_dir), Value::Bit(is_dir), Value::Bit(parent)]]));
+                }
                 "FN_GET_AUDIT_FILE" => {
                     let pattern = args.first().map(s).unwrap_or_default();
                     if !self.is_sysadmin() {
@@ -2668,8 +2704,12 @@ impl<'a> Engine<'a> {
         }
         // user-defined table-valued function
         let schema = if name.len() >= 2 { Some(name[name.len() - 2].as_str()) } else { None };
-        if let Some(f) = self.find_func(schema, name.last().unwrap()) {
-            return self.call_tvf(&f, args);
+        let fdb: Option<&str> = if name.len() >= 3 { Some(name[name.len() - 3].as_str()) } else { None };
+        if let Some(f) = self.find_func_at(fdb, schema, name.last().unwrap()) {
+            let saved = self.enter_function_db(fdb);
+            let r = self.call_tvf(&f, args);
+            self.leave_function_db(saved);
+            return r;
         }
         Err(SqlError::new(208, format!("Invalid object name '{}'.", name.join("."))))
     }

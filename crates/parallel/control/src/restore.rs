@@ -51,6 +51,8 @@ enum Made {
     Table(Name),
     View(Name),
     Proc(Name),
+    Func(Name),
+    Trigger(Name),
 }
 
 impl ClusterSession {
@@ -64,7 +66,7 @@ impl ClusterSession {
             if self.txn.borrow().is_some() {
                 return Err(SqlError::with(574, 16, 1, "RESTORE DATABASE cannot be used inside a user transaction."));
             }
-            self.create_database(&Stmt::CreateDatabase(target.clone(), None), &target).await?;
+            self.create_database(&Stmt::CreateDatabase(target.clone(), None, vec![]), &target).await?;
             created = true;
         }
         let previous = self.cur_db.clone();
@@ -120,6 +122,44 @@ impl ClusterSession {
         objects.sort_by_key(|o| object_id(o));
         let mut tables: Vec<&Table> = vec![];
         let mut modules: Vec<(&'static str, Name, String)> = vec![];
+        // (the functions that read no table of the backup are made first, on the shards too, so that a computed column can use them; the others
+        // with the views and procedures, after the tables, on the control node only: see `funcs.rs`)
+        let mut pre_functions: Vec<(Name, String)> = vec![];
+        // the triggers of the tables (trigger, table, text, disabled): made after the tables, which the control node then fires them around
+        let mut trigger_modules: Vec<(Name, Name, String, bool)> = vec![];
+        let reading: std::collections::HashSet<String> = {
+            let mut tabs: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut funcs: Vec<(String, Vec<String>, Vec<String>)> = vec![];
+            for o in &objects {
+                match o {
+                    Object::Table(t) => {
+                        tabs.insert(table_id(&[t.schema.clone(), t.name.clone()]));
+                    }
+                    Object::View(v) => {
+                        tabs.insert(table_id(&[v.schema.clone(), v.name.clone()]));
+                    }
+                    Object::Func(f) => {
+                        let (t, c) = crate::funcs::references(&*f.def);
+                        funcs.push((table_id(&[f.schema.clone(), f.name.clone()]), t, c));
+                    }
+                    _ => {}
+                }
+            }
+            let mut reading = std::collections::HashSet::new();
+            loop {
+                let mut changed = false;
+                for (id, t, c) in &funcs {
+                    if !reading.contains(id) && (t.iter().any(|x| tabs.contains(x)) || c.iter().any(|x| reading.contains(x))) {
+                        reading.insert(id.clone());
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            reading
+        };
         let mut refused: Vec<String> = vec![];
         for o in &objects {
             match o {
@@ -134,7 +174,10 @@ impl ClusterSession {
                         continue;
                     }
                     for g in &t.triggers {
-                        refused.push(format!("the trigger {} of {} (a cluster has no triggers)", g.name, shown));
+                        match crate::triggers::body_problem(&g.body) {
+                            Some(why) => refused.push(format!("the trigger {} of {} ({})", g.name, shown, why)),
+                            None => trigger_modules.push((vec![g.schema.clone(), g.name.clone()], vec![t.schema.clone(), t.name.clone()], script::module(&g.text), g.disabled)),
+                        }
                     }
                     tables.push(t);
                 }
@@ -145,7 +188,15 @@ impl ClusterSession {
                     modules.push(("VIEW", vec![v.schema.clone(), v.name.clone()], script::module(&v.text)));
                 }
                 Object::Proc(p) => modules.push(("PROCEDURE", vec![p.schema.clone(), p.name.clone()], script::module(&p.text))),
-                Object::Func(f) => refused.push(format!("the function {}.{} (a cluster has no stored functions)", f.schema, f.name)),
+                Object::Func(f) => {
+                    let name: Name = vec![f.schema.clone(), f.name.clone()];
+                    let text = script::module(&f.def.text);
+                    if reading.contains(&table_id(&name)) {
+                        modules.push(("FUNCTION", name, text));
+                    } else {
+                        pre_functions.push((name, text));
+                    }
+                }
                 Object::Seq(s) => refused.push(format!("the sequence {}.{}", s.schema, s.name)),
                 Object::Synonym(s) => refused.push(format!("the synonym {}.{}", s.schema, s.name)),
             }
@@ -215,6 +266,7 @@ impl ClusterSession {
         let mut clashes: Vec<(String, String)> = vec![];
         let mut names: Vec<String> = tables.iter().map(|t| table_id(&[t.schema.clone(), t.name.clone()])).collect();
         names.extend(modules.iter().map(|(_, n, _)| table_id(n)));
+        names.extend(pre_functions.iter().map(|(n, _)| table_id(n)));
         for n in &names {
             if let Some((id, kind)) = existing.iter().find(|(id, _)| id == n) {
                 clashes.push((id.clone(), kind.clone()));
@@ -238,6 +290,7 @@ impl ClusterSession {
                     "Table" => "TABLE",
                     "View" => "VIEW",
                     "Procedure" => "PROCEDURE",
+                    "Function" => "FUNCTION",
                     other => return Err(unsupported(&format!("replacing the {} {} by a restored object of the same name", other.to_lowercase(), id))),
                 };
                 let drop = Stmt::Drop { what: what.into(), names: vec![vec![schema.to_string(), name.to_string()]], if_exists: true };
@@ -248,9 +301,9 @@ impl ClusterSession {
 
         // ---- make it, send the rows; undo it all on a failure
         let mut made: Vec<Made> = vec![];
-        // (the stored functions of the backup are left out, so a computed column that calls one is too)
-        let missing_functions: Vec<String> = cat.objects.values().filter_map(|o| if let Object::Func(f) = o { Some(f.name.to_lowercase()) } else { None }).collect();
-        let out = self.restore_into(&src, &plan, &modules, keep_going, &missing_functions, &mut made, events).await;
+        // (a function that reads tables is on the control node only, so a computed column that calls one is left out)
+        let missing_functions: Vec<String> = cat.objects.values().filter_map(|o| if let Object::Func(f) = o { Some(f) } else { None }).filter(|f| reading.contains(&table_id(&[f.schema.clone(), f.name.clone()]))).map(|f| f.name.to_lowercase()).collect();
+        let out = self.restore_into(&src, &plan, &modules, &pre_functions, &trigger_modules, keep_going, &missing_functions, &mut made, events).await;
         let (nrows, sharded, replicated) = match out {
             Ok(x) => x,
             Err(e) => {
@@ -262,6 +315,8 @@ impl ClusterSession {
                         Made::Table(n) => ("TABLE", n),
                         Made::View(n) => ("VIEW", n),
                         Made::Proc(n) => ("PROCEDURE", n),
+                        Made::Func(n) => ("FUNCTION", n),
+                        Made::Trigger(n) => ("TRIGGER", n),
                     };
                     let drop = Stmt::Drop { what: what.into(), names: vec![name.clone()], if_exists: true };
                     let mut none = vec![];
@@ -287,9 +342,9 @@ impl ClusterSession {
 
     /// The part of the restore that changes the cluster: returns (rows, sharded tables, replicated tables).
     #[allow(clippy::too_many_arguments)]
-    async fn restore_into(&mut self, src: &BackupSource, plan: &[(&Table, DistChoice)], modules: &[(&'static str, Name, String)], keep_going: bool, missing_functions: &[String], made: &mut Vec<Made>, events: &mut Vec<Event>) -> Result<(u64, usize, usize), SqlError> {
+    async fn restore_into(&mut self, src: &BackupSource, plan: &[(&Table, DistChoice)], modules: &[(&'static str, Name, String)], pre_functions: &[(Name, String)], trigger_modules: &[(Name, Name, String, bool)], keep_going: bool, missing_functions: &[String], made: &mut Vec<Made>, events: &mut Vec<Event>) -> Result<(u64, usize, usize), SqlError> {
         // the schemas the objects are in (the shards need them too)
-        let mut schemas: Vec<String> = plan.iter().map(|(t, _)| t.schema.clone()).chain(modules.iter().filter_map(|(_, n, _)| n.first().cloned())).filter(|s| !s.eq_ignore_ascii_case("dbo")).collect();
+        let mut schemas: Vec<String> = plan.iter().map(|(t, _)| t.schema.clone()).chain(modules.iter().filter_map(|(_, n, _)| n.first().cloned())).chain(pre_functions.iter().filter_map(|(n, _)| n.first().cloned())).filter(|s| !s.eq_ignore_ascii_case("dbo")).collect();
         schemas.sort_by_key(|s| s.to_lowercase());
         schemas.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
         for s in schemas {
@@ -311,6 +366,19 @@ impl ClusterSession {
                 self.log_schema(&st);
             }
         }
+        // the functions that read no table (a computed column may call them)
+        let mut missing_functions: Vec<String> = missing_functions.to_vec();
+        for (name, text) in pre_functions {
+            match self.run_sql(text).await {
+                Ok(()) => made.push(Made::Func(name.clone())),
+                Err(e) if keep_going => {
+                    missing_functions.push(name.last().cloned().unwrap_or_default().to_lowercase());
+                    events.push(Event::Message(format!("Not restored: the function {} ({}).", name.join("."), e.message)));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let missing_functions = &missing_functions[..];
         // the tables, with what must be there before the rows
         let mut targets: HashMap<String, Target> = HashMap::new();
         let mut scripts = vec![];
@@ -390,8 +458,26 @@ impl ClusterSession {
         // the views and procedures, in the order they were made
         for (what, name, text) in modules {
             match self.run_sql(text).await {
-                Ok(()) => made.push(if *what == "VIEW" { Made::View(name.clone()) } else { Made::Proc(name.clone()) }),
+                Ok(()) => made.push(match *what {
+                    "VIEW" => Made::View(name.clone()),
+                    "FUNCTION" => Made::Func(name.clone()),
+                    _ => Made::Proc(name.clone()),
+                }),
                 Err(e) if keep_going => events.push(Event::Message(format!("Not restored: the {} {} ({}).", what.to_lowercase(), name.join("."), e.message))),
+                Err(e) => return Err(e),
+            }
+        }
+        // the triggers of the tables (the rows are in: loading them fired nothing)
+        for (name, table, text, disabled) in trigger_modules {
+            match self.run_sql(text).await {
+                Ok(()) => {
+                    made.push(Made::Trigger(name.clone()));
+                    if *disabled {
+                        let off = format!("DISABLE TRIGGER [{}] ON [{}].[{}]", name.last().cloned().unwrap_or_default(), table.first().cloned().unwrap_or_default(), table.last().cloned().unwrap_or_default());
+                        self.run_sql(&off).await?;
+                    }
+                }
+                Err(e) if keep_going => events.push(Event::Message(format!("Not restored: the trigger {} ({}).", name.join("."), e.message))),
                 Err(e) => return Err(e),
             }
         }

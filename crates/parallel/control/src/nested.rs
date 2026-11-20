@@ -138,7 +138,7 @@ fn json_err(e: serde_json::Error) -> SqlError {
 
 /// A literal for a value. The rewrite goes through JSON, which has no number for a decimal beyond 64 bits (a sum of money over
 /// many rows): such a value is written as a cast of its text, which says the same thing.
-fn lit(v: &Value) -> Expr {
+pub(crate) fn lit(v: &Value) -> Expr {
     if let Value::Dec(d) = v {
         if serde_json::to_value(v).is_err() {
             let ty = TypeRef { parts: vec!["decimal".into()], args: vec![38, d.s as i64], xml_schema: None };
@@ -275,6 +275,11 @@ impl ClusterSession {
 
     /// Run a query. One with subqueries or CTEs is rewritten around the results of its independent parts when it can be.
     pub(crate) async fn run_query(&mut self, q: &Query) -> Result<ResultSet, SqlError> {
+        // a query that calls a function that reads tables runs on the control node, over copies of every table it reaches (see `funcs.rs`)
+        if let Some(tables) = self.reading_function_tables(q) {
+            self.plan.push("gather: the query calls a function that reads tables, so it runs on the control node".into());
+            return self.gather_whole(q, &tables).await;
+        }
         if let Some(rs) = self.run_point_select(q).await? {
             return Ok(rs);
         }
@@ -622,7 +627,7 @@ impl ClusterSession {
 
     /// Put a result in a replicated temporary table on every shard (`cols` renames its columns) and make it known to this
     /// session as a table. None when it is too big to broadcast or its columns have no names.
-    async fn materialize(&mut self, rs: ResultSet, cols: Option<Vec<String>>, temps: &mut Vec<String>) -> Result<Option<String>, SqlError> {
+    pub(crate) async fn materialize(&mut self, rs: ResultSet, cols: Option<Vec<String>>, temps: &mut Vec<String>) -> Result<Option<String>, SqlError> {
         if rs.rows.len() as u64 > self.cluster.broadcast_limit.load(Ordering::Relaxed) {
             return Ok(None);
         }
@@ -660,6 +665,7 @@ impl ClusterSession {
             graph: None,
             edge_cons: vec![],
         };
+        self.temp_creates.insert(table.id.clone(), create.clone());
         self.local_tables.insert(table.id.clone(), table);
         self.plan.push(format!("materialized {} rows as the replicated table {}", rs.rows.len(), temp));
         Ok(Some(temp))
@@ -730,19 +736,25 @@ impl ClusterSession {
             graph: None,
             edge_cons: vec![],
         };
+        self.temp_creates.insert(table.id.clone(), create.clone());
         self.local_tables.insert(table.id.clone(), table);
         self.plan.push(format!("materialized {} rows spread over the shards by {} as {}", n, column, temp));
         Ok(Some(temp))
     }
 
     /// Drop the temporary tables a statement made, on every shard, and forget them.
-    async fn drop_temps(&mut self, temps: Vec<String>) {
+    pub(crate) async fn drop_temps(&mut self, temps: Vec<String>) {
         if temps.is_empty() {
             return;
         }
         let shards = self.all_shards();
         for t in temps {
-            self.local_tables.remove(&table_id(std::slice::from_ref(&t)));
+            let id = table_id(std::slice::from_ref(&t));
+            self.local_tables.remove(&id);
+            self.temp_creates.remove(&id);
+            if self.mirror_temps.remove(&id) {
+                let _ = self.mirror.execute_stmts(&[Stmt::Drop { what: "TABLE".into(), names: vec![vec![t.clone()]], if_exists: true }]);
+            }
             let drop = Stmt::Drop { what: "TABLE".into(), names: vec![vec![t]], if_exists: true };
             let _ = self.fan_run(&shards, |_| Work::Stmts(vec![drop.clone()])).await;
         }

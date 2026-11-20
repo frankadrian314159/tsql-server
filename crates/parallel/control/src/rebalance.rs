@@ -79,11 +79,17 @@ impl Cluster {
         let n = shards.len();
         let slots = slots.unwrap_or_else(|| (0..SLOTS).map(|i| (i % n) as u32).collect());
         let (dbs, logged_db) = crate::dbname::databases_of_log(&log);
+        let funcs_init = crate::funcs::functions_of_log(&log);
+        let triggers_init = crate::triggers::triggers_of_log(&log);
         let mirror = Server::new();
         {
             // the mirror learns the schema again
             let mut c = mirror.connect_internal();
             for st in &log {
+                // (the triggers are the control node's to fire: the engine here would fire them on the copies it is loaded with)
+                if crate::triggers::is_trigger_log_stmt(st) {
+                    continue;
+                }
                 let _ = c.execute_stmts(std::slice::from_ref(st));
             }
         }
@@ -123,7 +129,17 @@ impl Cluster {
             deadlocks: AtomicU64::new(0),
             dbs: Mutex::new(dbs),
             logged_db: Mutex::new(logged_db),
+            funcs: Mutex::new(funcs_init),
+            funcs_on_shards: Default::default(),
+            funcs_placed: Default::default(),
+            triggers: Mutex::new(triggers_init.0),
+            triggers_off: Mutex::new(triggers_init.1),
         });
+        {
+            // (the shards of a cluster that was running hold the functions that read no table)
+            let pure: std::collections::BTreeSet<String> = cluster.pure_functions().into_iter().map(|(i, _)| i).collect();
+            *cluster.funcs_on_shards.lock().unwrap_or_else(|e| e.into_inner()) = pure;
+        }
         cluster.start_deadlock_monitor();
         if attach {
             return Ok(cluster);
@@ -154,7 +170,7 @@ impl Cluster {
             }
             log.push(st.clone());
             match st {
-                Stmt::CreateDatabase(name, _) => self.dbs.lock().unwrap_or_else(|e| e.into_inner()).push(name.clone()),
+                Stmt::CreateDatabase(name, _, _) => self.dbs.lock().unwrap_or_else(|e| e.into_inner()).push(name.clone()),
                 Stmt::Drop { what, names, .. } if what.eq_ignore_ascii_case("DATABASE") => {
                     let mut dbs = self.dbs.lock().unwrap_or_else(|e| e.into_inner());
                     dbs.retain(|d| !names.iter().any(|n| n.last().is_some_and(|x| x.eq_ignore_ascii_case(d))));
@@ -207,7 +223,18 @@ impl Cluster {
                     if matches!(&st, Stmt::CreateView { .. }) || matches!(&st, Stmt::Drop { what, .. } if what.eq_ignore_ascii_case("VIEW")) {
                         continue;
                     }
+                    // (the functions are made below, the ones that read no table; the log may name ones that are not on the shards)
+                    if matches!(&st, Stmt::CreateFunction(_)) || matches!(&st, Stmt::Drop { what, .. } if what.eq_ignore_ascii_case("FUNCTION")) {
+                        continue;
+                    }
+                    if crate::triggers::is_trigger_log_stmt(&st) {
+                        continue;
+                    }
                     s.fan_run(&[id], |_| Work::Stmts(vec![shard_form(&st)])).await?;
+                }
+                for (fid, fst) in s.cluster.pure_functions() {
+                    let work = s.cluster.function_work(&fid, crate::funcs::or_alter_pub(&fst), "master");
+                    s.fan_run(&[id], |_| work.clone()).await?;
                 }
                 // a replicated table is the same on every shard
                 let tables: Vec<DistTable> = s.cluster.tables.lock().unwrap_or_else(|e| e.into_inner()).values().filter(|t| matches!(t.dist, Dist::Replicated)).cloned().collect();

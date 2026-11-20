@@ -102,7 +102,7 @@ impl ClusterSession {
     /// Whether an `EXEC` is of a system procedure (`sp_...`, `xp_...`) other than `sp_executesql`, and not one the cluster runs itself.
     fn is_catalog_proc(&self, ex: &ExecStmt) -> bool {
         let Some(n) = ex.name.last().map(|n| n.to_lowercase()) else { return false };
-        (n.starts_with("sp_") || n.starts_with("xp_")) && n != "sp_executesql" && !ex.name_is_var && !self.cluster.proc_routes.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&self.qid(&ex.name))
+        (n.starts_with("sp_") || n.starts_with("xp_")) && n != "sp_executesql" && !ex.name_is_var && self.cluster.proc_def(&self.qid(&ex.name)).is_none() && !self.cluster.proc_routes.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&self.qid(&ex.name))
     }
 
     fn mentions_distributed_table(&self, sql: &str) -> bool {
@@ -121,7 +121,14 @@ impl ClusterSession {
     }
 
     fn stmt_wants(&self, st: &Stmt) -> bool {
+        // (the engine here holds no rows: a statement that calls a function that reads tables must not be run by it)
+        if self.reading_function_tables(st).is_some() || self.calls_function_reading_tables(st) {
+            return true;
+        }
         match st {
+            Stmt::CreateFunction(_) | Stmt::CreateTrigger { .. } | Stmt::TriggerAdmin(_) => true,
+            Stmt::Drop { what, .. } if what.eq_ignore_ascii_case("TRIGGER") => true,
+            Stmt::Drop { what, .. } if what.eq_ignore_ascii_case("FUNCTION") => true,
             Stmt::CreateTable { .. } | Stmt::AlterTable { .. } | Stmt::CreateIndex { .. } | Stmt::DropIndex { .. } | Stmt::AlterIndex { .. } | Stmt::Truncate(_) | Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::BeginTran(_) | Stmt::Commit(_) | Stmt::Rollback(_) | Stmt::SaveTran(_) => {
                 // (a temporary table that a batch makes is the engine's own, until a statement needs it with the cluster's tables: see `temps_wanted`)
                 self.touches_distributed(st)
@@ -147,7 +154,8 @@ impl ClusterSession {
             }
             Stmt::Exec(ex) => match self.executesql_text(ex) {
                 Some(inner) => self.wants(&inner),
-                None => false,
+                // (a procedure of the cluster: its body reads the cluster's tables, which the control node's engine holds none of the rows of)
+                None => !ex.name_is_var && self.cluster.proc_def(&self.qid(&ex.name)).is_some(),
             },
             // a restore puts the backup's tables on the shards (see restore.rs); a backup of the cluster's database is refused there
             // (the engine here holds none of its rows). The other RESTOREs (HEADERONLY, VERIFYONLY) only read the file.
@@ -191,12 +199,20 @@ impl ClusterSession {
 
     /// `st` with the variables of the session replaced by their values.
     pub(crate) fn bind_vars(&self, st: &Stmt) -> Result<Stmt, SqlError> {
-        if self.vars.is_empty() && self.last_identity.is_none() {
+        let xact_read = self.txn.borrow().is_some() && matches!(st, Stmt::Query(_) | Stmt::Set { .. } | Stmt::If { .. } | Stmt::While { .. } | Stmt::Print(_));
+        if self.vars.is_empty() && self.last_identity.is_none() && self.catch_stack.is_empty() && !xact_read {
             return Ok(st.clone());
         }
+        // ERROR_NUMBER() and the like (in a CATCH block), XACT_STATE(): the control node's engine has no CATCH block, so the values go in
+        let caught = self.catch_stack.last().cloned();
+        let xact = match self.txn.borrow().as_ref() {
+            None => 0,
+            Some(t) if t.doomed => -1,
+            Some(_) => 1,
+        };
         // SCOPE_IDENTITY() and @@IDENTITY: the last value this session was given
         let ident = self.last_identity.map(|v| serde_json::to_value(Value::Dec(tsql_server::decimal::Dec::from_int(v))).unwrap_or(serde_json::Value::Null));
-        fn subst(v: &mut serde_json::Value, vars: &HashMap<String, Value>, ident: &Option<serde_json::Value>) {
+        fn subst(v: &mut serde_json::Value, vars: &HashMap<String, Value>, ident: &Option<serde_json::Value>, caught: &Option<SqlError>, xact: i32) {
             match v {
                 serde_json::Value::Object(m) => {
                     let is_ident = match (m.len(), m.get("SysVar"), m.get("Func")) {
@@ -209,6 +225,28 @@ impl ClusterSession {
                         *v = serde_json::json!({ "Lit": lit });
                         return;
                     }
+                    if let (1, Some(serde_json::Value::Object(f))) = (m.len(), m.get("Func")) {
+                        let func = f.get("name").and_then(|n| n.as_str()).map(|n| n.to_uppercase()).unwrap_or_default();
+                        let is_call = f.get("args").and_then(|a| a.as_array()).is_some_and(|a| a.is_empty());
+                        let value = if !is_call {
+                            None
+                        } else {
+                            match func.as_str() {
+                                "XACT_STATE" => Some(Value::Int(xact)),
+                                "ERROR_NUMBER" => Some(caught.as_ref().map(|e| Value::Int(e.number)).unwrap_or(Value::Null)),
+                                "ERROR_MESSAGE" => Some(caught.as_ref().map(|e| Value::Str(e.message.clone())).unwrap_or(Value::Null)),
+                                "ERROR_SEVERITY" => Some(caught.as_ref().map(|e| Value::Int(e.severity as i32)).unwrap_or(Value::Null)),
+                                "ERROR_STATE" => Some(caught.as_ref().map(|e| Value::Int(e.state as i32)).unwrap_or(Value::Null)),
+                                "ERROR_LINE" => Some(caught.as_ref().map(|_| Value::Int(1)).unwrap_or(Value::Null)),
+                                "ERROR_PROCEDURE" => Some(caught.as_ref().and_then(|e| e.procedure.clone()).map(Value::Str).unwrap_or(Value::Null)),
+                                _ => None,
+                            }
+                        };
+                        if let Some(j) = value.and_then(|x| serde_json::to_value(x).ok()) {
+                            *v = serde_json::json!({ "Lit": j });
+                            return;
+                        }
+                    }
                     if m.len() == 1 {
                         if let Some(serde_json::Value::String(name)) = m.get("Var") {
                             if let Some(val) = vars.get(&name.to_lowercase()) {
@@ -220,19 +258,19 @@ impl ClusterSession {
                         }
                     }
                     for c in m.values_mut() {
-                        subst(c, vars, ident);
+                        subst(c, vars, ident, caught, xact);
                     }
                 }
                 serde_json::Value::Array(a) => {
                     for c in a {
-                        subst(c, vars, ident);
+                        subst(c, vars, ident, caught, xact);
                     }
                 }
                 _ => {}
             }
         }
         let mut j = serde_json::to_value(st).map_err(|e| SqlError::new(50000, e.to_string()))?;
-        subst(&mut j, &self.vars, &ident);
+        subst(&mut j, &self.vars, &ident, &caught, xact);
         serde_json::from_value(j).map_err(|e| SqlError::new(50000, format!("a variable could not be substituted: {}", e)))
     }
 

@@ -146,7 +146,10 @@ fn a_control_node_that_starts_again_has_its_databases_and_their_tables() {
     {
         let mut s = h.cluster.session();
         run(&mut s, "CREATE DATABASE shop");
-        run(&mut s, "CREATE DATABASE other");
+        // (a database made with a file path: the path is not in the saved state, and a file that appears there later does not fail the restart)
+        let path = dir.join("other.mdf").display().to_string().replace(char::from(92), "/");
+        run(&mut s, &format!("CREATE DATABASE other ON (NAME = N'other', FILENAME = N'{path}')"));
+        std::fs::write(dir.join("other.mdf"), b"x").unwrap();
         run(&mut s, "USE shop");
         fill(&mut s, "items");
         run(&mut s, "CREATE VIEW v_all AS SELECT id FROM items");
@@ -245,4 +248,20 @@ fn a_procedure_of_a_database_runs_on_the_shard_of_its_key() {
     run(&mut s, "DISTRIBUTE PROCEDURE p_get BY @id");
     assert_eq!(one(&mut s, "EXEC p_get 9"), "n9");
     assert_eq!(one(&mut s, "EXEC shop.dbo.p_get 11"), "n11");
+}
+
+#[test]
+fn create_database_in_a_cluster_checks_its_file_paths_and_leaves_nothing_behind() {
+    let h = start(2, None);
+    let mut s = h.cluster.session();
+    let dir = std::env::temp_dir().join("tsql_cluster_createdb");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = dir.display().to_string().replace(char::from(92), "/");
+    // a folder where a file name belongs: refused (5170), and no database of that name is left on the control node or the shards
+    assert_eq!(error(&mut s, &format!("CREATE DATABASE fx ON (NAME = N'fx', FILENAME = N'{d}')")), 5170);
+    assert_eq!(one(&mut s, "SELECT COUNT(*) FROM sys.databases WHERE name = 'fx'"), "0");
+    run(&mut s, &format!("CREATE DATABASE fx ON (NAME = N'fx', FILENAME = N'{d}/fx.mdf') LOG ON (NAME = N'fx_log', FILENAME = N'{d}/fx.ldf')"));
+    assert_eq!(one(&mut s, "SELECT COUNT(*) FROM sys.databases WHERE name = 'fx'"), "1");
+    let _ = std::fs::remove_dir_all(&dir);
 }

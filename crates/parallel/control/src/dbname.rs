@@ -18,7 +18,7 @@ pub(crate) fn databases_of_log(log: &[Stmt]) -> (Vec<String>, String) {
     let mut cur = "master".to_string();
     for st in log {
         match st {
-            Stmt::CreateDatabase(n, _) => dbs.push(n.clone()),
+            Stmt::CreateDatabase(n, _, _) => dbs.push(n.clone()),
             Stmt::Drop { what, names, .. } if what.eq_ignore_ascii_case("DATABASE") => dbs.retain(|d| !names.iter().any(|n| n.last().is_some_and(|x| x.eq_ignore_ascii_case(d)))),
             Stmt::Use(d) => cur = d.clone(),
             _ => {}
@@ -69,7 +69,7 @@ impl ClusterSession {
 
     fn known_name(&self, name: &Name) -> bool {
         let id = self.qid(name);
-        self.table_by_id(&id).is_some() || self.cluster.views.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&id) || self.cluster.proc_routes.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&id)
+        self.table_by_id(&id).is_some() || self.cluster.views.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&id) || self.cluster.proc_routes.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&id) || self.cluster.proc_def(&id).is_some()
     }
 
     /// The statement with the tables it names in full (see the top of this file). A session in `master` is left as it is.
@@ -93,13 +93,21 @@ impl ClusterSession {
             Json::Object(m) => {
                 // what a statement makes or drops is named in full whether or not it is there yet; what it reads or changes, when it is a
                 // table (or view) of the cluster
-                for (key, always) in [("CreateTable", true), ("AlterTable", false), ("CreateView", true), ("CreateProc", true), ("CreateIndex", false), ("AlterIndex", false), ("Exec", false)] {
+                for (key, always) in [("CreateTable", true), ("AlterTable", false), ("CreateView", true), ("CreateProc", true), ("CreateFunction", true), ("CreateTrigger", true), ("CreateIndex", false), ("AlterIndex", false), ("Exec", false)] {
                     if let Some(Json::Object(inner)) = m.get_mut(key) {
                         let field = if matches!(key, "CreateIndex" | "AlterIndex") { "table" } else { "name" };
                         if let Some(n) = inner.get(field).and_then(names_of) {
                             if !n.is_empty() && (always || self.known_name(&n)) && !is_temp(&n) {
                                 put(inner.get_mut(field).unwrap(), &self.qn(&n));
                             }
+                        }
+                    }
+                }
+                // the table a trigger is on
+                if let Some(Json::Object(inner)) = m.get_mut("CreateTrigger") {
+                    if let Some(n) = inner.get("table").and_then(names_of) {
+                        if !n.is_empty() && !is_temp(&n) && self.known_name(&n) {
+                            put(inner.get_mut("table").unwrap(), &self.qn(&n));
                         }
                     }
                 }
@@ -128,7 +136,7 @@ impl ClusterSession {
                     }
                 }
                 if let Some(Json::Object(inner)) = m.get_mut("Drop") {
-                    let tables = inner.get("what").and_then(|w| w.as_str()).is_some_and(|w| matches!(w.to_uppercase().as_str(), "TABLE" | "VIEW" | "PROC" | "PROCEDURE"));
+                    let tables = inner.get("what").and_then(|w| w.as_str()).is_some_and(|w| matches!(w.to_uppercase().as_str(), "TABLE" | "VIEW" | "PROC" | "PROCEDURE" | "FUNCTION" | "TRIGGER"));
                     if tables {
                         if let Some(Json::Array(names)) = inner.get_mut("names") {
                             for nm in names.iter_mut() {
@@ -238,6 +246,7 @@ impl ClusterSession {
             return Err(e);
         }
         self.plan.push(format!("broadcast CREATE DATABASE to {} shards", shards.len()));
+        // (the schema log is replayed after a restart; the file paths are not serialized with the statement, so a path taken since cannot fail it)
         self.cluster.log_schema_in("master", st);
         Ok(())
     }
@@ -268,6 +277,11 @@ impl ClusterSession {
             self.cluster.views.lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| !k.starts_with(&prefix));
             self.cluster.proc_routes.lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| !k.starts_with(&prefix));
             self.cluster.fks.lock().unwrap_or_else(|e| e.into_inner()).retain(|f| !f.child.starts_with(&prefix) && !f.parent.starts_with(&prefix));
+            // (and its stored functions)
+            self.cluster.funcs.lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| !k.starts_with(&prefix));
+            self.cluster.funcs_on_shards.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| !k.starts_with(&prefix));
+            self.cluster.funcs_placed.lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| !k.starts_with(&prefix));
+            self.cluster.triggers.lock().unwrap_or_else(|e| e.into_inner()).retain(|(k, _)| !k.starts_with(&prefix));
             self.cluster.log_schema_in("master", &one);
             self.plan.push(format!("broadcast DROP DATABASE to {} shards", shards.len()));
         }

@@ -1929,10 +1929,11 @@ impl<'a> Engine<'a> {
         }
         // the compatibility views of SQL Server 2000 (sysobjects, sysusers, sysdatabases), which are found without the schema (or as dbo)
         if let Some(last) = name.last() {
-            let schema_ok = name.len() == 1 || name[name.len() - 2].eq_ignore_ascii_case("dbo");
+            // (msdb..backupset leaves the schema out: it is dbo's)
+            let schema_ok = name.len() == 1 || name[name.len() - 2].eq_ignore_ascii_case("dbo") || name[name.len() - 2].is_empty();
             // (and the tables of the policy store, which msdb has: see `sysview`)
             let in_msdb = name.len() < 3 || name[name.len() - 3].eq_ignore_ascii_case("msdb");
-            if schema_ok && (matches!(last.to_lowercase().as_str(), "sysobjects" | "sysusers" | "sysdatabases" | "syscomments") || (in_msdb && last.to_lowercase().starts_with("syspolicy_"))) {
+            if schema_ok && (matches!(last.to_lowercase().as_str(), "sysobjects" | "sysusers" | "sysdatabases" | "syscomments" | "sysprocesses") || (in_msdb && (last.to_lowercase().starts_with("syspolicy_") || matches!(last.to_lowercase().as_str(), "backupset" | "backupmediafamily" | "backupmediaset" | "backupfile" | "backupfilegroup" | "restorehistory" | "restorefile" | "restorefilegroup" | "suspect_pages")))) {
                 let found = self.locate(name);
                 if self.table_ref(&found).is_none() {
                     if let Some(mut rs) = self.sysview("sys", &display) {

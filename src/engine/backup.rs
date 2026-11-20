@@ -327,11 +327,11 @@ impl<'a> Engine<'a> {
             return Err(SqlError::with(155, 15, 1, "The option SQL_SERVER_FORMAT is valid for a full BACKUP DATABASE only."));
         }
         let result = if b.log {
-            self.backup_log(&dbkey, &tmp, name, description)
+            self.backup_log(&dbkey, &tmp, name.clone(), description.clone())
         } else if sqlserver {
-            self.backup_sqlserver(&dbkey, &tmp, name, description)
+            self.backup_sqlserver(&dbkey, &tmp, name.clone(), description.clone())
         } else {
-            self.backup_full(&dbkey, &tmp, copy_only, diff, name, description)
+            self.backup_full(&dbkey, &tmp, copy_only, diff, name.clone(), description.clone())
         };
         let (records, tables) = match result {
             Ok(x) => x,
@@ -342,6 +342,29 @@ impl<'a> Engine<'a> {
         };
         std::fs::rename(&tmp, &path).map_err(|e| io_fail(&path, "write to", e))?;
         let secs = started.elapsed().as_secs_f64().max(0.001);
+        {
+            // the backup history of msdb (a failure to write it does not fail the backup)
+            let (first_lsn, last_lsn) = verify(&path).map(|(h, ..)| (h.after_ts, h.ts)).unwrap_or((0, 0));
+            let d = &self.srv.databases[&dbkey];
+            let rec = super::backuphist::BackupRecord {
+                db: d.name.clone(),
+                kind: if b.log { 'L' } else if diff { 'I' } else { 'D' },
+                name,
+                description,
+                path: path.clone(),
+                size: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                start: micros_to_datetime(chrono::Utc::now().timestamp_micros() - (secs * 1_000_000.0) as i64),
+                finish: micros_to_datetime(chrono::Utc::now().timestamp_micros()),
+                first_lsn,
+                last_lsn,
+                diff_base: if diff { Some(first_lsn) } else { None },
+                copy_only,
+                recovery_full: d.recovery_full,
+                collation: d.collation.clone(),
+                created: d.created,
+            };
+            self.record_backup(&rec);
+        }
         if b.log {
             self.emit(Event::Message(format!("Processed {} log record(s) for database '{}', file '{}'.", records, b.db, path)));
         } else {
@@ -485,6 +508,26 @@ impl<'a> Engine<'a> {
     }
 
     pub fn exec_restore(&mut self, r: &RestoreStmt) -> Result<()> {
+        self.exec_restore_inner(r)?;
+        if matches!(r.kind, RestoreKind::Database | RestoreKind::Log) {
+            let path = self.backup_path(&r.path).unwrap_or_default();
+            let db = r.db.clone().unwrap_or_default();
+            let has = |n: &str| r.opts.iter().any(|(o, _)| o == n);
+            let rec = super::backuphist::RestoreRecord { db, kind: if r.kind == RestoreKind::Log { 'L' } else { 'D' }, replace: has("REPLACE"), recovery: !has("NORECOVERY"), path };
+            self.record_restore(&rec);
+        }
+        Ok(())
+    }
+
+    fn emit_restore_info(&mut self, kind: RestoreKind, f: &super::bakheader::BackupFacts) {
+        match kind {
+            RestoreKind::FileListOnly => self.emit_file_list_only(f),
+            RestoreKind::LabelOnly => self.emit_label_only(f),
+            _ => self.emit_header_only(f),
+        }
+    }
+
+    fn exec_restore_inner(&mut self, r: &RestoreStmt) -> Result<()> {
         self.check_backup_options(&r.opts, "RESTORE")?;
         let path = self.backup_path(&r.path)?;
         if is_sqlserver_backup(&path) {
@@ -496,30 +539,41 @@ impl<'a> Engine<'a> {
                 self.emit(Event::Message(format!("The backup set on file 1 is valid. ({} frames, {} table(s), {} row(s) or log record(s))", frames, tables, rows)));
                 Ok(())
             }
-            RestoreKind::HeaderOnly => {
+            RestoreKind::HeaderOnly | RestoreKind::FileListOnly | RestoreKind::LabelOnly => {
                 let (h, ..) = verify(&path)?;
                 let when = micros_to_datetime(h.wall);
-                let dt = |t: chrono::NaiveDateTime| Value::DateTime(t, crate::types::DtKind::DateTime);
-                let cols = ["BackupName", "BackupDescription", "BackupType", "ServerName", "DatabaseName", "BackupStartDate", "BackupFinishDate", "FirstLSN", "LastLSN", "RecoveryModel", "IsCopyOnly"];
-                let types = vec![DataType::NVarChar(128), DataType::NVarChar(255), DataType::TinyInt, DataType::NVarChar(128), DataType::NVarChar(128), DataType::DateTime, DataType::DateTime, DataType::BigInt, DataType::BigInt, DataType::NVarChar(60), DataType::Bit];
-                let row = vec![
-                    Value::Str(h.name.clone()),
-                    Value::Str(h.description.clone()),
-                    Value::Int(if h.log { 2 } else if h.diff_base.is_some() { 5 } else { 1 }),
-                    Value::Str(h.server.clone()),
-                    Value::Str(h.db.clone()),
-                    dt(when),
-                    dt(when),
-                    Value::BigInt(h.after_ts as i64),
-                    Value::BigInt(h.ts as i64),
-                    Value::Str(if h.recovery_full { "FULL".into() } else { "SIMPLE".into() }),
-                    Value::Bit(h.copy_only),
-                ];
-                self.emit(Event::Rows(ResultSet { columns: cols.iter().map(|c| c.to_string()).collect(), types, rows: vec![row] }));
-                if !self.ses.nocount {
-                    self.emit(Event::RowCount(1));
-                }
-                self.ses.rowcount = 1;
+                let size = std::fs::metadata(&path).map(|m| m.len() as i128).unwrap_or(0);
+                let facts = super::bakheader::BackupFacts {
+                    name: h.name.clone(),
+                    description: h.description.clone(),
+                    kind: if h.log { 2 } else if h.diff_base.is_some() { 5 } else { 1 },
+                    user: self.eff_login(),
+                    server: h.server.clone(),
+                    machine: std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| h.server.clone()),
+                    db: h.db.clone(),
+                    created: when,
+                    size,
+                    first_lsn: h.after_ts as i128,
+                    last_lsn: h.ts as i128,
+                    checkpoint_lsn: h.ts as i128,
+                    db_backup_lsn: h.diff_base.unwrap_or(h.ts) as i128,
+                    diff_base_lsn: h.diff_base.map(|d| d as i128),
+                    start: when,
+                    finish: when,
+                    recovery_full: h.recovery_full,
+                    copy_only: h.copy_only,
+                    collation: self.srv.databases.get(&h.db_key).map(|d| d.collation.clone()).unwrap_or_else(|| "SQL_Latin1_General_CP1_CI_AS".into()),
+                    vendor: 4608,
+                    major: 16,
+                    minor: 0,
+                    build: 1000,
+                    compressed: false,
+                    media_name: String::new(),
+                    media_description: String::new(),
+                    software: "Microsoft SQL Server".into(),
+                    media_date: when,
+                };
+                self.emit_restore_info(r.kind, &facts);
                 Ok(())
             }
             RestoreKind::Database => {
@@ -540,7 +594,7 @@ impl<'a> Engine<'a> {
         let unreadable = |why: String| SqlError::with(3241, 16, 1, format!("The media family on device '{}' is incorrectly formed: {}. SQL Server cannot process this media family.", path, why));
         match r.kind {
             RestoreKind::Log => Err(SqlError::with(3154, 16, 1, "Log backups of SQL Server cannot be restored by this server; only full database backups can.")),
-            RestoreKind::VerifyOnly | RestoreKind::HeaderOnly => {
+            RestoreKind::VerifyOnly | RestoreKind::HeaderOnly | RestoreKind::FileListOnly | RestoreKind::LabelOnly => {
                 let f = File::open(path).map_err(|e| io_fail(path, "open", e))?;
                 let mut ex = match crate::mssqlbak::Expanded::open(BufReader::new(f)) {
                     Ok(Ok(ex)) => ex,
@@ -560,17 +614,43 @@ impl<'a> Engine<'a> {
                     self.emit(Event::Message(format!("The backup set on file 1 is valid. ({} chunk(s), {} byte(s) expanded)", ex.layout.chunks.len(), ex.layout.total)));
                     return Ok(());
                 }
+                let size = std::fs::metadata(path).map(|m| m.len() as i128).unwrap_or(0);
+                let tape = scan.blocks.iter().find(|b| &b.kind == b"TAPE");
+                let vol = scan.blocks.iter().find(|b| &b.kind == b"VOLB");
                 let db = crate::sqlbak::Backup::open(ex).map(|b| b.db_name.clone()).unwrap_or_default();
-                let when = set.date_at(88).and_then(|d| chrono::NaiveDateTime::parse_from_str(&d, "%Y-%m-%d %H:%M:%S").ok()).unwrap_or_default();
-                let dt = |t: chrono::NaiveDateTime| Value::DateTime(t, crate::types::DtKind::DateTime);
-                let cols = ["BackupName", "BackupDescription", "BackupType", "UserName", "DatabaseName", "BackupStartDate", "SoftwareVersionMajor"];
-                let types = vec![DataType::NVarChar(128), DataType::NVarChar(255), DataType::TinyInt, DataType::NVarChar(128), DataType::NVarChar(128), DataType::DateTime, DataType::Int];
-                let row = vec![Value::Str(set.string_at(64)), Value::Str(set.string_at(68)), Value::Int(1), Value::Str(set.string_at(76)), Value::Str(db), dt(when), Value::Int(set.u8_at(93) as i32)];
-                self.emit(Event::Rows(ResultSet { columns: cols.iter().map(|c| c.to_string()).collect(), types, rows: vec![row] }));
-                if !self.ses.nocount {
-                    self.emit(Event::RowCount(1));
-                }
-                self.ses.rowcount = 1;
+                let parse = |d: Option<String>| d.and_then(|d| chrono::NaiveDateTime::parse_from_str(&d, "%Y-%m-%d %H:%M:%S").ok()).unwrap_or_default();
+                let when = parse(set.date_at(88));
+                let facts = super::bakheader::BackupFacts {
+                    name: set.string_at(64),
+                    description: set.string_at(68),
+                    kind: 1,
+                    user: set.string_at(76),
+                    server: vol.map(|v| v.string_at(60)).unwrap_or_default(),
+                    machine: vol.map(|v| v.string_at(60)).unwrap_or_default(),
+                    db,
+                    created: when,
+                    size,
+                    first_lsn: 0,
+                    last_lsn: 0,
+                    checkpoint_lsn: 0,
+                    db_backup_lsn: 0,
+                    diff_base_lsn: None,
+                    start: when,
+                    finish: when,
+                    recovery_full: true,
+                    copy_only: false,
+                    collation: "SQL_Latin1_General_CP1_CI_AS".into(),
+                    vendor: set.u16_at(60) as i32,
+                    major: set.u8_at(93) as i32,
+                    minor: set.u8_at(94) as i32,
+                    build: 0,
+                    compressed: ex_is_compressed(path),
+                    media_name: tape.map(|t| t.string_at(68)).unwrap_or_default(),
+                    media_description: tape.map(|t| t.string_at(72)).unwrap_or_default(),
+                    software: tape.map(|t| t.string_at(80)).unwrap_or_else(|| "Microsoft SQL Server".into()),
+                    media_date: when,
+                };
+                self.emit_restore_info(r.kind, &facts);
                 Ok(())
             }
             RestoreKind::Database => {
@@ -1044,4 +1124,10 @@ impl Iterator for RowBatches {
             }
         }
     }
+}
+
+/// True when a backup written by SQL Server is compressed (its first bytes are those of a compressed backup, not of a plain tape).
+fn ex_is_compressed(path: &str) -> bool {
+    let mut head = [0u8; 8];
+    File::open(path).and_then(|mut f| f.read_exact(&mut head)).map(|_| crate::mssqlbak::is_bak(&head)).unwrap_or(false)
 }

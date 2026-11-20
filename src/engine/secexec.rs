@@ -25,11 +25,14 @@ impl<'a> Engine<'a> {
     }
 
     pub fn is_sysadmin(&self) -> bool {
-        self.srv.security.is_sysadmin(&self.eff_login())
+        self.ses.system_ctx || self.srv.security.is_sysadmin(&self.eff_login())
     }
 
     /// The database user the current login acts as in `dbkey`; `None` when it has no access.
     pub fn db_user(&self, dbkey: &str) -> Option<String> {
+        if self.ses.system_ctx {
+            return Some("dbo".into());
+        }
         if let Some((_, Some(u))) = self.ses.imp_stack.last() {
             return Some(u.clone());
         }

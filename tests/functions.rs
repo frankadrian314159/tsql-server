@@ -363,3 +363,44 @@ fn the_system_variables_that_are_not_ints_are_typed_so() {
     assert_eq!(ty(&mut c, "d"), "int");
     assert_eq!(scalar(&mut c, "SELECT @@MAX_PRECISION"), "38");
 }
+
+#[test]
+fn a_function_is_called_by_a_name_with_its_database_in_it() {
+    let mut c = conn();
+    script(
+        &mut c,
+        "CREATE DATABASE fdb;
+         USE fdb;
+         CREATE TABLE t (a INT);
+         INSERT t VALUES (4), (5);
+         CREATE FUNCTION dbo.twice(@x INT) RETURNS INT AS BEGIN RETURN @x * 2 + (SELECT COUNT(*) FROM t) END;
+         CREATE FUNCTION dbo.rows_of() RETURNS TABLE AS RETURN (SELECT a FROM t);
+         USE master;",
+    );
+    // from another database, the call names the one the function is in; its body runs there (it reads fdb's table t)
+    assert_eq!(scalar(&mut c, "SELECT fdb.dbo.twice(10)"), "22");
+    assert_eq!(scalar(&mut c, "SELECT SUM(a) FROM fdb.dbo.rows_of()"), "9");
+    // and in its own database the short name still works
+    exec(&mut c, "USE fdb");
+    assert_eq!(scalar(&mut c, "SELECT dbo.twice(1)"), "4");
+    // (master has no such function)
+    assert!(c.execute("SELECT master.dbo.twice(1)").first_error().is_some());
+}
+
+#[test]
+fn a_statement_written_to_json_and_read_back_keeps_its_primary_and_unique_keys() {
+    // (the cluster's control node names the tables of a statement in full this way, and a `PRIMARY KEY` with no name is an
+    // `Option<Option<String>>` that a plain JSON round trip turns into none)
+    let st = tsql_server::parser::parse("CREATE TABLE shop.dbo.c (item INT PRIMARY KEY, code INT UNIQUE, v INT)").unwrap();
+    let back: Vec<tsql_server::ast::Stmt> = serde_json::from_value(serde_json::to_value(&st).unwrap()).unwrap();
+    let mut c = conn();
+    exec(&mut c, "CREATE DATABASE shop");
+    assert!(c.execute_stmts(&back).first_error().is_none());
+    exec(&mut c, "INSERT shop.dbo.c VALUES (2, 20, 1)");
+    assert_eq!(c.execute("INSERT shop.dbo.c VALUES (2, 21, 2)").first_error().map(|e| e.number), Some(2627));
+    assert_eq!(c.execute("INSERT shop.dbo.c VALUES (3, 20, 2)").first_error().map(|e| e.number), Some(2627));
+    // and the binary form is as it was: a statement saved in a cluster's state file reads back the same
+    let bytes = postcard::to_allocvec(&st).unwrap();
+    let same: Vec<tsql_server::ast::Stmt> = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(format!("{:?}", st), format!("{:?}", same));
+}

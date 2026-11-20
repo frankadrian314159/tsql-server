@@ -149,19 +149,19 @@ fn what_a_cluster_cannot_hold_is_refused_unless_the_rest_is_wanted() {
     let h = start(2);
     let path = backup_path("refused");
     let src_server = Server::new();
-    let _src = source(&src_server, &path, "GO\nCREATE FUNCTION dbo.twice (@x INT) RETURNS INT AS BEGIN RETURN @x * 2 END\nGO");
+    let _src = source(&src_server, &path, "GO\nCREATE TRIGGER trg_regions ON regions AFTER INSERT AS TRUNCATE TABLE regions\nGO");
     let mut s = h.cluster.session();
     let restore = format!("RESTORE DATABASE shop FROM DISK = '{}'", path);
-    // a stored function: refused, and nothing is made
+    // a trigger the control node cannot run: refused, and nothing is made
     let e = s.execute(&restore).first_error().cloned().expect("refused");
     assert_eq!(e.number, 50100);
-    assert!(e.message.contains("dbo.twice") && e.message.contains("CONTINUE_AFTER_ERROR"), "{}", e.message);
+    assert!(e.message.contains("trg_regions") && e.message.contains("CONTINUE_AFTER_ERROR"), "{}", e.message);
     assert_eq!(count(&mut h.cluster.mirror_server().connect_internal(), "SELECT COUNT(*) FROM sys.tables"), 0);
     // the rest, saying what was left out
     let r = s.execute(&format!("{} WITH CONTINUE_AFTER_ERROR", restore));
-    ok(&r, "the restore without the function");
+    ok(&r, "the restore without the trigger");
     ok(&s.execute("USE shop"), "USE shop");
-    assert!(messages(&r).iter().any(|m| m.starts_with("Not restored: the function dbo.twice")), "{:?}", messages(&r));
+    assert!(messages(&r).iter().any(|m| m.starts_with("Not restored: the trigger trg_regions")), "{:?}", messages(&r));
     assert_eq!(rows_of(&s.execute("SELECT COUNT(*) FROM orders")), vec![vec!["10050".to_string()]]);
     // the names are taken now: REPLACE drops the cluster's objects first, and the rows are not doubled
     assert_eq!(s.execute(&format!("{} WITH CONTINUE_AFTER_ERROR", restore)).first_error().map(|e| e.number), Some(3159));
@@ -172,17 +172,20 @@ fn what_a_cluster_cannot_hold_is_refused_unless_the_rest_is_wanted() {
 }
 
 #[test]
-fn a_unique_key_without_the_shard_key_and_a_computed_column_that_calls_a_function_are_left_out_with_a_note() {
+fn a_unique_key_without_the_shard_key_and_a_computed_column_that_calls_a_function_that_reads_tables_are_left_out_with_a_note() {
     let h = start(2);
     let path = backup_path("weak");
     let src_server = Server::new();
     let extra = "GO
 CREATE FUNCTION dbo.acct (@x INT) RETURNS NVARCHAR(12) AS BEGIN RETURN N'AW' + CAST(@x AS NVARCHAR(10)) END
 GO
-        CREATE TABLE people (id INT PRIMARY KEY, email VARCHAR(40) NOT NULL, acct AS dbo.acct(id));
+CREATE FUNCTION dbo.nregions () RETURNS INT AS BEGIN RETURN (SELECT COUNT(*) FROM dbo.regions) END
+GO
+        CREATE TABLE people (id INT PRIMARY KEY, email VARCHAR(40) NOT NULL, acct AS dbo.acct(id), nreg AS dbo.nregions());
         INSERT people (id, email) VALUES (1, 'a@x'), (2, 'b@x'), (3, 'c@x'), (4, 'd@x');
         CREATE UNIQUE INDEX ux_email ON people (email);
         CREATE INDEX ix_acct ON people (acct);
+        CREATE INDEX ix_nreg ON people (nreg);
 GO";
     let _src = source(&src_server, &path, extra);
     let mut s = h.cluster.session();
@@ -197,12 +200,58 @@ GO";
     let said = messages(&r).join("
 ");
     assert!(said.contains("the uniqueness of the unique index ux_email of [dbo].[people]"), "{}", said);
-    assert!(said.contains("the computed column [acct] of [dbo].[people]"), "{}", said);
-    assert!(said.contains("the index ix_acct of [dbo].[people]"), "{}", said);
-    // the rows are there, spread, without the computed column; the index on the e-mail is an ordinary one
+    // (the function that reads tables is on the control node only, so the column that calls it, and its index, are left out)
+    assert!(said.contains("the computed column [nreg] of [dbo].[people]"), "{}", said);
+    assert!(said.contains("the index ix_nreg of [dbo].[people]"), "{}", said);
+    // (the one that reads none is on the shards, so its column and index are kept)
+    assert!(!said.contains("the computed column [acct]"), "{}", said);
+    // the rows are there, spread; the index on the e-mail is an ordinary one
     assert_eq!(rows_of(&s.execute("SELECT id, email FROM people ORDER BY id")).len(), 4);
     assert_eq!(shard_counts(&h, "people").iter().sum::<i64>(), 4);
-    assert!(s.execute("SELECT acct FROM people").first_error().is_some(), "the computed column is not there");
+    assert_eq!(rows_of(&s.execute("SELECT acct FROM people WHERE id = 3")), vec![vec!["AW3".to_string()]]);
+    assert!(s.execute("SELECT nreg FROM people").first_error().is_some(), "the column that calls a function that reads tables is not there");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn stored_functions_are_restored_the_ones_that_read_no_table_to_the_shards_too() {
+    let h = start(2);
+    let path = backup_path("funcs");
+    let src_server = Server::new();
+    let extra = "GO
+CREATE FUNCTION dbo.twice (@x INT) RETURNS INT AS BEGIN RETURN @x * 2 END
+GO
+CREATE FUNCTION dbo.order_count () RETURNS INT AS BEGIN RETURN (SELECT COUNT(*) FROM dbo.orders) END
+GO
+CREATE FUNCTION dbo.big_orders (@min DECIMAL(10,2)) RETURNS TABLE AS RETURN (SELECT id, amount FROM dbo.orders WHERE amount >= @min)
+GO
+CREATE VIEW v_counted AS SELECT id, dbo.order_count() AS total FROM customers
+GO";
+    let oracle = source(&src_server, &path, extra);
+    let mut s = h.cluster.session();
+    let r = s.execute(&format!("RESTORE DATABASE shop FROM DISK = '{}'", path));
+    ok(&r, "the restore");
+    ok(&s.execute("USE shop"), "USE shop");
+    let mut o = oracle;
+    for q in [
+        "SELECT dbo.twice(21)",
+        "SELECT SUM(dbo.twice(id)) FROM customers",
+        "SELECT dbo.order_count()",
+        "SELECT COUNT(*) FROM dbo.big_orders(100)",
+        "SELECT MAX(total) FROM v_counted",
+        "SELECT TOP (3) c.id, dbo.order_count() FROM customers c ORDER BY c.id",
+    ] {
+        let want = o.query(q).unwrap().iter().map(|row| row.iter().map(display).collect::<Vec<_>>()).collect::<Vec<_>>();
+        let r = s.execute(q);
+        let got = rows_of(&r);
+        assert_eq!(got, want, "{}: {:?}", q, r.first_error());
+    }
+    // the shards have the function that reads no table and not the others
+    for sh in &h.shards {
+        let mut c = sh.server.connect();
+        assert!(c.execute("SELECT shop.dbo.twice(1)").first_error().is_none());
+        assert!(c.execute("SELECT shop.dbo.order_count()").first_error().is_some());
+    }
     let _ = std::fs::remove_file(&path);
 }
 
@@ -254,5 +303,34 @@ fn options_a_cluster_cannot_honour_are_errors() {
     assert_eq!(count(&mut h.cluster.mirror_server().connect_internal(), "SELECT COUNT(*) FROM sys.tables"), 0);
     // a backup of the cluster's database would hold no rows: refused
     assert_eq!(number(&mut s, format!("BACKUP DATABASE master TO DISK = '{}.x'", path)), Some(50100));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn the_triggers_of_a_backup_are_restored_and_fire_in_the_cluster() {
+    let h = start(2);
+    let path = backup_path("triggers");
+    let src_server = Server::new();
+    let extra = "GO
+CREATE TABLE audit_log (id INT IDENTITY(1,1) PRIMARY KEY, order_id INT, amount DECIMAL(10,2))
+GO
+CREATE TRIGGER trg_orders ON orders AFTER INSERT AS INSERT audit_log (order_id, amount) SELECT id, amount FROM inserted
+GO
+CREATE TRIGGER trg_off ON customers AFTER DELETE AS INSERT audit_log (order_id, amount) SELECT id, 0 FROM deleted
+GO
+DISABLE TRIGGER trg_off ON customers
+GO";
+    let _src = source(&src_server, &path, extra);
+    let mut s = h.cluster.session();
+    let r = s.execute(&format!("RESTORE DATABASE shop FROM DISK = '{}'", path));
+    ok(&r, "the restore");
+    ok(&s.execute("USE shop"), "USE shop");
+    assert_eq!(rows_of(&s.execute("SELECT COUNT(*) FROM audit_log")), vec![vec!["0".to_string()]], "the rows of the backup fired nothing");
+    ok(&s.execute("INSERT orders (customer_id, amount) VALUES (1, 5.50), (2, 7.25)"), "an insert");
+    assert_eq!(rows_of(&s.execute("SELECT amount FROM audit_log ORDER BY amount")), vec![vec!["5.50".to_string()], vec!["7.25".to_string()]]);
+    // the disabled one stays disabled
+    ok(&s.execute("INSERT customers VALUES (5000, N'Zed', 'EU', NULL)"), "a customer with no orders");
+    ok(&s.execute("DELETE FROM customers WHERE id = 5000"), "a delete");
+    assert_eq!(rows_of(&s.execute("SELECT COUNT(*) FROM audit_log")), vec![vec!["2".to_string()]]);
     let _ = std::fs::remove_file(&path);
 }

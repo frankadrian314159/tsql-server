@@ -379,7 +379,17 @@ impl Parser {
         if self.accept_kw("WITH") {
             loop {
                 let name = self.ident()?.to_uppercase();
-                let val = if self.accept_op("=") { Some(self.expr()?) } else { None };
+                let val = if self.accept_op("=") {
+                    Some(self.expr()?)
+                } else if name == "MOVE" {
+                    // MOVE 'logical name' TO 'path': the files are not separate here, so the target is read and not kept
+                    let logical = self.expr()?;
+                    self.expect_kw("TO")?;
+                    self.expr()?;
+                    Some(logical)
+                } else {
+                    None
+                };
                 opts.push((name, val));
                 if !self.accept_op(",") {
                     break;
@@ -2247,8 +2257,16 @@ impl Parser {
                                     val = self.advance_up();
                                 } else if self.accept_op("=") {
                                     val = self.advance_up();
-                                } else if name == "RECOVERY" {
+                                } else if !self.at_eos() && !self.is_op(",") && !self.is_op("(") && !self.is_kw("WITH") && (!self.is_stmt_start() || name == "RECOVERY") {
+                                    // a bare value: RECOVERY SIMPLE, PAGE_VERIFY CHECKSUM, CURSOR_DEFAULT GLOBAL, TARGET_RECOVERY_TIME 60 SECONDS
                                     val = self.advance_up();
+                                }
+                                if self.is_kw_any(&["SECONDS", "MINUTES"]) {
+                                    self.i += 1;
+                                }
+                                // a suboption list, as in AUTO_CREATE_STATISTICS ON (INCREMENTAL = OFF): accepted, there is nothing to set
+                                if self.is_op("(") {
+                                    self.skip_parens()?;
                                 }
                                 options.push((name, val));
                                 if !self.accept_op(",") {
@@ -2256,7 +2274,8 @@ impl Parser {
                                 }
                             }
                             if self.accept_kw("WITH") {
-                                while !self.at_eos() && !self.is_stmt_start() {
+                                // (WITH ROLLBACK IMMEDIATE: ROLLBACK starts a statement elsewhere, but not here)
+                                while !self.at_eos() && (self.is_kw("ROLLBACK") || !self.is_stmt_start()) {
                                     self.i += 1;
                                 }
                             }
@@ -2435,9 +2454,18 @@ impl Parser {
                             (RestoreKind::VerifyOnly, None)
                         } else if self.accept_kw("HEADERONLY") {
                             (RestoreKind::HeaderOnly, None)
+                        } else if self.accept_kw("FILELISTONLY") {
+                            (RestoreKind::FileListOnly, None)
+                        } else if self.accept_kw("LABELONLY") {
+                            (RestoreKind::LabelOnly, None)
                         } else {
                             return Err(self.err());
                         };
+                        // RESTORE DATABASE db FILE = 'x', FILEGROUP = 'y', READ_WRITE_FILEGROUPS FROM ...: a restore of some files; the whole
+                        // database is restored (the files are not separate here), so the list is read and not kept
+                        while !self.at_eos() && !self.is_kw("FROM") {
+                            self.i += 1;
+                        }
                         self.expect_kw("FROM")?;
                         let path = self.backup_device()?;
                         let opts = self.backup_options()?;
@@ -3945,14 +3973,26 @@ impl Parser {
             "DATABASE" => {
                 let name = self.ident()?;
                 let mut collation = None;
-                while !self.at_eos() && !self.is_stmt_start() {
+                let mut files = vec![];
+                let mut attach = false;
+                // the file lists, LOG ON, CONTAINMENT and WITH options (LEDGER = OFF, ...) are accepted; only the FILENAMEs are kept (to check them)
+                while !self.at_eos() && (self.is_kw("WITH") || !self.is_stmt_start()) {
                     if self.accept_kw("COLLATE") {
                         collation = Some(self.ident()?);
+                    } else if self.is_kw("FILENAME") && self.peek_is_op(1, "=") && matches!(self.toks.get(self.i + 2).map(|t| &t.tok), Some(Tok::Str(_))) {
+                        if let Tok::Str(f) = self.toks[self.i + 2].tok.clone() {
+                            files.push(f);
+                        }
+                        self.i += 3;
                     } else {
+                        attach |= self.is_kw("ATTACH") || self.is_kw("ATTACH_REBUILD_LOG");
                         self.i += 1;
                     }
                 }
-                Ok(Stmt::CreateDatabase(name, collation))
+                if attach {
+                    files.clear(); // the files of an attach exist
+                }
+                Ok(Stmt::CreateDatabase(name, collation, files))
             }
             "TYPE" => {
                 let name = self.name_parts()?;

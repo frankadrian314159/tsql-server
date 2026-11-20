@@ -65,7 +65,7 @@ fn indexes_report_type_uniqueness_and_key_ordinals() {
 fn objects_types_partitions_and_files() {
     let mut c = conn();
     setup(&mut c);
-    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.all_objects WHERE is_ms_shipped = 1"), "0");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.all_objects WHERE is_ms_shipped = 1"), "1");
     assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.tables WHERE is_ms_shipped = 0"), "2");
     let r = rows(&mut c, "SELECT name, max_length, precision, scale, is_nullable FROM sys.types WHERE name IN ('int', 'varchar', 'decimal', 'datetime2') ORDER BY name");
     assert_eq!(r, [["datetime2", "8", "27", "7", "1"], ["decimal", "17", "18", "0", "1"], ["int", "4", "10", "0", "1"], ["varchar", "8000", "0", "0", "1"]]);
@@ -608,4 +608,58 @@ fn the_users_node_of_ssms_sees_that_each_user_may_connect() {
         vec![vec!["bob".to_string(), "1".into()]]
     );
     assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.database_permissions WHERE grantee_principal_id = USER_ID('bob') AND type = 'SL' AND state = 'G' AND class = 1"), "1");
+}
+
+#[test]
+fn the_folder_picker_of_ssms_lists_drives_and_folders() {
+    let mut c = conn();
+    // the batch SSMS sends first: the view is announced in sys.all_objects and lists the drives
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.all_objects WHERE name='dm_os_enumerate_fixed_drives' AND type='V' AND is_ms_shipped=1"), "1");
+    script(
+        &mut c,
+        "CREATE TABLE #fixdrv (Name sysname NOT NULL, Size bigint NOT NULL, Type sysname NULL);
+         INSERT #fixdrv SELECT fixed_drive_path, free_space_in_bytes/(1024*1024), drive_type_desc FROM sys.dm_os_enumerate_fixed_drives;",
+    );
+    assert!(scalar(&mut c, "SELECT COUNT(*) FROM #fixdrv").parse::<i64>().unwrap() >= 1);
+    // the older route, and the folder listings
+    script(&mut c, "CREATE TABLE #d (Name sysname, Size bigint); INSERT #d (Name, Size) EXECUTE master.dbo.xp_fixeddrives;");
+    let dir = std::env::temp_dir().join("tsql_picker_test");
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    let p = dir.display().to_string();
+    script(&mut c, &format!("CREATE TABLE #s (n nvarchar(260)); INSERT #s EXEC master.dbo.xp_subdirs N'{p}';"));
+    assert_eq!(scalar(&mut c, "SELECT n FROM #s"), "sub");
+    script(&mut c, &format!("CREATE TABLE #e (a int, b int, c int); INSERT #e EXEC master.dbo.xp_fileexist N'{p}';"));
+    assert_eq!(rows(&mut c, "SELECT a, b, c FROM #e"), vec![vec!["0".to_string(), "1".into(), "1".into()]]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_file_pickers_of_ssms_enumerate_the_servers_folders() {
+    let mut c = conn();
+    let dir = std::env::temp_dir().join("tsql_picker_test2");
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("a.mdf"), b"x").unwrap();
+    let p = dir.display().to_string();
+    // the batch of the Locate Folder dialog
+    script(&mut c, &format!(
+        "CREATE TABLE #f (Name nvarchar(255) NOT NULL, IsFile bit NULL, FullName nvarchar(300) NOT NULL);
+         DECLARE @Path nvarchar(255) = N'{p}';
+         INSERT #f SELECT file_or_directory_name, 1 - is_directory, full_filesystem_path FROM sys.dm_os_enumerate_filesystem(@Path, '*') WHERE [level] = 0;"
+    ));
+    assert_eq!(rows(&mut c, "SELECT Name, IsFile FROM #f ORDER BY IsFile, Name"), vec![vec!["sub".to_string(), "0".into()], vec!["a.mdf".to_string(), "1".into()]]);
+    assert_eq!(scalar(&mut c, &format!("SELECT COUNT(*) FROM sys.dm_os_enumerate_filesystem(N'{p}', '*.mdf')")), "1");
+    assert_eq!(rows(&mut c, &format!("SELECT file_exists, file_is_a_directory, parent_directory_exists FROM sys.dm_os_file_exists(N'{p}')")), vec![vec!["0".to_string(), "1".into(), "1".into()]]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn msdb_backup_history_tables_exist_for_the_ssms_restore_dialog() {
+    let mut c = conn();
+    for t in ["backupset", "backupmediafamily", "backupmediaset", "backupfile", "backupfilegroup", "restorehistory", "restorefile", "restorefilegroup", "suspect_pages"] {
+        assert_eq!(scalar(&mut c, &format!("SELECT COUNT(*) FROM msdb.dbo.{t}")), "0", "{t}");
+    }
+    // the forms SSMS uses
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM msdb..backupset WHERE type = 'D' OR type = 'L'"), "0");
+    script(&mut c, "CREATE TABLE #tempbackup (database_name nvarchar(128), [type] char(1), backup_finish_date datetime); INSERT INTO #tempbackup SELECT database_name, [type], MAX(backup_finish_date) FROM msdb..backupset WHERE [type] = 'D' GROUP BY database_name, [type];");
+    assert_eq!(rows(&mut c, "SELECT bkps.database_name FROM msdb.dbo.backupset bkps ORDER BY bkps.database_name").len(), 0);
 }

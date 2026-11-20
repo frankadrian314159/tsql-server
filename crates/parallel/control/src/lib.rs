@@ -26,9 +26,12 @@ pub mod advisor;
 pub mod autoscale;
 pub mod client;
 pub mod dbname;
+pub mod dmlfuncs;
+pub mod execproc;
 pub mod deadlock;
 pub use tsql_server::rewrite::decorrelate;
 pub mod fk;
+pub mod funcs;
 pub mod flatten;
 pub mod gather;
 pub mod front;
@@ -44,6 +47,8 @@ pub mod rebalance;
 pub mod split;
 pub mod replicas;
 pub mod restore;
+pub mod rules;
+pub mod triggers;
 pub mod txn;
 
 use astutil::*;
@@ -212,6 +217,16 @@ pub struct Cluster {
     dbs: Mutex<Vec<String>>,
     /// the database the last statement of the schema log was made in (the log says `USE` when it changes)
     logged_db: Mutex<String>,
+    /// the stored functions (by id) as their `CREATE FUNCTION` statements: see `funcs.rs`
+    funcs: Mutex<HashMap<String, Stmt>>,
+    /// the functions that are on the shards (the ones that read no table)
+    funcs_on_shards: Mutex<std::collections::BTreeSet<String>>,
+    /// the statement (as JSON) each of them was made from there, to see that a changed one is made again
+    funcs_placed: Mutex<HashMap<String, String>>,
+    /// the triggers of the tables, in the order they were made: kept and fired by the control node (see `triggers.rs`)
+    triggers: Mutex<Vec<(String, Stmt)>>,
+    /// the ids of the triggers that are disabled
+    triggers_off: Mutex<std::collections::HashSet<String>>,
 }
 
 pub type FaultHook = Arc<dyn Fn(&str) -> bool + Send + Sync>;
@@ -272,6 +287,11 @@ impl Cluster {
             deadlocks: AtomicU64::new(0),
             dbs: Default::default(),
             logged_db: Mutex::new("master".into()),
+            funcs: Default::default(),
+            funcs_on_shards: Default::default(),
+            funcs_placed: Default::default(),
+            triggers: Default::default(),
+            triggers_off: Default::default(),
         });
         cluster.start_deadlock_monitor();
         Ok(cluster)
@@ -397,7 +417,7 @@ impl Cluster {
     }
 
     pub fn session(self: &Arc<Self>) -> ClusterSession {
-        ClusterSession { cluster: self.clone(), id: self.next_session.fetch_add(1, Ordering::Relaxed), mirror: self.mirror.connect_internal(), plan: vec![], temp_counter: 0, own_temps: vec![], txn: std::cell::RefCell::new(None), stmt_shards: std::cell::Cell::new(0), commit_seq: 0, vars: HashMap::new(), local_tables: HashMap::new(), tvars: HashMap::new(), identity_insert: Default::default(), last_identity: None, create_dist: None, cur_db: "master".into() }
+        ClusterSession { cluster: self.clone(), id: self.next_session.fetch_add(1, Ordering::Relaxed), mirror: self.mirror.connect_internal(), plan: vec![], temp_counter: 0, own_temps: vec![], txn: std::cell::RefCell::new(None), stmt_shards: std::cell::Cell::new(0), commit_seq: 0, vars: HashMap::new(), local_tables: HashMap::new(), tvars: HashMap::new(), identity_insert: Default::default(), last_identity: None, create_dist: None, cur_db: "master".into(), capture: None, trigger_stack: vec![], returning: false, catch_stack: vec![], proc_depth: 0, return_value: None, loop_ctl: 0, temp_creates: HashMap::new(), mirror_temps: Default::default() }
     }
 
     pub fn shard_status(&self) -> Vec<Result<ShardStatus, SqlError>> {
@@ -442,6 +462,24 @@ pub struct ClusterSession {
     /// the database the session is in (`USE`; the front end tells it before each batch): the tables its statements name are those
     /// of this database, see `dbname.rs`
     cur_db: String,
+    /// the rows the statement being run for the triggers of its table changed (see `triggers.rs`)
+    capture: Option<triggers::Capture>,
+    /// the triggers being run, innermost last: the table and whether it is an INSTEAD OF trigger
+    trigger_stack: Vec<(String, bool)>,
+    /// a `RETURN` has been run: the statements around it stop (see `exec_flow`)
+    returning: bool,
+    /// the errors being handled by the `CATCH` blocks that are running, innermost last (what `ERROR_NUMBER()` and `THROW;` read)
+    catch_stack: Vec<SqlError>,
+    /// procedures that are running, one inside the other (see `execproc.rs`)
+    proc_depth: usize,
+    /// the value of the `RETURN` that ended the procedure that is running
+    return_value: Option<Value>,
+    /// `BREAK` (1) or `CONTINUE` (2) has been run: the statements around it stop, up to the `WHILE`
+    loop_ctl: u8,
+    /// the `CREATE TABLE` of each temporary table the session materialized (by id), and those of them that the control node's engine has too
+    /// (it is given one only when a query that it runs reads it: see `refresh_mirror`)
+    temp_creates: HashMap<String, String>,
+    mirror_temps: std::collections::HashSet<String>,
 }
 
 /// A transaction of a control session: the shards that have begun it, and what it has changed.
@@ -774,7 +812,15 @@ impl ClusterSession {
         let mut events = vec![];
         for st in stmts {
             self.stmt_shards.set(0);
-            if let Err(e) = cl.rt.block_on(self.exec_stmt(st, &mut events)) {
+            let done = cl.rt.block_on(self.exec_stmt(st, &mut events));
+            if done.is_ok() && self.returning {
+                // (a RETURN ends the batch)
+                self.returning = false;
+                self.return_value = None;
+                break;
+            }
+            self.loop_ctl = 0;
+            if let Err(e) = done {
                 // the victim of a deadlock across shards: its wait was ended on the shard, and the transaction is rolled back
                 // everywhere, as SQL Server does (a deadlock inside one shard also comes back as 1205, with that shard's part
                 // already rolled back)
@@ -978,8 +1024,15 @@ impl ClusterSession {
         tsql_server::span!("ctl_exec_stmt");
         // (the tables the statement names are in the database the session is in: see `dbname.rs`)
         let qualified = self.qualify(st);
+        let qualified = self.qualify_functions(&qualified);
+        // (a DEFAULT or CHECK that calls a function that reads sharded tables is the control node's: see rules.rs)
+        let (qualified, mut control_rules) = self.split_control_rules(&qualified);
         let st = &qualified;
         self.sync_mirror_db()?;
+        match st {
+            Stmt::CreateTable { .. } | Stmt::AlterTable { .. } => self.refuse_reading_functions(st, "a computed column")?,
+            _ => {}
+        }
         match st {
             Stmt::BeginTran(_) => {
                 let mut t = self.txn.borrow_mut();
@@ -996,10 +1049,13 @@ impl ClusterSession {
             _ => {}
         }
         if let Some(t) = self.txn.borrow().as_ref() {
-            if t.doomed {
+            // (a transaction that can only be rolled back still lets a batch read, run its control of flow, and report: a CATCH block does)
+            let harmless = matches!(st, Stmt::Block(_) | Stmt::If { .. } | Stmt::While { .. } | Stmt::Try { .. } | Stmt::Print(_) | Stmt::Throw(_) | Stmt::RaiseError { .. } | Stmt::Return(_) | Stmt::Break | Stmt::Continue | Stmt::Declare(_) | Stmt::Set { .. } | Stmt::SetOpts(_) | Stmt::Noop)
+                || matches!(st, Stmt::Query(q) if !matches!(&q.body, QueryBody::Select(s) if s.into.is_some()));
+            if t.doomed && !harmless {
                 return Err(SqlError::new(3930, "The current transaction cannot be committed and cannot support operations that write to the log file. Roll back the transaction."));
             }
-            if matches!(st, Stmt::CreateTable { .. } | Stmt::AlterTable { .. } | Stmt::CreateView { .. } | Stmt::Drop { .. } | Stmt::CreateIndex { .. } | Stmt::DropIndex { .. } | Stmt::AlterIndex { .. } | Stmt::Truncate(_)) {
+            if matches!(st, Stmt::CreateTable { .. } | Stmt::AlterTable { .. } | Stmt::CreateView { .. } | Stmt::CreateFunction(_) | Stmt::CreateTrigger { .. } | Stmt::Drop { .. } | Stmt::CreateIndex { .. } | Stmt::DropIndex { .. } | Stmt::AlterIndex { .. } | Stmt::Truncate(_)) {
                 return Err(unsupported("schema changes and TRUNCATE inside a transaction"));
             }
         }
@@ -1010,10 +1066,17 @@ impl ClusterSession {
             if !self.cluster.proc_routes.lock().unwrap_or_else(|e| e.into_inner()).is_empty() && self.exec_routed_proc(ex, events).await? {
                 return Ok(());
             }
+            // (any other procedure of the cluster runs here, on the control node)
+            if self.exec_proc(ex, events).await? {
+                return Ok(());
+            }
+        }
+        if let Stmt::ExecStr(parts) = st {
+            return self.exec_string(parts, events).await;
         }
         // control of flow: a batch that mixes the cluster's tables with BEGIN ... END, IF and WHILE (SSMS's connect batches do) runs its
         // statements here, one after the other, each as it would be alone
-        if matches!(st, Stmt::Block(_) | Stmt::If { .. } | Stmt::While { .. }) {
+        if matches!(st, Stmt::Block(_) | Stmt::If { .. } | Stmt::While { .. } | Stmt::Try { .. }) {
             return self.exec_flow(st, events).await;
         }
         if self.exec_variable_stmt(st).await? {
@@ -1028,12 +1091,129 @@ impl ClusterSession {
                 if let (Ok(()), Some(n)) = (&r, name.last().filter(|n| n.starts_with('#'))) {
                     self.own_temps.push(n.clone());
                 }
+                if r.is_ok() {
+                    // (a function that named this table before it was there reads a sharded one now: refused when a procedure that runs on
+                    // the shards calls it, and the table not made)
+                    if let Some((p, f)) = self.cluster.stale_procedure() {
+                        let id = name.last().cloned().unwrap_or_default();
+                        let drop = Stmt::Drop { what: "TABLE".into(), names: vec![name.clone()], if_exists: true };
+                        let mut none = vec![];
+                        let _ = Box::pin(self.exec_stmt(&drop, &mut none)).await;
+                        return Err(SqlError::new(50105, format!("CREATE TABLE {} would make the function {}, which the procedure {} calls on the shards, read a sharded table, and each shard would answer from its slice. Drop or change the procedure first.", id, f, p)));
+                    }
+                    self.replace_functions_after_table_change().await?;
+                    self.add_control_rules(name, std::mem::take(&mut control_rules))?;
+                }
                 r
             }
-            Stmt::AlterTable { name, action } => self.alter_table(st, name, action).await,
+            Stmt::AlterTable { name, action } => {
+                // (a check of the control node's that is dropped by name)
+                if let AlterAction::DropConstraint(names, if_exists) = action {
+                    let rest = self.take_control_checks(name, names);
+                    if rest.len() < names.len() {
+                        if rest.is_empty() {
+                            return Ok(());
+                        }
+                        let st2 = Stmt::AlterTable { name: name.clone(), action: AlterAction::DropConstraint(rest, *if_exists) };
+                        if let Stmt::AlterTable { name: n2, action: a2 } = &st2 {
+                            return self.alter_table(&st2, n2, a2).await;
+                        }
+                    }
+                }
+                self.verify_control_checks(name, &control_rules).await?;
+                let nothing_left = matches!(action, AlterAction::AddDefs(d) if d.is_empty());
+                let r = if nothing_left { Ok(()) } else { self.alter_table(st, name, action).await };
+                if r.is_ok() {
+                    self.add_control_rules(name, std::mem::take(&mut control_rules))?;
+                }
+                r
+            }
             Stmt::Use(db) => self.use_database(db),
-            Stmt::CreateDatabase(name, _) => self.create_database(st, name).await,
+            Stmt::CreateDatabase(name, _, _) => self.create_database(st, name).await,
             Stmt::Drop { what, names, if_exists } if what.eq_ignore_ascii_case("DATABASE") => self.drop_database(st, names, *if_exists).await,
+            Stmt::Print(e) => {
+                let b = self.bind_expr(e)?;
+                let v = self.eval_scalar(&b).await?;
+                events.push(Event::Message(tsql_server::convert::display(&v)));
+                Ok(())
+            }
+            Stmt::Throw(Some((n, m, s))) => {
+                let (n, m, s) = (self.bind_expr(n)?, self.bind_expr(m)?, self.bind_expr(s)?);
+                let number = self.eval_scalar(&n).await?.as_i64().unwrap_or(50000) as i32;
+                let message = tsql_server::convert::display(&self.eval_scalar(&m).await?);
+                let state = self.eval_scalar(&s).await?.as_i64().unwrap_or(1) as u8;
+                Err(SqlError::with(number, 16, state, message))
+            }
+            Stmt::RaiseError { args, .. } => {
+                let mut vals = vec![];
+                for a in args {
+                    let b = self.bind_expr(a)?;
+                    vals.push(self.eval_scalar(&b).await?);
+                }
+                let first = vals.first().cloned().unwrap_or(Value::Null);
+                let (number, mut text) = match &first {
+                    Value::Str(s) => (50000, s.clone()),
+                    other => (other.as_i64().unwrap_or(50000) as i32, String::new()),
+                };
+                let severity = vals.get(1).and_then(|v| v.as_i64()).unwrap_or(16) as u8;
+                let state = vals.get(2).and_then(|v| v.as_i64()).unwrap_or(1) as u8;
+                // (%s and %d take the arguments after the state, in order)
+                let mut rest = vals.iter().skip(3);
+                let mut out = String::new();
+                let mut chars = text.chars().peekable();
+                while let Some(c) = chars.next() {
+                    if c == '%' {
+                        match chars.peek() {
+                            Some('s') | Some('d') | Some('i') | Some('u') => {
+                                chars.next();
+                                out.push_str(&rest.next().map(tsql_server::convert::display).unwrap_or_default());
+                            }
+                            Some('%') => {
+                                chars.next();
+                                out.push('%');
+                            }
+                            _ => out.push('%'),
+                        }
+                    } else {
+                        out.push(c);
+                    }
+                }
+                text = out;
+                if severity <= 10 {
+                    events.push(Event::Message(text));
+                    Ok(())
+                } else {
+                    Err(SqlError::with(number, severity, state, text))
+                }
+            }
+            Stmt::Throw(None) => match self.catch_stack.last() {
+                Some(e) => Err(e.clone()),
+                None => Err(SqlError::new(10704, "To rethrow an error, a THROW statement must be used inside a CATCH block. Insert the THROW statement inside a CATCH block, or insert the argument values for this THROW statement.")),
+            },
+            Stmt::Return(None) => {
+                self.returning = true;
+                Ok(())
+            }
+            Stmt::Return(Some(e)) => {
+                let b = self.bind_expr(e)?;
+                self.return_value = Some(self.eval_scalar(&b).await?);
+                self.returning = true;
+                Ok(())
+            }
+            Stmt::Break => {
+                self.loop_ctl = 1;
+                Ok(())
+            }
+            Stmt::Continue => {
+                self.loop_ctl = 2;
+                Ok(())
+            }
+            Stmt::Noop => Ok(()),
+            Stmt::CreateTrigger { .. } => self.create_trigger(st),
+            Stmt::Drop { what, names, if_exists } if what.eq_ignore_ascii_case("TRIGGER") => self.drop_triggers(st, names, *if_exists),
+            Stmt::TriggerAdmin(a) => self.trigger_admin(a),
+            Stmt::CreateFunction(cf) => self.create_function(st, cf).await,
+            Stmt::Drop { what, names, if_exists } if what.eq_ignore_ascii_case("FUNCTION") => self.drop_functions(st, names, *if_exists).await,
             Stmt::CreateProc { name, .. } => {
                 // (a procedure is made on every shard, which runs it; a changed one must be declared again)
                 self.broadcast(st).await?;
@@ -1107,7 +1287,12 @@ impl ClusterSession {
                     let ids: Vec<String> = names.iter().map(|n| table_id(n)).collect();
                     self.cluster.fks.lock().unwrap_or_else(|e| e.into_inner()).retain(|f| !ids.contains(&f.child) && !ids.contains(&f.parent));
                 }
+                {
+                    let ids: Vec<String> = names.iter().map(|n| table_id(n)).collect();
+                    self.cluster.triggers.lock().unwrap_or_else(|e| e.into_inner()).retain(|(_, s)| !matches!(s, Stmt::CreateTrigger { table, .. } if ids.contains(&table_id(table))));
+                }
                 self.log_schema(st);
+                self.replace_functions_after_table_change().await?;
                 Ok(())
             }
             Stmt::CreateIndex { table, unique, cols, xml, spatial, .. } => {
@@ -1176,6 +1361,13 @@ impl ClusterSession {
             Stmt::Restore(r) if r.kind == RestoreKind::Database => self.restore_database(r, events).await,
             // (the control node's own copy of the cluster's database holds no rows: a backup of it would be empty)
             Stmt::Backup(_) => Err(unsupported("BACKUP of the cluster's database (its rows are on the shards)")),
+            // any other procedure is the control node's engine's (a system procedure; a name that is nothing is its error 2812)
+            Stmt::Exec(ex) if !ex.name_is_var => {
+                let res = self.mirror.execute_stmts(std::slice::from_ref(st));
+                merge::check(&res)?;
+                events.extend(res.events);
+                Ok(())
+            }
             other => Err(unsupported(&format!("the statement {}", stmt_kind(other)))),
         }
     }
@@ -1284,6 +1476,9 @@ impl ClusterSession {
             Stmt::Block(stmts) => {
                 for s in stmts {
                     Box::pin(self.exec_stmt(s, events)).await?;
+                    if self.returning || self.loop_ctl != 0 {
+                        break;
+                    }
                 }
                 Ok(())
             }
@@ -1300,6 +1495,17 @@ impl ClusterSession {
                 let mut rounds = 0usize;
                 while self.condition(cond).await? {
                     Box::pin(self.exec_stmt(body, events)).await?;
+                    if self.returning {
+                        break;
+                    }
+                    match self.loop_ctl {
+                        1 => {
+                            self.loop_ctl = 0;
+                            break;
+                        }
+                        2 => self.loop_ctl = 0,
+                        _ => {}
+                    }
                     rounds += 1;
                     if rounds >= 1_000_000 {
                         return Err(unsupported("a WHILE loop of more than a million rounds"));
@@ -1307,8 +1513,59 @@ impl ClusterSession {
                 }
                 Ok(())
             }
+            Stmt::Try { body, catch } => self.exec_try(body, catch, events).await,
             other => Err(unsupported(&format!("the statement {}", stmt_kind(other)))),
         }
+    }
+
+    /// `BEGIN TRY ... END TRY BEGIN CATCH ... END CATCH`. An error of the `TRY` block (severity below 20) runs the `CATCH` block, in which
+    /// `ERROR_NUMBER()`, `ERROR_MESSAGE()`, `ERROR_SEVERITY()`, `ERROR_STATE()`, `ERROR_PROCEDURE()`, `XACT_STATE()` and `THROW;` tell and
+    /// repeat the error. A statement that fails inside a shard is undone by the shard; one that had changed several shards, or that failed
+    /// because a shard did, leaves the transaction half done, so the transaction can only be rolled back (`XACT_STATE() = -1`: the `CATCH`
+    /// block may read, but a write is error 3930), as in SQL Server. A deadlock victim (1205) is not caught: its transaction is already rolled back.
+    async fn exec_try(&mut self, body: &[Stmt], catch: &[Stmt], events: &mut Vec<Event>) -> Result<(), SqlError> {
+        let outer_shards = self.stmt_shards.get();
+        let trigger_depth = self.trigger_stack.len();
+        let mut caught: Option<SqlError> = None;
+        for s in body {
+            self.stmt_shards.set(0);
+            match Box::pin(self.exec_stmt(s, events)).await {
+                Ok(()) => {
+                    if self.returning || self.loop_ctl != 0 {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    if e.severity >= 20 || e.number == 1205 || e.number == 596 {
+                        return Err(e);
+                    }
+                    let fatal = matches!(e.number, 1222 | 40613 | 3314 | 50200 | 50210);
+                    if self.stmt_shards.get() > 1 || fatal {
+                        if let Some(t) = self.txn.borrow_mut().as_mut() {
+                            t.doomed = true;
+                        }
+                    }
+                    caught = Some(e);
+                    break;
+                }
+            }
+        }
+        self.stmt_shards.set(outer_shards);
+        let Some(mut e) = caught else { return Ok(()) };
+        self.trigger_stack.truncate(trigger_depth);
+        self.capture = None;
+        self.returning = false;
+        e.abort_batch = false;
+        self.catch_stack.push(e);
+        let mut r = Ok(());
+        for s in catch {
+            r = Box::pin(self.exec_stmt(s, events)).await;
+            if r.is_err() || self.returning || self.loop_ctl != 0 {
+                break;
+            }
+        }
+        self.catch_stack.pop();
+        r
     }
 
     /// Whether a condition holds (a NULL does not).
@@ -1467,6 +1724,10 @@ impl ClusterSession {
         let tables = self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let lookup = |i: &str| tables.get(i).cloned();
         let route = procs::validate(&params, &param, &body, &lookup, &self.cluster).map_err(|why| SqlError::new(50104, format!("The procedure {} cannot run on one shard: {}.", name.join("."), why)))?;
+        // (a procedure that runs on a shard can call only the functions that are there: not one that reads sharded tables)
+        if let Some((_, f)) = self.cluster.procedure_calling_reader(Some(&id), false) {
+            return Err(SqlError::new(50104, format!("The procedure {} cannot run on one shard: it calls the function {}, which reads sharded tables, and a shard would answer from its slice.", name.join("."), f)));
+        }
         self.cluster.proc_routes.lock().unwrap_or_else(|e| e.into_inner()).insert(id, route);
         self.cluster.save_state();
         Ok(())
@@ -1496,7 +1757,8 @@ impl ClusterSession {
         let mut args = ex.args.clone();
         let mut key: Option<Value> = None;
         for (i, a) in args.iter_mut().enumerate() {
-            let v = self.eval_scalar(&a.e).await?;
+            let b = self.bind_expr(&a.e)?;
+            let v = self.eval_scalar(&b).await?;
             let is_key = match &a.name {
                 Some(n) => n.trim_start_matches('@').eq_ignore_ascii_case(params[route.param].name.trim_start_matches('@')),
                 None => i == route.param,
@@ -1612,8 +1874,19 @@ impl ClusterSession {
                 Dist::Sharded { key, class }
             }
         };
-        self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner()).insert(t.id.clone(), t);
+        let id = t.id.clone();
+        let before = self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), t);
+        // (a procedure runs on the shards, and so does a function it calls, only while that function reads replicated tables: refuse a
+        // change that would leave it calling one over slices)
+        if let Some((p, f)) = self.cluster.stale_procedure() {
+            if let Some(old) = before {
+                self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), old);
+            }
+            return Err(SqlError::new(50105, format!("DISTRIBUTE TABLE {} would make the function {}, which the procedure {} calls on the shards, read a sharded table, and each shard would answer from its slice. Drop or change the procedure (or the function) first.", name.join("."), f, p)));
+        }
         self.cluster.save_state();
+        // (a function that reads the table runs on the shards only while the table is replicated)
+        self.replace_functions_after_table_change().await?;
         Ok(())
     }
 
@@ -1623,8 +1896,8 @@ impl ClusterSession {
             return Ok(v.clone());
         }
         let q = simple_query(Select { distinct: false, top: None, items: vec![SelectItem::Expr { e: e.clone(), alias: None }], into: None, from: vec![], where_: None, group: None, having: None });
-        if has_subquery(e) {
-            // a subquery may read distributed tables: the cluster answers it
+        if has_subquery(e) || self.reading_function_tables(e).is_some() || self.calls_function_reading_tables(e) {
+            // a subquery may read distributed tables (and so may a function): the cluster answers it
             let rs = self.run_query(&q).await?;
             return rs.rows.first().and_then(|r| r.first()).cloned().ok_or_else(|| SqlError::new(50000, "an expression returned no value"));
         }
@@ -1727,8 +2000,23 @@ impl ClusterSession {
         if ins.output.is_some() || ins.top.is_some() || !ins.ctes.is_empty() {
             return Err(unsupported("INSERT with OUTPUT, TOP or CTEs"));
         }
+        if self.triggers_apply(&t.id, triggers::Ev::Insert) {
+            return self.dml_with_triggers(&t, triggers::Ev::Insert, Stmt::Insert(Box::new(ins.clone())), events).await;
+        }
         let rows: Vec<Vec<Expr>> = match &ins.src {
-            InsertSrc::Values(v) => v.clone(),
+            InsertSrc::Values(v) => {
+                // (a call of a function that reads sharded tables is evaluated here, and the shards get its value)
+                let mut rows = v.clone();
+                for r in rows.iter_mut() {
+                    for cell in r.iter_mut() {
+                        if let Some(e2) = self.fold_reading_calls(cell, None, None).await? {
+                            *cell = e2;
+                        }
+                    }
+                }
+                self.refuse_reading_functions(&rows, "an INSERT")?;
+                rows
+            }
             InsertSrc::Query(q) => {
                 let rs = self.run_query(q).await?;
                 rs.rows.into_iter().map(|r| r.into_iter().map(Expr::Lit).collect()).collect()
@@ -1751,6 +2039,34 @@ impl ClusterSession {
             return Err(SqlError::new(213, format!("Column name or number of supplied values does not match table definition ({} values for {} columns).", bad.len(), names.len())));
         }
         let mut rows = rows;
+        // a DEFAULT of the control node's (see rules.rs): for a column the INSERT leaves out, or gives as DEFAULT
+        for (col, e) in self.cluster.default_rules(&t.id) {
+            let pos = names.iter().position(|c| c.eq_ignore_ascii_case(&col));
+            let needed = match pos {
+                None => true,
+                Some(p) => rows.iter().any(|r| matches!(r[p], Expr::Default)),
+            };
+            if !needed || t.cols.iter().find(|c| c.name.eq_ignore_ascii_case(&col)).is_none() {
+                continue;
+            }
+            let b = self.bind_expr(&e)?;
+            let v = self.eval_scalar(&b).await?;
+            match pos {
+                None => {
+                    for r in rows.iter_mut() {
+                        r.push(nested::lit(&v));
+                    }
+                    names.push(col);
+                }
+                Some(p) => {
+                    for r in rows.iter_mut() {
+                        if matches!(r[p], Expr::Default) {
+                            r[p] = nested::lit(&v);
+                        }
+                    }
+                }
+            }
+        }
         if let Some(ic) = &ident_col {
             let explicit = names.iter().any(|c| c.eq_ignore_ascii_case(ic));
             if explicit && !self.identity_insert.contains(&t.id) {
@@ -1807,8 +2123,15 @@ impl ClusterSession {
             Dist::Replicated => {
                 let shards = self.all_shards();
                 let st = make(rows);
-                let replies = self.fan_run(&shards, |_| Work::Stmts(vec![st.clone()])).await?;
-                count = replies.first().map(|r| r.row_count()).unwrap_or(0);
+                if self.capturing(&t.id) {
+                    let with_rows = triggers::with_output(st.clone());
+                    let results = self.fan_query(&shards, |_| Work::Stmts(vec![with_rows.clone()])).await?;
+                    count = results.first().map(|r| r.rows.len() as i64).unwrap_or(0);
+                    self.capture_rows(results, true);
+                } else {
+                    let replies = self.fan_run(&shards, |_| Work::Stmts(vec![st.clone()])).await?;
+                    count = replies.first().map(|r| r.row_count()).unwrap_or(0);
+                }
                 self.plan.push(format!("insert into replicated table on {} shards", n));
             }
             Dist::Sharded { key, class } => {
@@ -1833,8 +2156,15 @@ impl ClusterSession {
                 }
                 let used: Vec<usize> = (0..n).filter(|i| !per_shard[*i].is_empty()).collect();
                 let stmts: Vec<Stmt> = per_shard.into_iter().map(|rows| make(rows)).collect();
-                let replies = self.fan_run(&used, |i| Work::Stmts(vec![stmts[i].clone()])).await?;
-                count = replies.iter().map(|r| r.row_count()).sum();
+                if self.capturing(&t.id) {
+                    let with_rows: Vec<Stmt> = stmts.iter().cloned().map(triggers::with_output).collect();
+                    let results = self.fan_query(&used, |i| Work::Stmts(vec![with_rows[i].clone()])).await?;
+                    count = results.iter().map(|r| r.rows.len() as i64).sum();
+                    self.capture_rows(results, false);
+                } else {
+                    let replies = self.fan_run(&used, |i| Work::Stmts(vec![stmts[i].clone()])).await?;
+                    count = replies.iter().map(|r| r.row_count()).sum();
+                }
                 self.plan.push(format!("insert split over shards {:?}", used));
                 for (i, e) in entries.into_iter().enumerate() {
                     if !e.is_empty() {
@@ -1943,6 +2273,18 @@ impl ClusterSession {
 
     async fn run_dml(&mut self, t: &DistTable, st: Stmt, shards: Vec<usize>, events: &mut Vec<Event>) -> Result<(), SqlError> {
         tsql_server::span!("ctl_run_dml");
+        if self.capturing(&t.id) {
+            // (the rows the shards changed come back, for the triggers of the table)
+            let with_rows = triggers::with_output(st.clone());
+            let results = self.fan_query(&shards, |_| Work::Stmts(vec![with_rows.clone()])).await?;
+            let replicated = matches!(t.dist, Dist::Replicated);
+            let count: i64 = if replicated { results.first().map(|r| r.rows.len() as i64).unwrap_or(0) } else { results.iter().map(|r| r.rows.len() as i64).sum() };
+            self.capture_rows(results, replicated);
+            self.plan.push(format!("{} on shards {:?}, with its rows kept for the triggers", stmt_kind(&st).to_lowercase(), shards));
+            self.bump(&t.id);
+            events.push(Event::RowCount(count));
+            return Ok(());
+        }
         let replies = self.fan_run(&shards, |_| Work::Stmts(vec![st.clone()])).await?;
         let count = match t.dist {
             Dist::Replicated => replies.first().map(|r| r.row_count()).unwrap_or(0),
@@ -1960,6 +2302,13 @@ impl ClusterSession {
         let t = self.table(name)?;
         if !u.from.is_empty() || u.output.is_some() || u.top.is_some() || u.current_of.is_some() || !u.ctes.is_empty() {
             return Err(unsupported("UPDATE with FROM, OUTPUT, TOP, CURRENT OF or CTEs"));
+        }
+        // (the calls of functions that read sharded tables are evaluated here, and the shards get their values: see dmlfuncs.rs)
+        if let Some(u2) = self.fold_update(u).await? {
+            return Box::pin(self.update(&u2, events)).await;
+        }
+        if self.triggers_apply(&t.id, triggers::Ev::Update) {
+            return self.dml_with_triggers(&t, triggers::Ev::Update, Stmt::Update(Box::new(u.clone())), events).await;
         }
         let mut exprs: Vec<&Expr> = u.where_.iter().collect();
         let mut moves_key = false;
@@ -1999,6 +2348,7 @@ impl ClusterSession {
                 _ => Err(unsupported("correlated subqueries in UPDATE")),
             };
         }
+        self.refuse_reading_functions(u, "an UPDATE")?;
         self.fk_check_update(&t, u).await?;
         if moves_key {
             return self.update_moving_key(&t, u, events).await;
@@ -2077,6 +2427,12 @@ impl ClusterSession {
         if !d.from.is_empty() || d.output.is_some() || d.top.is_some() || d.current_of.is_some() || !d.ctes.is_empty() {
             return Err(unsupported("DELETE with FROM, OUTPUT, TOP, CURRENT OF or CTEs"));
         }
+        if let Some(d2) = self.fold_delete(d).await? {
+            return Box::pin(self.delete(&d2, events)).await;
+        }
+        if self.triggers_apply(&t.id, triggers::Ev::Delete) {
+            return self.dml_with_triggers(&t, triggers::Ev::Delete, Stmt::Delete(Box::new(d.clone())), events).await;
+        }
         if let Some(w) = &d.where_ {
             if has_window_or_session(w) {
                 return Err(unsupported("variables in DELETE"));
@@ -2088,6 +2444,7 @@ impl ClusterSession {
                 };
             }
         }
+        self.refuse_reading_functions(d, "a DELETE")?;
         self.fk_before_delete(&t, d.where_.as_ref(), events).await?;
         self.edges_before_node_delete(&t, d.where_.as_ref(), events).await?;
         let shards = self.dml_shards(&t, d.where_.as_ref()).await?;
@@ -2145,6 +2502,11 @@ impl ClusterSession {
         let ids = referenced_tables(q);
         let tables: Vec<DistTable> = ids.iter().filter_map(|i| self.table_by_id(i)).collect();
         if tables.is_empty() {
+            // (a function it calls may read a replicated table, which every shard holds and the control node's own copy does not)
+            if self.calls_function_reading_tables(q) {
+                self.plan.push("direct: it calls functions that read replicated tables, on shard 0".into());
+                return self.direct(0, q).await;
+            }
             self.plan.push("local: reads no distributed table".into());
             return self.mirror_query(q);
         }
@@ -2554,6 +2916,14 @@ impl ClusterSession {
         if current.loaded == Some(current.version) {
             return Ok(());
         }
+        // (a temporary table of the session, such as `inserted` of a trigger, is made in the control node's engine when it is first needed there)
+        if let Some(create) = self.temp_creates.get(&t.id).cloned() {
+            if !self.mirror_temps.contains(&t.id) {
+                let stmts = tsql_server::parser::parse(&create)?;
+                merge::check(&self.mirror.execute_stmts(&stmts))?;
+                self.mirror_temps.insert(t.id.clone());
+            }
+        }
         merge::check(&self.mirror.execute_stmts(&[Stmt::Truncate(Target::Table(t.name.clone()))]))?;
         let cols: Vec<String> = t.cols.iter().filter(|c| !c.computed).map(|c| c.name.clone()).collect();
         let scan = simple_query(Select {
@@ -2568,16 +2938,28 @@ impl ClusterSession {
         });
         let shards = if matches!(t.dist, Dist::Replicated) { vec![0] } else { self.all_shards() };
         let results = self.fan_query(&shards, |_| Work::Stmts(vec![Stmt::Query(Box::new(scan.clone()))])).await?;
-        for rs in results {
-            let mut it = rs.rows.into_iter();
-            loop {
-                let chunk: Vec<Vec<Value>> = it.by_ref().take(20_000).collect();
-                if chunk.is_empty() {
-                    break;
-                }
-                self.mirror.load_rows(&t.name, Some(&cols), chunk)?;
-            }
+        // (the mirror's table has the IDENTITY the control node numbers by, and the copy carries the numbers the rows were given)
+        let identity = t.identity.is_some();
+        if identity {
+            merge::check(&self.mirror.execute_stmts(&[Stmt::SetOpts(vec![SetOpt::IdentityInsert(t.name.clone(), true)])]))?;
         }
+        let loaded: Result<(), SqlError> = (|| {
+            for rs in results {
+                let mut it = rs.rows.into_iter();
+                loop {
+                    let chunk: Vec<Vec<Value>> = it.by_ref().take(20_000).collect();
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    self.mirror.load_rows(&t.name, Some(&cols), chunk)?;
+                }
+            }
+            Ok(())
+        })();
+        if identity {
+            let _ = self.mirror.execute_stmts(&[Stmt::SetOpts(vec![SetOpt::IdentityInsert(t.name.clone(), false)])]);
+        }
+        loaded?;
         if let Some(e) = self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&t.id) {
             e.loaded = Some(current.version);
         }

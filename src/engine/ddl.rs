@@ -566,7 +566,7 @@ impl<'a> Engine<'a> {
                 self.current_db().assign_schema_id(&n.to_lowercase());
                 self.current_db().schema_owner.insert(n.to_lowercase(), owner);
             }
-            Stmt::CreateDatabase(n, coll) => {
+            Stmt::CreateDatabase(n, coll, files) => {
                 if let Some(cn) = coll {
                     if crate::collation::get(cn).is_none() {
                         return Err(SqlError::with(448, 16, 1, format!("Invalid collation '{}'.", cn)));
@@ -578,6 +578,18 @@ impl<'a> Engine<'a> {
                 let k = n.to_lowercase();
                 if self.srv.databases.contains_key(&k) {
                     return Err(SqlError::new(1801, format!("Database '{}' already exists. Choose a different database name.", n)));
+                }
+                // the files are not created (a database here lives in the catalog), but their paths are held to what SQL Server demands of them
+                for f in files {
+                    let p = std::path::Path::new(f);
+                    if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
+                        if !dir.is_dir() {
+                            return Err(SqlError::new(5133, format!("Directory lookup for the file \"{}\" failed with the operating system error 3(The system cannot find the path specified.).", f)));
+                        }
+                    }
+                    if p.exists() {
+                        return Err(SqlError::new(5170, format!("Cannot create file '{}' because it already exists. Change the file path or the file name, and retry the operation.", f)));
+                    }
                 }
                 let id = self.srv.databases.len() as i32 + 1;
                 self.ensure_tx()?;

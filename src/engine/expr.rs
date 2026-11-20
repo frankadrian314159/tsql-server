@@ -861,7 +861,9 @@ impl<'a> Engine<'a> {
             }
         }
         // user-defined function?
-        if let Some(f) = self.find_func(fc.schema.as_deref(), &fc.name_orig()) {
+        // (`db.schema.f(...)` names the database the function is in; the call runs there)
+        let fdb: Option<String> = if fc.parts.len() >= 3 { Some(fc.parts[fc.parts.len() - 3].clone()) } else { None };
+        if let Some(f) = self.find_func_at(fdb.as_deref(), fc.schema.as_deref(), &fc.name_orig()) {
             if f.def.ret_type.is_some() {
                 let mut args = vec![];
                 let mut mask = vec![];
@@ -874,7 +876,10 @@ impl<'a> Engine<'a> {
                         mask.push(false);
                     }
                 }
-                return self.call_scalar_udf(&f, args, &mask);
+                let saved = self.enter_function_db(fdb.as_deref());
+                let r = self.call_scalar_udf(&f, args, &mask);
+                self.leave_function_db(saved);
+                return r;
             }
         }
         let mut args = Vec::with_capacity(fc.args.len());

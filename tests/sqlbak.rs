@@ -234,7 +234,7 @@ fn restore_database_from_a_sql_server_backup() {
     let r = c.execute(&format!("RESTORE HEADERONLY FROM DISK = '{}'", path));
     let rs = r.resultsets();
     assert_eq!(rs[0].rows[0][0].to_string(), "AdventureWorks2025-Full Database Backup");
-    assert_eq!(rs[0].rows[0][4].to_string(), "AdventureWorks2025");
+    assert_eq!(rs[0].rows[0][9].to_string(), "AdventureWorks2025");
     let r = c.execute(&format!("RESTORE DATABASE aw FROM DISK = '{}'", path));
     assert!(r.errors().is_empty(), "{:?}", r.errors());
     let n = |c: &mut tsql_server::Connection, sql: &str| c.execute(sql).resultsets()[0].rows[0][0].to_string();

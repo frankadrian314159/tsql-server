@@ -231,6 +231,10 @@ impl<'a> Engine<'a> {
                             rows.push(vec![sv(&c.name), Value::Int(c.id), Value::Int(sid(&c.schema)), Value::Int(c.parent), sv(c.code), sv(c.desc), date(db.created), date(db.created), Value::Bit(false), Value::Null]);
                         }
                     }
+                    if lname == "all_objects" {
+                        // the system view SSMS probes for before it lists the server's drives
+                        rows.push(vec![sv("dm_os_enumerate_fixed_drives"), Value::Int(-1001), Value::Int(sid("sys")), Value::Int(0), sv("V"), sv("VIEW"), date(db.created), date(db.created), Value::Bit(true), Value::Null]);
+                    }
                     for (tn, (tk, trg)) in &db.triggers {
                         let _ = tn;
                         if lname == "objects" || lname == "all_objects" {
@@ -852,6 +856,31 @@ impl<'a> Engine<'a> {
                 }
                 // the policy store (msdb.dbo.syspolicy_*): Policy-Based Management is not implemented, so the store is as a new server's
                 // (policy management off, no policies), which is what SSMS's Management > Policy Management reads
+                // the backup history of msdb before its tables exist (see backuphist.rs): empty
+                "backupset" | "backupmediafamily" | "backupmediaset" | "backupfile" | "backupfilegroup" | "restorehistory" | "restorefile" | "restorefilegroup" | "suspect_pages" => {
+                    use DataType::*;
+                    let n = |x: &str| (x.to_string(), NVarChar(128));
+                    let cols: Vec<(String, DataType)> = match lname.as_str() {
+                        "backupset" => {
+                            let mut c: Vec<(String, DataType)> = vec![("backup_set_id".into(), Int), ("backup_set_uuid".into(), Guid), ("media_set_id".into(), Int), ("first_family_number".into(), TinyInt), ("first_media_number".into(), SmallInt), ("last_family_number".into(), TinyInt), ("last_media_number".into(), SmallInt), ("catalog_family_number".into(), TinyInt), ("catalog_media_number".into(), SmallInt), ("position".into(), Int), ("expiration_date".into(), DateTime), ("software_vendor_id".into(), Int), n("name"), ("description".into(), NVarChar(255)), n("user_name"), ("software_major_version".into(), TinyInt), ("software_minor_version".into(), TinyInt), ("software_build_version".into(), SmallInt), ("time_zone".into(), SmallInt), ("mtf_minor_version".into(), TinyInt)];
+                            for l in ["first_lsn", "last_lsn", "checkpoint_lsn", "database_backup_lsn"] {
+                                c.push((l.into(), Decimal(25, 0)));
+                            }
+                            c.extend([("database_creation_date".into(), DateTime), ("backup_start_date".into(), DateTime), ("backup_finish_date".into(), DateTime), ("type".into(), Char(1)), ("sort_order".into(), SmallInt), ("code_page".into(), SmallInt), ("compatibility_level".into(), TinyInt), ("database_version".into(), Int), ("backup_size".into(), Decimal(20, 0)), n("database_name"), n("server_name"), n("machine_name"), ("flags".into(), Int), ("unicode_locale".into(), Int), ("unicode_compare_style".into(), Int), n("collation_name"), ("is_password_protected".into(), Bit), ("recovery_model".into(), NVarChar(60)), ("has_bulk_logged_data".into(), Bit), ("is_snapshot".into(), Bit), ("is_readonly".into(), Bit), ("is_single_user".into(), Bit), ("has_backup_checksums".into(), Bit), ("is_damaged".into(), Bit), ("begins_log_chain".into(), Bit), ("has_incomplete_metadata".into(), Bit), ("is_force_offline".into(), Bit), ("is_copy_only".into(), Bit), ("first_recovery_fork_guid".into(), Guid), ("last_recovery_fork_guid".into(), Guid), ("fork_point_lsn".into(), Decimal(25, 0)), ("database_guid".into(), Guid), ("family_guid".into(), Guid), ("differential_base_lsn".into(), Decimal(25, 0)), ("differential_base_guid".into(), Guid), ("backup_channel_type".into(), TinyInt), ("backup_channel_type_desc".into(), NVarChar(60)), ("compressed_backup_size".into(), Decimal(20, 0)), ("key_algorithm".into(), NVarChar(32)), ("encryptor_thumbprint".into(), VarBinary(20)), ("encryptor_type".into(), NVarChar(32))]);
+                            c
+                        }
+                        "backupmediafamily" => vec![("media_set_id".into(), Int), ("family_sequence_number".into(), TinyInt), ("media_family_id".into(), Guid), ("media_count".into(), Int), n("logical_device_name"), ("physical_device_name".into(), NVarChar(260)), ("device_type".into(), TinyInt), ("physical_block_size".into(), Int), ("mirror".into(), TinyInt)],
+                        "backupmediaset" => vec![("media_set_id".into(), Int), ("media_uuid".into(), Guid), ("media_family_count".into(), TinyInt), n("name"), ("description".into(), NVarChar(255)), n("software_name"), ("software_vendor_id".into(), Int), ("MTF_major_version".into(), TinyInt), ("mirror_count".into(), TinyInt), ("is_password_protected".into(), Bit), ("is_compressed".into(), Bit)],
+                        "backupfile" => vec![("backup_set_id".into(), Int), ("first_family_number".into(), TinyInt), ("first_media_number".into(), SmallInt), n("filegroup_name"), ("page_size".into(), Int), ("file_number".into(), Decimal(10, 0)), ("backed_up_page_count".into(), Decimal(10, 0)), ("file_type".into(), Char(1)), ("source_file_block_size".into(), Decimal(10, 0)), ("file_size".into(), Decimal(20, 0)), n("logical_name"), ("physical_name".into(), NVarChar(260)), ("state".into(), TinyInt), ("state_desc".into(), NVarChar(60)), ("create_lsn".into(), Decimal(25, 0)), ("drop_lsn".into(), Decimal(25, 0)), ("file_guid".into(), Guid), ("read_only_lsn".into(), Decimal(25, 0)), ("read_write_lsn".into(), Decimal(25, 0)), ("differential_base_lsn".into(), Decimal(25, 0)), ("differential_base_guid".into(), Guid), ("backup_size".into(), Decimal(20, 0)), ("filegroup_guid".into(), Guid), ("is_readonly".into(), Bit), ("is_present".into(), Bit)],
+                        "backupfilegroup" => vec![("backup_set_id".into(), Int), n("name"), ("filegroup_id".into(), Int), ("filegroup_guid".into(), Guid), ("type".into(), Char(2)), ("type_desc".into(), NVarChar(60)), ("is_default".into(), Bit), ("is_readonly".into(), Bit), ("log_filegroup_guid".into(), Guid)],
+                        "restorehistory" => vec![("restore_history_id".into(), Int), ("restore_date".into(), DateTime), n("destination_database_name"), n("user_name"), ("backup_set_id".into(), Int), ("restore_type".into(), Char(1)), ("replace".into(), Bit), ("recovery".into(), Bit), ("restart".into(), Bit), ("stop_at".into(), DateTime), ("device_count".into(), TinyInt), n("stop_at_mark_name"), ("stop_before".into(), Bit)],
+                        "restorefile" => vec![("restore_history_id".into(), Int), ("file_number".into(), Decimal(10, 0)), ("destination_phys_name".into(), NVarChar(260))],
+                        "restorefilegroup" => vec![("restore_history_id".into(), Int), n("filegroup_name")],
+                        _ => vec![("database_id".into(), Int), ("file_id".into(), Int), ("page_id".into(), BigInt), ("event_type".into(), Int), ("error_count".into(), Int), ("last_update_date".into(), DateTime)],
+                    };
+                    let refs: Vec<(&str, DataType)> = cols.iter().map(|(a, t)| (a.as_str(), t.clone())).collect();
+                    Some(rs(&refs, vec![]))
+                }
                 "syspolicy_configuration" => Some(rs(
                     &[("name", nv()), ("current_value", DataType::Int)],
                     vec![vec![sv("Enabled"), Value::Int(0)], vec![sv("HistoryRetentionInDays"), Value::Int(90)], vec![sv("LogOnSuccess"), Value::Int(0)]],
@@ -949,6 +978,14 @@ impl<'a> Engine<'a> {
                 }
                 "change_tracking_databases" => Some(rs(&[("database_id", DataType::Int), ("is_auto_cleanup_on", DataType::TinyInt), ("retention_period", DataType::Int), ("retention_period_units", DataType::TinyInt), ("retention_period_units_desc", nv())], vec![])),
                 "service_broker_endpoints" => Some(rs(&[("name", nv()), ("endpoint_id", DataType::Int), ("principal_id", DataType::Int), ("protocol", DataType::TinyInt), ("protocol_desc", nv()), ("type", DataType::TinyInt), ("type_desc", nv()), ("state", DataType::TinyInt), ("state_desc", nv()), ("is_admin_endpoint", DataType::Bit), ("port", DataType::Int), ("is_dynamic_port", DataType::Bit), ("ip_address", nv())], vec![])),
+                // SQL Server 2000's list of connections (SSMS counts them before it drops a database)
+                "sysprocesses" => {
+                    let rows = self.srv.core.session_list().into_iter().map(|s| {
+                        let dbid = self.srv.databases.get(&s.db.to_lowercase()).map(|d| d.id).unwrap_or(1);
+                        vec![Value::Int(s.spid), Value::Int(dbid), sv(&s.login), sv(&s.host), sv(&s.app), sv(s.status), sv(&s.command), date(s.login_time), date(s.last_batch), Value::Int(0), Value::Int(0)]
+                    }).collect();
+                    Some(rs(&[("spid", DataType::SmallInt), ("dbid", DataType::SmallInt), ("loginame", nv()), ("hostname", nv()), ("program_name", nv()), ("status", nv()), ("cmd", nv()), ("login_time", DataType::DateTime), ("last_batch", DataType::DateTime), ("blocked", DataType::SmallInt), ("waittime", DataType::BigInt)], rows))
+                }
                 "sysdatabases" => {
                     let rows = self.srv.databases.values().map(|d| vec![sv(&d.name), Value::Int(d.id), Value::Bin(vec![1]), Value::Int(0), Value::Int(16), Value::Int(0), date(d.created), date(d.created), Value::Int(0), Value::Int(160), sv(&format!("{}.mdf", d.name)), Value::Int(957)]).collect();
                     Some(rs(&[("name", nv()), ("dbid", DataType::SmallInt), ("sid", DataType::VarBinary(85)), ("mode", DataType::SmallInt), ("status", DataType::Int), ("status2", DataType::Int), ("crdate", DataType::DateTime), ("reserved", DataType::DateTime), ("category", DataType::Int), ("cmptlevel", DataType::TinyInt), ("filename", nv()), ("version", DataType::SmallInt)], rows))
@@ -1781,6 +1818,13 @@ impl<'a> Engine<'a> {
                     ))
                 }
                 // the machine the server runs on, as SQL Server shows it (SSMS reads it when it connects)
+                "dm_os_enumerate_fixed_drives" => {
+                    let rows: Vec<Row> = super::sysprocs::fixed_drives().into_iter().map(|(d, mb)| {
+                        let path = if cfg!(windows) { format!("{}:", d) } else { d };
+                        vec![sv(&path), Value::BigInt(mb as i64 * 1024 * 1024), sv("Fixed")]
+                    }).collect();
+                    Some(rs(&[("fixed_drive_path", nv()), ("free_space_in_bytes", DataType::BigInt), ("drive_type_desc", nv())], rows))
+                }
                 "dm_os_host_info" => {
                     let (platform, distribution, release, sku) = match std::env::consts::OS {
                         "windows" => ("Windows", "Windows", "10.0", 48),

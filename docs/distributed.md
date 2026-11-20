@@ -183,7 +183,8 @@ tables sharded on the item), and its table shows how each query ran (`split`, `s
     new value would be missing): delete and insert the row instead, or do not index a column that is updated.
   * *a join whose sharded tables are all fixed to one shard* (by literals on their keys, or by equalities between their keys, in `WHERE`
     or the `ON` of inner joins) runs on that shard as a whole.
-  * *procedures that run on one shard* (`CREATE PROCEDURE` is made on every shard; `DISTRIBUTE PROCEDURE name BY @param` declares that
+  * *procedures that run on one shard* (a procedure that is not declared like this runs on the control node: see *Stored procedures*;
+    `CREATE PROCEDURE` is made on every shard; `DISTRIBUTE PROCEDURE name BY @param` declares that
     the parameter's value is the shard key of everything the procedure reads and writes): a call `EXEC name ...` is one request to the
     shard that owns that value, inside the session's transaction when there is one (so a transaction can call several, on several
     shards, and commit them together by two-phase commit). The declaration is *checked* against the body and refused (error 50104,
@@ -223,6 +224,113 @@ tables sharded on the item), and its table shows how each query ran (`split`, `s
 * **Control plane and data plane.** Statements, errors and row counts are Flight *actions* and *tickets* whose bodies are the
   engine's syntax trees in postcard (the control node sends a rewritten query without a SQL printer); result sets are Arrow
   record batches (native columns for common kinds; decimals, dates, times and GUIDs travel as exact packed values).
+
+## Stored functions
+
+`CREATE [OR ALTER] FUNCTION` (scalar, inline and multi-statement table-valued) and `DROP FUNCTION` work in a cluster, in any of its
+databases. The control node's engine (the *mirror*) checks a function and keeps it; the registry of functions is rebuilt from the schema log
+when a control node starts again, so no file format changes. Where else a function lives depends on what it reads:
+
+* A function that **runs on the shards** (it reads no table of the cluster, or only *replicated* ones, which every shard holds in full; it
+  reads no view; and the functions it calls are the same) is made on every shard too, as a procedure is, so a query that calls it still
+  runs on the shards: `SELECT SUM(dbo.dbl(qty)) FROM items` is scattered, and the function may be used in `INSERT`, `UPDATE`, `DELETE`,
+  in a procedure, and in a computed column, a default or a `CHECK`. A query that names no table but calls a function that reads a
+  replicated one (`SELECT dbo.region_name('EU')`) runs on shard 0, since the control node's own copy of a table has no rows. A shard that
+  joins is given these functions.
+* A function that **reads a sharded table** (or a view) lives on the control node only, because a shard holds a slice of each such table
+  and would answer from its slice. A query that calls one, directly, through a view, or through another function, is *gathered*: every
+  table it reaches (the function's too) is copied into the control node and the whole query runs there. The answer is exact, at
+  single-node speed, and the copies of tables are kept until a change bumps their version. The plan says `gather: the query calls a
+  function that reads tables`. An `INSERT`, `UPDATE` or `DELETE`, a default and a `CHECK` that calls one is run by the control node, which
+  evaluates the calls and sends the shards their values (see *Functions that read sharded tables, in data changes*); a computed column that
+  calls one is refused with error 50100.
+
+Which kind a function is is worked out from what it reads *now*: a table made after the function, or dropped, or distributed
+(`DISTRIBUTE TABLE`, which needs an empty table) moves the functions that read it between the shards and the control node. A stored
+procedure that runs on one shard (a routed one, see *Procedures that run on one shard*) can call only the functions that are there, and
+nothing is allowed to strand one: `CREATE TABLE`
+(of a table a function named before it was there), `DISTRIBUTE TABLE` and `CREATE OR ALTER FUNCTION` are refused (error 50105, naming the
+procedure and the function) when they would take from the shards a function that a procedure calls, and nothing is changed; drop the
+procedure first. `DISTRIBUTE PROCEDURE` is refused (error 50104) for a procedure that calls a function that reads sharded tables. A procedure
+that is not routed runs on the control node and may call any function. A statement that calls a function is checked every time it runs.
+A restore treats a function that reads any table of the backup as one that reads sharded tables when it decides which computed columns
+to keep, even when the table ends up replicated (the function itself is then put on the shards, but its computed column is left out).
+
+A function that is changed (`CREATE OR ALTER`) moves between the two kinds as what it reads changes: one that begins to read a table leaves the
+shards, one that stops is put on them. A call is given the database of its function (`db.schema.f(...)`, which the engine runs in that
+database, as SQL Server does), since a shard's connection is in whichever database it was last sent to; from another database a function is
+called by that name (`SELECT shop.dbo.dbl(21)`). Dropping a database drops its functions. Triggers are not supported.
+
+### Functions that read sharded tables, in data changes
+
+A shard cannot call a function that reads sharded tables (it would answer from its slice), so the control node does what the shards cannot:
+
+* **`INSERT ... VALUES`, `UPDATE`, `DELETE` with a call whose arguments are constants or variables** (`VALUES (1, dbo.total())`,
+  `SET qty = dbo.total()`, `WHERE qty > dbo.total() / 2`): the call is evaluated first, over the tables as they are before the statement,
+  and the statement goes to the shards with its value. `INSERT ... SELECT` runs its `SELECT` as any query that calls such a function does.
+* **A call over the columns of the table being changed** (`SET rnk = dbo.rank_of(qty)`, `WHERE dbo.rank_of(qty) >= 9`): the control node
+  reads the distinct values of the arguments among the rows concerned (the rows the `WHERE` lets through, for the `SET`; compared as bytes, so
+  `'a'` and `'A'` are two values, and NULL is one), calls the function once for each, and the statement gets a `CASE` that looks the value
+  up. At most 5000 distinct values; more is refused (50100). A row that appears between the reading and the writing, with values that
+  were not read, raises a divide-by-zero error instead of getting a wrong value: run the statement again. The plan says
+  `function f evaluated first on the control node`.
+* **`DEFAULT` and `CHECK` that call such a function** are not given to the shards or to the control node's engine: the control node keeps
+  them as *rules* of the table. A `CHECK` is verified after each `INSERT` or `UPDATE` over the rows it wrote, in the statement's
+  transaction; a row for which the condition is false undoes the statement with error 547 (`ALTER TABLE ... ADD CHECK` verifies the rows
+  that are there, `DROP CONSTRAINT name` drops it). A `DEFAULT` is evaluated, once for the statement, when an `INSERT` leaves the column
+  out or says `DEFAULT` for it. A rule is a hidden trigger (`ck$table$name`, `df$table$column`): logged with the schema, found again when
+  the control node starts, dropped with the table, not listed by `DISABLE TRIGGER ALL`, and it gives the table the limits of a table with
+  triggers (an `UPDATE` of the shard key is refused). The constraint is not in `sys.check_constraints` or `sys.default_constraints`.
+* **A computed column** that calls one is still refused: it is evaluated whenever a row is read, on the shard that holds it.
+
+## Stored procedures
+
+A procedure made with `CREATE PROCEDURE` is made on every shard and on the control node. `EXEC` of one that is declared with
+`DISTRIBUTE PROCEDURE` goes to the shard of its key (see *Procedures that run on one shard*). `EXEC` of any other procedure of the cluster
+runs on the control node: its body is run statement by statement by the session's own executor, so what it reads and writes goes through
+the cluster like any batch (a query over sharded tables is scattered, gathered or moved as it would be alone, and DML keeps its triggers,
+foreign keys and global indexes). That is what makes `EXEC` work anywhere a statement does: in a batch, in a procedure, in a trigger body.
+
+The body runs in a scope of its own, in the database the procedure was made in: the parameters (by name or by position, with defaults, a string
+converted to the parameter's type), `OUTPUT` parameters copied back to the caller's variables, `RETURN value` into `EXEC @rc = ...`, table-valued
+parameters (`READONLY`), `IF`, `WHILE` with `BREAK` and `CONTINUE`, `TRY ... CATCH` and `THROW`, nested calls to 32 levels (error 217), and
+`EXEC('text')` (a batch of its own, which does not see the caller's variables). The caller's variables are not visible inside. A name that is not
+a procedure of the cluster (a system procedure) is the control node's engine's, and an unknown one is its error 2812. Not supported: a routed
+procedure with an `OUTPUT` parameter or a return value, cursors, `EXECUTE AS`.
+
+## Triggers
+
+`CREATE [OR ALTER] TRIGGER`, `DROP TRIGGER`, `ENABLE | DISABLE TRIGGER` work for the triggers of tables (`AFTER` and `INSTEAD OF`, for `INSERT`,
+`UPDATE` and `DELETE`, in any database). They are the control node's: kept in a registry that is rebuilt from the schema log, and made
+neither on the control node's engine nor on the shards, which would fire them on the wrong rows (a shard holds a slice of each table, and a
+trigger that reads or writes another table has to reach every shard). The control node fires them around the statements it runs:
+
+* the statement runs inside a transaction (the client's, or one of its own), with `OUTPUT` added on the shards so that the control node gets the
+  rows that were inserted and deleted;
+* an `AFTER` trigger then runs once for the statement, as T-SQL of the session: `inserted` and `deleted` are replicated temporary tables
+  holding those rows, and what the body reads or writes goes through the cluster, in the same transaction, so a trigger may change any table;
+  an error, or a `ROLLBACK`, undoes the statement and everything the trigger did (a `ROLLBACK` ends the batch with error 3609, as in SQL Server);
+* an `INSTEAD OF` trigger runs in place of the statement: `deleted` holds the rows it would delete or change, `inserted` the rows it would
+  insert (or the changed rows). Only one `INSTEAD OF` trigger per event (error 2111).
+
+As in SQL Server: a trigger is not fired again by what it does to its own table (direct recursion is off), an `INSTEAD OF` trigger's own
+statement on its table is done for real (and fires its `AFTER` triggers), triggers nest to 32 levels (error 217), a statement that changes no row
+fires nothing, and `UPDATE(column)` tells whether the statement set the column. A trigger body may use data changes, queries, variables,
+`IF`, `WHILE`, `BEGIN ... END`, `TRY ... CATCH`, `EXEC` (of any procedure of the cluster), `PRINT`, `THROW`, `RAISERROR`, `RETURN` and `ROLLBACK`; one that
+uses anything else (cursors, `TRUNCATE`, ...) is refused when it is made, not when it fires. Not supported: triggers on views, DDL and logon triggers, `COLUMNS_UPDATED()`,
+`INSERT ... EXEC` into a table with an `INSTEAD OF` trigger, an `UPDATE` of the shard key of a table that has triggers, and a statement that
+changes more rows than a statement can broadcast (the limit `broadcast_limit` sets) on a table that has triggers. Rows loaded by `INSERT BULK`
+and by a restore fire nothing. Row counts and results of a trigger body are not sent to the client.
+
+## TRY ... CATCH
+
+The control node runs `BEGIN TRY ... END TRY BEGIN CATCH ... END CATCH` in batches that use the cluster's tables and in trigger bodies. An error of
+the `TRY` block (severity below 20) runs the `CATCH` block, where `ERROR_NUMBER()`, `ERROR_MESSAGE()`, `ERROR_SEVERITY()`, `ERROR_STATE()`,
+`ERROR_PROCEDURE()` and `THROW;` (which repeats the error; error 10704 outside a `CATCH` block) work, and `XACT_STATE()` tells the transaction's
+state (0 none, 1 usable, -1 doomed). A statement that fails inside one shard is undone by that shard, so the transaction goes on. A statement that had
+changed several shards when it failed, and any error that ends a trigger, leaves the transaction half done, so it can only be rolled back
+(`XACT_STATE() = -1`): the `CATCH` block may read and `ROLLBACK`, and a write is error 3930. A deadlock victim (1205) is not caught: its transaction is
+rolled back everywhere before the batch ends. `ERROR_LINE()` is always 1.
 
 ## Elasticity
 
@@ -382,9 +490,13 @@ to this server's format in a temporary file, as a single-node restore does).
   unique constraint (other than the primary key, which must contain the shard key) that lacks the shard key is refused, as the
   rest of what a cluster cannot hold; `WITH CONTINUE_AFTER_ERROR` makes it an ordinary index and says so (`Not restored: the
   uniqueness of the unique index ...`). AdventureWorks has such keys on `rowguid` and on business keys.
-* **Computed columns that call a stored function** (the cluster has none) are left out with their indexes, with a note, under
-  `CONTINUE_AFTER_ERROR` (`Sales.Customer.AccountNumber` of AdventureWorks calls `dbo.ufnLeadingZeros`).
-* **What a cluster cannot hold is refused** before anything is made: stored functions, triggers, sequences, synonyms,
+* **Stored functions** are restored (see *Stored functions*): the ones that read no table of the backup are made first, on the shards
+  too, so a computed column may call them (`Sales.Customer.AccountNumber` of AdventureWorks calls `dbo.ufnLeadingZeros`, which is
+  restored with its column); the ones that read tables are made after the tables, on the control node only. A **computed column that
+  calls a function that reads tables** is left out with its indexes, with a note, under `CONTINUE_AFTER_ERROR`.
+* **Triggers** of tables are restored (see *Triggers*), disabled ones disabled, after the tables and rows (loading the rows fires nothing).
+  One whose body the control node cannot run (see *Triggers*), and a trigger of a view, is refused with the rest.
+* **What a cluster cannot hold is refused** before anything is made: sequences, synonyms,
   system-versioned and graph tables, columnstore indexes, xml typed by a schema collection, foreign keys to other databases,
   security policies and DDL triggers. `WITH CONTINUE_AFTER_ERROR` restores the rest and says what it left out (as messages
   beginning `Not restored:`), including views and procedures that could not be made without what was left out. Never restored,
@@ -416,7 +528,7 @@ changes, and the `CREATE DATABASE`s are in it.
 
 What is the same in every database: the shards, the slots and the sharding of each table. What differs from SQL Server: a cluster has
 no cross-database transactions beyond what a transaction already does (every table is reached through its shards), and a database has no
-settings of its own (files, collation, recovery model): `CREATE DATABASE` ignores them.
+settings of its own (files, collation, recovery model): `CREATE DATABASE` ignores them, except that the folders and names of its `FILENAME`s are checked on the control node first, as a single server checks them (the paths are not serialized into the schema log, which a restart replays).
 
 ## Temporary tables of a client
 
@@ -499,8 +611,8 @@ generated rows.
 * **Snapshots are in memory and fuzzy** (see Replication); a replicated shard's transactions in flight at a failover are lost
   (the client sees an error and retries). Membership changes go through the shard's leader one voter at a time.
 * **Refused** (error 50100 says so): `UNIQUE` constraints or unique indexes that do not contain the shard key, stored
-  functions and triggers (they would need an interpreter next to the data; a procedure is made on every shard and can be
-  declared to run on one, see *Procedures that run on one shard*), temporal
+  triggers (a function is supported, see *Stored functions*; a procedure is made on every shard and can be declared to run on one,
+  see *Procedures that run on one shard*), temporal
   tables, DML with joins (`UPDATE ... FROM`), `OUTPUT` or `TOP` in DML, `INSERT ... DEFAULT VALUES`/`EXEC`, correlated
   subqueries in DML, schema changes inside a transaction, the T-SQL `BULK INSERT` statement (`INSERT BULK`, the protocol's bulk
   load, works), `BACKUP` of the cluster's database, and restoring anything but a full backup (see *Restoring a backup into a
