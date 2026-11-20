@@ -48,7 +48,7 @@ tables sharded on the item), and its table shows how each query ran (`split`, `s
 * **DDL** (`CREATE`/`DROP TABLE`, `ALTER TABLE`, indexes, `SET`) runs on the control node's own *mirror* engine first (which
   checks it and keeps the schema), then on every shard; a table that cannot be created everywhere is removed again.
   `ALTER TABLE` may add, change (not the shard key or an identity column) and drop columns and constraints; adding a primary key
-  or a `UNIQUE` constraint without the shard key is refused. **Views** are kept by the control node (the shards hold none): a
+  is refused (a `UNIQUE` constraint may be added: see *Unique keys across shards*). **Views** are kept by the control node (the shards hold none): a
   query that reads a view is rewritten around its definition, as a derived table (see subqueries below); writes through a view
   are refused. **`IDENTITY` columns** are numbered by the control node (a counter per table in its state, so the numbers do not
   depend on the shard a row lands on, and survive a restart); the shards' tables have no identity of their own.
@@ -283,6 +283,74 @@ A shard cannot call a function that reads sharded tables (it would answer from i
   triggers (an `UPDATE` of the shard key is refused). The constraint is not in `sys.check_constraints` or `sys.default_constraints`.
 * **A computed column** that calls one is still refused: it is evaluated whenever a row is read, on the shard that holds it.
 
+## DDL triggers
+
+`CREATE | ALTER | DROP TRIGGER name ON DATABASE FOR events AS ...` and `ENABLE | DISABLE TRIGGER name | ALL ON DATABASE` work in a cluster. The control
+node keeps the triggers of each database (logged with the schema, so they are there when it starts again) and runs their bodies itself, since a
+body reads and writes the cluster's tables, which only it can do. The events are those of the DDL the cluster runs for tables, indexes, views,
+procedures, functions, triggers, schemas and types (`CREATE_TABLE`, `DROP_TABLE`, `DDL_TABLE_EVENTS`, `DDL_DATABASE_LEVEL_EVENTS`, ...); an unknown event
+is error 1082. `EVENTDATA()` gives the event's XML (`EventType`, `PostTime`, `SPID`, `ServerName`, `LoginName`, `UserName`, `DatabaseName`,
+`SchemaName`, `ObjectName`, `ObjectType`, `TSQLCommand/CommandText`), read with `.value()`.
+
+* **A trigger runs before the statement**, not after it as on a single server: the statement changes the shards and the control node's engine,
+  which cannot be taken back together. An error stops the statement, and so does `ROLLBACK` followed by `THROW` or `RAISERROR`, which is how a
+  trigger refuses `DROP_TABLE` or `ALTER_TABLE`. A `ROLLBACK` alone ends the batch with error 3609, as it does there.
+* A statement that fails after its triggers ran leaves what they wrote (an audit row, say), and a body that selects from the catalog sees the object
+  as it was before the statement.
+* A trigger does not run for DDL its own body runs, nor for what a `RESTORE` makes.
+* **Not supported:** `ON ALL SERVER` and `LOGON` triggers (error 50100). A DDL trigger is not in the control node's engine, so `sys.triggers`
+  does not list it.
+
+## User-defined types
+
+`CREATE TYPE name FROM base [NOT] NULL` (an alias type) and `CREATE TYPE name AS TABLE (...)` (a table type) are made on the control node's
+engine and on every shard, logged with the schema (so a control node that starts again, and a new shard, have them), and dropped with
+`DROP TYPE`. A column, a variable, a `CAST` and a parameter may then be of the type, on the shards and on the control node. A column of an alias
+type may be the shard key (it is classified by its base type). A table type is a table variable's type and the type of a table-valued parameter
+(`READONLY`) of a procedure the control node runs. A `RESTORE` makes the types of the backup before its tables, procedures and functions, and
+no longer says that it left them out. As on a single server (this engine does not refuse to drop a type that a column uses), `DROP TYPE` does
+not check for users of the type. Types are made outside a transaction.
+
+## XML and spatial indexes
+
+`CREATE [PRIMARY] XML INDEX` and `CREATE SPATIAL INDEX` are declarations on a single server (they are checked and kept in the catalog, and change no
+result or plan: see [optimizer.md](optimizer.md) and [spatial.md](spatial.md)). A cluster keeps them the same way: the statement runs on the
+control node's engine, which applies the rules (one primary XML index per column, the names shared with the table's other indexes, the
+primary key a table needs), then on every shard, and is logged with the schema. `DROP INDEX` drops them (a primary XML index takes the
+secondary ones built on it), the catalog views show them, and a `RESTORE` makes them after the table's rows, the primary XML indexes first.
+
+## Full-text catalogs and indexes
+
+`CREATE | ALTER | DROP FULLTEXT CATALOG` and `... FULLTEXT INDEX` are declarations on a single server: a search tokenises the text of the rows it
+looks at (see [triggers.md](triggers.md)). A cluster keeps them as it keeps XML indexes: the control node's engine applies the rules
+(errors 7608 to 7615: the key index must be a unique, non-nullable, single-column index, one full-text index per table, a catalog with indexes is
+not dropped), then every shard runs the statement, and it is logged with the schema. The key index may be a unique key that does not contain the
+shard key (see *Unique keys across shards*). `CONTAINS` and `FREETEXT` are evaluated by the shards over their own rows; a query that reads
+`CONTAINSTABLE` or `FREETEXTTABLE` reads the table they name, which the control node gathers as it does for any query it runs itself. As on a
+single server, a predicate on a table that has no full-text index is not an error. Catalogs are made outside a transaction here, as are all schema
+changes. A `RESTORE` makes the catalogs of the backup first, and the full-text index of each table after its unique key index.
+
+## Unique keys across shards
+
+A shard can keep a unique key unique only among its own rows, so a `PRIMARY KEY`, `UNIQUE` constraint or `UNIQUE` index whose columns do not
+include the shard key is also checked by the control node (the shards keep their own copy of the index too). The keys are read from the control
+node's engine after every change of the table, so the names of constraints the engine made up (`UQ__t__...`) are known, and
+`DROP INDEX` and `DROP CONSTRAINT` forget them.
+
+* An **`INSERT`** looks for the new values among the rows the shards hold, and among the new rows themselves; a duplicate is error 2627
+  (a constraint) or 2601 (an index), worded as the engine words them. Values are compared as a unique index compares them: a NULL equals
+  a NULL (one is allowed), case and trailing spaces do not count (the default collation).
+* An **`UPDATE`** that sets a column of the key reads the values the rows would have (the engine evaluates the `SET`), and looks for them among
+  the rows the statement does not change and among themselves, so a statement may swap values between its own rows. One that moves the
+  shard key is checked as the `INSERT` it becomes, after its delete. A statement that changes a key in more than 200 000 rows is refused (50100).
+* **`CREATE UNIQUE INDEX`** and **`ALTER TABLE ... ADD UNIQUE`** verify the rows that are there (error 1505 for a duplicate).
+* **Concurrent sessions.** The control node keeps a lock of the unique keys of each table. A session takes it before it looks for a value
+  and holds it until its transaction ends (until the statement ends, with none), so the next session finds what the first wrote. Sessions
+  that write such a table take turns; one that waits more than 10 s gets error 1222. Reads are not affected.
+* **Not checked:** a filtered unique index that lacks the shard key (refused when it is made), a key column that an `INSERT` leaves out or
+  gives `DEFAULT` (its value is not known to the control node), and the rows a `RESTORE` puts in (they come from a table that was unique
+  as a whole). Only the control node keeps these keys: a write that does not come through it is not checked.
+
 ## Stored procedures
 
 A procedure made with `CREATE PROCEDURE` is made on every shard and on the control node. `EXEC` of one that is declared with
@@ -317,7 +385,7 @@ As in SQL Server: a trigger is not fired again by what it does to its own table 
 statement on its table is done for real (and fires its `AFTER` triggers), triggers nest to 32 levels (error 217), a statement that changes no row
 fires nothing, and `UPDATE(column)` tells whether the statement set the column. A trigger body may use data changes, queries, variables,
 `IF`, `WHILE`, `BEGIN ... END`, `TRY ... CATCH`, `EXEC` (of any procedure of the cluster), `PRINT`, `THROW`, `RAISERROR`, `RETURN` and `ROLLBACK`; one that
-uses anything else (cursors, `TRUNCATE`, ...) is refused when it is made, not when it fires. Not supported: triggers on views, DDL and logon triggers, `COLUMNS_UPDATED()`,
+uses anything else (cursors, `TRUNCATE`, ...) is refused when it is made, not when it fires. Not supported: triggers on views, `ALL SERVER` and logon triggers (database DDL triggers are: see *DDL triggers*), `COLUMNS_UPDATED()`,
 `INSERT ... EXEC` into a table with an `INSTEAD OF` trigger, an `UPDATE` of the shard key of a table that has triggers, and a statement that
 changes more rows than a statement can broadcast (the limit `broadcast_limit` sets) on a table that has triggers. Rows loaded by `INSERT BULK`
 and by a restore fire nothing. Row counts and results of a trigger body are not sent to the client.
@@ -486,10 +554,14 @@ to this server's format in a temporary file, as a single-node restore does).
   committed rows (a durable or replicated shard takes ordinary `INSERT`s, which its log and its replicas keep). The foreign keys
   are not checked again for the restored rows (they come from a consistent database), and on an in-memory shard neither are the
   check constraints.
-* **Unique keys that do not contain the shard key.** A cluster checks uniqueness only within a shard, so a unique index or
-  unique constraint (other than the primary key, which must contain the shard key) that lacks the shard key is refused, as the
-  rest of what a cluster cannot hold; `WITH CONTINUE_AFTER_ERROR` makes it an ordinary index and says so (`Not restored: the
-  uniqueness of the unique index ...`). AdventureWorks has such keys on `rowguid` and on business keys.
+* **DDL triggers** of the database are restored last, so that nothing the restore makes runs them, and the disabled ones stay disabled (see
+  *DDL triggers*).
+* **User-defined types** (`CREATE TYPE ... FROM` and `... AS TABLE`) are restored first, and the columns of the restored tables, and the parameters
+  of the procedures, keep them (see *User-defined types*).
+* **Unique keys that do not contain the shard key** are restored and kept unique across the shards by the control node (see *Unique
+  keys across shards*); AdventureWorks has such keys on `rowguid` and on business keys. A *filtered* one cannot be checked that way:
+  it is refused with the rest, and `WITH CONTINUE_AFTER_ERROR` makes it an ordinary index and says so. A `DISTRIBUTION` may shard a
+  table on a column outside its primary key: the primary key is then checked across the shards as well.
 * **Stored functions** are restored (see *Stored functions*): the ones that read no table of the backup are made first, on the shards
   too, so a computed column may call them (`Sales.Customer.AccountNumber` of AdventureWorks calls `dbo.ufnLeadingZeros`, which is
   restored with its column); the ones that read tables are made after the tables, on the control node only. A **computed column that
@@ -498,11 +570,11 @@ to this server's format in a temporary file, as a single-node restore does).
   One whose body the control node cannot run (see *Triggers*), and a trigger of a view, is refused with the rest.
 * **What a cluster cannot hold is refused** before anything is made: sequences, synonyms,
   system-versioned and graph tables, columnstore indexes, xml typed by a schema collection, foreign keys to other databases,
-  security policies and DDL triggers. `WITH CONTINUE_AFTER_ERROR` restores the rest and says what it left out (as messages
+  security policies. `WITH CONTINUE_AFTER_ERROR` restores the rest and says what it left out (as messages
   beginning `Not restored:`), including views and procedures that could not be made without what was left out. Never restored,
-  with a message: user-defined types (columns keep their base types), the database's users, roles and permissions (the
-  database keeps its own), disabled foreign keys (the cluster enforces every foreign key it knows), and XML, spatial
-  and full-text indexes (declarations here, which change no answer).
+  with a message: the database's users, roles and permissions (the
+  database keeps its own), and disabled foreign keys (the cluster enforces every foreign key it knows). XML and spatial indexes
+  and full-text catalogs and indexes are restored (the catalogs before the tables, the indexes after them).
 * **The database.** The objects go into the cluster's database of the name the statement gives (`RESTORE DATABASE advw ...` makes
   `advw` on the control node and on every shard if the cluster does not have it; see *Databases*), and the session is in the database
   it was in. If any of the names in it is taken, the restore is error 3159; `WITH REPLACE` drops the objects of those names first. A
@@ -610,7 +682,7 @@ generated rows.
   the cheapest to roll back, and a wait that is not a cycle falls back on the lock timeout.
 * **Snapshots are in memory and fuzzy** (see Replication); a replicated shard's transactions in flight at a failover are lost
   (the client sees an error and retries). Membership changes go through the shard's leader one voter at a time.
-* **Refused** (error 50100 says so): `UNIQUE` constraints or unique indexes that do not contain the shard key, stored
+* **Refused** (error 50100 says so): filtered unique indexes that do not contain the shard key, stored
   triggers (a function is supported, see *Stored functions*; a procedure is made on every shard and can be declared to run on one,
   see *Procedures that run on one shard*), temporal
   tables, DML with joins (`UPDATE ... FROM`), `OUTPUT` or `TOP` in DML, `INSERT ... DEFAULT VALUES`/`EXEC`, correlated

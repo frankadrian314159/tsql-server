@@ -53,6 +53,8 @@ enum Made {
     Proc(Name),
     Func(Name),
     Trigger(Name),
+    /// a DDL trigger of the database
+    DdlTrigger(String),
 }
 
 impl ClusterSession {
@@ -204,9 +206,6 @@ impl ClusterSession {
         if !cat.policies.is_empty() {
             refused.push(format!("{} security polic(ies) (row-level security)", cat.policies.len()));
         }
-        if !cat.ddl_triggers.is_empty() {
-            refused.push(format!("{} DDL trigger(s)", cat.ddl_triggers.len()));
-        }
         if !refused.is_empty() {
             if !keep_going {
                 return Err(unsupported(&format!("restoring {} into a cluster (RESTORE ... WITH CONTINUE_AFTER_ERROR restores the rest without them)", refused.join("; "))));
@@ -214,9 +213,6 @@ impl ClusterSession {
             for x in &refused {
                 events.push(Event::Message(format!("Not restored: {}.", x)));
             }
-        }
-        if !cat.types.is_empty() {
-            events.push(Event::Message(format!("Not restored: {} user-defined type(s); the columns of the restored tables have their base types.", cat.types.len())));
         }
         let defaults = tsql_server::security::DbSecurity::default();
         let principals = cat.security.principals.keys().filter(|k| !defaults.principals.contains_key(*k)).count();
@@ -246,12 +242,12 @@ impl ClusterSession {
             };
             if let DistChoice::By(k) = &choice {
                 let at = check_key(t, k)?;
-                // a unique index or constraint without the shard key cannot be checked across shards: refused, or (with
+                // a filtered unique index without the shard key cannot be checked across shards (see uniq.rs): refused, or (with
                 // CONTINUE_AFTER_ERROR) made an ordinary index, and said so
                 let weak = script::uniques_without(t, at);
                 if !weak.is_empty() && !keep_going {
                     return Err(unsupported(&format!(
-                        "the unique key(s) {} of {} that do not contain the shard key {} (RESTORE ... WITH CONTINUE_AFTER_ERROR makes them ordinary indexes; or name another key with DISTRIBUTION, or REPLICATED)",
+                        "the filtered unique key(s) {} of {} that do not contain the shard key {} (RESTORE ... WITH CONTINUE_AFTER_ERROR makes them ordinary indexes; or name another key with DISTRIBUTION, or REPLICATED)",
                         weak.join(", "),
                         t.name,
                         k
@@ -303,7 +299,16 @@ impl ClusterSession {
         let mut made: Vec<Made> = vec![];
         // (a function that reads tables is on the control node only, so a computed column that calls one is left out)
         let missing_functions: Vec<String> = cat.objects.values().filter_map(|o| if let Object::Func(f) = o { Some(f) } else { None }).filter(|f| reading.contains(&table_id(&[f.schema.clone(), f.name.clone()]))).map(|f| f.name.to_lowercase()).collect();
+        // (the DDL triggers of the database being restored into do not run for the objects the restore makes)
+        self.no_ddl_triggers = true;
         let out = self.restore_into(&src, &plan, &modules, &pre_functions, &trigger_modules, keep_going, &missing_functions, &mut made, events).await;
+        let out = match out {
+            Ok(x) => Ok(x),
+            Err(e) => {
+                self.no_ddl_triggers = false;
+                Err(e)
+            }
+        };
         let (nrows, sharded, replicated) = match out {
             Ok(x) => x,
             Err(e) => {
@@ -311,12 +316,19 @@ impl ClusterSession {
                 let ids: Vec<String> = made.iter().filter_map(|m| if let Made::Table(n) = m { Some(self.qid(n)) } else { None }).collect();
                 self.cluster.fks.lock().unwrap_or_else(|x| x.into_inner()).retain(|f| !ids.contains(&f.child));
                 for m in made.iter().rev() {
+                    if let Made::DdlTrigger(n) = m {
+                        let drop = Stmt::TriggerAdmin(Box::new(TriggerAdmin { names: vec![vec![n.clone()]], all: false, scope: TriggerScope::Database, act: TriggerAct::Drop { if_exists: true } }));
+                        let mut none = vec![];
+                        let _ = Box::pin(self.exec_stmt(&drop, &mut none)).await;
+                        continue;
+                    }
                     let (what, name) = match m {
                         Made::Table(n) => ("TABLE", n),
                         Made::View(n) => ("VIEW", n),
                         Made::Proc(n) => ("PROCEDURE", n),
                         Made::Func(n) => ("FUNCTION", n),
                         Made::Trigger(n) => ("TRIGGER", n),
+                        Made::DdlTrigger(_) => continue,
                     };
                     let drop = Stmt::Drop { what: what.into(), names: vec![name.clone()], if_exists: true };
                     let mut none = vec![];
@@ -325,6 +337,7 @@ impl ClusterSession {
                 return Err(e);
             }
         };
+        self.no_ddl_triggers = false;
         events.push(Event::Message(format!(
             "Processed {} row(s) in {} table(s) for database '{}', file '{}': {} sharded and {} replicated over {} shard(s).",
             nrows,
@@ -345,6 +358,7 @@ impl ClusterSession {
     async fn restore_into(&mut self, src: &BackupSource, plan: &[(&Table, DistChoice)], modules: &[(&'static str, Name, String)], pre_functions: &[(Name, String)], trigger_modules: &[(Name, Name, String, bool)], keep_going: bool, missing_functions: &[String], made: &mut Vec<Made>, events: &mut Vec<Event>) -> Result<(u64, usize, usize), SqlError> {
         // the schemas the objects are in (the shards need them too)
         let mut schemas: Vec<String> = plan.iter().map(|(t, _)| t.schema.clone()).chain(modules.iter().filter_map(|(_, n, _)| n.first().cloned())).chain(pre_functions.iter().filter_map(|(n, _)| n.first().cloned())).filter(|s| !s.eq_ignore_ascii_case("dbo")).collect();
+        schemas.extend(src.catalog.types.values().map(|u| u.schema.clone()).filter(|s| !s.eq_ignore_ascii_case("dbo")));
         schemas.sort_by_key(|s| s.to_lowercase());
         schemas.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
         for s in schemas {
@@ -365,6 +379,29 @@ impl ClusterSession {
                 // (logged, so that a control node started again from its state file has the schema before the tables made in it)
                 self.log_schema(&st);
             }
+        }
+        // the full-text catalogs, which the full-text indexes of the tables name
+        for c in &src.catalog.fulltext_catalogs {
+            let sql = format!("CREATE FULLTEXT CATALOG [{}] WITH ACCENT_SENSITIVITY = {}{}", c.name, if c.accent_sensitive { "ON" } else { "OFF" }, if c.is_default { " AS DEFAULT" } else { "" });
+            self.run_sql(&sql).await?;
+        }
+        // the user-defined types, which the columns of the tables and the parameters of the modules use
+        let mut types: Vec<&tsql_server::catalog::UserType> = src.catalog.types.values().collect();
+        types.sort_by_key(|u| u.type_id);
+        for u in types {
+            let name: Name = vec![u.schema.clone(), u.name.clone()];
+            let st = match &u.kind {
+                tsql_server::catalog::UserTypeKind::Alias(ty, nullable) => {
+                    let sql = format!("CREATE TYPE [{}].[{}] FROM {} {}", u.schema, u.name, ty, if *nullable { "NULL" } else { "NOT NULL" });
+                    match tsql_server::parser::parse(&sql)?.into_iter().next() {
+                        Some(st) => st,
+                        None => continue,
+                    }
+                }
+                tsql_server::catalog::UserTypeKind::Table(defs) => Stmt::CreateType { name: name.clone(), base: None, nullable: None, table: Some(defs.clone()) },
+            };
+            let mut none = vec![];
+            Box::pin(self.exec_stmt(&st, &mut none)).await?;
         }
         // the functions that read no table (a computed column may call them)
         let mut missing_functions: Vec<String> = missing_functions.to_vec();
@@ -481,6 +518,24 @@ impl ClusterSession {
                 Err(e) => return Err(e),
             }
         }
+        // the DDL triggers of the database, last: nothing the restore made ran them
+        let mut ddl: Vec<&tsql_server::catalog::DdlTrigger> = src.catalog.ddl_triggers.iter().collect();
+        ddl.sort_by_key(|t| t.object_id);
+        for t in ddl {
+            let create = Stmt::TriggerAdmin(Box::new(TriggerAdmin { names: vec![vec![t.name.clone()]], all: false, scope: TriggerScope::Database, act: TriggerAct::Create { events: t.events.clone(), body: Arc::new((*t.body).clone()), text: t.text.clone(), or_alter: false } }));
+            let mut none = vec![];
+            match Box::pin(self.exec_stmt(&create, &mut none)).await {
+                Ok(()) => {
+                    made.push(Made::DdlTrigger(t.name.clone()));
+                    if t.disabled {
+                        let off = Stmt::TriggerAdmin(Box::new(TriggerAdmin { names: vec![vec![t.name.clone()]], all: false, scope: TriggerScope::Database, act: TriggerAct::Enable(false) }));
+                        Box::pin(self.exec_stmt(&off, &mut none)).await?;
+                    }
+                }
+                Err(e) if keep_going => events.push(Event::Message(format!("Not restored: the DDL trigger {} ({}).", t.name, e.message))),
+                Err(e) => return Err(e),
+            }
+        }
         Ok((total, sharded, replicated))
     }
 
@@ -565,9 +620,7 @@ fn check_key(t: &Table, key: &str) -> Result<usize, SqlError> {
     if KeyClass::of_type_name(&script::type_name(&t.columns[at].ty)).is_none() {
         return Err(unsupported(&format!("the shard key {} of {} (type {})", key, shown, t.columns[at].ty)));
     }
-    if t.pk.as_ref().is_some_and(|k| !k.cols.contains(&at)) {
-        return Err(unsupported(&format!("the shard key {} of {}, which the primary key of the table does not contain", key, shown)));
-    }
+    // (a primary key without the shard key is checked across the shards by the control node: see uniq.rs)
     Ok(at)
 }
 

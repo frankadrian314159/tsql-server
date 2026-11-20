@@ -265,3 +265,22 @@ fn create_database_in_a_cluster_checks_its_file_paths_and_leaves_nothing_behind(
     assert_eq!(one(&mut s, "SELECT COUNT(*) FROM sys.databases WHERE name = 'fx'"), "1");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_table_of_master_is_still_read_by_its_plain_name_after_ddl_in_another_database() {
+    let h = start(3, None);
+    let mut s = h.cluster.session();
+    run(&mut s, "CREATE TABLE audit (n INT PRIMARY KEY, what VARCHAR(40))");
+    run(&mut s, "INSERT audit VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+    run(&mut s, "CREATE DATABASE other");
+    run(&mut s, "USE other");
+    // (the shards' connections of this session ran DDL in `other`)
+    run(&mut s, "CREATE TABLE o (id INT PRIMARY KEY)");
+    run(&mut s, "USE master");
+    assert_eq!(one(&mut s, "SELECT COUNT(*) FROM audit"), "3");
+    run(&mut s, "INSERT audit VALUES (4, 'd')");
+    run(&mut s, "UPDATE audit SET what = 'x' WHERE n = 4");
+    assert_eq!(one(&mut s, "SELECT what FROM audit WHERE n = 4"), "x");
+    run(&mut s, "DELETE audit WHERE n = 4");
+    assert_eq!(one(&mut s, "SELECT COUNT(*) FROM audit"), "3");
+}

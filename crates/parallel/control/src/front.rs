@@ -200,7 +200,7 @@ impl ClusterSession {
     /// `st` with the variables of the session replaced by their values.
     pub(crate) fn bind_vars(&self, st: &Stmt) -> Result<Stmt, SqlError> {
         let xact_read = self.txn.borrow().is_some() && matches!(st, Stmt::Query(_) | Stmt::Set { .. } | Stmt::If { .. } | Stmt::While { .. } | Stmt::Print(_));
-        if self.vars.is_empty() && self.last_identity.is_none() && self.catch_stack.is_empty() && !xact_read {
+        if self.vars.is_empty() && self.last_identity.is_none() && self.catch_stack.is_empty() && self.eventdata.is_empty() && !xact_read {
             return Ok(st.clone());
         }
         // ERROR_NUMBER() and the like (in a CATCH block), XACT_STATE(): the control node's engine has no CATCH block, so the values go in
@@ -212,7 +212,9 @@ impl ClusterSession {
         };
         // SCOPE_IDENTITY() and @@IDENTITY: the last value this session was given
         let ident = self.last_identity.map(|v| serde_json::to_value(Value::Dec(tsql_server::decimal::Dec::from_int(v))).unwrap_or(serde_json::Value::Null));
-        fn subst(v: &mut serde_json::Value, vars: &HashMap<String, Value>, ident: &Option<serde_json::Value>, caught: &Option<SqlError>, xact: i32) {
+        // EVENTDATA() in a DDL trigger: the event's XML
+        let event = self.eventdata.last().and_then(|x| serde_json::to_value(Expr::Cast { e: Box::new(Expr::Lit(Value::Str(x.clone()))), ty: TypeRef { parts: vec!["xml".into()], args: vec![], xml_schema: None }, try_: false, style: None }).ok());
+        fn subst(v: &mut serde_json::Value, vars: &HashMap<String, Value>, ident: &Option<serde_json::Value>, caught: &Option<SqlError>, xact: i32, event: &Option<serde_json::Value>) {
             match v {
                 serde_json::Value::Object(m) => {
                     let is_ident = match (m.len(), m.get("SysVar"), m.get("Func")) {
@@ -228,6 +230,12 @@ impl ClusterSession {
                     if let (1, Some(serde_json::Value::Object(f))) = (m.len(), m.get("Func")) {
                         let func = f.get("name").and_then(|n| n.as_str()).map(|n| n.to_uppercase()).unwrap_or_default();
                         let is_call = f.get("args").and_then(|a| a.as_array()).is_some_and(|a| a.is_empty());
+                        if is_call && func == "EVENTDATA" {
+                            if let Some(e) = event {
+                                *v = e.clone();
+                                return;
+                            }
+                        }
                         let value = if !is_call {
                             None
                         } else {
@@ -258,19 +266,19 @@ impl ClusterSession {
                         }
                     }
                     for c in m.values_mut() {
-                        subst(c, vars, ident, caught, xact);
+                        subst(c, vars, ident, caught, xact, event);
                     }
                 }
                 serde_json::Value::Array(a) => {
                     for c in a {
-                        subst(c, vars, ident, caught, xact);
+                        subst(c, vars, ident, caught, xact, event);
                     }
                 }
                 _ => {}
             }
         }
         let mut j = serde_json::to_value(st).map_err(|e| SqlError::new(50000, e.to_string()))?;
-        subst(&mut j, &self.vars, &ident, &caught, xact);
+        subst(&mut j, &self.vars, &ident, &caught, xact, &event);
         serde_json::from_value(j).map_err(|e| SqlError::new(50000, format!("a variable could not be substituted: {}", e)))
     }
 

@@ -909,7 +909,7 @@ fn alter_table_changes_the_columns_on_every_shard() {
     p.check("SELECT id, v FROM moved WHERE id = 4", false);
     p.check("SELECT id, v FROM moved ORDER BY id", true);
     // what would change how rows are placed is refused, not done wrongly
-    for sql in ["ALTER TABLE customers ALTER COLUMN id BIGINT", "ALTER TABLE customers DROP COLUMN id", "ALTER TABLE customers ADD z INT IDENTITY", "ALTER TABLE customers ADD CONSTRAINT u UNIQUE (name)"] {
+    for sql in ["ALTER TABLE customers ALTER COLUMN id BIGINT", "ALTER TABLE customers DROP COLUMN id", "ALTER TABLE customers ADD z INT IDENTITY"] {
         assert_eq!(p.cl.execute(sql).first_error().map(|e| e.number), Some(50100), "{}", sql);
     }
 }

@@ -238,8 +238,11 @@ impl ClusterSession {
 
     /// `ENABLE | DISABLE TRIGGER name | ALL ON table`.
     pub(crate) fn trigger_admin(&mut self, a: &TriggerAdmin) -> Result<(), SqlError> {
+        if matches!(a.scope, TriggerScope::Database) {
+            return self.ddl_trigger_admin(a);
+        }
         let (TriggerScope::Table(table), TriggerAct::Enable(on)) = (&a.scope, &a.act) else {
-            return Err(unsupported("DDL and logon triggers"));
+            return Err(unsupported("ALL SERVER and LOGON triggers"));
         };
         let table = self.qn(table);
         let names: Vec<Name> = a.names.iter().map(|n| self.qn(n)).collect();

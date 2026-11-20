@@ -664,6 +664,7 @@ impl ClusterSession {
             identity: None,
             graph: None,
             edge_cons: vec![],
+            weak_uniques: vec![],
         };
         self.temp_creates.insert(table.id.clone(), create.clone());
         self.local_tables.insert(table.id.clone(), table);
@@ -735,6 +736,7 @@ impl ClusterSession {
             identity: None,
             graph: None,
             edge_cons: vec![],
+            weak_uniques: vec![],
         };
         self.temp_creates.insert(table.id.clone(), create.clone());
         self.local_tables.insert(table.id.clone(), table);

@@ -54,7 +54,12 @@ fn column(c: &Column) -> String {
     if let Some(f) = &c.computed_text {
         return format!("{} AS ({})", bracket(&c.name), f);
     }
-    let mut l = format!("{} {}", bracket(&c.name), c.ty);
+    // (a column of a user-defined type keeps its name: its values are those of the base type)
+    let shown = match &c.user_type {
+        Some(u) => u.split('.').map(bracket).collect::<Vec<_>>().join("."),
+        None => c.ty.to_string(),
+    };
+    let mut l = format!("{} {}", bracket(&c.name), shown);
     if let Some(coll) = &c.collation {
         l.push_str(&format!(" COLLATE {}", coll));
     }
@@ -79,10 +84,11 @@ pub fn table(t: &Table) -> TableScript {
     table_sharded(t, None, &[])
 }
 
-/// The unique indexes and constraints of `t` (not its primary key) that do not contain column `key`: a cluster that shards the table
+/// The filtered unique indexes and constraints of `t` (not its primary key) that do not contain column `key`: a cluster that shards the table
 /// on `key` cannot check them across its shards.
 pub fn uniques_without(t: &Table, key: usize) -> Vec<&str> {
-    t.uniques.iter().filter(|u| !u.cols.contains(&key)).map(|u| u.name.as_str()).collect()
+    // (a unique key without the shard key is checked across shards by the cluster's control node, except a filtered one)
+    t.uniques.iter().filter(|u| !u.cols.contains(&key) && u.filter.is_some()).map(|u| u.name.as_str()).collect()
 }
 
 /// As [`table`], for a table that is sharded on column `shard_key`: a unique index or constraint that does not contain it is made an
@@ -115,11 +121,11 @@ pub fn table_sharded(t: &Table, shard_key: Option<usize>, missing_functions: &[S
             skipped.push(format!("the {} {} of {} (it uses a computed column that was left out)", if u.is_index { "unique index" } else { "unique constraint" }, u.name, tq));
             continue;
         }
-        if let Some(k) = shard_key.filter(|k| !u.cols.contains(k)) {
+        if let Some(k) = shard_key.filter(|k| !u.cols.contains(k) && u.filter.is_some()) {
             let include = if u.include.is_empty() { String::new() } else { format!(" INCLUDE ({})", u.include.iter().map(|&c| col(c)).collect::<Vec<_>>().join(", ")) };
             let filter = u.filter.as_ref().map(|f| format!(" WHERE {}", f.text)).unwrap_or_default();
             indexes.push(format!("CREATE INDEX {} ON {} ({}){}{}", bracket(&u.name), tq, cols, include, filter));
-            skipped.push(format!("the uniqueness of the {} {} of {} (it does not contain the shard key {}, and a cluster checks uniqueness only within a shard; it is an ordinary index)", if u.is_index { "unique index" } else { "unique constraint" }, u.name, tq, col(k)));
+            skipped.push(format!("the uniqueness of the {} {} of {} (it is filtered and does not contain the shard key {}, and a cluster cannot check a filtered unique key across shards; it is an ordinary index)", if u.is_index { "unique index" } else { "unique constraint" }, u.name, tq, col(k)));
         } else if u.is_index {
             let include = if u.include.is_empty() { String::new() } else { format!(" INCLUDE ({})", u.include.iter().map(|&c| col(c)).collect::<Vec<_>>().join(", ")) };
             let filter = u.filter.as_ref().map(|f| format!(" WHERE {}", f.text)).unwrap_or_default();
@@ -146,15 +152,55 @@ pub fn table_sharded(t: &Table, shard_key: Option<usize>, missing_functions: &[S
         let filter = i.filter.as_ref().map(|f| format!(" WHERE {}", f.text)).unwrap_or_default();
         indexes.push(format!("CREATE INDEX {} ON {} ({}){}{}", bracket(&i.name), tq, cols, include, filter));
     }
-    // (XML and spatial indexes are declarations only, which change no answer; a cluster does not take them)
-    for x in &t.xml_indexes {
-        skipped.push(format!("the XML index {} of {}", x.name, tq));
+    // XML indexes (the primary ones first: a secondary one is built on one) and spatial indexes: declarations, which the cluster keeps
+    let mut xml: Vec<&crate::catalog::XmlIndexDef> = t.xml_indexes.iter().collect();
+    xml.sort_by_key(|x| !x.primary);
+    for x in xml {
+        if gone.contains(&x.col) {
+            skipped.push(format!("the XML index {} of {} (it uses a computed column that was left out)", x.name, tq));
+            continue;
+        }
+        if x.primary {
+            indexes.push(format!("CREATE PRIMARY XML INDEX {} ON {} ({})", bracket(&x.name), tq, col(x.col)));
+        } else {
+            let using = x.using.as_ref().map(|u| format!(" USING XML INDEX {}", bracket(u))).unwrap_or_default();
+            let kind = match x.secondary {
+                Some('V') => " FOR VALUE",
+                Some('P') => " FOR PATH",
+                Some('R') => " FOR PROPERTY",
+                _ => "",
+            };
+            indexes.push(format!("CREATE XML INDEX {} ON {} ({}){}{}", bracket(&x.name), tq, col(x.col), using, kind));
+        }
     }
     for x in &t.spatial_indexes {
-        skipped.push(format!("the spatial index {} of {}", x.name, tq));
+        if gone.contains(&x.col) {
+            skipped.push(format!("the spatial index {} of {} (it uses a computed column that was left out)", x.name, tq));
+            continue;
+        }
+        let scheme = format!("{}_{}", if x.geography { "GEOGRAPHY" } else { "GEOMETRY" }, if x.auto { "AUTO_GRID" } else { "GRID" });
+        let level = |g: u8| match g {
+            1 => "LOW",
+            3 => "HIGH",
+            _ => "MEDIUM",
+        };
+        let mut opts = vec![];
+        if let Some(b) = x.bbox {
+            opts.push(format!("BOUNDING_BOX = ({}, {}, {}, {})", b[0], b[1], b[2], b[3]));
+        }
+        opts.push(format!("GRIDS = (LEVEL_1 = {}, LEVEL_2 = {}, LEVEL_3 = {}, LEVEL_4 = {})", level(x.grids[0]), level(x.grids[1]), level(x.grids[2]), level(x.grids[3])));
+        opts.push(format!("CELLS_PER_OBJECT = {}", x.cells));
+        indexes.push(format!("CREATE SPATIAL INDEX {} ON {} ({}) USING {} WITH ({})", bracket(&x.name), tq, col(x.col), scheme, opts.join(", ")));
     }
-    if t.fulltext.is_some() {
-        skipped.push(format!("the full-text index of {} (full-text search scans the rows without one)", tq));
+    if let Some(f) = &t.fulltext {
+        if f.cols.iter().any(|(c, _)| gone.contains(c)) {
+            skipped.push(format!("the full-text index of {} (it uses a computed column that was left out)", tq));
+        } else {
+            // (after the unique index that is its key, which is among the statements above)
+            let cols = f.cols.iter().map(|(c, l)| format!("{} LANGUAGE {}", col(*c), l)).collect::<Vec<_>>().join(", ");
+            let cat = f.catalog.as_ref().map(|c| format!(" ON {}", bracket(c))).unwrap_or_default();
+            indexes.push(format!("CREATE FULLTEXT INDEX ON {} ({}) KEY INDEX {}{} WITH (CHANGE_TRACKING = {})", tq, cols, bracket(&f.key_index), cat, f.tracking));
+        }
     }
     let mut foreign_keys = vec![];
     for f in t.fks.iter() {

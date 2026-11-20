@@ -55,7 +55,9 @@ impl ClusterSession {
 
     /// A table name in full, in the session's database (a name that has its database is as it is; a temporary table's has none).
     pub(crate) fn qn(&self, name: &Name) -> Name {
-        if self.in_master() || name.len() >= 3 || is_temp(name) {
+        // (in master the name stays as it is while the cluster has no other database; with one, a shard's connection may still be in the
+        // database an earlier statement of the session ran in, so the name says `master`: the id of a master table has no database in it)
+        if name.len() >= 3 || is_temp(name) || (self.in_master() && !self.multi_db()) {
             return name.clone();
         }
         let schema = if name.len() == 2 { name[0].clone() } else { "dbo".to_string() };
@@ -74,7 +76,7 @@ impl ClusterSession {
 
     /// The statement with the tables it names in full (see the top of this file). A session in `master` is left as it is.
     pub(crate) fn qualify(&self, st: &Stmt) -> Stmt {
-        if self.in_master() {
+        if self.in_master() && !self.multi_db() {
             return st.clone();
         }
         let Ok(mut v) = serde_json::to_value(st) else { return st.clone() };

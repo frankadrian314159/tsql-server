@@ -198,7 +198,7 @@ fn triggers_are_disabled_enabled_and_dropped_and_a_dropped_table_takes_its_trigg
     assert_eq!(error(&mut s, "CREATE TRIGGER trg_none ON nothing AFTER INSERT AS SELECT 1"), 208);
     run(&mut s, "CREATE VIEW dbo.v AS SELECT id FROM dbo.items");
     assert_eq!(error(&mut s, "CREATE TRIGGER trg_view ON dbo.v INSTEAD OF DELETE AS SELECT 1"), 50100);
-    assert_eq!(error(&mut s, "CREATE TRIGGER trg_ddl ON DATABASE FOR CREATE_TABLE AS SELECT 1"), 50100);
+    assert_eq!(error(&mut s, "CREATE TRIGGER trg_ddl ON ALL SERVER FOR CREATE_DATABASE AS SELECT 1"), 50100);
     // a dropped table takes its triggers: a table of the same name again has none
     run(&mut s, "CREATE TRIGGER trg_again ON items AFTER INSERT AS INSERT audit SELECT id, 'ins', qty FROM inserted");
     run(&mut s, "DROP TABLE items");

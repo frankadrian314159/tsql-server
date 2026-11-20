@@ -81,6 +81,7 @@ impl Cluster {
         let (dbs, logged_db) = crate::dbname::databases_of_log(&log);
         let funcs_init = crate::funcs::functions_of_log(&log);
         let triggers_init = crate::triggers::triggers_of_log(&log);
+        let log_for_ddl = log.clone();
         let mirror = Server::new();
         {
             // the mirror learns the schema again
@@ -108,6 +109,7 @@ impl Cluster {
             schema_log: Mutex::new(log),
             state_path: if attach { None } else { Some(path) },
             migration: RwLock::new(()),
+            uniq_locks: Mutex::new(HashMap::new()),
             mirror,
             tables: Mutex::new(tables),
             gather: Mutex::new(()),
@@ -134,6 +136,7 @@ impl Cluster {
             funcs_placed: Default::default(),
             triggers: Mutex::new(triggers_init.0),
             triggers_off: Mutex::new(triggers_init.1),
+            ddl_triggers: Mutex::new(crate::ddltrig::ddl_triggers_of_log(&log_for_ddl)),
         });
         {
             // (the shards of a cluster that was running hold the functions that read no table)

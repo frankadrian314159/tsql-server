@@ -172,7 +172,7 @@ fn what_a_cluster_cannot_hold_is_refused_unless_the_rest_is_wanted() {
 }
 
 #[test]
-fn a_unique_key_without_the_shard_key_and_a_computed_column_that_calls_a_function_that_reads_tables_are_left_out_with_a_note() {
+fn a_computed_column_that_calls_a_function_that_reads_tables_is_left_out_with_a_note_and_a_unique_key_without_the_shard_key_is_kept() {
     let h = start(2);
     let path = backup_path("weak");
     let src_server = Server::new();
@@ -190,23 +190,20 @@ GO";
     let _src = source(&src_server, &path, extra);
     let mut s = h.cluster.session();
     let restore = format!("RESTORE DATABASE shop FROM DISK = '{}' WITH DISTRIBUTION = N'dbo.people BY id'", path);
-    // the unique index does not contain the shard key: refused with the rest, and nothing is made
-    let e = s.execute(&restore).first_error().cloned().expect("refused");
-    assert_eq!(e.number, 50100);
-    assert_eq!(count(&mut h.cluster.mirror_server().connect_internal(), "SELECT COUNT(*) FROM sys.tables"), 0);
-    let r = s.execute(&format!("{}, CONTINUE_AFTER_ERROR", restore));
+    let r = s.execute(&restore);
     ok(&r, "the restore");
     ok(&s.execute("USE shop"), "USE shop");
     let said = messages(&r).join("
 ");
-    assert!(said.contains("the uniqueness of the unique index ux_email of [dbo].[people]"), "{}", said);
+    assert!(!said.contains("ux_email"), "the unique index is kept, with no note: {}", said);
     // (the function that reads tables is on the control node only, so the column that calls it, and its index, are left out)
     assert!(said.contains("the computed column [nreg] of [dbo].[people]"), "{}", said);
     assert!(said.contains("the index ix_nreg of [dbo].[people]"), "{}", said);
     // (the one that reads none is on the shards, so its column and index are kept)
     assert!(!said.contains("the computed column [acct]"), "{}", said);
-    // the rows are there, spread; the index on the e-mail is an ordinary one
+    // the rows are there, spread; the index on the e-mail is unique across the shards (it does not contain the shard key)
     assert_eq!(rows_of(&s.execute("SELECT id, email FROM people ORDER BY id")).len(), 4);
+    assert_eq!(s.execute("INSERT people (id, email) VALUES (9, 'c@x')").first_error().map(|e| e.number), Some(2601));
     assert_eq!(shard_counts(&h, "people").iter().sum::<i64>(), 4);
     assert_eq!(rows_of(&s.execute("SELECT acct FROM people WHERE id = 3")), vec![vec!["AW3".to_string()]]);
     assert!(s.execute("SELECT nreg FROM people").first_error().is_some(), "the column that calls a function that reads tables is not there");
@@ -295,14 +292,149 @@ fn options_a_cluster_cannot_honour_are_errors() {
     assert_eq!(number(&mut s, format!("{} WITH NORECOVERY", restore)), Some(50100));
     assert_eq!(number(&mut s, format!("{} WITH DISTRIBUTION = N'dbo.nothing REPLICATED'", restore)), Some(208));
     assert_eq!(number(&mut s, format!("{} WITH DISTRIBUTION = N'orders BY'", restore)), Some(102));
-    // a shard key outside the primary key could not keep it unique
-    assert_eq!(number(&mut s, format!("{} WITH DISTRIBUTION = N'orders BY customer_id'", restore)), Some(50100));
     assert_eq!(number(&mut s, format!("BEGIN TRAN; {}", restore)), Some(574));
     let _ = s.execute("ROLLBACK");
     // nothing was made by any of them
     assert_eq!(count(&mut h.cluster.mirror_server().connect_internal(), "SELECT COUNT(*) FROM sys.tables"), 0);
     // a backup of the cluster's database would hold no rows: refused
     assert_eq!(number(&mut s, format!("BACKUP DATABASE master TO DISK = '{}.x'", path)), Some(50100));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_table_may_be_sharded_on_a_column_outside_its_primary_key_which_the_control_node_keeps_unique() {
+    let h = start(3);
+    let path = backup_path("pkout");
+    let src_server = Server::new();
+    let _src = source(&src_server, &path, "");
+    let mut s = h.cluster.session();
+    let r = s.execute(&format!("RESTORE DATABASE shop FROM DISK = '{}' WITH DISTRIBUTION = N'dbo.orders BY customer_id'", path));
+    ok(&r, "the restore");
+    ok(&s.execute("USE shop"), "USE shop");
+    let n = rows_of(&s.execute("SELECT COUNT(*) FROM orders"))[0][0].clone();
+    // an order number that exists is refused, wherever the new row would go
+    ok(&s.execute("SET IDENTITY_INSERT orders ON"), "identity insert");
+    for c in [1, 2, 3, 4, 5, 6] {
+        let e = s.execute(&format!("INSERT orders (id, customer_id, amount) VALUES (5, {}, 1)", c)).first_error().map(|e| e.number);
+        assert_eq!(e, Some(2627), "customer {}", c);
+    }
+    assert_eq!(rows_of(&s.execute("SELECT COUNT(*) FROM orders"))[0][0], n);
+    ok(&s.execute("SET IDENTITY_INSERT orders OFF"), "identity insert off");
+    ok(&s.execute("INSERT orders (customer_id, amount) VALUES (3, 1)"), "an insert that is numbered by the control node");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn user_defined_types_are_restored_and_their_columns_keep_them() {
+    let h = start(2);
+    let path = backup_path("udt");
+    let src_server = Server::new();
+    let extra = "GO
+CREATE SCHEMA hr;
+GO
+CREATE TYPE dbo.Phone FROM VARCHAR(20) NOT NULL;
+CREATE TYPE hr.Badge FROM INT NULL;
+CREATE TYPE dbo.IdList AS TABLE (id INT);
+GO
+CREATE TABLE hr.staff (id INT PRIMARY KEY, phone dbo.Phone, badge hr.Badge);
+INSERT hr.staff VALUES (1, '555-1', 10), (2, '555-2', NULL), (3, '555-3', 30);
+GO
+CREATE PROCEDURE dbo.pick @ids dbo.IdList READONLY AS SELECT phone FROM hr.staff WHERE id IN (SELECT id FROM @ids) ORDER BY phone;
+GO";
+    let _src = source(&src_server, &path, extra);
+    let mut s = h.cluster.session();
+    let r = s.execute(&format!("RESTORE DATABASE shop FROM DISK = '{}'", path));
+    ok(&r, "the restore");
+    assert!(!messages(&r).join(" ").contains("user-defined type"), "no note about types: {:?}", messages(&r));
+    ok(&s.execute("USE shop"), "USE shop");
+    assert_eq!(rows_of(&s.execute("SELECT COUNT(*) FROM sys.types WHERE name IN ('Phone', 'Badge', 'IdList') AND is_user_defined = 1")), vec![vec!["3".to_string()]]);
+    assert_eq!(rows_of(&s.execute("SELECT t.name FROM sys.columns c JOIN sys.types t ON t.user_type_id = c.user_type_id WHERE c.object_id = OBJECT_ID('hr.staff') AND c.name = 'phone'")), vec![vec!["Phone".to_string()]]);
+    // the type's rule is the column's
+    assert_eq!(s.execute("INSERT hr.staff VALUES (4, NULL, 1)").first_error().map(|e| e.number), Some(515));
+    let r = s.execute("DECLARE @l dbo.IdList; INSERT @l VALUES (1), (3); EXEC dbo.pick @l");
+    ok(&r, "the procedure with a table type");
+    assert_eq!(rows_of(&r), vec![vec!["555-1".to_string()], vec!["555-3".to_string()]]);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn xml_and_spatial_indexes_are_restored_the_primary_one_first() {
+    let h = start(2);
+    let path = backup_path("declidx");
+    let src_server = Server::new();
+    let extra = "GO
+CREATE TABLE docs (id INT PRIMARY KEY, body XML);
+INSERT docs VALUES (1, '<a><b>x</b></a>'), (2, '<a/>');
+CREATE XML INDEX xp_body ON docs (body) USING XML INDEX pxml_body FOR PATH;
+GO
+CREATE TABLE places (id INT PRIMARY KEY, g GEOMETRY);
+CREATE SPATIAL INDEX sx ON places (g) USING GEOMETRY_GRID WITH (BOUNDING_BOX = (0, 0, 10, 10));
+GO";
+    // (the primary index is made first by the source, so that the secondary one can be built on it)
+    let extra = extra.replace("CREATE XML INDEX xp_body", "CREATE PRIMARY XML INDEX pxml_body ON docs (body);\nCREATE XML INDEX xp_body");
+    let _src = source(&src_server, &path, &extra);
+    let mut s = h.cluster.session();
+    let r = s.execute(&format!("RESTORE DATABASE shop FROM DISK = '{}'", path));
+    ok(&r, "the restore");
+    let said = messages(&r).join(" ");
+    assert!(!said.contains("XML index") && !said.contains("spatial index"), "no note about them: {}", said);
+    ok(&s.execute("USE shop"), "USE shop");
+    assert_eq!(rows_of(&s.execute("SELECT COUNT(*) FROM sys.xml_indexes")), vec![vec!["2".to_string()]]);
+    assert_eq!(rows_of(&s.execute("SELECT COUNT(*) FROM sys.spatial_indexes")), vec![vec!["1".to_string()]]);
+    assert_eq!(rows_of(&s.execute("SELECT COUNT(*) FROM docs")), vec![vec!["2".to_string()]]);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn full_text_catalogs_and_indexes_are_restored_and_searches_work() {
+    let h = start(2);
+    let path = backup_path("ft");
+    let src_server = Server::new();
+    let extra = "GO
+CREATE TABLE notes (id INT NOT NULL, code VARCHAR(10) NOT NULL, body NVARCHAR(100) NULL, CONSTRAINT pk_notes PRIMARY KEY (id), CONSTRAINT uq_code UNIQUE (code));
+INSERT notes VALUES (1, 'a', 'the quick fox'), (2, 'b', 'a lazy dog'), (3, 'c', 'fox and dog'), (4, 'd', 'nothing');
+GO
+CREATE FULLTEXT CATALOG ftc AS DEFAULT;
+GO
+CREATE FULLTEXT INDEX ON notes (body) KEY INDEX uq_code ON ftc WITH (CHANGE_TRACKING = MANUAL);
+GO";
+    let _src = source(&src_server, &path, extra);
+    let mut s = h.cluster.session();
+    let r = s.execute(&format!("RESTORE DATABASE shop FROM DISK = '{}' WITH DISTRIBUTION = N'dbo.notes BY id'", path));
+    ok(&r, "the restore");
+    assert!(!messages(&r).join(" ").contains("full-text"), "no note about them: {:?}", messages(&r));
+    ok(&s.execute("USE shop"), "USE shop");
+    assert_eq!(rows_of(&s.execute("SELECT COUNT(*) FROM sys.fulltext_catalogs")), vec![vec!["1".to_string()]]);
+    assert_eq!(rows_of(&s.execute("SELECT change_tracking_state_desc FROM sys.fulltext_indexes")), vec![vec!["MANUAL".to_string()]]);
+    assert_eq!(rows_of(&s.execute("SELECT COUNT(*) FROM notes WHERE CONTAINS(body, 'fox')")), vec![vec!["2".to_string()]]);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn ddl_triggers_of_a_backup_are_restored_last_and_do_not_run_for_what_the_restore_makes() {
+    let h = start(2);
+    let path = backup_path("ddltrig");
+    let src_server = Server::new();
+    let extra = "GO
+CREATE TABLE ddl_log (n INT IDENTITY(1,1) PRIMARY KEY, what VARCHAR(40));
+GO
+CREATE TRIGGER no_drops ON DATABASE FOR DROP_TABLE AS BEGIN ROLLBACK; THROW 50001, 'no drops', 1; END;
+GO
+CREATE TRIGGER log_creates ON DATABASE FOR CREATE_TABLE AS INSERT ddl_log (what) VALUES ('created');
+GO
+DISABLE TRIGGER log_creates ON DATABASE;
+GO";
+    let _src = source(&src_server, &path, extra);
+    let mut s = h.cluster.session();
+    let r = s.execute(&format!("RESTORE DATABASE shop FROM DISK = '{}'", path));
+    ok(&r, "the restore");
+    assert!(!messages(&r).join(" ").contains("DDL trigger"), "no note about them: {:?}", messages(&r));
+    ok(&s.execute("USE shop"), "USE shop");
+    // the one that refuses drops is there and runs
+    assert_eq!(s.execute("DROP TABLE regions").first_error().map(|e| e.number), Some(50001));
+    // the one that was disabled in the backup is disabled
+    ok(&s.execute("CREATE TABLE fresh (id INT PRIMARY KEY)"), "create");
+    assert_eq!(rows_of(&s.execute("SELECT COUNT(*) FROM ddl_log")), vec![vec!["0".to_string()]]);
     let _ = std::fs::remove_file(&path);
 }
 

@@ -26,6 +26,7 @@ pub mod advisor;
 pub mod autoscale;
 pub mod client;
 pub mod dbname;
+pub mod ddltrig;
 pub mod dmlfuncs;
 pub mod execproc;
 pub mod deadlock;
@@ -49,6 +50,7 @@ pub mod replicas;
 pub mod restore;
 pub mod rules;
 pub mod triggers;
+pub mod uniq;
 pub mod txn;
 
 use astutil::*;
@@ -110,6 +112,9 @@ pub struct DistTable {
     /// the control node's to do, as the foreign keys are)
     #[serde(default)]
     pub edge_cons: Vec<EdgeCons>,
+    /// unique keys that do not contain the shard key: the control node checks them across the shards (see uniq.rs)
+    #[serde(default)]
+    pub weak_uniques: Vec<uniq::WeakUnique>,
 }
 
 impl DistTable {
@@ -179,6 +184,8 @@ pub struct Cluster {
     state_path: Option<std::path::PathBuf>,
     /// statements hold it for reading; moving slots between shards holds it for writing
     migration: RwLock<()>,
+    /// per table, the lock of its unique keys (see uniq.rs)
+    uniq_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     mirror: Server,
     tables: Mutex<HashMap<String, DistTable>>,
     /// held while the mirror's copies of tables are loaded and queried
@@ -227,6 +234,8 @@ pub struct Cluster {
     triggers: Mutex<Vec<(String, Stmt)>>,
     /// the ids of the triggers that are disabled
     triggers_off: Mutex<std::collections::HashSet<String>>,
+    /// the DDL triggers of the databases (see ddltrig.rs)
+    ddl_triggers: Mutex<Vec<ddltrig::DdlTrig>>,
 }
 
 pub type FaultHook = Arc<dyn Fn(&str) -> bool + Send + Sync>;
@@ -266,6 +275,7 @@ impl Cluster {
             schema_log: Mutex::new(vec![]),
             state_path: None,
             migration: RwLock::new(()),
+            uniq_locks: Mutex::new(HashMap::new()),
             mirror: Server::new(),
             tables: Mutex::new(HashMap::new()),
             gather: Mutex::new(()),
@@ -292,6 +302,7 @@ impl Cluster {
             funcs_placed: Default::default(),
             triggers: Default::default(),
             triggers_off: Default::default(),
+            ddl_triggers: Default::default(),
         });
         cluster.start_deadlock_monitor();
         Ok(cluster)
@@ -417,7 +428,7 @@ impl Cluster {
     }
 
     pub fn session(self: &Arc<Self>) -> ClusterSession {
-        ClusterSession { cluster: self.clone(), id: self.next_session.fetch_add(1, Ordering::Relaxed), mirror: self.mirror.connect_internal(), plan: vec![], temp_counter: 0, own_temps: vec![], txn: std::cell::RefCell::new(None), stmt_shards: std::cell::Cell::new(0), commit_seq: 0, vars: HashMap::new(), local_tables: HashMap::new(), tvars: HashMap::new(), identity_insert: Default::default(), last_identity: None, create_dist: None, cur_db: "master".into(), capture: None, trigger_stack: vec![], returning: false, catch_stack: vec![], proc_depth: 0, return_value: None, loop_ctl: 0, temp_creates: HashMap::new(), mirror_temps: Default::default() }
+        ClusterSession { cluster: self.clone(), id: self.next_session.fetch_add(1, Ordering::Relaxed), mirror: self.mirror.connect_internal(), plan: vec![], temp_counter: 0, own_temps: vec![], txn: std::cell::RefCell::new(None), stmt_shards: std::cell::Cell::new(0), commit_seq: 0, vars: HashMap::new(), local_tables: HashMap::new(), tvars: HashMap::new(), identity_insert: Default::default(), last_identity: None, create_dist: None, cur_db: "master".into(), capture: None, trigger_stack: vec![], returning: false, catch_stack: vec![], proc_depth: 0, return_value: None, loop_ctl: 0, temp_creates: HashMap::new(), mirror_temps: Default::default(), uniq_guards: vec![], eventdata: vec![], ddl_rolled_back: false, no_ddl_triggers: false, batch_text: String::new() }
     }
 
     pub fn shard_status(&self) -> Vec<Result<ShardStatus, SqlError>> {
@@ -480,6 +491,16 @@ pub struct ClusterSession {
     /// (it is given one only when a query that it runs reads it: see `refresh_mirror`)
     temp_creates: HashMap<String, String>,
     mirror_temps: std::collections::HashSet<String>,
+    /// the locks of unique keys this session holds, until its transaction (or statement) ends
+    uniq_guards: Vec<(String, tokio::sync::OwnedMutexGuard<()>)>,
+    /// the XML of the events whose DDL triggers are running (`EVENTDATA()`), the innermost last
+    eventdata: Vec<String>,
+    /// a `ROLLBACK` ran in a DDL trigger (see ddltrig.rs)
+    ddl_rolled_back: bool,
+    /// no DDL triggers run (a restore makes its objects without them)
+    no_ddl_triggers: bool,
+    /// the text of the batch being run (the `CommandText` of an event)
+    batch_text: String,
 }
 
 /// A transaction of a control session: the shards that have begun it, and what it has changed.
@@ -751,6 +772,7 @@ impl ClusterSession {
     pub fn execute(&mut self, sql: &str) -> BatchResult {
         tsql_server::span!("ctl_execute");
         self.plan.clear();
+        self.batch_text = sql.to_string();
         let cl = self.cluster.clone();
         let mut events = vec![];
         // ADVISE DISTRIBUTION [RESET]: what the queries had to move or gather so far, and the distribution that would have spared it
@@ -813,6 +835,9 @@ impl ClusterSession {
         for st in stmts {
             self.stmt_shards.set(0);
             let done = cl.rt.block_on(self.exec_stmt(st, &mut events));
+            if self.txn.borrow().is_none() {
+                self.uniq_guards.clear();
+            }
             if done.is_ok() && self.returning {
                 // (a RETURN ends the batch)
                 self.returning = false;
@@ -846,6 +871,9 @@ impl ClusterSession {
                 events.push(Event::Error(e));
                 break;
             }
+        }
+        if self.txn.borrow().is_none() {
+            self.uniq_guards.clear();
         }
         BatchResult { events }
     }
@@ -1029,6 +1057,8 @@ impl ClusterSession {
         let (qualified, mut control_rules) = self.split_control_rules(&qualified);
         let st = &qualified;
         self.sync_mirror_db()?;
+        // (the DDL triggers of the database run before a statement that raises an event: see ddltrig.rs)
+        self.fire_ddl_triggers(st, events).await?;
         match st {
             Stmt::CreateTable { .. } | Stmt::AlterTable { .. } => self.refuse_reading_functions(st, "a computed column")?,
             _ => {}
@@ -1044,6 +1074,11 @@ impl ClusterSession {
             }
             Stmt::Commit(_) => return self.commit_txn(events).await,
             Stmt::Rollback(Some(name)) => return self.rollback_to_savepoint(name).await,
+            // (in a DDL trigger there is no transaction to end: the statement the trigger is for is stopped, see ddltrig.rs)
+            Stmt::Rollback(None) if !self.eventdata.is_empty() && self.txn.borrow().is_none() => {
+                self.ddl_rolled_back = true;
+                return Ok(());
+            }
             Stmt::Rollback(None) => return self.rollback_txn().await,
             Stmt::SaveTran(name) => return self.save_savepoint(name).await,
             _ => {}
@@ -1055,7 +1090,7 @@ impl ClusterSession {
             if t.doomed && !harmless {
                 return Err(SqlError::new(3930, "The current transaction cannot be committed and cannot support operations that write to the log file. Roll back the transaction."));
             }
-            if matches!(st, Stmt::CreateTable { .. } | Stmt::AlterTable { .. } | Stmt::CreateView { .. } | Stmt::CreateFunction(_) | Stmt::CreateTrigger { .. } | Stmt::Drop { .. } | Stmt::CreateIndex { .. } | Stmt::DropIndex { .. } | Stmt::AlterIndex { .. } | Stmt::Truncate(_)) {
+            if matches!(st, Stmt::CreateTable { .. } | Stmt::AlterTable { .. } | Stmt::CreateView { .. } | Stmt::CreateFunction(_) | Stmt::CreateTrigger { .. } | Stmt::CreateType { .. } | Stmt::FullText(_) | Stmt::Drop { .. } | Stmt::CreateIndex { .. } | Stmt::DropIndex { .. } | Stmt::AlterIndex { .. } | Stmt::Truncate(_)) {
                 return Err(unsupported("schema changes and TRUNCATE inside a transaction"));
             }
         }
@@ -1116,7 +1151,11 @@ impl ClusterSession {
                         }
                         let st2 = Stmt::AlterTable { name: name.clone(), action: AlterAction::DropConstraint(rest, *if_exists) };
                         if let Stmt::AlterTable { name: n2, action: a2 } = &st2 {
-                            return self.alter_table(&st2, n2, a2).await;
+                            let r = self.alter_table(&st2, n2, a2).await;
+                            if r.is_ok() {
+                                self.refresh_weak_uniques(n2);
+                            }
+                            return r;
                         }
                     }
                 }
@@ -1125,6 +1164,7 @@ impl ClusterSession {
                 let r = if nothing_left { Ok(()) } else { self.alter_table(st, name, action).await };
                 if r.is_ok() {
                     self.add_control_rules(name, std::mem::take(&mut control_rules))?;
+                    self.refresh_weak_uniques(name);
                 }
                 r
             }
@@ -1221,6 +1261,23 @@ impl ClusterSession {
                 self.log_schema(st);
                 Ok(())
             }
+            // (a full-text catalog or index is a declaration, which the shards and the control node's engine keep: a search scans the rows)
+            Stmt::FullText(_) => {
+                self.broadcast(st).await?;
+                self.log_schema(st);
+                Ok(())
+            }
+            // (a user-defined type is made on every shard and on the control node's engine: the columns and parameters that use it are there)
+            Stmt::CreateType { .. } => {
+                self.broadcast(st).await?;
+                self.log_schema(st);
+                Ok(())
+            }
+            Stmt::Drop { what, .. } if what.eq_ignore_ascii_case("TYPE") => {
+                self.broadcast(st).await?;
+                self.log_schema(st);
+                Ok(())
+            }
             Stmt::Drop { what, names, .. } if what.eq_ignore_ascii_case("PROCEDURE") || what.eq_ignore_ascii_case("PROC") => {
                 self.broadcast(st).await?;
                 for n in names {
@@ -1295,21 +1352,41 @@ impl ClusterSession {
                 self.replace_functions_after_table_change().await?;
                 Ok(())
             }
-            Stmt::CreateIndex { table, unique, cols, xml, spatial, .. } => {
-                if xml.is_some() || spatial.is_some() {
-                    return Err(unsupported("XML and spatial indexes"));
-                }
+            Stmt::CreateIndex { name: ix_name, table, unique, cols, xml, spatial, filter, .. } => {
+                // (an XML or spatial index is a declaration, which the shards and the control node's engine keep: it changes no answer)
+                let _ = (xml, spatial);
                 let t = self.table(table)?;
+                let mut weak = false;
                 if let (true, Dist::Sharded { key, .. }) = (*unique, &t.dist) {
                     if !cols.iter().any(|(c, _)| c.eq_ignore_ascii_case(&t.cols[*key].name)) {
-                        return Err(unsupported(&format!("a unique index that does not contain the shard key ({})", t.cols[*key].name)));
+                        if filter.is_some() {
+                            return Err(unsupported(&format!("a filtered unique index that does not contain the shard key ({})", t.cols[*key].name)));
+                        }
+                        // (the rows there are checked against it, across the shards: see uniq.rs)
+                        self.lock_unique(&t.id).await?;
+                        let names: Vec<String> = cols.iter().map(|(c, _)| c.clone()).collect();
+                        self.verify_unique_existing(table, &names, ix_name).await?;
+                        weak = true;
                     }
                 }
                 self.broadcast(st).await?;
                 self.log_schema(st);
+                if weak {
+                    self.refresh_weak_uniques(table);
+                }
                 Ok(())
             }
-            Stmt::DropIndex { .. } | Stmt::AlterIndex { .. } => {
+            Stmt::DropIndex { names, .. } => {
+                self.broadcast(st).await?;
+                self.log_schema(st);
+                for (_, t) in names.iter() {
+                    if let Some(t) = t {
+                        self.refresh_weak_uniques(t);
+                    }
+                }
+                Ok(())
+            }
+            Stmt::AlterIndex { .. } => {
                 self.broadcast(st).await?;
                 self.log_schema(st);
                 Ok(())
@@ -1320,7 +1397,7 @@ impl ClusterSession {
                 for o in opts {
                     match o {
                         SetOpt::IdentityInsert(name, on) => {
-                            let id = table_id(name);
+                            let id = self.qid(name);
                             if self.table_by_id(&id).is_none() {
                                 rest.push(o.clone());
                             } else if *on {
@@ -1378,7 +1455,6 @@ impl ClusterSession {
         }
         let mut cols: Vec<ColInfo> = vec![];
         let mut pk: Vec<String> = vec![];
-        let mut uniques: Vec<Vec<String>> = vec![];
         let mut identity: Option<(usize, i64, i64)> = None;
         let mut graph: Option<bool> = None;
         let mut edge_cons: Vec<EdgeCons> = vec![];
@@ -1393,15 +1469,10 @@ impl ClusterSession {
                     if cd.pk.is_some() {
                         pk = vec![cd.name.clone()];
                     }
-                    if cd.unique.is_some() {
-                        uniques.push(vec![cd.name.clone()]);
-                    }
-                    let type_name = cd.ty.as_ref().and_then(|t| t.parts.last()).map(|s| s.to_lowercase()).unwrap_or_default();
+                    let type_name = self.base_type_name(cd.ty.as_ref());
                     cols.push(ColInfo { name: cd.name.clone(), computed: cd.computed.is_some(), type_name, hidden: false });
                 }
                 TableDef::PrimaryKey { cols: c, .. } => pk = c.iter().map(|(n, _)| n.clone()).collect(),
-                TableDef::Unique { cols: c, .. } => uniques.push(c.iter().map(|(n, _)| n.clone()).collect()),
-                TableDef::Index { cols: c, unique: true, .. } => uniques.push(c.iter().map(|(n, _)| n.clone()).collect()),
                 TableDef::Period { .. } => return Err(unsupported("system-versioned tables")),
                 // (the control node numbers the rows of a graph table, `$graph_id`: the shards would each number them from 0)
                 TableDef::Graph { edge, .. } => graph = Some(*edge),
@@ -1444,11 +1515,7 @@ impl ClusterSession {
             let key = cols.iter().position(|c| c.name.eq_ignore_ascii_case(&key_name)).ok_or_else(|| SqlError::new(1911, format!("Column name '{}' does not exist in the target table.", key_name)))?;
             let class = KeyClass::of_type_name(&cols[key].type_name)
                 .ok_or_else(|| unsupported(&format!("the shard key {} of type {} (use an integer, character or uniqueidentifier first key column, or DISTRIBUTE TABLE ... REPLICATED)", key_name, cols[key].type_name)))?;
-            for u in &uniques {
-                if !u.iter().any(|c| c.eq_ignore_ascii_case(&key_name)) {
-                    return Err(unsupported(&format!("a UNIQUE constraint that does not contain the shard key ({})", key_name)));
-                }
-            }
+            // (a unique key without the shard key is checked across the shards by the control node: see uniq.rs; a filtered one is refused)
             Dist::Sharded { key, class }
         };
         if let Err(e) = self.broadcast(st).await {
@@ -1463,10 +1530,28 @@ impl ClusterSession {
             return Err(e);
         }
         let id = table_id(name);
-        self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), DistTable { id, name: name.clone(), cols, dist, version: 0, loaded: None, rows: None, identity: identity.map(|(col, next, inc)| Identity { col, next, inc }), indexes: vec![], graph: graph_meta, edge_cons });
+        self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), DistTable { id, name: name.clone(), cols, dist, version: 0, loaded: None, rows: None, identity: identity.map(|(col, next, inc)| Identity { col, next, inc }), indexes: vec![], graph: graph_meta, edge_cons, weak_uniques: vec![] });
         self.cluster.fks.lock().unwrap_or_else(|e| e.into_inner()).extend(fks);
         self.log_schema(st);
+        self.refresh_weak_uniques(name);
         Ok(())
+    }
+
+    /// The name of the type of a column as the cluster classifies shard keys by it: a user-defined alias type is its base type.
+    fn base_type_name(&self, ty: Option<&TypeRef>) -> String {
+        let mut name = ty.and_then(|t| t.parts.last()).map(|s| s.to_lowercase()).unwrap_or_default();
+        let log = self.cluster.schema_log.lock().unwrap_or_else(|e| e.into_inner());
+        for _ in 0..8 {
+            let base = log.iter().rev().find_map(|st| match st {
+                Stmt::CreateType { name: n, base: Some(b), .. } if n.last().is_some_and(|l| l.eq_ignore_ascii_case(&name)) => b.parts.last().map(|s| s.to_lowercase()),
+                _ => None,
+            });
+            match base {
+                Some(b) => name = b,
+                None => break,
+            }
+        }
+        name
     }
 
     /// `BEGIN ... END`, `IF ... ELSE` and `WHILE`: the condition is worked out by the cluster (it may read the cluster's tables), and the
@@ -1601,9 +1686,12 @@ impl ClusterSession {
                             }
                         }
                         TableDef::PrimaryKey { .. } => return Err(unsupported("adding a primary key")),
-                        TableDef::Unique { cols, .. } => {
+                        TableDef::Unique { cols, name: uname, .. } => {
                             if !cols.iter().any(|(c, _)| is(c, &key_col)) && key_col.is_some() {
-                                return Err(unsupported("a UNIQUE constraint that does not contain the shard key"));
+                                // (the rows there are checked against it, across the shards: see uniq.rs)
+                                self.lock_unique(&table_id(name)).await?;
+                                let names: Vec<String> = cols.iter().map(|(c, _)| c.clone()).collect();
+                                self.verify_unique_existing(name, &names, uname.as_deref().unwrap_or("UQ")).await?;
                             }
                         }
                         TableDef::Period { .. } => return Err(unsupported("system-versioned tables")),
@@ -2116,6 +2204,10 @@ impl ClusterSession {
         if !self.cluster.fks_of_child(&t.id).is_empty() {
             self.fk_check_insert(&t, &names, &rows).await?;
         }
+        // (a unique key without the shard key is checked across the shards: see uniq.rs)
+        if !t.weak_uniques.is_empty() {
+            self.check_unique_insert(&t, &names, &rows).await?;
+        }
         let cols_for_shards: Option<Vec<String>> = if ident_col.is_some() || given.is_some() || t.graph.is_some() { Some(names.clone()) } else { None };
         let make = |rows: Vec<Vec<Expr>>| Stmt::Insert(Box::new(Insert { ctes: vec![], target: ins.target.clone(), cols: cols_for_shards.clone(), output: None, src: InsertSrc::Values(rows), top: None }));
         let count: i64;
@@ -2350,6 +2442,9 @@ impl ClusterSession {
         }
         self.refuse_reading_functions(u, "an UPDATE")?;
         self.fk_check_update(&t, u).await?;
+        if !moves_key && !t.weak_uniques.is_empty() {
+            self.check_unique_update(&t, u).await?;
+        }
         if moves_key {
             return self.update_moving_key(&t, u, events).await;
         }

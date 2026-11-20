@@ -166,6 +166,26 @@ pub fn referenced_tables_of<T: serde::Serialize>(q: &T) -> Vec<String> {
                         }
                     }
                 }
+                // CONTAINSTABLE(table, ...) and FREETEXTTABLE(table, ...) read the table they name (the parser passes its name as text)
+                if m.len() == 1 {
+                    if let Some(serde_json::Value::Object(f)) = m.get("Func") {
+                        let is_ft = f.get("name").and_then(|n| n.as_array()).and_then(|n| n.first()).and_then(|n| n.as_str()).is_some_and(|n| n == "FT_CONTAINSTABLE" || n == "FT_FREETEXTTABLE");
+                        if is_ft {
+                            fn first_str(v: &serde_json::Value) -> Option<String> {
+                                match v {
+                                    serde_json::Value::String(s) => Some(s.clone()),
+                                    serde_json::Value::Object(m) => m.values().find_map(first_str),
+                                    serde_json::Value::Array(a) => a.iter().find_map(first_str),
+                                    _ => None,
+                                }
+                            }
+                            if let Some(t) = f.get("args").and_then(|a| a.as_array()).and_then(|a| a.first()).and_then(first_str) {
+                                let name: Vec<String> = t.split('\u{1}').map(|p| p.to_string()).collect();
+                                out.push(table_id(&name));
+                            }
+                        }
+                    }
+                }
                 for c in m.values() {
                     walk(c, out);
                 }
