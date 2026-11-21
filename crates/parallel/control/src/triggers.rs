@@ -50,6 +50,26 @@ pub(crate) fn triggers_of_log(log: &[Stmt]) -> (Vec<(String, Stmt)>, HashSet<Str
                     out.retain(|(_, s)| !matches!(s, Stmt::CreateTrigger { table, .. } if table_id(table) == tid));
                 }
             }
+            // a table renamed (`sp_rename 'db.schema.table', 'new'`, logged with the table named in full) takes its triggers with it
+            Stmt::Exec(ex) => {
+                if let Some((obj, new, ty)) = ClusterSession::rename_args(ex) {
+                    if ty.is_empty() || ty == "OBJECT" {
+                        let old: Name = obj.split('.').map(|p| p.trim().trim_matches(|c| c == '[' || c == ']').to_string()).collect();
+                        let mut renamed = old.clone();
+                        if let Some(l) = renamed.last_mut() {
+                            *l = new.trim().trim_matches(|c| c == '[' || c == ']').to_string();
+                        }
+                        let old_id = table_id(&old);
+                        for (_, s) in out.iter_mut() {
+                            if let Stmt::CreateTrigger { table, .. } = s {
+                                if table_id(table) == old_id {
+                                    *table = renamed.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             Stmt::Drop { what, names, .. } if what.eq_ignore_ascii_case("DATABASE") => {
                 for n in names {
                     if let Some(db) = n.last() {
@@ -103,11 +123,12 @@ pub(crate) fn body_problem(body: &[Stmt]) -> Option<String> {
             Stmt::While { body, .. } => check(body),
             Stmt::Try { .. } => Some("TRY ... CATCH".into()),
             Stmt::Exec(_) | Stmt::ExecStr(_) | Stmt::Break | Stmt::Continue => None,
+            Stmt::DeclareCursor { .. } | Stmt::CursorOp { .. } | Stmt::Fetch { .. } => None,
             Stmt::Return(Some(_)) => Some("RETURN with a value".into()),
             other => Some(stmt_kind(other)),
         }
     }
-    body.iter().find_map(check).map(|w| format!("a trigger that uses {} (the control node runs data changes, queries, variables, IF, WHILE, PRINT, THROW, RAISERROR, RETURN and ROLLBACK)", w))
+    body.iter().find_map(check).map(|w| format!("a trigger that uses {} (the control node runs data changes, queries, variables, cursors, IF, WHILE, PRINT, THROW, RAISERROR, RETURN and ROLLBACK)", w))
 }
 
 /// The rows of the statement being run, kept for its triggers.
@@ -508,6 +529,7 @@ impl ClusterSession {
         let stmts = rewrite_body(body, &ins_t, &del_t, columns, set);
         self.trigger_stack.push((t.id.clone(), instead));
         let saved_vars = self.vars.clone();
+        let saved_cursors = std::mem::take(&mut self.cursors);
         let had_txn = self.txn.borrow().is_some();
         let mut quiet: Vec<Event> = vec![];
         let mut r: Result<(), SqlError> = Ok(());
@@ -527,6 +549,7 @@ impl ClusterSession {
             }
         }
         self.vars = saved_vars;
+        self.cursors = saved_cursors;
         self.trigger_stack.pop();
         self.drop_temps(temps).await;
         r?;

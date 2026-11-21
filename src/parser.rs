@@ -35,7 +35,7 @@ pub static GRAPH_USED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 const STMT_START: &[&str] = &[
     "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "ALTER", "DROP", "TRUNCATE", "DECLARE", "SET", "IF", "WHILE", "BEGIN", "RETURN", "BREAK", "CONTINUE", "PRINT",
     "EXEC", "EXECUTE", "USE", "COMMIT", "ROLLBACK", "SAVE", "THROW", "RAISERROR", "OPEN", "CLOSE", "FETCH", "DEALLOCATE", "WAITFOR", "GOTO", "GRANT", "REVOKE", "DENY",
-    "DBCC", "WITH", "END", "ELSE", "REVERT", "BACKUP", "RESTORE", "KILL", "RECONFIGURE", "BULK", "ENABLE", "DISABLE",
+    "DBCC", "WITH", "END", "ELSE", "REVERT", "BACKUP", "RESTORE", "KILL", "RECONFIGURE", "BULK", "ENABLE", "DISABLE", "UPDATETEXT", "READTEXT", "WRITETEXT",
 ];
 const NILADIC: &[&str] = &["CURRENT_TIMESTAMP", "CURRENT_USER", "SESSION_USER", "SYSTEM_USER", "USER", "CURRENT_DATE"];
 const DATEPART_FUNCS: &[&str] = &["DATEADD", "DATEDIFF", "DATEDIFF_BIG", "DATEPART", "DATENAME", "DATETRUNC", "DATE_BUCKET"];
@@ -2064,6 +2064,26 @@ impl Parser {
                     "WITH" => self.st_with(),
                     "INSERT" => self.st_insert(Vec::new()),
                     "UPDATE" => self.st_update(Vec::new()),
+                    // the text-pointer statements of the old `text`, `ntext` and `image` types: they are read, so that a procedure that has one can be
+                    // made (Reporting Services' has), and raise error 50100 when one runs (there are no text pointers here: change the value with UPDATE)
+                    "UPDATETEXT" | "READTEXT" | "WRITETEXT" => {
+                        let what = self.advance_up();
+                        loop {
+                            if self.at_eos() {
+                                break;
+                            }
+                            if self.is_kw("WITH") && self.peek_kw(1, &["LOG"]) {
+                                self.i += 2;
+                                continue;
+                            }
+                            if self.is_stmt_start() {
+                                break;
+                            }
+                            self.i += 1;
+                        }
+                        let msg = format!("{} is not supported: there are no text pointers here, so change the value of a text, ntext or image column with UPDATE (a column of this size is changed as a whole).", what);
+                        Ok(Stmt::Throw(Some((Expr::Lit(Value::Int(50100)), Expr::Lit(Value::Str(msg)), Expr::Lit(Value::Int(1))))))
+                    }
                     "DELETE" => self.st_delete(Vec::new()),
                     "MERGE" => self.st_merge(Vec::new()),
                     "TRUNCATE" => {
@@ -2645,7 +2665,13 @@ impl Parser {
             self.i += 1;
             return Ok(Target::Var(v.to_lowercase()));
         }
-        Ok(Target::Table(self.name_parts()?))
+        let name = self.name_parts()?;
+        // table hints on the target of a data change: `UPDATE t WITH (TABLOCK, XLOCK) SET ...` (taken and ignored, as hints of a query are)
+        if self.is_kw("WITH") && self.peek_is_op(1, "(") {
+            self.i += 1;
+            self.skip_parens()?;
+        }
+        Ok(Target::Table(name))
     }
 
     fn top_clause(&mut self) -> R<Option<(Expr, bool)>> {
@@ -2698,6 +2724,26 @@ impl Parser {
         Ok(c)
     }
 
+    /// The column list of an `INSERT`: a column may be written with a qualifier (`INSERT INTO t (a, s.b) SELECT ... FROM src s`, which SQL Server
+    /// accepts and Reporting Services' scripts have): the qualifier is read and dropped.
+    fn insert_col_list(&mut self) -> R<Vec<String>> {
+        self.expect_op("(")?;
+        let mut c = vec![];
+        loop {
+            let mut n = self.ident()?;
+            while self.is_op(".") {
+                self.i += 1;
+                n = self.ident()?;
+            }
+            c.push(n);
+            if !self.accept_op(",") {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        Ok(c)
+    }
+
     fn st_insert(&mut self, ctes: Vec<Cte>) -> R<Stmt> {
         self.i += 1;
         let top = self.top_clause()?;
@@ -2705,7 +2751,7 @@ impl Parser {
         let target = self.target()?;
         let mut cols = None;
         if self.is_op("(") && !self.peek_kw(1, &["SELECT"]) {
-            cols = Some(self.col_list()?);
+            cols = Some(self.insert_col_list()?);
         }
         let output = self.output_clause()?;
         let src = if self.is_kw("VALUES") {
@@ -2752,6 +2798,19 @@ impl Parser {
                 if parts.len() >= 2 && parts.last().unwrap().eq_ignore_ascii_case("modify") && self.is_op("(") {
                     parts.pop();
                     let e = self.xml_modify_call(Expr::Col(parts.clone()))?;
+                    sets.push(SetItem::Col { parts, op: None, e });
+                } else if parts.len() >= 2 && parts.last().unwrap().eq_ignore_ascii_case("write") && self.is_op("(") {
+                    // SET col.WRITE(expression, @Offset, @Length): the part of the value from the offset, of the length, becomes the expression
+                    // (a NULL offset appends it; a NULL length goes to the end of the value; a NULL expression only deletes)
+                    parts.pop();
+                    self.i += 1;
+                    let ins = self.expr()?;
+                    self.expect_op(",")?;
+                    let off = self.expr()?;
+                    self.expect_op(",")?;
+                    let len = self.expr()?;
+                    self.expect_op(")")?;
+                    let e = Expr::Func(Box::new(FuncCall { name: "$WRITE".to_string(), schema: None, parts: vec![], args: vec![Expr::Col(parts.clone()), ins, off, len], distinct: false, star: false, over: None, within: None }));
                     sets.push(SetItem::Col { parts, op: None, e });
                 } else {
                     let op = self.assign_op().ok_or_else(|| self.err())?;
@@ -3873,10 +3932,28 @@ impl Parser {
                     }
                 }
                 let (mut include, mut filter) = (vec![], None);
+                let mut drop_existing = false;
                 while self.is_kw_any(&["INCLUDE", "WHERE", "WITH", "ON", "ORDER"]) {
                     let w = self.advance_up();
                     if w == "WITH" && self.is_op("(") && spatial.is_some() {
                         self.spatial_options(spatial.as_mut().unwrap())?;
+                    } else if w == "WITH" && self.is_op("(") {
+                        // (`WITH (DROP_EXISTING = ON, ...)`: the index that is there is replaced; the other options change nothing here)
+                        let mut j = self.i + 1;
+                        let mut depth = 1;
+                        while j < self.toks.len() && depth > 0 {
+                            match &self.toks[j].tok {
+                                Tok::Op("(") => depth += 1,
+                                Tok::Op(")") => depth -= 1,
+                                _ => {
+                                    if self.toks[j].up == "DROP_EXISTING" && j + 2 < self.toks.len() && matches!(self.toks[j + 1].tok, Tok::Op("=")) && self.toks[j + 2].up == "ON" {
+                                        drop_existing = true;
+                                    }
+                                }
+                            }
+                            j += 1;
+                        }
+                        self.skip_parens()?;
                     } else if w == "WHERE" {
                         filter = Some(self.expr_text()?);
                     } else if w == "INCLUDE" && self.is_op("(") {
@@ -3894,7 +3971,12 @@ impl Parser {
                         self.i += 1;
                     }
                 }
-                Ok(Stmt::CreateIndex { name, table, cols, unique, include, filter, xml, spatial, columnstore })
+                let create = Stmt::CreateIndex { name: name.clone(), table: table.clone(), cols, unique, include, filter, xml, spatial, columnstore };
+                if drop_existing {
+                    // (the index that is there goes first, if there is one)
+                    return Ok(Stmt::Block(vec![Stmt::DropIndex { names: vec![(vec![name], Some(table))], if_exists: true }, create]));
+                }
+                Ok(create)
             }
             "VIEW" => {
                 let name = self.name_parts()?;
@@ -4176,6 +4258,14 @@ impl Parser {
         loop {
             defs.push(self.table_def()?);
             if !self.accept_op(",") {
+                // (a table constraint may follow a column with no comma between them)
+                if self.is_kw("CONSTRAINT") {
+                    continue;
+                }
+                break;
+            }
+            // (a comma left before the closing parenthesis, as Reporting Services' scripts do, is accepted)
+            if self.is_op(")") {
                 break;
             }
         }
@@ -4338,6 +4428,19 @@ impl Parser {
         self.column_def()
     }
 
+    /// At `CONSTRAINT name ...`: whether it is a table constraint (a key with a column list, or a `FOREIGN KEY (...)`), not one of the column before it.
+    fn table_constraint_follows(&self) -> bool {
+        let up = |n: usize| self.peek(n).up.as_str();
+        let paren = |n: usize| matches!(self.peek(n).tok, Tok::Op("("));
+        let after_kind = |n: usize| if matches!(up(n), "CLUSTERED" | "NONCLUSTERED") { n + 1 } else { n };
+        match up(2) {
+            "PRIMARY" => up(3) == "KEY" && paren(after_kind(4)),
+            "UNIQUE" => paren(after_kind(3)),
+            "FOREIGN" => up(3) == "KEY" && paren(4),
+            _ => false,
+        }
+    }
+
     fn column_def(&mut self) -> R<TableDef> {
         let name = self.ident()?;
         let mut col = ColumnDef { name, ty: None, nullable: None, identity: None, default: None, default_text: None, default_name: None, computed: None, computed_text: None, pk: None, unique: None, checks: vec![], fk: None, collation: None, mask: None, generated: None };
@@ -4353,6 +4456,10 @@ impl Parser {
             col.ty = Some(self.parse_type()?);
         }
         loop {
+            // (a table constraint written straight after the last column, with no comma: `... datetime CONSTRAINT pk PRIMARY KEY (a DESC)`)
+            if self.is_kw("CONSTRAINT") && self.table_constraint_follows() {
+                break;
+            }
             let mut cname = None;
             if self.accept_kw("CONSTRAINT") {
                 cname = Some(self.ident()?);
@@ -4533,6 +4640,11 @@ impl Parser {
     fn alter_table(&mut self) -> R<Stmt> {
         self.i += 1;
         let name = self.name_parts()?;
+        // `ALTER TABLE t WITH CHECK | NOCHECK ADD CONSTRAINT ...` (Reporting Services' scripts say it): the words only say whether existing rows are
+        // checked against a foreign key or CHECK being added, which this server always does
+        if self.is_kw("WITH") && self.peek_kw(1, &["CHECK", "NOCHECK"]) && self.peek_kw(2, &["ADD"]) {
+            self.i += 2;
+        }
         if self.accept_kw("ADD") {
             let mut defs = vec![];
             loop {

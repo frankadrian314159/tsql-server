@@ -131,6 +131,7 @@ impl Cluster {
             victims: Mutex::new(Default::default()),
             deadlocks: AtomicU64::new(0),
             dbs: Mutex::new(dbs),
+            dropped_dbs: Default::default(),
             logged_db: Mutex::new(logged_db),
             funcs: Mutex::new(funcs_init),
             funcs_on_shards: Default::default(),

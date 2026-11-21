@@ -42,6 +42,19 @@ impl ClusterSession {
         if !self.cur_db.eq_ignore_ascii_case(db) {
             self.cur_db = db.to_string();
         }
+        self.leave_dropped_database();
+    }
+
+    /// A session that is in a database that has been dropped (by another session: on a single server the drop would be refused while it is in
+    /// use, but a client's pooled connection may sit in the database) goes back to `master`, as the connection of a client that is told it was
+    /// dropped would. Returns the database the session is in now when it moved.
+    pub fn leave_dropped_database(&mut self) -> Option<String> {
+        let gone = self.cluster.dropped_dbs.lock().unwrap_or_else(|e| e.into_inner()).contains(&self.cur_db.to_lowercase());
+        if gone {
+            self.cur_db = "master".to_string();
+            return Some(self.cur_db.clone());
+        }
+        None
     }
 
     /// Whether the cluster has a database besides `master`.
@@ -249,6 +262,7 @@ impl ClusterSession {
         }
         self.plan.push(format!("broadcast CREATE DATABASE to {} shards", shards.len()));
         // (the schema log is replayed after a restart; the file paths are not serialized with the statement, so a path taken since cannot fail it)
+        self.cluster.dropped_dbs.lock().unwrap_or_else(|e| e.into_inner()).remove(&name.to_lowercase());
         self.cluster.log_schema_in("master", st);
         Ok(())
     }
@@ -284,6 +298,8 @@ impl ClusterSession {
             self.cluster.funcs_on_shards.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| !k.starts_with(&prefix));
             self.cluster.funcs_placed.lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| !k.starts_with(&prefix));
             self.cluster.triggers.lock().unwrap_or_else(|e| e.into_inner()).retain(|(k, _)| !k.starts_with(&prefix));
+            self.cluster.ddl_triggers.lock().unwrap_or_else(|e| e.into_inner()).retain(|t| !t.db.eq_ignore_ascii_case(&db));
+            self.cluster.dropped_dbs.lock().unwrap_or_else(|e| e.into_inner()).insert(db.to_lowercase());
             self.cluster.log_schema_in("master", &one);
             self.plan.push(format!("broadcast DROP DATABASE to {} shards", shards.len()));
         }

@@ -48,7 +48,8 @@ tables sharded on the item), and its table shows how each query ran (`split`, `s
 * **DDL** (`CREATE`/`DROP TABLE`, `ALTER TABLE`, indexes, `SET`) runs on the control node's own *mirror* engine first (which
   checks it and keeps the schema), then on every shard; a table that cannot be created everywhere is removed again.
   `ALTER TABLE` may add, change (not the shard key or an identity column) and drop columns and constraints; adding a primary key
-  is refused (a `UNIQUE` constraint may be added: see *Unique keys across shards*). **Views** are kept by the control node (the shards hold none): a
+  or a `UNIQUE` constraint is allowed (see *Unique keys across shards*: one without the shard key is checked across the shards, against the rows
+  that are there first), but a column that is a primary key or `UNIQUE` as it is added, and an `IDENTITY` column, are refused. **Views** are kept by the control node (the shards hold none): a
   query that reads a view is rewritten around its definition, as a derived table (see subqueries below); writes through a view
   are refused. **`IDENTITY` columns** are numbered by the control node (a counter per table in its state, so the numbers do not
   depend on the shard a row lands on, and survive a restart); the shards' tables have no identity of their own.
@@ -283,6 +284,19 @@ A shard cannot call a function that reads sharded tables (it would answer from i
   triggers (an `UPDATE` of the shard key is refused). The constraint is not in `sys.check_constraints` or `sys.default_constraints`.
 * **A computed column** that calls one is still refused: it is evaluated whenever a row is read, on the shard that holds it.
 
+## UPDATE ... FROM and DELETE ... FROM
+
+A data change that joins another table (`UPDATE t SET c = s.v FROM s WHERE t.k = s.k`, `UPDATE x SET ... FROM t x JOIN s ON ...`, `DELETE t FROM t JOIN s ON ...`) is run by the control node: it reads the join as a query over the cluster (the key of the target's rows and, for an `UPDATE`, the new value of each column the `SET` names, worked out by the engine for every joined row), then applies the changes to the target by key, 100 rows at a time, as ordinary data changes: they go to the shards that hold the rows, fire the triggers and the checks of the table, and are part of the transaction. The key is the primary key, else every column that is not computed. When several rows of the join match one row of the target the first is applied (SQL Server applies an arbitrary one). The join is held by the control node: more than 200 000 rows are refused (50100). `OUTPUT`, `TOP` and CTEs in such a statement are still refused.
+
+## Cursors
+
+`DECLARE name CURSOR FOR query`, `OPEN`, `FETCH [NEXT | PRIOR | FIRST | LAST | ABSOLUTE n | RELATIVE n] FROM name INTO @v, ...`, `CLOSE`, `DEALLOCATE` and
+`@@FETCH_STATUS` work over the cluster's tables in a batch, a procedure the control node runs and the body of a trigger (`FETCH` from `deleted` or
+`inserted` included). A cursor is a **static snapshot**: `OPEN` runs the query, with the variables it names as they are at that moment, and
+keeps the rows; changes made afterwards are not seen. `FETCH` must have `INTO` (one that would return the row as a result set is refused, 50100).
+A cursor belongs to the batch that declared it, and a trigger's to the trigger. The errors are the engine's: 16916 (no such cursor), 16917 (not
+open), 16905 (declared twice).
+
 ## DDL triggers
 
 `CREATE | ALTER | DROP TRIGGER name ON DATABASE FOR events AS ...` and `ENABLE | DISABLE TRIGGER name | ALL ON DATABASE` work in a cluster. The control
@@ -329,6 +343,78 @@ shard key (see *Unique keys across shards*). `CONTAINS` and `FREETEXT` are evalu
 `CONTAINSTABLE` or `FREETEXTTABLE` reads the table they name, which the control node gathers as it does for any query it runs itself. As on a
 single server, a predicate on a table that has no full-text index is not an error. Catalogs are made outside a transaction here, as are all schema
 changes. A `RESTORE` makes the catalogs of the backup first, and the full-text index of each table after its unique key index.
+
+## Schema changes inside a transaction
+
+`CREATE`, `ALTER` and `DROP` of tables, indexes, views, procedures, functions, triggers and types work after `BEGIN TRAN` (Reporting Services' upgrade scripts
+do the whole migration in one transaction). The control node's engine, the schema log and the shards' own copies are not one transaction, so such a change cannot be
+undone together with the rest. **A schema change commits what the transaction has done so far, is made, and the client goes on in a new transaction of the same depth**
+(`@@TRANCOUNT` is as it was): a `ROLLBACK` undoes what came after the last schema change, not the change nor what came before it. This also lets go of the locks the
+transaction held, which the change would otherwise wait for. `TRUNCATE` inside a transaction is still refused (50100).
+
+## UPDATE ... FROM and DELETE ... FROM
+
+A data change that joins another table (`UPDATE t SET c = s.v FROM s WHERE t.k = s.k`, `UPDATE x SET ... FROM t x JOIN s ON ...`, `DELETE t FROM t JOIN s ON ...`) is run by the control node: it reads the join as a query over the cluster (the key of the target's rows and, for an `UPDATE`, the new value of each column the `SET` names, worked out by the engine for every joined row), then applies the changes to the target by key, 100 rows at a time, as ordinary data changes: they go to the shards that hold the rows, fire the triggers and the checks of the table, and are part of the transaction. The key is the primary key, else every column that is not computed. When several rows of the join match one row of the target the first is applied (SQL Server applies an arbitrary one). The join is held by the control node: more than 200 000 rows are refused (50100). `OUTPUT`, `TOP` and CTEs in such a statement are still refused.
+
+## Cursors
+
+`DECLARE name CURSOR FOR query`, `OPEN`, `FETCH [NEXT | PRIOR | FIRST | LAST | ABSOLUTE n | RELATIVE n] FROM name INTO @v, ...`, `CLOSE`, `DEALLOCATE` and
+`@@FETCH_STATUS` work over the cluster's tables in a batch, a procedure the control node runs and the body of a trigger (`FETCH` from `deleted` or
+`inserted` included). A cursor is a **static snapshot**: `OPEN` runs the query, with the variables it names as they are at that moment, and
+keeps the rows; changes made afterwards are not seen. `FETCH` must have `INTO` (one that would return the row as a result set is refused, 50100).
+A cursor belongs to the batch that declared it, and a trigger's to the trigger. The errors are the engine's: 16916 (no such cursor), 16917 (not
+open), 16905 (declared twice).
+
+## DDL triggers
+
+`CREATE | ALTER | DROP TRIGGER name ON DATABASE FOR events AS ...` and `ENABLE | DISABLE TRIGGER name | ALL ON DATABASE` work in a cluster. The control
+node keeps the triggers of each database (logged with the schema, so they are there when it starts again) and runs their bodies itself, since a
+body reads and writes the cluster's tables, which only it can do. The events are those of the DDL the cluster runs for tables, indexes, views,
+procedures, functions, triggers, schemas and types (`CREATE_TABLE`, `DROP_TABLE`, `DDL_TABLE_EVENTS`, `DDL_DATABASE_LEVEL_EVENTS`, ...); an unknown event
+is error 1082. `EVENTDATA()` gives the event's XML (`EventType`, `PostTime`, `SPID`, `ServerName`, `LoginName`, `UserName`, `DatabaseName`,
+`SchemaName`, `ObjectName`, `ObjectType`, `TSQLCommand/CommandText`), read with `.value()`.
+
+* **A trigger runs before the statement**, not after it as on a single server: the statement changes the shards and the control node's engine,
+  which cannot be taken back together. An error stops the statement, and so does `ROLLBACK` followed by `THROW` or `RAISERROR`, which is how a
+  trigger refuses `DROP_TABLE` or `ALTER_TABLE`. A `ROLLBACK` alone ends the batch with error 3609, as it does there.
+* A statement that fails after its triggers ran leaves what they wrote (an audit row, say), and a body that selects from the catalog sees the object
+  as it was before the statement.
+* A trigger does not run for DDL its own body runs, nor for what a `RESTORE` makes.
+* **Not supported:** `ON ALL SERVER` and `LOGON` triggers (error 50100). A DDL trigger is not in the control node's engine, so `sys.triggers`
+  does not list it.
+
+## User-defined types
+
+`CREATE TYPE name FROM base [NOT] NULL` (an alias type) and `CREATE TYPE name AS TABLE (...)` (a table type) are made on the control node's
+engine and on every shard, logged with the schema (so a control node that starts again, and a new shard, have them), and dropped with
+`DROP TYPE`. A column, a variable, a `CAST` and a parameter may then be of the type, on the shards and on the control node. A column of an alias
+type may be the shard key (it is classified by its base type). A table type is a table variable's type and the type of a table-valued parameter
+(`READONLY`) of a procedure the control node runs. A `RESTORE` makes the types of the backup before its tables, procedures and functions, and
+no longer says that it left them out. As on a single server (this engine does not refuse to drop a type that a column uses), `DROP TYPE` does
+not check for users of the type. Types are made outside a transaction.
+
+## XML and spatial indexes
+
+`CREATE [PRIMARY] XML INDEX` and `CREATE SPATIAL INDEX` are declarations on a single server (they are checked and kept in the catalog, and change no
+result or plan: see [optimizer.md](optimizer.md) and [spatial.md](spatial.md)). A cluster keeps them the same way: the statement runs on the
+control node's engine, which applies the rules (one primary XML index per column, the names shared with the table's other indexes, the
+primary key a table needs), then on every shard, and is logged with the schema. `DROP INDEX` drops them (a primary XML index takes the
+secondary ones built on it), the catalog views show them, and a `RESTORE` makes them after the table's rows, the primary XML indexes first.
+
+## Full-text catalogs and indexes
+
+`CREATE | ALTER | DROP FULLTEXT CATALOG` and `... FULLTEXT INDEX` are declarations on a single server: a search tokenises the text of the rows it
+looks at (see [triggers.md](triggers.md)). A cluster keeps them as it keeps XML indexes: the control node's engine applies the rules
+(errors 7608 to 7615: the key index must be a unique, non-nullable, single-column index, one full-text index per table, a catalog with indexes is
+not dropped), then every shard runs the statement, and it is logged with the schema. The key index may be a unique key that does not contain the
+shard key (see *Unique keys across shards*). `CONTAINS` and `FREETEXT` are evaluated by the shards over their own rows; a query that reads
+`CONTAINSTABLE` or `FREETEXTTABLE` reads the table they name, which the control node gathers as it does for any query it runs itself. As on a
+single server, a predicate on a table that has no full-text index is not an error. Catalogs are made outside a transaction here, as are all schema
+changes. A `RESTORE` makes the catalogs of the backup first, and the full-text index of each table after its unique key index.
+
+## Schema changes inside a transaction
+
+`CREATE`, `ALTER` and `DROP` of tables, indexes, views, procedures, functions, triggers and types work after `BEGIN TRAN` (Reporting Services' upgrade scripts do the whole migration in one transaction). The control node's engine, the schema log and the shards' own copies are not one transaction, so such a change cannot be undone together: **it is made at once, and a `ROLLBACK` does not undo it** (the rows the transaction wrote are undone, as always). On the shards it runs in a session of its own, apart from the transaction's, so that it does not take the transaction's locks; an `ALTER TABLE` of a table the transaction has written waits for the lock timeout. `TRUNCATE` inside a transaction is still refused (50100).
 
 ## Unique keys across shards
 
@@ -384,8 +470,8 @@ trigger that reads or writes another table has to reach every shard). The contro
 As in SQL Server: a trigger is not fired again by what it does to its own table (direct recursion is off), an `INSTEAD OF` trigger's own
 statement on its table is done for real (and fires its `AFTER` triggers), triggers nest to 32 levels (error 217), a statement that changes no row
 fires nothing, and `UPDATE(column)` tells whether the statement set the column. A trigger body may use data changes, queries, variables,
-`IF`, `WHILE`, `BEGIN ... END`, `TRY ... CATCH`, `EXEC` (of any procedure of the cluster), `PRINT`, `THROW`, `RAISERROR`, `RETURN` and `ROLLBACK`; one that
-uses anything else (cursors, `TRUNCATE`, ...) is refused when it is made, not when it fires. Not supported: triggers on views, `ALL SERVER` and logon triggers (database DDL triggers are: see *DDL triggers*), `COLUMNS_UPDATED()`,
+`IF`, `WHILE`, `BEGIN ... END`, `TRY ... CATCH`, `EXEC` (of any procedure of the cluster), cursors, `PRINT`, `THROW`, `RAISERROR`, `RETURN` and `ROLLBACK`; one that
+uses anything else (`TRUNCATE`, ...) is refused when it is made, not when it fires. Not supported: triggers on views, `ALL SERVER` and logon triggers (database DDL triggers are: see *DDL triggers*), `COLUMNS_UPDATED()`,
 `INSERT ... EXEC` into a table with an `INSTEAD OF` trigger, an `UPDATE` of the shard key of a table that has triggers, and a statement that
 changes more rows than a statement can broadcast (the limit `broadcast_limit` sets) on a table that has triggers. Rows loaded by `INSERT BULK`
 and by a restore fire nothing. Row counts and results of a trigger body are not sent to the client.
@@ -587,7 +673,7 @@ to this server's format in a temporary file, as a single-node restore does).
 
 A cluster has the databases `CREATE DATABASE` makes, besides `master`. `CREATE DATABASE name` is made on the control node's engine and on
 every shard (so `sys.databases` and SSMS's Databases node list it), `DROP DATABASE name` drops it from all of them with the tables, views
-and procedures the cluster holds in it (a database that a session is in cannot be dropped: 3702), and `USE name` is the engine's own: the
+and procedures the cluster holds in it (a database that the session that drops it is in cannot be dropped: 3702; another session that is in it, a client's pooled connection say, goes back to `master` at its next batch instead of failing on a database that is gone), and `USE name` is the engine's own: the
 control node is told which database a client is in before each batch.
 
 A table is named by its database, schema and name, and a table of another database is named in full (`shop.dbo.items`). A statement of a
@@ -685,8 +771,8 @@ generated rows.
 * **Refused** (error 50100 says so): filtered unique indexes that do not contain the shard key, stored
   triggers (a function is supported, see *Stored functions*; a procedure is made on every shard and can be declared to run on one,
   see *Procedures that run on one shard*), temporal
-  tables, DML with joins (`UPDATE ... FROM`), `OUTPUT` or `TOP` in DML, `INSERT ... DEFAULT VALUES`/`EXEC`, correlated
-  subqueries in DML, schema changes inside a transaction, the T-SQL `BULK INSERT` statement (`INSERT BULK`, the protocol's bulk
+  tables, `OUTPUT` or `TOP` in DML, `INSERT ... DEFAULT VALUES`/`EXEC`, correlated
+  subqueries in DML, the T-SQL `BULK INSERT` statement (`INSERT BULK`, the protocol's bulk
   load, works), `BACKUP` of the cluster's database, and restoring anything but a full backup (see *Restoring a backup into a
   cluster*). Views cannot be written through.
 * **Foreign keys and identity values are the control node's**: the checks are not atomic across sessions (see Foreign keys),

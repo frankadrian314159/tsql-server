@@ -235,6 +235,8 @@ pub struct SessionState {
     pub options: i32,
     /// The table arguments (table variables passed by name) of the system procedure call being run, by argument position.
     pub sys_tables: Vec<Option<Table>>,
+    /// the database a system procedure was named in (`[db].[sys].[sp_procedure_params_100_managed]`), for the one being run
+    pub sys_db: Option<String>,
     pub nocount: bool,
     pub xact_abort: bool,
     pub rowcount_limit: i64,
@@ -359,6 +361,7 @@ impl SessionState {
             module_owner: vec![],
             options: 5496,
             sys_tables: vec![],
+            sys_db: None,
             nocount: false,
             xact_abort: false,
             rowcount_limit: 0,
@@ -831,9 +834,23 @@ impl<'a> Engine<'a> {
             // a condition may change from one iteration to the next: no cached subquery results
             let saved = self.ses.sub_cache.take();
             let saved_sets = self.ses.in_sets.take();
+            // (a system procedure that changes the catalog, `sp_rename`, begins a transaction of its own that nothing else ends: an `EXEC` that
+            // found no transaction open ends the implicit one it leaves, as the statements of a procedure do for theirs)
+            let exec_owns = matches!(st, Stmt::Exec(_)) && self.ses.nest_level == 0 && self.ses.tx.is_none();
             let r = self.exec_inner(st);
             self.ses.sub_cache = saved;
             self.ses.in_sets = saved_sets;
+            let r = if exec_owns && self.ses.tx.as_ref().is_some_and(|t| t.implicit) {
+                match r {
+                    Ok(()) => self.finish_implicit().map_err(Interrupt::Error),
+                    Err(e) => {
+                        self.rollback_tx();
+                        Err(e)
+                    }
+                }
+            } else {
+                r
+            };
             return match r {
                 Err(Interrupt::Error(e)) => self.handle_error(e),
                 other => other,
@@ -2035,8 +2052,10 @@ impl<'a> Engine<'a> {
             rc = r?;
         } else {
             self.ses.sys_tables = bound.iter().map(|b| b.table.clone()).collect();
+            self.ses.sys_db = if plain.len() >= 3 { Some(plain[plain.len() - 3].clone()) } else { None };
             let r = self.exec_sysproc(&lname, &bound.iter().map(|b| (b.name.clone(), b.val.clone(), b.out_var.clone())).collect::<Vec<_>>());
             self.ses.sys_tables.clear();
+            self.ses.sys_db = None;
             match r? {
                 Some(v) => rc = v,
                 None => return Err(SqlError::new(2812, format!("Could not find stored procedure '{}'.", plain.join("."))).into()),

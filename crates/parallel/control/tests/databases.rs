@@ -284,3 +284,99 @@ fn a_table_of_master_is_still_read_by_its_plain_name_after_ddl_in_another_databa
     run(&mut s, "DELETE audit WHERE n = 4");
     assert_eq!(one(&mut s, "SELECT COUNT(*) FROM audit"), "3");
 }
+
+#[test]
+fn a_guarded_create_database_or_ddl_is_the_clusters_whatever_the_branch_of_a_flow_statement() {
+    let h = start(3, None);
+    let mut s = h.cluster.session();
+    // (what Reporting Services sends: the front end asks `wants` which engine runs a batch)
+    assert!(s.wants("IF NOT EXISTS (SELECT name FROM master.dbo.sysdatabases WHERE name = N'RS') CREATE DATABASE [RS] COLLATE Latin1_General_100_CI_AS_KS_WS"));
+    assert!(s.wants("BEGIN\nIF 1 = 1 CREATE TABLE t (id INT PRIMARY KEY)\nEND"));
+    assert!(s.wants("WHILE 1 = 0 DROP DATABASE d"));
+    assert!(s.wants("BEGIN TRY CREATE DATABASE d2 END TRY BEGIN CATCH SELECT 1 END CATCH"));
+    // a flow statement that makes only a temporary table, or reads the catalog, is the engine's
+    assert!(!s.wants("IF 1 = 1 CREATE TABLE #t (id INT)"));
+    assert!(!s.wants("IF NOT EXISTS (SELECT * FROM sys.objects WHERE name = 'x') SELECT 1"));
+    // run as the cluster runs it, the database is on the shards too: a table can be made in it
+    run(&mut s, "IF NOT EXISTS (SELECT name FROM master.dbo.sysdatabases WHERE name = N'RS') CREATE DATABASE [RS]");
+    run(&mut s, "USE RS");
+    run(&mut s, "CREATE TABLE [dbo].[SessionLock] ([SessionID] varchar(32) NOT NULL)");
+    run(&mut s, "INSERT SessionLock VALUES ('a'), ('b')");
+    assert_eq!(one(&mut s, "SELECT COUNT(*) FROM SessionLock"), "2");
+}
+
+#[test]
+fn users_roles_and_grants_on_tables_of_the_cluster_are_kept_by_the_control_node() {
+    let h = start(3, None);
+    let mut s = h.cluster.session();
+    run(&mut s, "CREATE TABLE lock_t (id INT PRIMARY KEY)");
+    run(&mut s, "EXEC sp_addrole 'RSExecRole'");
+    run(&mut s, "GRANT SELECT, INSERT, UPDATE, DELETE, REFERENCES ON [dbo].[lock_t] TO RSExecRole");
+    assert_eq!(one(&mut s, "SELECT COUNT(*) FROM sys.database_permissions p JOIN sys.database_principals r ON r.principal_id = p.grantee_principal_id WHERE r.name = 'RSExecRole' AND p.permission_name = 'INSERT'"), "1");
+    run(&mut s, "REVOKE INSERT ON [dbo].[lock_t] FROM RSExecRole");
+    assert_eq!(one(&mut s, "SELECT COUNT(*) FROM sys.database_permissions p JOIN sys.database_principals r ON r.principal_id = p.grantee_principal_id WHERE r.name = 'RSExecRole' AND p.permission_name = 'INSERT'"), "0");
+}
+
+#[test]
+fn a_session_in_a_database_that_another_session_drops_goes_back_to_master() {
+    let h = start(3, None);
+    let mut a = h.cluster.session();
+    let mut b = h.cluster.session();
+    run(&mut a, "CREATE DATABASE RS");
+    run(&mut a, "USE RS");
+    run(&mut a, "CREATE TABLE t (id INT PRIMARY KEY)");
+    // (a client's pooled connection sits in RS while another session drops it)
+    run(&mut b, "DROP DATABASE RS");
+    assert_eq!(one(&mut a, "SELECT COUNT(*) FROM master.dbo.sysdatabases WHERE name = N'RS'"), "0");
+    assert_eq!(a.current_database(), "master");
+    run(&mut a, "IF NOT EXISTS (SELECT name FROM master.dbo.sysdatabases WHERE name = N'RS') CREATE DATABASE [RS]");
+    run(&mut a, "USE RS");
+    run(&mut a, "CREATE TABLE t (id INT PRIMARY KEY)");
+    run(&mut a, "INSERT t VALUES (1)");
+    assert_eq!(one(&mut a, "SELECT COUNT(*) FROM t"), "1");
+}
+
+#[test]
+fn a_use_in_a_batch_the_cluster_runs_is_the_connections_database_for_the_next_batch() {
+    let h = start(3, None);
+    h.cluster.enable_tds();
+    // (a client's connection: the batches go to the front end, which gives the cluster the ones it wants)
+    let mut c = h.cluster.mirror_server().connect();
+    let ok = |r: tsql_server::BatchResult, what: &str| assert!(r.first_error().is_none(), "{}: {:?}", what, r.first_error());
+    ok(c.execute("CREATE DATABASE RS"), "create database");
+    // (Reporting Services' upgrade scripts: a batch that says USE and then names a table of the database)
+    ok(c.execute("USE [RS]\r\nCREATE TABLE [dbo].[SessionData] (id INT PRIMARY KEY, x INT NULL)"), "use and create");
+    ok(c.execute("if (select count(*) from dbo.syscolumns where id = object_id('SessionData') and name = 'y') = 0\r\nbegin\r\nALTER TABLE [dbo].[SessionData] ADD [y] bit NULL\r\nend"), "the next batch");
+    ok(c.execute("INSERT SessionData (id, x, y) VALUES (1, 2, 1)"), "insert");
+    assert_eq!(c.current_database(), "RS");
+}
+
+#[test]
+fn roles_users_and_grants_made_with_either_syntax_are_there_when_the_control_node_starts_again() {
+    let dir = std::env::temp_dir().join(format!("tsql-secstate-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let state = dir.join("cluster.state");
+    let h = start(2, Some(&state));
+    {
+        let mut s = h.cluster.session();
+        run(&mut s, "CREATE DATABASE RS");
+        run(&mut s, "USE RS");
+        run(&mut s, "CREATE TABLE t (id INT PRIMARY KEY)");
+        // (Reporting Services' way, and the standard one)
+        assert!(s.wants("if not exists (select * from sysusers where issqlrole = 1 and name = 'RSExecRole') BEGIN EXEC sp_addrole 'RSExecRole' END"));
+        run(&mut s, "EXEC sp_addrole 'RSExecRole'");
+        run(&mut s, "CREATE ROLE other_role");
+        run(&mut s, "GRANT SELECT ON t TO RSExecRole");
+        run(&mut s, "EXEC sp_addrolemember 'db_datareader', 'other_role'");
+    }
+    // a second control node over the same shards, started from the state file
+    let again = Cluster::open(&state, &h.cfg).unwrap();
+    let mut s = again.session();
+    run(&mut s, "USE RS");
+    assert_eq!(one(&mut s, "SELECT COUNT(*) FROM sys.database_principals WHERE name IN ('RSExecRole', 'other_role') AND type = 'R'"), "2");
+    assert_eq!(one(&mut s, "SELECT COUNT(*) FROM sys.database_permissions p JOIN sys.database_principals r ON r.principal_id = p.grantee_principal_id WHERE r.name = 'RSExecRole' AND p.permission_name = 'SELECT'"), "1");
+    // (what an upgrade script does next)
+    run(&mut s, "GRANT SELECT, INSERT ON [dbo].[t] TO RSExecRole");
+    let _ = std::fs::remove_dir_all(&dir);
+}

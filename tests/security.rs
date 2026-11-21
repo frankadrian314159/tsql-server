@@ -120,6 +120,26 @@ fn roles_and_membership() {
 }
 
 #[test]
+fn storage_options_of_the_older_procedures_are_accepted() {
+    let (_s, mut sa) = setup();
+    // (Reporting Services sets `text in row` on its tables: a storage option, which changes no answer here)
+    exec(&mut sa, "EXEC sp_tableoption N'[dbo].[emp]', 'text in row', 'ON'");
+    exec(&mut sa, "EXEC sp_indexoption 'emp', 'AllowRowLocks', 1");
+    assert_eq!(scalar(&mut sa, "SELECT COUNT(*) FROM emp"), "2");
+}
+
+#[test]
+fn sp_addrole_and_sp_droprole_are_create_role_and_drop_role() {
+    let (_s, mut sa) = setup();
+    exec(&mut sa, "EXEC sp_addrole 'RSExecRole'");
+    assert_eq!(scalar(&mut sa, "SELECT COUNT(*) FROM sys.database_principals WHERE name = 'RSExecRole' AND type = 'R'"), "1");
+    assert_eq!(err_no(&mut sa, "EXEC sp_addrole 'RSExecRole'"), 15023);
+    exec(&mut sa, "EXEC sp_addrolemember 'RSExecRole', 'ann'");
+    exec(&mut sa, "EXEC sp_droprole 'RSExecRole'");
+    assert_eq!(scalar(&mut sa, "SELECT COUNT(*) FROM sys.database_principals WHERE name = 'RSExecRole'"), "0");
+}
+
+#[test]
 fn schema_and_database_level_grants() {
     let (s, mut sa) = setup();
     exec(&mut sa, "CREATE SCHEMA hr");
@@ -395,4 +415,17 @@ fn delete_needs_select_on_the_columns_its_where_clause_reads() {
     assert_eq!(rows(&mut sa, "SELECT COUNT(*) FROM emp"), vec![vec!["1"]]);
     exec(&mut sa, "GRANT SELECT ON emp TO ann");
     exec(&mut ann, "DELETE FROM emp WHERE salary = 200");
+}
+
+#[test]
+fn permissions_on_sql_agent_objects_this_server_does_not_have_are_accepted() {
+    let (_s, mut sa) = setup();
+    exec(&mut sa, "EXEC sp_addrole 'RSExecRole'");
+    // (Reporting Services' setup)
+    exec(&mut sa, "GRANT EXECUTE ON master.dbo.xp_sqlagent_notify TO RSExecRole");
+    exec(&mut sa, "GRANT EXECUTE ON msdb.dbo.sp_add_job TO RSExecRole");
+    exec(&mut sa, "GRANT SELECT ON msdb.dbo.sysjobs TO RSExecRole");
+    exec(&mut sa, "REVOKE EXECUTE ON msdb.dbo.sp_add_job FROM RSExecRole");
+    // an object of an ordinary database is still found or refused
+    assert_eq!(err_no(&mut sa, "GRANT SELECT ON dbo.no_such_table TO RSExecRole"), 15151);
 }

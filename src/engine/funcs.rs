@@ -1208,6 +1208,58 @@ impl<'a> Engine<'a> {
                     Value::Dto(_) => Value::Int(10),
                 }
             }
+            // `SET col.WRITE(expression, offset, length)`: the value with the part from `offset` (counted from 0) of `length` replaced
+            "$WRITE" => {
+                need(name, &a, 4)?;
+                if a[0].is_null() {
+                    Value::Null
+                } else {
+                    let off = if a[2].is_null() { None } else { Some(int(&a[2])?) };
+                    let len = if a[3].is_null() { None } else { Some(int(&a[3])?) };
+                    let total = match &a[0] {
+                        Value::Bin(b) => b.len(),
+                        Value::Str(t) => t.chars().count(),
+                        _ => 0,
+                    };
+                    // the part replaced: [start, end)
+                    let (start, end) = match off {
+                        None => (total, total),
+                        Some(o) => {
+                            if o < 0 || o as usize > total || len.is_some_and(|l| l < 0) {
+                                return Err(SqlError::new(537, "Invalid offset or length passed to the .WRITE clause.").into());
+                            }
+                            let start = o as usize;
+                            (start, len.map_or(total, |l| (start + l as usize).min(total)))
+                        }
+                    };
+                    match &a[0] {
+                        Value::Bin(cur) => {
+                            let ins: Vec<u8> = match &a[1] {
+                                Value::Null => vec![],
+                                Value::Bin(b) => b.clone(),
+                                other => convert::to_str(other).into_bytes(),
+                            };
+                            let mut out = cur[..start].to_vec();
+                            out.extend(ins);
+                            out.extend_from_slice(&cur[end..]);
+                            Value::Bin(out)
+                        }
+                        Value::Str(cur) => {
+                            let chars: Vec<char> = cur.chars().collect();
+                            let ins: String = match &a[1] {
+                                Value::Null => String::new(),
+                                Value::Bin(b) => String::from_utf8_lossy(b).into_owned(),
+                                other => convert::to_str(other),
+                            };
+                            let mut out: String = chars[..start].iter().collect();
+                            out.push_str(&ins);
+                            out.extend(chars[end..].iter());
+                            Value::Str(out)
+                        }
+                        other => other.clone(),
+                    }
+                }
+            }
             "LEFT" | "RIGHT" => {
                 need(name, &a, 2)?;
                 if any_null(&a) { Value::Null } else {

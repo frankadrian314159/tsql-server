@@ -1933,7 +1933,7 @@ impl<'a> Engine<'a> {
             let schema_ok = name.len() == 1 || name[name.len() - 2].eq_ignore_ascii_case("dbo") || name[name.len() - 2].is_empty();
             // (and the tables of the policy store, which msdb has: see `sysview`)
             let in_msdb = name.len() < 3 || name[name.len() - 3].eq_ignore_ascii_case("msdb");
-            if schema_ok && (matches!(last.to_lowercase().as_str(), "sysobjects" | "sysusers" | "sysdatabases" | "syscomments" | "sysprocesses") || (in_msdb && (last.to_lowercase().starts_with("syspolicy_") || matches!(last.to_lowercase().as_str(), "backupset" | "backupmediafamily" | "backupmediaset" | "backupfile" | "backupfilegroup" | "restorehistory" | "restorefile" | "restorefilegroup" | "suspect_pages")))) {
+            if schema_ok && (matches!(last.to_lowercase().as_str(), "sysobjects" | "sysusers" | "sysdatabases" | "syscomments" | "sysprocesses" | "syscolumns" | "sysindexes" | "sysmembers" | "syslogins") || (in_msdb && (last.to_lowercase().starts_with("syspolicy_") || matches!(last.to_lowercase().as_str(), "sysjobs" | "syscategories" | "sysjobschedules" | "sysschedules" | "sysjobsteps" | "sysjobservers" | "sysjobhistory" | "backupset" | "backupmediafamily" | "backupmediaset" | "backupfile" | "backupfilegroup" | "restorehistory" | "restorefile" | "restorefilegroup" | "suspect_pages")))) {
                 let found = self.locate(name);
                 if self.table_ref(&found).is_none() {
                     if let Some(mut rs) = self.sysview("sys", &display) {

@@ -11,7 +11,7 @@
   with no user in a database cannot `USE` it (error 916); `master` and `tempdb` admit everyone as `guest`.
 * **Roles**: the fixed database roles `db_owner`, `db_datareader`, `db_datawriter`, `db_ddladmin`,
   `db_denydatareader`, `db_denydatawriter`, `db_securityadmin`, `db_accessadmin`, `public` (everyone), and your own
-  (`CREATE ROLE`, `ALTER ROLE r ADD MEMBER u`, `sp_addrolemember`).
+  (`CREATE ROLE`, `ALTER ROLE r ADD MEMBER u`, `sp_addrolemember`, and the older `sp_addrole` and `sp_droprole`).
 
 ## Password policy and lockout
 

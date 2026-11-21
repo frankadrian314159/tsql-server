@@ -186,3 +186,23 @@ fn two_sessions_cannot_both_take_the_same_free_value() {
     assert_eq!(one(&mut s1, "SELECT COUNT(DISTINCT email) FROM people WHERE email LIKE 'race%'"), "8");
     assert_eq!(one(&mut s1, "SELECT COUNT(*) FROM people WHERE email LIKE 'race%'"), "8");
 }
+
+#[test]
+fn a_primary_key_added_later_is_kept_with_or_without_the_shard_key() {
+    let h = start(3);
+    let mut s = h.cluster.session();
+    // (what Reporting Services does: make the table, then add its key)
+    run(&mut s, "CREATE TABLE cache (a INT NOT NULL, b VARCHAR(10) NOT NULL, v INT NULL)");
+    run(&mut s, "INSERT cache VALUES (1,'x',1),(2,'y',2),(3,'z',3),(4,'w',4)");
+    // a key without the shard key (the first column) is checked across the shards
+    run(&mut s, "ALTER TABLE cache ADD CONSTRAINT pk_cache PRIMARY KEY NONCLUSTERED (b)");
+    assert_eq!(error(&mut s, "INSERT cache VALUES (9,'x',9)"), 2627);
+    run(&mut s, "INSERT cache VALUES (9,'q',9)");
+    // a key that has duplicates among the rows is refused when it is added
+    run(&mut s, "CREATE TABLE dup (a INT NOT NULL, b INT NOT NULL)");
+    run(&mut s, "INSERT dup VALUES (1,1),(2,1),(3,2)");
+    assert_eq!(error(&mut s, "ALTER TABLE dup ADD CONSTRAINT pk_dup PRIMARY KEY (b)"), 1505);
+    // a key with the shard key is the shards' to keep
+    run(&mut s, "ALTER TABLE dup ADD CONSTRAINT pk_dup2 PRIMARY KEY (a)");
+    assert_eq!(error(&mut s, "INSERT dup VALUES (1, 5)"), 2627);
+}

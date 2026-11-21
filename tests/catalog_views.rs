@@ -663,3 +663,59 @@ fn msdb_backup_history_tables_exist_for_the_ssms_restore_dialog() {
     script(&mut c, "CREATE TABLE #tempbackup (database_name nvarchar(128), [type] char(1), backup_finish_date datetime); INSERT INTO #tempbackup SELECT database_name, [type], MAX(backup_finish_date) FROM msdb..backupset WHERE [type] = 'D' GROUP BY database_name, [type];");
     assert_eq!(rows(&mut c, "SELECT bkps.database_name FROM msdb.dbo.backupset bkps ORDER BY bkps.database_name").len(), 0);
 }
+
+#[test]
+fn syscolumns_of_sql_server_2000_lists_the_columns_of_the_tables() {
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE sc (id INT PRIMARY KEY, name VARCHAR(20) NOT NULL, note NVARCHAR(10) NULL)");
+    // (Reporting Services' upgrade scripts: is a column there?)
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM dbo.syscolumns WHERE id = object_id('sc') AND name = 'note'"), "1");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM dbo.syscolumns WHERE id = object_id('sc') AND name = 'nope'"), "0");
+    assert_eq!(rows(&mut c, "SELECT name, colid, isnullable FROM syscolumns WHERE id = OBJECT_ID('sc') ORDER BY colid"), vec![vec!["id", "1", "0"], vec!["name", "2", "0"], vec!["note", "3", "1"]]);
+}
+
+#[test]
+fn sysindexes_of_sql_server_2000_lists_the_indexes_of_the_tables() {
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE si (id INT PRIMARY KEY, a INT, b INT)");
+    exec(&mut c, "CREATE INDEX ix_a ON si (a)");
+    exec(&mut c, "CREATE TABLE heap (x INT)");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM dbo.sysindexes WHERE id = object_id('si') AND name = 'ix_a'"), "1");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sysindexes WHERE id = object_id('si') AND name = 'ix_none'"), "0");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sysindexes WHERE id = object_id('si') AND indid = 1"), "1");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sysindexes WHERE id = object_id('heap') AND indid = 0"), "1");
+}
+
+#[test]
+fn sysmembers_of_sql_server_2000_lists_the_members_of_the_roles() {
+    let mut c = conn();
+    exec(&mut c, "EXEC sp_addrole 'RSExecRole'");
+    let q = "SELECT COUNT(*) FROM sysusers u JOIN sysmembers m ON u.uid = m.memberuid JOIN sysusers r ON r.uid = m.groupuid WHERE r.name = 'db_owner' AND u.name = 'RSExecRole'";
+    assert_eq!(scalar(&mut c, q), "0");
+    exec(&mut c, "EXEC sp_addrolemember 'db_owner', 'RSExecRole'");
+    assert_eq!(scalar(&mut c, q), "1");
+}
+
+#[test]
+fn syslogins_of_sql_server_2000_lists_the_logins() {
+    let mut c = conn();
+    // (Reporting Services' setup)
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM syslogins WHERE name = N'sa' AND hasaccess = 1 AND isntgroup = 0 AND isntuser = 0"), "1");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM master.dbo.syslogins WHERE name = N'nobody'"), "0");
+    exec(&mut c, "CREATE LOGIN ann WITH PASSWORD = 'Str0ng!pw1'");
+    assert_eq!(scalar(&mut c, "SELECT sysadmin FROM syslogins WHERE name = 'ann'"), "0");
+    exec(&mut c, "ALTER LOGIN ann DISABLE");
+    assert_eq!(scalar(&mut c, "SELECT hasaccess FROM syslogins WHERE name = 'ann'"), "0");
+}
+
+#[test]
+fn msdb_has_the_sql_server_agent_tables_and_they_are_empty() {
+    let mut c = conn();
+    // (Reporting Services' upgrade script joins its schedules to the jobs)
+    exec(&mut c, "CREATE TABLE schedule (scheduleId UNIQUEIDENTIFIER PRIMARY KEY)");
+    exec(&mut c, "INSERT schedule VALUES (NEWID())");
+    for t in ["sysjobs", "syscategories", "sysjobschedules", "sysschedules", "sysjobsteps", "sysjobservers", "sysjobhistory"] {
+        assert_eq!(scalar(&mut c, &format!("SELECT COUNT(*) FROM msdb.dbo.{}", t)), "0", "{}", t);
+    }
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM schedule s JOIN msdb.dbo.sysjobs j ON (CONVERT(sysname, s.scheduleid) = j.name)"), "0");
+}

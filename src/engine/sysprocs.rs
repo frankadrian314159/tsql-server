@@ -166,6 +166,47 @@ impl<'a> Engine<'a> {
                     };
                     self.put_table(&loc, t);
                     r?;
+                } else if objtype == "INDEX" {
+                    // `sp_rename 'table.index', 'new name', 'INDEX'`
+                    if parts.len() < 2 {
+                        return Err(SqlError::new(15248, "Either the parameter @objname is ambiguous or the claimed @objtype (INDEX) is wrong.").into());
+                    }
+                    let tparts = &parts[..parts.len() - 1];
+                    let old = parts[parts.len() - 1].clone();
+                    let loc = self.locate(tparts);
+                    let tt = self.table_ref(&loc).cloned().ok_or_else(|| self.invalid_object(tparts))?;
+                    self.check_alter(&loc, tparts.last().unwrap())?;
+                    self.ddl_lock(&loc, &tt)?;
+                    self.undo_table(&loc, &tt);
+                    let mut t = self.take_table(&loc).ok_or_else(|| self.invalid_object(tparts))?;
+                    let taken = |t: &crate::catalog::Table| {
+                        t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(&newname)) || t.uniques.iter().any(|k| k.name.eq_ignore_ascii_case(&newname)) || t.pk.as_ref().is_some_and(|k| k.name.eq_ignore_ascii_case(&newname))
+                    };
+                    let r: Result<()> = if taken(&t) && !old.eq_ignore_ascii_case(&newname) {
+                        Err(SqlError::new(15338, format!("Error: The new name '{}' is already in use as a INDEX name and will cause a duplicate that is not permitted.", newname)))
+                    } else {
+                        let mut found = false;
+                        for i in t.indexes.iter_mut().filter(|i| i.name.eq_ignore_ascii_case(&old)) {
+                            i.name = newname.clone();
+                            found = true;
+                        }
+                        for k in t.uniques.iter_mut().filter(|k| k.name.eq_ignore_ascii_case(&old)) {
+                            k.name = newname.clone();
+                            found = true;
+                        }
+                        if let Some(k) = t.pk.as_mut().filter(|k| k.name.eq_ignore_ascii_case(&old)) {
+                            k.name = newname.clone();
+                            found = true;
+                        }
+                        if found {
+                            t.sync_indexes();
+                            Ok(())
+                        } else {
+                            Err(SqlError::new(15225, format!("No item by the name of '{}' could be found in the current database '{}', given that @itemtype was input as '{}'.", objname, self.ses.db, objtype)))
+                        }
+                    };
+                    self.put_table(&loc, t);
+                    r?;
                 } else {
                     let loc = self.locate(&parts);
                     match &loc {
@@ -409,6 +450,129 @@ impl<'a> Engine<'a> {
                 self.exec_security(&crate::ast::SecStmt::AlterRole { role, add: name == "sp_addrolemember", member })?;
                 Ok(Some(Value::Int(0)))
             }
+            // (the legacy forms of CREATE ROLE and DROP ROLE: Reporting Services makes its role with sp_addrole)
+            // The parameters of a procedure or function, as `SqlCommandBuilder.DeriveParameters` asks for them (the Reporting Services portal does,
+            // for a function of the database a data source names): one row each, the return value of a procedure first
+            "sp_procedure_params_100_managed" | "sp_procedure_params_managed" => {
+                let arg = |pos: usize, nm: &str| -> Option<String> {
+                    args.iter().enumerate().find(|(i, a)| a.0.as_deref().map(|n| n.trim_start_matches('@').eq_ignore_ascii_case(nm)).unwrap_or(a.0.is_none() && *i == pos)).and_then(|(_, a)| if a.1.is_null() { None } else { Some(convert::to_str(&a.1)) })
+                };
+                let wanted = arg(0, "procedure_name").unwrap_or_default();
+                let mut parts: Vec<String> = wanted.split('.').map(|p| p.trim().trim_matches(|c| c == '[' || c == ']').to_string()).collect();
+                if let Some(schema) = arg(2, "procedure_schema") {
+                    if parts.len() == 1 {
+                        parts.insert(0, schema);
+                    }
+                }
+                let only = arg(3, "parameter_name");
+                // (in the database the procedure was named in, if it was)
+                let saved_db = self.ses.db.clone();
+                if let Some(db) = self.ses.sys_db.clone() {
+                    if self.srv.databases.contains_key(&db.to_lowercase()) {
+                        self.ses.db = db;
+                    }
+                }
+                let found: Option<(bool, Vec<crate::ast::Param>)> = match self.locate(&parts) {
+                    Loc::Db(d, k) => match self.srv.databases.get(&d).and_then(|db| db.objects.get(&k)) {
+                        Some(Object::Proc(p)) => Some((true, p.params.clone())),
+                        Some(Object::Func(f)) => Some((false, f.def.params.clone())),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let mut rows: Vec<Row> = vec![];
+                let mut failure: Option<SqlError> = None;
+                if let Some((is_proc, params)) = found {
+                    // OLE DB type codes, as the provider's rowset gives them
+                    let oledb = |t: &DataType| -> i32 {
+                        match t.base_name() {
+                            "tinyint" => 17,
+                            "smallint" => 2,
+                            "int" => 3,
+                            "bigint" => 20,
+                            "bit" => 11,
+                            "decimal" => 131,
+                            "money" | "smallmoney" => 6,
+                            "float" => 5,
+                            "real" => 4,
+                            "char" | "varchar" | "text" => 129,
+                            "nchar" | "nvarchar" | "ntext" | "xml" => 130,
+                            "binary" | "varbinary" | "image" | "timestamp" => 128,
+                            "date" => 133,
+                            "time" => 134,
+                            "datetime" | "smalldatetime" | "datetime2" => 135,
+                            "datetimeoffset" => 146,
+                            "uniqueidentifier" => 72,
+                            _ => 12,
+                        }
+                    };
+                    let mut push = |name: &str, pos: i32, kind: i32, has_default: bool, ty: &DataType| {
+                        let (len, prec, scale) = match ty {
+                            DataType::Decimal(p, s) => (Value::Null, Value::Int(*p as i32), Value::Int(*s as i32)),
+                            DataType::TinyInt => (Value::Null, Value::Int(3), Value::Int(0)),
+                            DataType::SmallInt => (Value::Null, Value::Int(5), Value::Int(0)),
+                            DataType::Int => (Value::Null, Value::Int(10), Value::Int(0)),
+                            DataType::BigInt => (Value::Null, Value::Int(19), Value::Int(0)),
+                            other => (other.length().map(|n| Value::Int(if n == crate::types::MAX { i32::MAX } else { n })).unwrap_or(Value::Null), Value::Null, Value::Null),
+                        };
+                        rows.push(vec![
+                            Value::Str(name.to_string()),
+                            Value::Int(pos),
+                            Value::Int(kind),
+                            Value::Bit(has_default),
+                            Value::Bit(true),
+                            Value::Int(oledb(ty)),
+                            len,
+                            prec,
+                            scale,
+                            Value::Null,
+                            Value::Null,
+                            Value::Str(ty.base_name().to_string()),
+                            Value::Null,
+                            Value::Null,
+                            Value::Null,
+                        ]);
+                    };
+                    if is_proc && only.is_none() {
+                        push("@RETURN_VALUE", 0, 4, false, &DataType::Int);
+                    }
+                    for (i, prm) in params.iter().enumerate() {
+                        if only.as_ref().is_some_and(|o| !o.eq_ignore_ascii_case(&prm.name)) {
+                            continue;
+                        }
+                        let name = if prm.name.starts_with('@') { prm.name.clone() } else { format!("@{}", prm.name) };
+                        match self.resolve_type(&prm.ty) {
+                            Ok(ty) => push(&name, i as i32 + 1, if prm.out { 2 } else { 1 }, prm.default.is_some(), &ty),
+                            Err(e) => {
+                                failure = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                }
+                self.ses.db = saved_db;
+                if let Some(e) = failure {
+                    return Err(e.into());
+                }
+                let cols: Vec<String> = ["PARAMETER_NAME", "ORDINAL_POSITION", "PARAMETER_TYPE", "PARAMETER_HASDEFAULT", "IS_NULLABLE", "DATA_TYPE", "CHARACTER_MAXIMUM_LENGTH", "NUMERIC_PRECISION", "NUMERIC_SCALE", "TYPE_CATALOG_NAME", "TYPE_SCHEMA_NAME", "TYPE_NAME", "XML_CATALOGNAME", "XML_SCHEMANAME", "XML_SCHEMACOLLECTIONNAME"].iter().map(|c| c.to_string()).collect();
+                // (the provider casts the type codes, precision and scale to smallint, as SQL Server returns them)
+                let mut rs = Rowset::from_rows(&cols, rows);
+                for i in [2usize, 3, 4, 5, 7, 8] {
+                    rs.schema.cols[i].ty = Some(DataType::SmallInt);
+                }
+                self.emit_rowset(rs);
+                Ok(Some(Value::Int(0)))
+            }
+            "sp_addrole" => {
+                let role = args.first().map(|a| convert::to_str(&a.1)).unwrap_or_default();
+                self.exec_security(&crate::ast::SecStmt::CreateRole { name: role })?;
+                Ok(Some(Value::Int(0)))
+            }
+            "sp_droprole" => {
+                let role = args.first().map(|a| convert::to_str(&a.1)).unwrap_or_default();
+                self.drop_object("ROLE", &[role], false)?;
+                Ok(Some(Value::Int(0)))
+            }
             "sp_addsrvrolemember" | "sp_dropsrvrolemember" => {
                 let member = args.first().map(|a| convert::to_str(&a.1)).unwrap_or_default();
                 let role = args.get(1).map(|a| convert::to_str(&a.1)).unwrap_or_default();
@@ -430,7 +594,7 @@ impl<'a> Engine<'a> {
             // the registry and the installation of Windows: this server has neither, so a value that is asked for stays NULL (SSMS reads
             // the paths and settings of the instance with these when it connects)
             "xp_instance_regread" | "xp_regread" | "xp_instance_regenumvalues" | "xp_regenumvalues" | "xp_instance_regenumkeys" | "xp_regenumkeys" | "xp_qv" => Ok(Some(Value::Int(0))),
-            "sp_addextendedproperty" | "sp_updateextendedproperty" | "sp_dropextendedproperty" | "sp_recompile" | "sp_refreshview" | "sp_updatestats" | "sp_autostats" | "sp_setapprole" | "sp_procoption" | "sp_unbindrule" | "sp_bindrule" => Ok(Some(Value::Int(0))),
+            "sp_tableoption" | "sp_indexoption" | "sp_dboption" | "sp_addextendedproperty" | "sp_updateextendedproperty" | "sp_dropextendedproperty" | "sp_recompile" | "sp_refreshview" | "sp_updatestats" | "sp_autostats" | "sp_setapprole" | "sp_procoption" | "sp_unbindrule" | "sp_bindrule" => Ok(Some(Value::Int(0))),
             "sp_spaceused" => {
                 self.emit_rowset(Rowset::from_rows(&["database_name".into(), "database_size".into()], vec![vec![Value::Str(self.ses.db.clone()), Value::Str("8.00 MB".into())]]));
                 Ok(Some(Value::Int(0)))

@@ -172,3 +172,22 @@ fn a_function_that_reads_no_sharded_table_works_in_dml_defaults_and_checks() {
     assert_eq!(rows(&mut s, "SELECT id, v, w FROM t ORDER BY id"), vec![vec!["2".to_string(), "42".to_string(), "4".to_string()], vec!["3".to_string(), "84".to_string(), "6".to_string()], vec!["4".to_string(), "20".to_string(), "8".to_string()]]);
     assert_ne!(error(&mut s, "INSERT t (id) VALUES (60)"), 0);
 }
+
+#[test]
+fn every_procedure_is_the_clusters_so_that_output_parameters_pass_through_nested_calls() {
+    let h = start(3);
+    let mut s = h.cluster.session();
+    // (the front end gives the cluster a batch it wants; a procedure that names no table of the cluster must be wanted too: Reporting Services'
+    // GetUserID names none, and is called, with an OUTPUT parameter, by a procedure that does)
+    assert!(s.wants("CREATE PROCEDURE dbo.inner_p @x INT OUTPUT AS SET @x = 7"));
+    assert!(s.wants("DROP PROCEDURE dbo.inner_p"));
+    assert!(!s.wants("CREATE PROCEDURE #tmp_p AS SELECT 1"));
+    run(&mut s, "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(10))");
+    run(&mut s, "CREATE PROCEDURE dbo.by_name @name VARCHAR(10), @id INT OUTPUT AS SELECT @id = (SELECT id FROM users WHERE name = @name) IF @id IS NULL BEGIN SET @id = 100 INSERT users VALUES (@id, @name) END");
+    run(&mut s, "CREATE PROCEDURE dbo.get_id @name VARCHAR(10), @id INT OUTPUT AS EXEC by_name @name, @id OUTPUT");
+    run(&mut s, "CREATE PROCEDURE dbo.create_obj @name VARCHAR(10) AS DECLARE @who INT EXEC get_id @name, @who OUTPUT SELECT @who AS got");
+    assert_eq!(rows(&mut s, "EXEC dbo.create_obj 'ann'"), vec![vec!["100".to_string()]]);
+    // the row the innermost procedure made is in the cluster's table, and a second call finds it
+    assert_eq!(rows(&mut s, "SELECT id, name FROM users"), vec![vec!["100".to_string(), "ann".into()]]);
+    assert_eq!(rows(&mut s, "EXEC dbo.create_obj 'ann'"), vec![vec!["100".to_string()]]);
+}

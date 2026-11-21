@@ -78,7 +78,14 @@ pub trait Interceptor: Send {
     }
     /// The database the connection is in, told before each batch is handled (a `USE` that the engine ran changes it): a cluster's
     /// control node names the tables of the batch by it. Nothing by default.
-    fn set_database(&mut self, _db: &str) {}
+    fn set_database(&mut self, _db: &str) -> Option<String> {
+        None
+    }
+    /// After the interceptor handled a batch: the database the connection is in now, when the batch changed it (a batch the interceptor
+    /// ran that has a `USE` in it: the engine did not see the `USE`). None by default.
+    fn database_after(&mut self) -> Option<String> {
+        None
+    }
     /// A temporary table of the session handed over (see [`Interceptor::temps_wanted`]): `create` is its `CREATE TABLE`, `rows` its rows.
     fn adopt_temp(&mut self, _name: &str, _create: &str, _rows: Vec<Vec<Value>>) -> Result<(), SqlError> {
         Ok(())
@@ -508,7 +515,10 @@ impl Connection {
     /// Tell the interceptor which database the connection is in (see [`Interceptor::set_database`]).
     fn sync_interceptor_db(&mut self) {
         if let Some(i) = self.interceptor.as_mut() {
-            i.set_database(&self.session.db);
+            // (the interceptor may say the connection's database is gone: it is in the one it names)
+            if let Some(db) = i.set_database(&self.session.db) {
+                self.session.db = db;
+            }
         }
     }
 
@@ -565,6 +575,9 @@ impl Connection {
                 true
             });
             if handled {
+                if let Some(db) = i.database_after() {
+                    self.session.db = db;
+                }
                 return BatchResult { events };
             }
         }
@@ -613,6 +626,9 @@ impl Connection {
                 true
             });
             if handled {
+                if let Some(db) = i.database_after() {
+                    self.session.db = db;
+                }
                 return BatchResult { events };
             }
         }
@@ -635,6 +651,9 @@ impl Connection {
         }
         if let Some(i) = self.interceptor.as_mut() {
             if i.handle(sql, sink) {
+                if let Some(db) = i.database_after() {
+                    self.session.db = db;
+                }
                 return;
             }
         }

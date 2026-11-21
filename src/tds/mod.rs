@@ -240,6 +240,7 @@ fn message_token(out: &mut Vec<u8>, token: u8, number: i32, state: u8, class: u8
 }
 
 fn error_token(out: &mut Vec<u8>, e: &SqlError) {
+    trace(&format!("error {}: {}", e.number, e.message));
     message_token(out, 0xAA, e.number, e.state, e.severity, &e.message, e.procedure.as_deref().unwrap_or(""));
 }
 

@@ -224,3 +224,28 @@ fn an_empty_string_is_zero_as_a_number_and_1900_as_a_date() {
     assert_eq!(err_no(&mut c, "SELECT CAST('x' AS INT)"), 245);
     assert_eq!(err_no(&mut c, "SELECT CAST('' AS UNIQUEIDENTIFIER)"), 8169);
 }
+
+#[test]
+fn update_set_column_write_replaces_a_part_of_a_large_value() {
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE seg (id INT PRIMARY KEY, b VARBINARY(MAX) NULL, t VARCHAR(MAX) NULL)");
+    exec(&mut c, "INSERT seg VALUES (1, 0x01020304, 'abcdef'), (2, NULL, NULL), (3, 0x, '')");
+    // replace two bytes at offset 1
+    exec(&mut c, "UPDATE seg SET b.WRITE(0xAABBCC, 1, 2) WHERE id = 1");
+    assert_eq!(scalar(&mut c, "SELECT CONVERT(VARCHAR(20), b, 2) FROM seg WHERE id = 1"), "01AABBCC04");
+    // a NULL offset appends, a NULL length goes to the end
+    exec(&mut c, "UPDATE seg SET b.WRITE(0xFF, NULL, 0) WHERE id = 1");
+    assert_eq!(scalar(&mut c, "SELECT CONVERT(VARCHAR(20), b, 2) FROM seg WHERE id = 1"), "01AABBCC04FF");
+    exec(&mut c, "UPDATE seg SET b.WRITE(0xEE, 2, NULL) WHERE id = 1");
+    assert_eq!(scalar(&mut c, "SELECT CONVERT(VARCHAR(20), b, 2) FROM seg WHERE id = 1"), "01AAEE");
+    // characters, with the expression and offset from variables and the part cut out
+    exec(&mut c, "DECLARE @x VARCHAR(10) = 'XY', @o INT = 2, @l INT = 3; UPDATE seg SET t.WRITE(@x, @o, @l) WHERE id = 1");
+    assert_eq!(scalar(&mut c, "SELECT t FROM seg WHERE id = 1"), "abXYf");
+    exec(&mut c, "UPDATE seg SET t.WRITE(NULL, 1, 2) WHERE id = 1");
+    assert_eq!(scalar(&mut c, "SELECT t FROM seg WHERE id = 1"), "aYf");
+    // a NULL value stays NULL; an empty one can be appended to; an offset past the end is an error
+    exec(&mut c, "UPDATE seg SET b.WRITE(0x01, NULL, 0), t.WRITE('z', NULL, 0) WHERE id IN (2, 3)");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM seg WHERE id = 2 AND b IS NULL"), "1");
+    assert_eq!(scalar(&mut c, "SELECT t FROM seg WHERE id = 3"), "z");
+    assert_eq!(err_no(&mut c, "UPDATE seg SET b.WRITE(0x01, 99, 1) WHERE id = 1"), 537);
+}

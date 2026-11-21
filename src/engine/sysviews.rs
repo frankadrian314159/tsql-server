@@ -696,6 +696,45 @@ impl<'a> Engine<'a> {
                         rows,
                     ))
                 }
+                // the logins as SQL Server 2000 had them (Reporting Services' setup asks whether `sa` is there and has access)
+                "syslogins" => {
+                    let rows = self
+                        .srv
+                        .security
+                        .logins
+                        .values()
+                        .map(|l| {
+                            let nt = l.external.is_some();
+                            let sysadmin = l.name.eq_ignore_ascii_case("sa") as i32;
+                            vec![
+                                Value::Bin(l.name.to_lowercase().into_bytes()),
+                                Value::Int(0),
+                                date(self.srv.start_time),
+                                date(self.srv.start_time),
+                                sv(&l.name),
+                                sv(&l.default_db),
+                                sv("us_english"),
+                                Value::Int(l.disabled as i32),
+                                Value::Int(!l.disabled as i32),
+                                Value::Int(nt as i32),
+                                Value::Int(0),
+                                Value::Int(nt as i32),
+                                Value::Int(sysadmin),
+                                Value::Int(sysadmin),
+                                Value::Int(sysadmin),
+                                Value::Int(sysadmin),
+                                Value::Int(sysadmin),
+                                Value::Int(sysadmin),
+                                Value::Int(sysadmin),
+                                Value::Int(sysadmin),
+                            ]
+                        })
+                        .collect();
+                    Some(rs(
+                        &[("sid", DataType::VarBinary(85)), ("status", DataType::SmallInt), ("createdate", DataType::DateTime), ("updatedate", DataType::DateTime), ("name", nv()), ("dbname", nv()), ("language", nv()), ("denylogin", DataType::Int), ("hasaccess", DataType::Int), ("isntname", DataType::Int), ("isntgroup", DataType::Int), ("isntuser", DataType::Int), ("sysadmin", DataType::Int), ("securityadmin", DataType::Int), ("serveradmin", DataType::Int), ("setupadmin", DataType::Int), ("processadmin", DataType::Int), ("diskadmin", DataType::Int), ("dbcreator", DataType::Int), ("bulkadmin", DataType::Int)],
+                        rows,
+                    ))
+                }
                 "sql_logins" | "server_principals" => {
                     // the logins, then the fixed server roles; a login's id is its place in the list
                     let sql_only = lname == "sql_logins";
@@ -881,6 +920,15 @@ impl<'a> Engine<'a> {
                     let refs: Vec<(&str, DataType)> = cols.iter().map(|(a, t)| (a.as_str(), t.clone())).collect();
                     Some(rs(&refs, vec![]))
                 }
+                // SQL Server Agent's catalog in msdb: there is no Agent here, so no job, schedule or step; the tables are there and empty (Reporting Services'
+                // setup joins its schedules to `msdb.dbo.sysjobs`)
+                "sysjobs" => Some(rs(&[("job_id", DataType::Guid), ("originating_server_id", DataType::Int), ("name", nv()), ("enabled", DataType::TinyInt), ("description", nv()), ("start_step_id", DataType::Int), ("category_id", DataType::Int), ("owner_sid", DataType::VarBinary(85)), ("date_created", DataType::DateTime), ("date_modified", DataType::DateTime), ("version_number", DataType::Int)], vec![])),
+                "syscategories" => Some(rs(&[("category_id", DataType::Int), ("category_class", DataType::Int), ("category_type", DataType::TinyInt), ("name", nv())], vec![])),
+                "sysjobschedules" => Some(rs(&[("schedule_id", DataType::Int), ("job_id", DataType::Guid), ("next_run_date", DataType::Int), ("next_run_time", DataType::Int)], vec![])),
+                "sysschedules" => Some(rs(&[("schedule_id", DataType::Int), ("schedule_uid", DataType::Guid), ("originating_server_id", DataType::Int), ("name", nv()), ("owner_sid", DataType::VarBinary(85)), ("enabled", DataType::Int), ("freq_type", DataType::Int), ("freq_interval", DataType::Int), ("date_created", DataType::DateTime), ("date_modified", DataType::DateTime)], vec![])),
+                "sysjobsteps" => Some(rs(&[("job_id", DataType::Guid), ("step_id", DataType::Int), ("step_name", nv()), ("subsystem", nv()), ("command", nv()), ("database_name", nv())], vec![])),
+                "sysjobservers" => Some(rs(&[("job_id", DataType::Guid), ("server_id", DataType::Int), ("last_run_outcome", DataType::TinyInt)], vec![])),
+                "sysjobhistory" => Some(rs(&[("instance_id", DataType::Int), ("job_id", DataType::Guid), ("step_id", DataType::Int), ("step_name", nv()), ("run_status", DataType::Int), ("run_date", DataType::Int), ("run_time", DataType::Int), ("message", nv())], vec![])),
                 "syspolicy_configuration" => Some(rs(
                     &[("name", nv()), ("current_value", DataType::Int)],
                     vec![vec![sv("Enabled"), Value::Int(0)], vec![sv("HistoryRetentionInDays"), Value::Int(90)], vec![sv("LogOnSuccess"), Value::Int(0)]],
@@ -894,6 +942,69 @@ impl<'a> Engine<'a> {
                         .chain(constraint_objects(db).into_iter().map(|c| vec![sv(&c.name), Value::Int(c.id), sv(c.code), Value::Int(sid(&c.schema)), Value::Int(0), Value::Int(c.parent), date(db.created), sv(c.code), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0)]))
                         .collect();
                     Some(rs(&[("name", nv()), ("id", DataType::Int), ("xtype", DataType::Char(2)), ("uid", DataType::SmallInt), ("info", DataType::SmallInt), ("parent_obj", DataType::Int), ("crdate", DataType::DateTime), ("type", DataType::Char(2)), ("status", DataType::Int), ("category", DataType::Int), ("base_schema_ver", DataType::Int), ("replinfo", DataType::Int), ("schema_ver", DataType::Int), ("stats_schema_ver", DataType::Int), ("ftcatid", DataType::SmallInt), ("userstat", DataType::SmallInt), ("sysstat", DataType::SmallInt), ("indexdel", DataType::SmallInt), ("version", DataType::Int), ("deltrig", DataType::Int), ("instrig", DataType::Int), ("updtrig", DataType::Int), ("seltrig", DataType::Int), ("cache", DataType::Int)], rows))
+                }
+                // the columns of the tables, as SQL Server 2000 had them (Reporting Services' upgrade scripts ask `dbo.syscolumns` whether a column is there)
+                "syscolumns" => {
+                    let mut rows = vec![];
+                    for o in db.objects.values() {
+                        if let Object::Table(t) = o {
+                            for (i, c) in t.columns.iter().enumerate() {
+                                let (tid, ml, p, s) = type_info(&c.ty);
+                                rows.push(vec![
+                                    sv(&c.name),
+                                    Value::Int(t.object_id),
+                                    Value::Int(tid),
+                                    Value::Int(tid),
+                                    Value::Int(ml),
+                                    Value::Int(p),
+                                    Value::Int(s),
+                                    Value::Int(i as i32 + 1),
+                                    Value::Int(0),
+                                    Value::Int(tid),
+                                    Value::Int(tid),
+                                    Value::Int(p),
+                                    Value::Int(s),
+                                    Value::Int(c.computed.is_some() as i32),
+                                    Value::Int(0),
+                                    Value::Int(c.nullable as i32),
+                                    if c.ty.is_string() { sv(c.collation.as_deref().unwrap_or(crate::collation::DEFAULT_NAME)) } else { Value::Null },
+                                ]);
+                            }
+                        }
+                    }
+                    Some(rs(&[("name", nv()), ("id", DataType::Int), ("xtype", DataType::TinyInt), ("xusertype", DataType::SmallInt), ("length", DataType::SmallInt), ("xprec", DataType::TinyInt), ("xscale", DataType::TinyInt), ("colid", DataType::SmallInt), ("number", DataType::SmallInt), ("type", DataType::TinyInt), ("usertype", DataType::SmallInt), ("prec", DataType::SmallInt), ("scale", DataType::Int), ("iscomputed", DataType::Int), ("isoutparam", DataType::Int), ("isnullable", DataType::Int), ("collation", nv())], rows))
+                }
+                // the indexes of the tables, as SQL Server 2000 had them: one row per index (a table with no clustered index has its heap, `indid` 0)
+                "sysindexes" => {
+                    let mut rows = vec![];
+                    for o in db.objects.values() {
+                        if let Object::Table(t) = o {
+                            let mut named: Vec<(String, usize, bool, bool)> = vec![];
+                            if let Some(pk) = &t.pk {
+                                named.push((pk.name.clone(), pk.cols.len(), pk.clustered, true));
+                            }
+                            for u in &t.uniques {
+                                named.push((u.name.clone(), u.cols.len(), u.clustered, true));
+                            }
+                            for i in &t.indexes {
+                                if !named.iter().any(|n| n.0.eq_ignore_ascii_case(&i.name)) {
+                                    named.push((i.name.clone(), i.cols.len(), false, i.unique));
+                                }
+                            }
+                            if !named.iter().any(|n| n.2) {
+                                rows.push(vec![Value::Int(t.object_id), Value::Int(0), sv(&t.name), Value::Int(0), Value::Int(0)]);
+                            }
+                            let mut next = 2;
+                            for (name, keys, clustered, unique) in named {
+                                let indid = if clustered { 1 } else { next };
+                                if !clustered {
+                                    next += 1;
+                                }
+                                rows.push(vec![Value::Int(t.object_id), Value::Int(indid), sv(&name), Value::Int(if unique { 2 } else { 0 }), Value::Int(keys as i32)]);
+                            }
+                        }
+                    }
+                    Some(rs(&[("id", DataType::Int), ("indid", DataType::SmallInt), ("name", nv()), ("status", DataType::Int), ("keycnt", DataType::SmallInt)], rows))
                 }
                 // the text of views, procedures, functions and triggers, in pieces of 4000 characters (the view designer reads a view's)
                 "syscomments" => {
@@ -917,6 +1028,16 @@ impl<'a> Engine<'a> {
                         add(trg.object_id, &trg.text);
                     }
                     Some(rs(&[("id", DataType::Int), ("number", DataType::SmallInt), ("colid", DataType::SmallInt), ("status", DataType::SmallInt), ("ctext", DataType::VarBinary(8000)), ("texttype", DataType::SmallInt), ("language", DataType::SmallInt), ("encrypted", DataType::Bit), ("compressed", DataType::Bit), ("text", DataType::NVarChar(4000))], rows))
+                }
+                // which user is in which role, as SQL Server 2000 had it (Reporting Services' upgrade scripts ask whether `RSExecRole` is a `db_owner`)
+                "sysmembers" => {
+                    let rows = db
+                        .security
+                        .members
+                        .iter()
+                        .filter_map(|(role, member)| Some(vec![Value::Int(db.security.principals.get(member)?.id), Value::Int(db.security.principals.get(role)?.id)]))
+                        .collect();
+                    Some(rs(&[("memberuid", DataType::SmallInt), ("groupuid", DataType::SmallInt)], rows))
                 }
                 "sysusers" => {
                     let rows = db

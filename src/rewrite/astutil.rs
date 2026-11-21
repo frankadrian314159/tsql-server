@@ -130,6 +130,21 @@ pub fn shard_form(st: &Stmt) -> Stmt {
                 .collect();
             Stmt::CreateTable { name: name.clone(), defs, versioning: versioning.clone() }
         }
+        // (an IDENTITY column added later is numbered by the control node, too)
+        Stmt::AlterTable { name, action: AlterAction::AddDefs(defs) } if defs.iter().any(|d| matches!(d, TableDef::Column(cd) if cd.identity.is_some())) => {
+            let defs = defs
+                .iter()
+                .map(|d| match d {
+                    TableDef::Column(cd) if cd.identity.is_some() => {
+                        let mut c = cd.clone();
+                        c.identity = None;
+                        TableDef::Column(c)
+                    }
+                    other => other.clone(),
+                })
+                .collect();
+            Stmt::AlterTable { name: name.clone(), action: AlterAction::AddDefs(defs) }
+        }
         other => other.clone(),
     }
 }

@@ -398,6 +398,15 @@ impl<'a> Engine<'a> {
                     }
                     PermTargetAst::Object(name) => {
                         let loc = self.locate(name);
+                        // (a system procedure or table of `master` or `msdb` that this server does not have, `xp_sqlagent_notify` or `msdb.dbo.sysjobs` of SQL Server
+                        // Agent say: a permission on it changes nothing here, and a script that sets it up, as Reporting Services' does, goes on)
+                        if let Loc::Db(d, k) = &loc {
+                            let missing = self.srv.databases.get(d).is_some_and(|db| !db.objects.contains_key(k));
+                            let last = k.rsplit('.').next().unwrap_or("");
+                            if missing && (d == "master" || d == "msdb") && (last.starts_with("xp_") || last.starts_with("sp_") || last.starts_with("sys")) {
+                                return Ok(());
+                            }
+                        }
                         let key = match &loc {
                             Loc::Db(d, k) if d == &dbk && self.srv.databases[d].objects.contains_key(k) => k.clone(),
                             _ => return Err(SqlError::new(15151, format!("Cannot find the object '{}', because it does not exist or you do not have permission.", name.join(".")))),

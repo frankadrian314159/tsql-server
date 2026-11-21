@@ -982,7 +982,7 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    fn drop_object(&mut self, what: &str, name: &[String], if_exists: bool) -> Result<()> {
+    pub(super) fn drop_object(&mut self, what: &str, name: &[String], if_exists: bool) -> Result<()> {
         if matches!(what, "LOGIN" | "USER" | "ROLE") {
             return self.drop_principal(what, name.last().unwrap(), if_exists);
         }

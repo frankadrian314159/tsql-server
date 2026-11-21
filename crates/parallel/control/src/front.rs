@@ -124,6 +124,10 @@ impl ClusterSession {
     /// Whether an `EXEC` is of a system procedure (`sp_...`, `xp_...`) other than `sp_executesql`, and not one the cluster runs itself.
     fn is_catalog_proc(&self, ex: &ExecStmt) -> bool {
         let Some(n) = ex.name.last().map(|n| n.to_lowercase()) else { return false };
+        // (an sp_rename of an index or a column of a table of the cluster is the cluster's: see renames.rs)
+        if self.is_cluster_rename(ex) || renames::is_security_proc(ex) {
+            return false;
+        }
         (n.starts_with("sp_") || n.starts_with("xp_")) && n != "sp_executesql" && !ex.name_is_var && self.cluster.proc_def(&self.qid(&ex.name)).is_none() && !self.cluster.proc_routes.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&self.qid(&ex.name))
     }
 
@@ -148,6 +152,16 @@ impl ClusterSession {
             return true;
         }
         match st {
+            // (control of flow: what its branches run decides, so that `IF NOT EXISTS (...) CREATE DATABASE x` or `IF ... DROP TABLE t` is the
+            // cluster's, as the statement alone would be; the condition's own tables are found by the text of the batch)
+            Stmt::If { then, els, .. } => self.stmt_wants(then) || els.as_ref().is_some_and(|e| self.stmt_wants(e)),
+            Stmt::Block(b) => b.iter().any(|s| self.stmt_wants(s)),
+            Stmt::While { body, .. } => self.stmt_wants(body),
+            Stmt::Try { body, catch } => body.iter().chain(catch.iter()).any(|s| self.stmt_wants(s)),
+            // (every procedure is the cluster's to make, whether or not it names a table: one that calls another, and takes its OUTPUT parameters, runs on the
+            // control node, which can only run a procedure it knows; a procedure the engine alone held would be called without the cluster's variables)
+            Stmt::CreateProc { name, .. } if !is_temp_name(name) => true,
+            Stmt::Drop { what, names, .. } if (what.eq_ignore_ascii_case("PROCEDURE") || what.eq_ignore_ascii_case("PROC")) && names.iter().any(|n| !is_temp_name(n)) => true,
             Stmt::CreateFunction(_) | Stmt::CreateTrigger { .. } | Stmt::TriggerAdmin(_) => true,
             Stmt::Drop { what, .. } if what.eq_ignore_ascii_case("TRIGGER") => true,
             Stmt::Drop { what, .. } if what.eq_ignore_ascii_case("FUNCTION") => true,
@@ -174,6 +188,11 @@ impl ClusterSession {
                 };
                 referenced_tables(&q).iter().any(|t| self.table_by_id(t).is_some() || self.is_view(t))
             }
+            Stmt::Exec(ex) if self.is_cluster_rename(ex) => true,
+            // (users, roles, their members and permissions are kept in the schema log, so that a control node that starts again has them: not logins, which
+            // carry passwords and are the engine's alone)
+            Stmt::Exec(ex) if renames::is_security_proc(ex) => true,
+            Stmt::Security(sec) => !matches!(&**sec, SecStmt::CreateLogin { .. } | SecStmt::AlterLogin { .. } | SecStmt::ExecuteAs { .. } | SecStmt::Revert),
             Stmt::Exec(ex) => match self.executesql_text(ex) {
                 Some(inner) => self.wants(&inner),
                 // (a procedure of the cluster: its body reads the cluster's tables, which the control node's engine holds none of the rows of)
@@ -222,7 +241,7 @@ impl ClusterSession {
     /// `st` with the variables of the session replaced by their values.
     pub(crate) fn bind_vars(&self, st: &Stmt) -> Result<Stmt, SqlError> {
         let xact_read = XACT_STATE_SEEN.load(std::sync::atomic::Ordering::Relaxed) && self.txn.borrow().is_some() && matches!(st, Stmt::Query(_) | Stmt::Set { .. } | Stmt::If { .. } | Stmt::While { .. } | Stmt::Print(_));
-        if self.vars.is_empty() && self.last_identity.is_none() && self.catch_stack.is_empty() && self.eventdata.is_empty() && !xact_read {
+        if self.vars.is_empty() && self.last_identity.is_none() && self.catch_stack.is_empty() && self.eventdata.is_empty() && self.cursors.is_empty() && !xact_read {
             return Ok(st.clone());
         }
         // ERROR_NUMBER() and the like (in a CATCH block), XACT_STATE(): the control node's engine has no CATCH block, so the values go in
@@ -236,7 +255,7 @@ impl ClusterSession {
         let ident = self.last_identity.map(|v| serde_json::to_value(Value::Dec(tsql_server::decimal::Dec::from_int(v))).unwrap_or(serde_json::Value::Null));
         // EVENTDATA() in a DDL trigger: the event's XML
         let event = self.eventdata.last().and_then(|x| serde_json::to_value(Expr::Cast { e: Box::new(Expr::Lit(Value::Str(x.clone()))), ty: TypeRef { parts: vec!["xml".into()], args: vec![], xml_schema: None }, try_: false, style: None }).ok());
-        fn subst(v: &mut serde_json::Value, vars: &HashMap<String, Value>, ident: &Option<serde_json::Value>, caught: &Option<SqlError>, xact: i32, event: &Option<serde_json::Value>) {
+        fn subst(v: &mut serde_json::Value, vars: &HashMap<String, Value>, ident: &Option<serde_json::Value>, caught: &Option<SqlError>, xact: i32, event: &Option<serde_json::Value>, fetch: i32) {
             match v {
                 serde_json::Value::Object(m) => {
                     let is_ident = match (m.len(), m.get("SysVar"), m.get("Func")) {
@@ -244,6 +263,12 @@ impl ClusterSession {
                         (1, _, Some(serde_json::Value::Object(f))) => f.get("name").and_then(|n| n.as_str()).map(|n| n.eq_ignore_ascii_case("SCOPE_IDENTITY")).unwrap_or(false),
                         _ => false,
                     };
+                    if let (1, Some(serde_json::Value::String(s))) = (m.len(), m.get("SysVar")) {
+                        if s.eq_ignore_ascii_case("@@FETCH_STATUS") {
+                            *v = serde_json::json!({ "Lit": serde_json::to_value(Value::Int(fetch)).unwrap_or(serde_json::Value::Null) });
+                            return;
+                        }
+                    }
                     if is_ident {
                         let lit = ident.clone().unwrap_or_else(|| serde_json::to_value(Value::Null).unwrap_or(serde_json::Value::Null));
                         *v = serde_json::json!({ "Lit": lit });
@@ -288,19 +313,19 @@ impl ClusterSession {
                         }
                     }
                     for c in m.values_mut() {
-                        subst(c, vars, ident, caught, xact, event);
+                        subst(c, vars, ident, caught, xact, event, fetch);
                     }
                 }
                 serde_json::Value::Array(a) => {
                     for c in a {
-                        subst(c, vars, ident, caught, xact, event);
+                        subst(c, vars, ident, caught, xact, event, fetch);
                     }
                 }
                 _ => {}
             }
         }
         let mut j = serde_json::to_value(st).map_err(|e| SqlError::new(50000, e.to_string()))?;
-        subst(&mut j, &self.vars, &ident, &caught, xact, &event);
+        subst(&mut j, &self.vars, &ident, &caught, xact, &event, self.fetch_status);
         serde_json::from_value(j).map_err(|e| SqlError::new(50000, format!("a variable could not be substituted: {}", e)))
     }
 
@@ -538,8 +563,18 @@ impl ControlInterceptor {
 }
 
 impl Interceptor for ControlInterceptor {
-    fn set_database(&mut self, db: &str) {
+    fn set_database(&mut self, db: &str) -> Option<String> {
         self.session.set_current_database(db);
+        // (a database that was dropped while the connection was in it: the connection is in master now, the engine's own session too)
+        if !self.session.current_database().eq_ignore_ascii_case(db) {
+            return Some(self.session.current_database().to_string());
+        }
+        None
+    }
+
+    fn database_after(&mut self) -> Option<String> {
+        // (a batch the cluster ran that said `USE db`: the connection's engine is in it too, from the next batch)
+        Some(self.session.current_database().to_string())
     }
 
     fn temps_wanted(&mut self, sql: &str) -> Vec<String> {

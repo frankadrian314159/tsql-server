@@ -197,6 +197,8 @@ reads a table's relationships with `EXEC sp_fkeys`; a designer that gets an erro
 flickers and nothing appears. On a cluster a system procedure (`sp_...`, `xp_...`) that is given the name of a table is the engine's, not
 the cluster's: the name is a value, and the engine holds the schema of every table.
 
+**Reporting Services** (SSRS) makes its catalog databases (`ReportServer`, `ReportServerTempDB`) with scripts that use the older parts of SQL Server, which the server and a cluster's control node take: `sp_addrole`/`sp_droprole`, `sp_tableoption`, `ALTER TABLE ... WITH NOCHECK ADD`, a comma before the `)` of `CREATE TABLE`, table hints on the target of `UPDATE`, `DELETE` and `INSERT`, the compatibility views `syscolumns` and `sysindexes`, cursors in triggers, and `GRANT` on the SQL Server Agent objects of `master` and `msdb` (accepted, with no effect: there is no Agent). `UPDATE t SET col.WRITE(expression, offset, length)` changes a part of a `varchar(max)`, `nvarchar(max)` or `varbinary(max)` value (a NULL offset appends, a NULL length goes to the end of the value, a NULL expression only deletes). `UPDATETEXT`, `READTEXT` and `WRITETEXT` are read, so that a procedure that has one can be made, and raise error 50100 when run: there are no text pointers, so the writes SSRS makes to its chunk tables with them do not work.
+
 ## Not supported
 
 * Group-based logins and NTLM-only domains; see [authentication.md](authentication.md) for what Azure AD and Kerberos do cover.

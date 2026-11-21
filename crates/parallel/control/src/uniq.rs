@@ -48,7 +48,7 @@ fn tuple_key(vals: &[Value]) -> String {
 }
 
 /// `c1 = v1 AND c2 = v2` (a NULL is `IS NULL`).
-fn tuple_cond(cols: &[String], vals: &[Value]) -> Expr {
+pub(crate) fn tuple_cond(cols: &[String], vals: &[Value]) -> Expr {
     let mut out: Option<Expr> = None;
     for (c, v) in cols.iter().zip(vals) {
         let one = if v.is_null() { Expr::IsNull(Box::new(col(c)), false) } else { Expr::Binary(BinOp::Eq, Box::new(col(c)), Box::new(nested::lit(v))) };
@@ -60,7 +60,7 @@ fn tuple_cond(cols: &[String], vals: &[Value]) -> Expr {
     out.unwrap_or(Expr::Lit(Value::Int(1)))
 }
 
-fn any_tuple(cols: &[String], tuples: &[Vec<Value>]) -> Expr {
+pub(crate) fn any_tuple(cols: &[String], tuples: &[Vec<Value>]) -> Expr {
     let mut out: Option<Expr> = None;
     for t in tuples {
         let c = Expr::Paren(Box::new(tuple_cond(cols, t)));

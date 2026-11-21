@@ -25,6 +25,7 @@ pub use tsql_server::rewrite::astutil;
 pub mod advisor;
 pub mod autoscale;
 pub mod client;
+pub mod cursors;
 pub mod dbname;
 pub mod ddltrig;
 pub mod dmlfuncs;
@@ -45,12 +46,14 @@ pub mod pushdown;
 pub mod plan;
 pub mod procs;
 pub mod rebalance;
+pub mod renames;
 pub mod split;
 pub mod replicas;
 pub mod restore;
 pub mod rules;
 pub mod triggers;
 pub mod uniq;
+pub mod updfrom;
 pub mod txn;
 
 use astutil::*;
@@ -222,6 +225,8 @@ pub struct Cluster {
     deadlocks: AtomicU64,
     /// the databases the cluster has besides `master` (`CREATE DATABASE`), in the case they were made in; see `dbname.rs`
     dbs: Mutex<Vec<String>>,
+    /// databases that were dropped (lower case): a session still in one goes back to `master` (see dbname.rs)
+    dropped_dbs: Mutex<std::collections::HashSet<String>>,
     /// the database the last statement of the schema log was made in (the log says `USE` when it changes)
     logged_db: Mutex<String>,
     /// the stored functions (by id) as their `CREATE FUNCTION` statements: see `funcs.rs`
@@ -296,6 +301,7 @@ impl Cluster {
             victims: Mutex::new(Default::default()),
             deadlocks: AtomicU64::new(0),
             dbs: Default::default(),
+            dropped_dbs: Default::default(),
             logged_db: Mutex::new("master".into()),
             funcs: Default::default(),
             funcs_on_shards: Default::default(),
@@ -428,7 +434,7 @@ impl Cluster {
     }
 
     pub fn session(self: &Arc<Self>) -> ClusterSession {
-        ClusterSession { cluster: self.clone(), id: self.next_session.fetch_add(1, Ordering::Relaxed), mirror: self.mirror.connect_internal(), plan: vec![], temp_counter: 0, own_temps: vec![], txn: std::cell::RefCell::new(None), stmt_shards: std::cell::Cell::new(0), commit_seq: 0, vars: HashMap::new(), local_tables: HashMap::new(), tvars: HashMap::new(), identity_insert: Default::default(), last_identity: None, create_dist: None, cur_db: "master".into(), capture: None, trigger_stack: vec![], returning: false, catch_stack: vec![], proc_depth: 0, return_value: None, loop_ctl: 0, temp_creates: HashMap::new(), mirror_temps: Default::default(), uniq_guards: vec![], eventdata: vec![], ddl_rolled_back: false, no_ddl_triggers: false, batch_text: String::new() }
+        ClusterSession { cluster: self.clone(), id: self.next_session.fetch_add(1, Ordering::Relaxed), mirror: self.mirror.connect_internal(), plan: vec![], temp_counter: 0, own_temps: vec![], txn: std::cell::RefCell::new(None), stmt_shards: std::cell::Cell::new(0), commit_seq: 0, vars: HashMap::new(), local_tables: HashMap::new(), tvars: HashMap::new(), identity_insert: Default::default(), last_identity: None, create_dist: None, cur_db: "master".into(), capture: None, trigger_stack: vec![], returning: false, catch_stack: vec![], proc_depth: 0, return_value: None, loop_ctl: 0, temp_creates: HashMap::new(), mirror_temps: Default::default(), uniq_guards: vec![], eventdata: vec![], ddl_rolled_back: false, no_ddl_triggers: false, batch_text: String::new(), cursors: HashMap::new(), fetch_status: 0 }
     }
 
     pub fn shard_status(&self) -> Vec<Result<ShardStatus, SqlError>> {
@@ -501,6 +507,9 @@ pub struct ClusterSession {
     no_ddl_triggers: bool,
     /// the text of the batch being run (the `CommandText` of an event)
     batch_text: String,
+    /// the cursors this batch declared (see cursors.rs), and what `@@FETCH_STATUS` says
+    cursors: HashMap<String, cursors::CursorState>,
+    fetch_status: i32,
 }
 
 /// A transaction of a control session: the shards that have begun it, and what it has changed.
@@ -773,6 +782,8 @@ impl ClusterSession {
         tsql_server::span!("ctl_execute");
         self.plan.clear();
         self.batch_text = sql.to_string();
+        self.cursors.clear();
+        self.leave_dropped_database();
         front::note_xact_state(sql);
         let cl = self.cluster.clone();
         let mut events = vec![];
@@ -1035,6 +1046,26 @@ impl ClusterSession {
 
     /// Run a statement on the mirror first (which checks it), then on every shard.
     async fn broadcast(&mut self, st: &Stmt) -> Result<(), SqlError> {
+        // A schema change in a transaction: the control node's engine, the schema log and the shards' copies are not one transaction, so it cannot be
+        // undone with the rest. What the transaction has done so far is committed first (as a DDL statement commits in some other systems; it also
+        // lets go of the locks the schema change would wait for), the change is made, and the client goes on in a new transaction of the same depth:
+        // a `ROLLBACK` undoes what came after the last schema change.
+        let depth = self.txn.borrow().as_ref().map(|t| t.depth);
+        let Some(depth) = depth else { return self.broadcast_now(st).await };
+        if let Some(t) = self.txn.borrow_mut().as_mut() {
+            t.depth = 1;
+        }
+        let mut none = vec![];
+        let committed = self.commit_txn(&mut none).await;
+        let r = match committed {
+            Ok(()) => self.broadcast_now(st).await,
+            Err(e) => Err(e),
+        };
+        *self.txn.borrow_mut() = Some(TxnState { shards: Default::default(), depth, doomed: false, wrote: Default::default(), savepoints: vec![] });
+        r
+    }
+
+    async fn broadcast_now(&mut self, st: &Stmt) -> Result<(), SqlError> {
         // (the mirror takes the rows of a graph table as the shards do, with the `$graph_id` they were given, so it makes the table in their form)
         let for_mirror = if matches!(st, Stmt::CreateTable { defs, .. } if defs.iter().any(|d| matches!(d, TableDef::Graph { .. }))) { shard_form(st) } else { st.clone() };
         self.sync_mirror_db()?;
@@ -1091,8 +1122,9 @@ impl ClusterSession {
             if t.doomed && !harmless {
                 return Err(SqlError::new(3930, "The current transaction cannot be committed and cannot support operations that write to the log file. Roll back the transaction."));
             }
-            if matches!(st, Stmt::CreateTable { .. } | Stmt::AlterTable { .. } | Stmt::CreateView { .. } | Stmt::CreateFunction(_) | Stmt::CreateTrigger { .. } | Stmt::CreateType { .. } | Stmt::FullText(_) | Stmt::Drop { .. } | Stmt::CreateIndex { .. } | Stmt::DropIndex { .. } | Stmt::AlterIndex { .. } | Stmt::Truncate(_)) {
-                return Err(unsupported("schema changes and TRUNCATE inside a transaction"));
+            // (a schema change inside a transaction commits what came before it: see `broadcast`)
+            if matches!(st, Stmt::Truncate(_)) {
+                return Err(unsupported("TRUNCATE inside a transaction"));
             }
         }
         if let Stmt::Exec(ex) = st {
@@ -1118,7 +1150,8 @@ impl ClusterSession {
         if self.exec_variable_stmt(st).await? {
             return Ok(());
         }
-        let bound = self.bind_vars(st)?;
+        // (the variables a cursor's query names are those of the moment it is opened, see cursors.rs)
+        let bound = if matches!(st, Stmt::DeclareCursor { .. }) { st.clone() } else { self.bind_vars(st)? };
         let st = &bound;
         match st {
             Stmt::CreateTable { name, defs, versioning } => {
@@ -1250,6 +1283,14 @@ impl ClusterSession {
                 Ok(())
             }
             Stmt::Noop => Ok(()),
+            Stmt::DeclareCursor { .. } | Stmt::CursorOp { .. } | Stmt::Fetch { .. } => self.exec_cursor(st).await,
+            // (sp_rename of an index or a column of a table of the cluster: the shards rename it too, see renames.rs)
+            Stmt::Exec(ex) if self.is_cluster_rename(ex) => self.exec_rename(st, ex).await,
+            Stmt::Exec(ex) if renames::is_security_proc(ex) => {
+                merge::check(&self.mirror.execute_stmts(std::slice::from_ref(st)))?;
+                self.log_schema(st);
+                Ok(())
+            }
             Stmt::CreateTrigger { .. } => self.create_trigger(st),
             Stmt::Drop { what, names, if_exists } if what.eq_ignore_ascii_case("TRIGGER") => self.drop_triggers(st, names, *if_exists),
             Stmt::TriggerAdmin(a) => self.trigger_admin(a),
@@ -1260,6 +1301,17 @@ impl ClusterSession {
                 self.broadcast(st).await?;
                 self.cluster.proc_routes.lock().unwrap_or_else(|e| e.into_inner()).remove(&table_id(name));
                 self.log_schema(st);
+                Ok(())
+            }
+            // (users, roles and permissions are the control node's engine's, which authenticates the clients and holds the schema of every table; a
+            // `GRANT` on a table of the cluster is recorded there. Logins carry passwords and the session's identity changes with `EXECUTE AS`: neither is
+            // written to the schema log. The rest is, so that a control node that starts again has it)
+            Stmt::Security(sec) => {
+                merge::check(&self.mirror.execute_stmts(std::slice::from_ref(st)))?;
+                if !matches!(&**sec, SecStmt::CreateLogin { .. } | SecStmt::AlterLogin { .. } | SecStmt::ExecuteAs { .. } | SecStmt::Revert) {
+                    self.log_schema(st);
+                }
+                self.plan.push("security statement: kept by the control node's engine".into());
                 Ok(())
             }
             // (a full-text catalog or index is a declaration, which the shards and the control node's engine keep: a search scans the rows)
@@ -1509,15 +1561,28 @@ impl ClusterSession {
         let dist = if choice == Some(restore::DistChoice::Replicated) {
             Dist::Replicated
         } else {
-            let key_name = match &choice {
+            let named = matches!(&choice, Some(restore::DistChoice::By(_)));
+            let preferred = match &choice {
                 Some(restore::DistChoice::By(c)) => c.clone(),
                 _ => pk.first().cloned().or_else(|| cols.iter().find(|c| !c.computed && !c.hidden).or_else(|| cols.iter().find(|c| !c.computed)).map(|c| c.name.clone())).ok_or_else(|| SqlError::new(1113, "A table needs at least one column."))?,
             };
-            let key = cols.iter().position(|c| c.name.eq_ignore_ascii_case(&key_name)).ok_or_else(|| SqlError::new(1911, format!("Column name '{}' does not exist in the target table.", key_name)))?;
-            let class = KeyClass::of_type_name(&cols[key].type_name)
-                .ok_or_else(|| unsupported(&format!("the shard key {} of type {} (use an integer, character or uniqueidentifier first key column, or DISTRIBUTE TABLE ... REPLICATED)", key_name, cols[key].type_name)))?;
-            // (a unique key without the shard key is checked across the shards by the control node: see uniq.rs; a filtered one is refused)
-            Dist::Sharded { key, class }
+            let usable = |n: &str| cols.iter().find(|c| c.name.eq_ignore_ascii_case(n)).is_some_and(|c| KeyClass::of_type_name(&c.type_name).is_some());
+            // (a column that was asked for is the key, or an error; the default one, the first column or the first of the primary key, is the key when the
+            // cluster can shard on its type, else the first column it can: a table of columns of no such type is replicated)
+            let key_name = if named || usable(&preferred) { Some(preferred) } else { cols.iter().find(|c| !c.computed && !c.hidden && KeyClass::of_type_name(&c.type_name).is_some()).map(|c| c.name.clone()) };
+            match key_name {
+                None => {
+                    self.plan.push("no column of the table can be a shard key: it is replicated".into());
+                    Dist::Replicated
+                }
+                Some(key_name) => {
+                    let key = cols.iter().position(|c| c.name.eq_ignore_ascii_case(&key_name)).ok_or_else(|| SqlError::new(1911, format!("Column name '{}' does not exist in the target table.", key_name)))?;
+                    let class = KeyClass::of_type_name(&cols[key].type_name)
+                        .ok_or_else(|| unsupported(&format!("the shard key {} of type {} (use an integer, character or uniqueidentifier first key column, or DISTRIBUTE TABLE ... REPLICATED)", key_name, cols[key].type_name)))?;
+                    // (a unique key without the shard key is checked across the shards by the control node: see uniq.rs; a filtered one is refused)
+                    Dist::Sharded { key, class }
+                }
+            }
         };
         if let Err(e) = self.broadcast(st).await {
             // the mirror (and perhaps some shards) made the table: take it back, so that nothing knows a table the
@@ -1671,22 +1736,44 @@ impl ClusterSession {
         };
         let ident_col = t.identity.as_ref().map(|i| t.cols[i.col].name.clone());
         let is = |c: &str, of: &Option<String>| of.as_deref().map(|k| k.eq_ignore_ascii_case(c)).unwrap_or(false);
+        // an IDENTITY column added to an empty table: (its name, seed, increment), numbered by the control node as any identity column is
+        let mut new_identity: Option<(String, i64, i64)> = None;
         match action {
             AlterAction::AddDefs(defs) => {
                 for d in defs {
                     match d {
                         TableDef::Column(cd) => {
-                            if cd.identity.is_some() {
-                                return Err(unsupported("adding an IDENTITY column"));
+                            if let Some((seed, inc)) = &cd.identity {
+                                if t.identity.is_some() {
+                                    return Err(SqlError::new(2744, format!("Multiple identity columns specified for table '{}'. Only one identity column per table is allowed.", name.last().cloned().unwrap_or_default())));
+                                }
+                                if !self.table_is_empty(&t).await? {
+                                    return Err(unsupported("adding an IDENTITY column to a table that has rows (the rows would need numbers)"));
+                                }
+                                let seed = self.eval_scalar(seed).await?.as_i64().unwrap_or(1);
+                                let inc = self.eval_scalar(inc).await?.as_i64().unwrap_or(1);
+                                new_identity = Some((cd.name.clone(), seed, inc));
                             }
                             if cd.pk.is_some() {
                                 return Err(unsupported("adding a primary key"));
                             }
-                            if cd.unique.is_some() {
-                                return Err(unsupported("adding a UNIQUE column"));
+                            // (a column added with UNIQUE has no value in the rows that are there: only an empty table can take it)
+                            if cd.unique.is_some() && !self.table_is_empty(&t).await? {
+                                return Err(unsupported("adding a UNIQUE column to a table that has rows"));
                             }
                         }
-                        TableDef::PrimaryKey { .. } => return Err(unsupported("adding a primary key")),
+                        // (a primary key made later: one with the shard key is the shards' to keep, as any key is; one without is checked across the shards
+                        // by the control node, against the rows that are there first: see uniq.rs)
+                        TableDef::PrimaryKey { cols, name: pname } => {
+                            if t.cols.iter().any(|c| c.computed) && cols.iter().any(|(n, _)| t.cols.iter().any(|c| c.computed && c.name.eq_ignore_ascii_case(n))) {
+                                return Err(unsupported("a primary key on a computed column"));
+                            }
+                            if !cols.iter().any(|(c, _)| is(c, &key_col)) && key_col.is_some() {
+                                self.lock_unique(&table_id(name)).await?;
+                                let names: Vec<String> = cols.iter().map(|(c, _)| c.clone()).collect();
+                                self.verify_unique_existing(name, &names, pname.as_deref().unwrap_or("PK")).await?;
+                            }
+                        }
                         TableDef::Unique { cols, name: uname, .. } => {
                             if !cols.iter().any(|(c, _)| is(c, &key_col)) && key_col.is_some() {
                                 // (the rows there are checked against it, across the shards: see uniq.rs)
@@ -1789,6 +1876,11 @@ impl ClusterSession {
                         i.col = p;
                     }
                 }
+                if let Some((n, seed, inc)) = &new_identity {
+                    if let Some(p) = cols.iter().position(|c| c.name.eq_ignore_ascii_case(n)) {
+                        e.identity = Some(Identity { col: p, next: *seed, inc: *inc });
+                    }
+                }
                 e.cols = cols;
                 e.version += 1;
                 e.loaded = None;
@@ -1797,6 +1889,18 @@ impl ClusterSession {
         }
         self.log_schema(st);
         Ok(())
+    }
+
+    /// Whether a table has no rows on any shard.
+    async fn table_is_empty(&mut self, t: &DistTable) -> Result<bool, SqlError> {
+        // (it only reads: a statement that fails after it has not changed several shards)
+        let shards_before = self.stmt_shards.get();
+        let count = simple_query(Select { distinct: false, top: None, items: vec![SelectItem::Expr { e: Expr::Func(Box::new(FuncCall { name: "COUNT".into(), schema: None, parts: vec![], args: vec![], distinct: false, star: true, over: None, within: None })), alias: None }], into: None, from: vec![TableRef::Table { name: t.name.clone(), alias: None, hints: vec![] }], where_: None, group: None, having: None });
+        let shards = self.all_shards();
+        let counts = self.fan_query(&shards, |_| Work::Stmts(vec![Stmt::Query(Box::new(count.clone()))])).await;
+        self.stmt_shards.set(shards_before);
+        let counts = counts?;
+        Ok(counts.iter().all(|r| r.rows.first().map(|x| matches!(x[0], Value::Int(0))).unwrap_or(true)))
     }
 
     /// `DISTRIBUTE PROCEDURE p BY @param`: check the procedure body against the declaration (see `procs.rs`) and route its calls.
@@ -2085,6 +2189,17 @@ impl ClusterSession {
             }
             Target::Var(_) => return Err(unsupported("INSERT into a table variable that is not declared in this batch")),
         };
+        // (`WITH c AS (...) INSERT INTO t SELECT ... FROM c`: the common table expressions are those of the SELECT)
+        if !ins.ctes.is_empty() && ins.output.is_none() && ins.top.is_none() {
+            if let InsertSrc::Query(q) = &ins.src {
+                let mut q2 = (**q).clone();
+                let mut ctes = ins.ctes.clone();
+                ctes.extend(q2.ctes.drain(..));
+                q2.ctes = ctes;
+                let ins2 = Insert { ctes: vec![], src: InsertSrc::Query(Box::new(q2)), ..ins.clone() };
+                return Box::pin(self.insert_values(&ins2, events)).await;
+            }
+        }
         let t = self.table(name)?;
         if ins.output.is_some() || ins.top.is_some() || !ins.ctes.is_empty() {
             return Err(unsupported("INSERT with OUTPUT, TOP or CTEs"));
@@ -2392,6 +2507,10 @@ impl ClusterSession {
     async fn update(&mut self, u: &Update, events: &mut Vec<Event>) -> Result<(), SqlError> {
         tsql_server::span!("ctl_update");
         let Target::Table(name) = &u.target else { return Err(unsupported("UPDATE of a table variable")) };
+        // (an UPDATE that joins another table: the control node reads the join and applies it by key, see updfrom.rs)
+        if !u.from.is_empty() && u.output.is_none() && u.top.is_none() && u.current_of.is_none() && u.ctes.is_empty() {
+            return self.update_from(u, events).await;
+        }
         let t = self.table(name)?;
         if !u.from.is_empty() || u.output.is_some() || u.top.is_some() || u.current_of.is_some() || !u.ctes.is_empty() {
             return Err(unsupported("UPDATE with FROM, OUTPUT, TOP, CURRENT OF or CTEs"));
@@ -2438,7 +2557,9 @@ impl ClusterSession {
             // subqueries that do not depend on the row are evaluated first
             return match self.resolve_stmt(&Stmt::Update(Box::new(u.clone()))).await? {
                 Some(Stmt::Update(u2)) if !exprs_have_subquery(&u2) => Box::pin(self.update(&u2, events)).await,
-                _ => Err(unsupported("correlated subqueries in UPDATE")),
+                // (a subquery that depends on the row: the control node reads the rows and their new values as a query, which the cluster can run, and applies
+                // them by key: see updfrom.rs)
+                _ => self.update_from(u, events).await,
             };
         }
         self.refuse_reading_functions(u, "an UPDATE")?;
@@ -2519,6 +2640,10 @@ impl ClusterSession {
     async fn delete(&mut self, d: &Delete, events: &mut Vec<Event>) -> Result<(), SqlError> {
         tsql_server::span!("ctl_delete");
         let Target::Table(name) = &d.target else { return Err(unsupported("DELETE from a table variable")) };
+        // (a DELETE that joins another table: see updfrom.rs)
+        if !d.from.is_empty() && d.output.is_none() && d.top.is_none() && d.current_of.is_none() && d.ctes.is_empty() {
+            return self.delete_from(d, events).await;
+        }
         let t = self.table(name)?;
         if !d.from.is_empty() || d.output.is_some() || d.top.is_some() || d.current_of.is_some() || !d.ctes.is_empty() {
             return Err(unsupported("DELETE with FROM, OUTPUT, TOP, CURRENT OF or CTEs"));
@@ -2536,7 +2661,7 @@ impl ClusterSession {
             if has_subquery(w) {
                 return match self.resolve_stmt(&Stmt::Delete(Box::new(d.clone()))).await? {
                     Some(Stmt::Delete(d2)) if !d2.where_.as_ref().map(has_subquery).unwrap_or(false) => Box::pin(self.delete(&d2, events)).await,
-                    _ => Err(unsupported("correlated subqueries in DELETE")),
+                    _ => self.delete_from(d, events).await,
                 };
             }
         }

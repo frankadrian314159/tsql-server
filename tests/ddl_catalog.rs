@@ -214,3 +214,142 @@ fn performance_smoke() {
     exec(&mut c, "UPDATE big SET g = g + 1 WHERE id % 2 = 0");
     exec(&mut c, "DELETE big WHERE g > 40");
 }
+
+#[test]
+fn alter_table_with_check_or_nocheck_add_constraint() {
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE chunk (id INT NOT NULL, v INT NULL)");
+    exec(&mut c, "ALTER TABLE [dbo].[chunk] WITH NOCHECK ADD CONSTRAINT [PK_chunk] PRIMARY KEY NONCLUSTERED ([id]) ON [PRIMARY]");
+    exec(&mut c, "INSERT chunk VALUES (1, 1)");
+    assert_eq!(err_no(&mut c, "INSERT chunk VALUES (1, 2)"), 2627);
+    exec(&mut c, "ALTER TABLE chunk WITH CHECK ADD CONSTRAINT ck_v CHECK (v < 100)");
+    assert_eq!(err_no(&mut c, "INSERT chunk VALUES (2, 500)"), 547);
+    // (the forms that were there are as they were)
+    exec(&mut c, "ALTER TABLE chunk NOCHECK CONSTRAINT ck_v");
+    exec(&mut c, "ALTER TABLE chunk WITH CHECK CHECK CONSTRAINT ck_v");
+}
+
+#[test]
+fn create_table_accepts_a_comma_before_the_closing_parenthesis_and_textimage_on() {
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE [dbo].[SecData](\r\n    [SecDataID] uniqueidentifier NOT NULL,\r\n    [XmlDescription] [ntext] NOT NULL,  \r\n    [NtSecDescPrimary] [image] NOT NULL,\r\n    [NtSecDescSecondary] [ntext] NULL,\r\n)  ON [PRIMARY] TEXTIMAGE_ON[PRIMARY]");
+    exec(&mut c, "INSERT SecData VALUES (NEWID(), 'x', 0x01, NULL)");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM SecData"), "1");
+}
+
+#[test]
+fn table_hints_on_the_target_of_a_data_change() {
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE sch (id INT PRIMARY KEY, flag INT NULL)");
+    exec(&mut c, "INSERT INTO sch WITH (TABLOCK) VALUES (1, 1), (2, 1)");
+    exec(&mut c, "UPDATE [sch] WITH (tablock, xlock) SET [flag] = NULL");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sch WHERE flag IS NULL"), "2");
+    exec(&mut c, "DELETE FROM sch WITH (ROWLOCK) WHERE id = 1");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sch"), "1");
+}
+
+#[test]
+fn the_text_pointer_statements_are_read_so_that_a_procedure_with_one_can_be_made() {
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE chunk (id INT PRIMARY KEY, content IMAGE NULL)");
+    // (Reporting Services' WriteChunkPortion)
+    exec(
+        &mut c,
+        "CREATE PROCEDURE WriteChunkPortion @ptr binary(16), @perm bit, @idx int = NULL, @del int = NULL, @Content image AS\r\nIF @perm != 0 BEGIN\r\n    UPDATETEXT chunk.Content @ptr @idx @del @Content\r\nEND ELSE BEGIN\r\n    UPDATETEXT [master].dbo.chunk.Content @ptr @idx @del WITH LOG @Content\r\nEND",
+    );
+    // the statement itself says it is not supported
+    assert_eq!(err_no(&mut c, "DECLARE @p binary(16) = 0x00; EXEC WriteChunkPortion @p, 1, 0, 0, 0x01"), 50100);
+    exec(&mut c, "SELECT 1");
+}
+
+#[test]
+fn sp_rename_renames_an_index() {
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE ren (id INT PRIMARY KEY, a INT, b INT)");
+    exec(&mut c, "CREATE UNIQUE INDEX [IX_old] ON ren (a, b)");
+    exec(&mut c, "EXEC sp_rename 'ren.IX_old', 'UQ_new', 'INDEX'");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.indexes WHERE object_id = OBJECT_ID('ren') AND name = 'UQ_new'"), "1");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.indexes WHERE object_id = OBJECT_ID('ren') AND name = 'IX_old'"), "0");
+    // the index still enforces what it did, under its new name
+    exec(&mut c, "INSERT ren VALUES (1, 1, 1)");
+    assert_eq!(err_no(&mut c, "INSERT ren VALUES (2, 1, 1)"), 2601);
+    assert_eq!(err_no(&mut c, "EXEC sp_rename 'ren.nope', 'x', 'INDEX'"), 15225);
+    exec(&mut c, "CREATE INDEX [IX_two] ON ren (b)");
+    assert_eq!(err_no(&mut c, "EXEC sp_rename 'ren.IX_two', 'UQ_new', 'INDEX'"), 15338);
+    exec(&mut c, "DROP INDEX UQ_new ON ren");
+}
+
+#[test]
+fn create_index_with_drop_existing_replaces_the_index() {
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE snap (id INT PRIMARY KEY, a INT, b INT, m VARCHAR(10))");
+    exec(&mut c, "CREATE INDEX [IX_clean] ON [dbo].[snap] (a, b)");
+    // (Reporting Services' upgrade script)
+    exec(&mut c, "CREATE INDEX [IX_clean] ON [dbo].[snap]([a], [b]) INCLUDE ([m])\r\nWITH (DROP_EXISTING = ON)");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.indexes WHERE object_id = OBJECT_ID('snap') AND name = 'IX_clean'"), "1");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.index_columns ic JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id WHERE i.name = 'IX_clean' AND ic.is_included_column = 1"), "1");
+    // with no index of the name it just makes one
+    exec(&mut c, "CREATE INDEX [IX_new] ON [dbo].[snap] (b) WITH (DROP_EXISTING = ON)");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.indexes WHERE object_id = OBJECT_ID('snap') AND name = 'IX_new'"), "1");
+    // without the option an existing name is still an error
+    assert_eq!(err_no(&mut c, "CREATE INDEX [IX_new] ON [dbo].[snap] (b)"), 1913);
+}
+
+#[test]
+fn an_sp_rename_is_committed_with_its_statement_and_a_later_rollback_leaves_it() {
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE ExecutionLog (id INT PRIMARY KEY, v INT NULL)");
+    exec(&mut c, "exec sp_rename 'dbo.ExecutionLog', 'ExecutionLog_Old'");
+    exec(&mut c, "BEGIN TRANSACTION");
+    exec(&mut c, "INSERT ExecutionLog_Old VALUES (1, 1)");
+    exec(&mut c, "ROLLBACK TRANSACTION");
+    // the rename stands, the insert is undone
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM ExecutionLog_Old"), "0");
+    exec(&mut c, "CREATE TABLE ExecutionLog (id INT PRIMARY KEY)");
+    // inside a transaction it is the transaction's, as before
+    exec(&mut c, "BEGIN TRANSACTION");
+    exec(&mut c, "exec sp_rename 'dbo.ExecutionLog', 'ExecutionLog_Two'");
+    exec(&mut c, "ROLLBACK TRANSACTION");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM ExecutionLog"), "0");
+}
+
+#[test]
+fn an_insert_column_list_may_name_a_column_with_a_qualifier() {
+    let mut c = conn();
+    exec(&mut c, "CREATE TABLE dst (a INT, mime VARCHAR(10))");
+    exec(&mut c, "CREATE TABLE src (a INT, mime VARCHAR(10))");
+    exec(&mut c, "INSERT src VALUES (1, 'x'), (2, 'y')");
+    // (Reporting Services' CopyChunksOfType)
+    exec(&mut c, "INSERT INTO dst (a, C.mime) SELECT C.a, C.mime FROM src C");
+    assert_eq!(rows(&mut c, "SELECT a, mime FROM dst ORDER BY a"), vec![vec!["1", "x"], vec!["2", "y"]]);
+}
+
+#[test]
+fn a_table_constraint_may_follow_the_last_column_with_no_comma() {
+    let mut c = conn();
+    // (Reporting Services' DBUpgradeHistory)
+    exec(&mut c, "create table [dbo].[DBUpgradeHistory](\r\n   [UpgradeID] bigint identity(1,1) not null,\r\n   [DbVersion] nvarchar(25),\r\n   [User] nvarchar(128) default System_User,\r\n   [DateTime] datetime default Current_Timestamp\r\n   CONSTRAINT [PK_DBUpgradeHistory] PRIMARY KEY (UpgradeID DESC)\r\n   ) ON [Primary]");
+    exec(&mut c, "INSERT [dbo].[DBUpgradeHistory] ([DbVersion]) VALUES ('100')");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM DBUpgradeHistory"), "1");
+    assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM sys.indexes WHERE name = 'PK_DBUpgradeHistory' AND is_primary_key = 1"), "1");
+    // a column's own constraints are still its own
+    exec(&mut c, "create table kk (a int CONSTRAINT pk_kk PRIMARY KEY, b int CONSTRAINT uq_kk UNIQUE, c int CONSTRAINT df_kk DEFAULT 5 CONSTRAINT ck_kk CHECK (c > 0) CONSTRAINT uq2 UNIQUE (a, b))");
+    exec(&mut c, "INSERT kk (a, b) VALUES (1, 2)");
+    assert_eq!(scalar(&mut c, "SELECT c FROM kk"), "5");
+}
+
+#[test]
+fn sp_procedure_params_100_managed_describes_the_parameters_of_a_procedure_or_function() {
+    let mut c = conn();
+    exec(&mut c, "CREATE PROCEDURE dbo.p1 @a INT, @b VARCHAR(20) = 'x', @c DECIMAL(10,2) OUTPUT AS SELECT 1");
+    exec(&mut c, "CREATE FUNCTION dbo.f1 (@PersonID INT) RETURNS TABLE AS RETURN SELECT @PersonID AS id");
+    // (what the Reporting Services portal asks for a function of the database a data source names)
+    let r = rows(&mut c, "EXEC [master].[sys].[sp_procedure_params_100_managed] @procedure_name = N'f1'");
+    assert_eq!(r.iter().map(|x| format!("{}/{}/{}", x[0], x[2], x[11])).collect::<Vec<_>>(), vec!["@personid/1/int"]);
+    let r = rows(&mut c, "EXEC sys.sp_procedure_params_100_managed N'p1'");
+    assert_eq!(r.iter().map(|x| format!("{}/{}/{}/{}", x[0], x[1], x[2], x[11])).collect::<Vec<_>>(), vec!["@RETURN_VALUE/0/4/int", "@a/1/1/int", "@b/2/1/varchar", "@c/3/2/decimal"]);
+    assert_eq!(r[2][3], "1", "@b has a default");
+    assert_eq!(r[2][6], "20", "the length of a varchar");
+    assert_eq!(r[3][7], "10", "the precision of a decimal");
+    assert_eq!(rows(&mut c, "EXEC sys.sp_procedure_params_100_managed N'dbo.nope'").len(), 0);
+}
