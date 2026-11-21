@@ -502,6 +502,10 @@ pub struct Connection {
 }
 
 impl Connection {
+    pub(crate) fn session_mut(&mut self) -> &mut SessionState {
+        &mut self.session
+    }
+
     /// A second connection for the same login that can run statements that only read while this one is busy (what the
     /// requests of a MARS connection that are read-only do in parallel). `None` while a transaction is open: the statements of
     /// a transaction run one at a time.

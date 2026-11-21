@@ -49,7 +49,7 @@ pub struct BackupHeader {
 }
 
 #[derive(Serialize, Deserialize)]
-enum Frame {
+pub(crate) enum Frame {
     Header(BackupHeader),
     Catalog(Box<Database>),
     Rows { key: String, rows: Vec<(usize, Row)> },
@@ -73,21 +73,21 @@ fn bad_media(path: &str, why: &str) -> SqlError {
     SqlError::with(3241, 16, 1, format!("The media family on device '{}' is incorrectly formed: {}. SQL Server cannot process this media family.", path, why))
 }
 
-struct FrameWriter {
+pub(crate) struct FrameWriter {
     w: BufWriter<File>,
     frames: u64,
     path: String,
 }
 
 impl FrameWriter {
-    fn create(path: &str) -> Result<FrameWriter> {
+    pub(crate) fn create(path: &str) -> Result<FrameWriter> {
         let f = File::create(path).map_err(|e| io_fail(path, "open", e))?;
         let mut w = BufWriter::with_capacity(256 << 10, f);
         w.write_all(MAGIC).map_err(|e| io_fail(path, "write to", e))?;
         Ok(FrameWriter { w, frames: 0, path: path.to_string() })
     }
 
-    fn put(&mut self, f: &Frame) -> Result<()> {
+    pub(crate) fn put(&mut self, f: &Frame) -> Result<()> {
         let bytes = postcard::to_allocvec(f).map_err(|e| SqlError::with(3013, 16, 1, format!("BACKUP is terminating abnormally: {}.", e)))?;
         let wr = |w: &mut BufWriter<File>, b: &[u8]| w.write_all(b);
         wr(&mut self.w, &(bytes.len() as u32).to_le_bytes()).and_then(|_| wr(&mut self.w, &crc32fast::hash(&bytes).to_le_bytes())).and_then(|_| wr(&mut self.w, &bytes)).map_err(|e| io_fail(&self.path, "write to", e))?;
@@ -95,7 +95,7 @@ impl FrameWriter {
         Ok(())
     }
 
-    fn finish(mut self, tables: u64, rows: u64) -> Result<()> {
+    pub(crate) fn finish(mut self, tables: u64, rows: u64) -> Result<()> {
         let frames = self.frames;
         self.put(&Frame::End { frames, tables, rows })?;
         self.w.flush().map_err(|e| io_fail(&self.path, "write to", e))?;

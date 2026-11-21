@@ -672,7 +672,7 @@ impl<R: Read + Seek> Backup<R> {
                 rows.push((r.fu32(4), [ty[0], ty[1]], r.fu32(0), r.var(0).map(|(n, _)| utf16(n)).unwrap_or_default()));
             }
         })?;
-        for (nsid, ty, id, name) in rows {
+        for (nsid, ty, _id, _name) in rows {
             let schema = self.schemas.get(&nsid).cloned().unwrap_or_default();
             if schema == "sys" || schema == "INFORMATION_SCHEMA" {
                 continue;
@@ -909,12 +909,16 @@ impl<R: Read + Seek> Backup<R> {
         Some(())
     }
 
-    /// Decode the rows of a table (only the stored columns: computed columns are not in the pages).
-    pub fn rows(&mut self, t: &TableMeta) -> Res<Rows> {
-        let mut out = Rows::default();
-        let Some((obj, idx, clustered)) = t.data else { return Ok(out) };
+    /// Stream the rows of a table in batches (512 rows at a time) without collecting them all into memory.
+    pub fn stream_rows<F>(&mut self, t: &TableMeta, mut on_batch: F) -> Res<HashMap<String, u64>>
+    where
+        F: FnMut(Vec<Vec<Value>>) -> Res<()>,
+    {
+        let mut skipped = HashMap::new();
+        let Some((obj, idx, clustered)) = t.data else { return Ok(skipped) };
         let cols: Vec<&ColMeta> = t.cols.iter().filter(|c| !c.computed).collect();
         let plan = Plan::new(t, &cols);
+        let mut batch = Vec::with_capacity(512);
         for pid in self.leaf_pages(obj, idx, clustered) {
             let p = self.page(pid)?;
             for off in Self::slots(&p) {
@@ -922,9 +926,49 @@ impl<R: Read + Seek> Backup<R> {
                 if !matches!(r.kind(), 0 | 1) {
                     continue;
                 }
-                out.rows.push(plan.decode(&r, &cols, &mut out.skipped, &mut |ptr| self.lob(ptr)));
+                batch.push(plan.decode(&r, &cols, &mut skipped, &mut |ptr| self.lob(ptr)));
+                if batch.len() >= 512 {
+                    on_batch(std::mem::replace(&mut batch, Vec::with_capacity(512)))?;
+                }
             }
         }
+        if !batch.is_empty() {
+            on_batch(batch)?;
+        }
+        Ok(skipped)
+    }
+
+    /// Decode at most `limit` rows of a table.
+    pub fn sample_rows(&mut self, t: &TableMeta, limit: usize) -> Res<Vec<Vec<Value>>> {
+        let mut out = Vec::new();
+        let Some((obj, idx, clustered)) = t.data else { return Ok(out) };
+        let cols: Vec<&ColMeta> = t.cols.iter().filter(|c| !c.computed).collect();
+        let plan = Plan::new(t, &cols);
+        let mut skipped = HashMap::new();
+        for pid in self.leaf_pages(obj, idx, clustered) {
+            let p = self.page(pid)?;
+            for off in Self::slots(&p) {
+                let Some(r) = Rec::new(&p, off) else { continue };
+                if !matches!(r.kind(), 0 | 1) {
+                    continue;
+                }
+                out.push(plan.decode(&r, &cols, &mut skipped, &mut |ptr| self.lob(ptr)));
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Decode the rows of a table (only the stored columns: computed columns are not in the pages).
+    pub fn rows(&mut self, t: &TableMeta) -> Res<Rows> {
+        let mut out = Rows::default();
+        let skipped = self.stream_rows(t, |batch| {
+            out.rows.extend(batch);
+            Ok(())
+        })?;
+        out.skipped = skipped;
         Ok(out)
     }
 }

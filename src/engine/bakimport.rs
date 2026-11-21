@@ -10,6 +10,10 @@ use std::collections::HashMap;
 use crate::types::{DataType, DtKind, Value};
 use crate::{mssqlbak, Server};
 use chrono::Timelike;
+use super::backup::{BackupHeader, Frame, FrameWriter};
+use super::dml::table_schema;
+use super::obj_key;
+use super::SrvGuard;
 
 /// What an import did, and what it could not bring over.
 #[derive(Debug, Default)]
@@ -138,6 +142,23 @@ fn run(conn: &mut crate::Connection, sql: &str) -> Result<(), String> {
     }
 }
 
+fn create_table(conn: &mut crate::Connection, t: &TableMeta, with_computed: bool, alias_names: &HashMap<u32, String>) -> Result<(), String> {
+    let defs: Vec<String> = t
+        .cols
+        .iter()
+        .filter_map(|c| {
+            if c.computed {
+                let expr = c.definition.as_ref().filter(|_| with_computed)?;
+                return Some(format!("{} AS {}{}", quote(&c.name), expr, if c.persisted { " PERSISTED" } else { "" }));
+            }
+            let nullable = c.nullable;
+            let identity = c.identity.map(|(seed, inc, _)| format!(" IDENTITY({},{})", seed, inc)).unwrap_or_default();
+            Some(format!("{} {}{}{}", quote(&c.name), alias_names.get(&c.utype).cloned().unwrap_or_else(|| type_sql(&c.ty)), identity, if nullable { " NULL" } else { " NOT NULL" }))
+        })
+        .collect();
+    run(conn, &format!("CREATE TABLE {} ({})", qname(t), defs.join(", ")))
+}
+
 /// Read the SQL Server backup at `src` and write its database as a backup of this server's format at `out`.
 pub fn convert(src: &str, out: &str) -> Result<Report, String> {
     let f = std::fs::File::open(src).map_err(|e| format!("cannot open {}: {}", src, e))?;
@@ -188,23 +209,44 @@ pub fn convert(src: &str, out: &str) -> Result<Report, String> {
         }
     }
     for t in &tables {
-        let data = bak.rows(t)?;
         let tn = format!("{}.{}", t.schema, t.name);
-        for (c, n) in &data.skipped {
-            report.skipped.push((tn.clone(), c.clone(), *n));
-        }
-        // computed columns come in their place among the others. When the table cannot be built with them (an expression that
-        // this server cannot evaluate, found out when the rows go in) it is built again without them.
         let wants_computed = t.cols.iter().any(|c| c.computed && c.definition.is_some());
         let mut with_computed = wants_computed;
-        let mut loaded = load_table(&mut conn, t, &data, with_computed, &alias_names);
-        if let (Err(e), true) = (&loaded, wants_computed) {
+        let mut created = create_table(&mut conn, t, with_computed, &alias_names);
+        if let (Err(e), true) = (&created, wants_computed) {
             report.problems.push(format!("the computed columns of {} were not created: {}", tn, e));
             let _ = conn.execute(&format!("DROP TABLE {}", qname(t)));
             with_computed = false;
-            loaded = load_table(&mut conn, t, &data, false, &alias_names);
+            created = create_table(&mut conn, t, false, &alias_names);
         }
-        loaded?;
+        created?;
+
+        if with_computed {
+            if let Ok(sample) = bak.sample_rows(t, 1) {
+                if let Some(row) = sample.into_iter().next() {
+                    let stored: Vec<&ColMeta> = t.cols.iter().filter(|c| !c.computed).collect();
+                    let cols = stored.iter().map(|c| quote(&c.name)).collect::<Vec<_>>().join(", ");
+                    let has_identity = stored.iter().any(|c| c.identity.is_some());
+                    if has_identity {
+                        let _ = run(&mut conn, &format!("SET IDENTITY_INSERT {} ON", qname(t)));
+                    }
+                    let vals = format!("({})", row.iter().map(literal).collect::<Vec<_>>().join(", "));
+                    let test_res = run(&mut conn, &format!("INSERT INTO {} ({}) VALUES {}", qname(t), cols, vals));
+                    if has_identity {
+                        let _ = run(&mut conn, &format!("SET IDENTITY_INSERT {} OFF", qname(t)));
+                    }
+                    if let Err(e) = test_res {
+                        report.problems.push(format!("the computed columns of {} were not created: {}", tn, e));
+                        let _ = conn.execute(&format!("DROP TABLE {}", qname(t)));
+                        with_computed = false;
+                        create_table(&mut conn, t, false, &alias_names)?;
+                    } else {
+                        let _ = run(&mut conn, &format!("TRUNCATE TABLE {}", qname(t)));
+                    }
+                }
+            }
+        }
+
         for c in t.cols.iter().filter(|c| c.computed) {
             if with_computed && c.definition.is_some() {
                 computed_created.insert((t.id, c.colid));
@@ -213,7 +255,6 @@ pub fn convert(src: &str, out: &str) -> Result<Report, String> {
             }
         }
         report.tables += 1;
-        report.rows += data.rows.len() as u64;
     }
     let catalogs = create_fulltext_catalogs(&mut conn, &mut bak, &mut report);
     create_keys(&mut conn, &tables, &computed_created, &catalogs, &mut report);
@@ -229,8 +270,124 @@ pub fn convert(src: &str, out: &str) -> Result<Report, String> {
     for m in modules.iter().filter(|m| matches!(&m.kind, b"AF" | b"FS" | b"FT" | b"PC" | b"TA")) {
         report.problems.push(format!("CLR object {}.{} was not created: CLR is not supported", m.schema, m.name));
     }
-    let path = out.replace('\'', "''");
-    run(&mut conn, &format!("BACKUP DATABASE {} TO DISK = N'{}' WITH INIT", quote(&db), path))?;
+
+    let mut db_catalog = {
+        let state = scratch.shared.state.read().unwrap();
+        state.databases.get(&db.to_lowercase()).cloned().ok_or_else(|| "database not found".to_string())?
+    };
+    for t in &tables {
+        if let Some(col) = t.cols.iter().find(|c| c.identity.is_some()) {
+            if let Some((seed, inc, last)) = col.identity {
+                let tk = obj_key(&t.schema, &t.name);
+                if let Some(crate::catalog::Object::Table(tbl)) = db_catalog.objects.get_mut(&tk) {
+                    let next = if (inc > 0 && last >= seed) || (inc < 0 && last <= seed) {
+                        last + inc
+                    } else {
+                        seed
+                    };
+                    tbl.identity_next.set(Some(next));
+                }
+            }
+        }
+    }
+
+    let mut w = FrameWriter::create(out).map_err(|e| e.to_string())?;
+    let header = BackupHeader {
+        log: false,
+        db: db.clone(),
+        db_key: db.to_lowercase(),
+        server: "TSQL-SERVER".to_string(),
+        wall: chrono::Utc::now().timestamp_micros(),
+        ts: 1,
+        after_ts: 0,
+        diff_base: None,
+        recovery_full: true,
+        copy_only: false,
+        name: format!("{}-Converted Database Backup", db),
+        description: String::new(),
+    };
+    w.put(&Frame::Header(header)).map_err(|e| e.to_string())?;
+    w.put(&Frame::Catalog(Box::new(db_catalog.clone()))).map_err(|e| e.to_string())?;
+
+    {
+        let shared = &scratch.shared;
+        let guard = SrvGuard::new(&shared.state);
+        let mut eng = crate::engine::Engine::new(guard, conn.session_mut());
+
+        for t in &tables {
+            let tk = obj_key(&t.schema, &t.name);
+            let tn = format!("{}.{}", t.schema, t.name);
+            let Some(crate::catalog::Object::Table(tbl)) = db_catalog.objects.get(&tk) else { continue };
+            let has_computed = tbl.columns.iter().any(|c| c.computed.is_some());
+            let schema = table_schema(tbl, &tbl.name);
+            let computed_cols: Vec<(usize, std::sync::Arc<crate::ast::Expr>)> = tbl.columns.iter().enumerate()
+                .filter_map(|(i, c)| c.computed.as_ref().map(|e| (i, e.clone())))
+                .collect();
+            let ncols = tbl.columns.len();
+
+            let stored_cols: Vec<&crate::catalog::Column> = tbl.columns.iter().filter(|c| c.computed.is_none()).collect();
+            let spatial_cols: Vec<(usize, DataType, String)> = stored_cols.iter().enumerate()
+                .filter_map(|(i, c)| {
+                    if matches!(c.ty, DataType::Geography | DataType::Geometry) {
+                        Some((i, c.ty.clone(), c.name.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let mut row_id = 0usize;
+            let mut table_rows = 0u64;
+
+            let skipped = bak.stream_rows(t, |batch| {
+                let mut frame_batch = Vec::with_capacity(batch.len());
+                for mut val_row in batch {
+                    if !spatial_cols.is_empty() {
+                        for (idx, ty, col_name) in &spatial_cols {
+                            if let Some(v) = val_row.get_mut(*idx) {
+                                if !v.is_null() {
+                                    if let Ok(coerced) = crate::convert::coerce_store(v, ty, &tbl.name, col_name) {
+                                        *v = coerced;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let full_row = if has_computed {
+                        let mut full = vec![Value::Null; ncols];
+                        let mut val_iter = val_row.into_iter();
+                        for (ci, col) in tbl.columns.iter().enumerate() {
+                            if col.computed.is_none() {
+                                if let Some(v) = val_iter.next() {
+                                    full[ci] = v;
+                                }
+                            }
+                        }
+                        for (ci, expr) in &computed_cols {
+                            if let Ok(v) = eng.ev_row(&schema, &full, expr) {
+                                full[*ci] = crate::convert::cast(&v, &tbl.columns[*ci].ty, None).unwrap_or(v);
+                            }
+                        }
+                        full
+                    } else {
+                        val_row
+                    };
+                    frame_batch.push((row_id, full_row));
+                    row_id += 1;
+                    table_rows += 1;
+                }
+                w.put(&Frame::Rows { key: tk.clone(), rows: frame_batch }).map_err(|e| e.to_string())?;
+                Ok(())
+            })?;
+
+            for (c, n) in &skipped {
+                report.skipped.push((tn.clone(), c.clone(), *n));
+            }
+            report.rows += table_rows;
+        }
+    }
+
+    w.finish(report.tables as u64, report.rows).map_err(|e| e.to_string())?;
     Ok(report)
 }
 
@@ -412,6 +569,7 @@ fn create_keys(conn: &mut crate::Connection, tables: &[TableMeta], computed: &st
 }
 
 /// Create a table and put its rows in.
+#[cfg(test)]
 fn load_table(conn: &mut crate::Connection, t: &TableMeta, data: &crate::sqlbak::Rows, with_computed: bool, alias_names: &HashMap<u32, String>) -> Result<(), String> {
     // a column with values that could not be read must be able to hold NULL
     let defs: Vec<String> = t
