@@ -1,6 +1,7 @@
 param(
     [string]$Bind = "0.0.0.0",
-    [int]$Port = 1433
+    [int]$Port = 1433,
+    [string]$SaPassword = ""
 )
 
 $ClusterDir = "C:\Users\frank\Projects\tsql-server\data\cluster"
@@ -35,7 +36,8 @@ try {
     Start-Sleep -Seconds 1
 
     Write-Host "Starting control node on ${Bind}:${Port}..."
-    $null = Start-DetachedProcess -CommandLine "bin\tsql-cluster.exe --config cluster.json --state cluster.state --listen $Port --bind $Bind > cluster.log 2> cluster.err.log" -WorkingDir $ClusterDir
+    $pwArg = if ($SaPassword) { "--sa-password `"$SaPassword`"" } else { "" }
+    $null = Start-DetachedProcess -CommandLine "bin\tsql-cluster.exe --config cluster.json --state cluster.state --listen $Port --bind $Bind $pwArg > cluster.log 2> cluster.err.log" -WorkingDir $ClusterDir
 
     Start-Sleep -Seconds 2
 

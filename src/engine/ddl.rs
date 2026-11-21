@@ -459,9 +459,14 @@ impl<'a> Engine<'a> {
                 if exists && !*or_alter && !*alter {
                     return Err(self.object_exists_err(&n));
                 }
-                // validate by compiling
+                // validate by compiling without running the query over the underlying data
                 let saved = std::mem::take(&mut self.ses.cte_stack);
+                let saved_plan = std::mem::take(&mut self.ses.plan);
+                let prev_dry = self.ses.dry_run;
+                self.ses.dry_run = true;
                 let probe = self.exec_query(query, None);
+                self.ses.dry_run = prev_dry;
+                self.ses.plan = saved_plan;
                 self.ses.cte_stack = saved;
                 let rs = probe?;
                 if let Some(c) = cols {
