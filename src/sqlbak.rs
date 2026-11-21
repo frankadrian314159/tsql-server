@@ -872,8 +872,8 @@ impl<R: Read + Seek> Backup<R> {
                     self.lob_node(u32_at(l, 4)?, u16_at(l, 10)? as usize, 0, &mut out)?;
                 }
             }
-            // the 16-byte pointer of text, ntext and image columns: type, blob id, page, file, slot of a root in a text page
-            0 if ptr.len() == 16 => self.lob_node(u32_at(ptr, 8)?, u16_at(ptr, 14)? as usize, 0, &mut out)?,
+            // the 16-byte or 24-byte pointer of text, ntext and image columns: type, blob id, page, file, slot of a root in a text page
+            _ if ptr.len() == 16 || ptr.len() == 24 => self.lob_node(u32_at(ptr, 8)?, u16_at(ptr, 14)? as usize, 0, &mut out)?,
             _ => return None,
         }
         Some(out)
@@ -1012,8 +1012,14 @@ impl Plan {
                 Kind::Fixed(pos, n) => r.fixed(pos, n).and_then(|b| fixed_value(c, b)),
                 Kind::Bit(pos, bit) => r.fixed(pos, 1).map(|b| Value::Bit(b[0] >> bit & 1 != 0)),
                 Kind::Var(k) => match r.var(k) {
-                    // text, ntext and image keep a pointer in the row (the form of an in-row value is not known)
-                    Some((_, false)) if matches!(c.xtype, 34 | 35 | 99) => None,
+                    // text, ntext and image keep a 16-byte or 24-byte pointer in the row (even without complex bit 0x8000)
+                    Some((b, false)) if matches!(c.xtype, 34 | 35 | 99) => {
+                        if b.len() == 16 || b.len() == 24 {
+                            lob(b).and_then(|v| var_value(c, &v)).or_else(|| var_value(c, b))
+                        } else {
+                            var_value(c, b)
+                        }
+                    }
                     Some((b, false)) => var_value(c, b),
                     Some((b, true)) => lob(b).and_then(|v| var_value(c, &v)),
                     // a trailing variable-length column of zero length is not stored at all
