@@ -811,9 +811,9 @@ fn updates_and_deletes_may_have_subqueries_and_may_change_the_shard_key() {
         p.check("SELECT status, COUNT(*) AS n, SUM(qty) AS q FROM orders GROUP BY status ORDER BY status", true);
         p.check("SELECT COUNT(*) AS n FROM orders", false);
     }
-    // a correlated subquery is not supported in UPDATE (an error, not a wrong answer)
-    let r = p.cl.execute("UPDATE orders SET qty = 0 WHERE amount > (SELECT AVG(o2.amount) FROM orders o2 WHERE o2.customer_id = orders.customer_id)");
-    assert_eq!(r.first_error().map(|e| e.number), Some(50100));
+    // a correlated subquery in UPDATE is now supported (read as a query and applied by key)
+    p.both("UPDATE orders SET qty = 0 WHERE amount > (SELECT AVG(o2.amount) FROM orders o2 WHERE o2.customer_id = orders.customer_id)");
+    p.check("SELECT status, COUNT(*) AS n, SUM(qty) AS q FROM orders GROUP BY status ORDER BY status", true);
     // changing the shard key moves rows between shards, atomically
     p.both("CREATE TABLE kt (id INT PRIMARY KEY, v INT)");
     p.both(&format!("INSERT kt VALUES {}", (1..=40).map(|i| format!("({}, {})", i, i * 10)).collect::<Vec<_>>().join(",")));
