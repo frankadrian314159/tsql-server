@@ -329,11 +329,32 @@ impl<'a> Engine<'a> {
                 }
                 tl.t.data.specs.iter().any(|sp| (sp.unique || sp.pk) && sp.filter.is_none() && !sp.cols.is_empty() && sp.cols.iter().all(|c| cols.contains(c)))
             };
+            let has_equi_link = |c: usize| -> bool {
+                for (ci, cond) in conds.iter().enumerate() {
+                    let Some(s) = &cond_refs[ci] else { continue };
+                    if !s.contains(&c) || !s.iter().any(|x| joined.contains(x)) {
+                        continue;
+                    }
+                    if let Expr::Binary(BinOp::Eq, l, r) = cond {
+                        let left_in_c = refs_of(l, &leaves).map(|s| s.contains(&c)).unwrap_or(false);
+                        let right_in_c = refs_of(r, &leaves).map(|s| s.contains(&c)).unwrap_or(false);
+                        let left_in_joined = refs_of(l, &leaves).map(|s| s.iter().any(|x| joined.contains(x))).unwrap_or(false);
+                        let right_in_joined = refs_of(r, &leaves).map(|s| s.iter().any(|x| joined.contains(x))).unwrap_or(false);
+                        if (left_in_c && right_in_joined) || (right_in_c && left_in_joined) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            };
             let next = *pool
                 .iter()
                 .min_by(|&&a, &&b| {
+                    let (ea, eb) = (!connected.is_empty() && !has_equi_link(a), !connected.is_empty() && !has_equi_link(b));
                     let (ka, kb) = (!connected.is_empty() && !unique_link(a), !connected.is_empty() && !unique_link(b));
-                    ka.cmp(&kb).then(leaves[a].est.partial_cmp(&leaves[b].est).unwrap_or(std::cmp::Ordering::Equal))
+                    ea.cmp(&eb)
+                        .then(ka.cmp(&kb))
+                        .then(leaves[a].est.partial_cmp(&leaves[b].est).unwrap_or(std::cmp::Ordering::Equal))
                 })
                 .unwrap();
             order.push(next);

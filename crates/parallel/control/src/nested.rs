@@ -257,6 +257,7 @@ impl ClusterSession {
             return Ok(None);
         }
         let Some(t) = self.table_by_id(&id) else { return Ok(None) };
+        self.cluster.advisor.record_read(&t.id);
         match &t.dist {
             Dist::Replicated => {
                 self.plan.push("direct: replicated tables, on shard 0".into());

@@ -198,6 +198,10 @@ pub struct Cluster {
     next_session: AtomicU64,
     /// the largest table (in rows) a join broadcasts to every shard
     broadcast_limit: AtomicU64,
+    /// read percentage threshold (e.g. 75 for 75%) required for advisor to recommend replication
+    advisor_read_threshold: AtomicU64,
+    /// max table size in bytes for advisor to recommend replication (default 10 MB)
+    advisor_max_bytes: AtomicU64,
     /// the longest list an `IN (SELECT ...)` is turned into (longer results become replicated temporary tables)
     in_list_limit: AtomicU64,
     in_join_min: AtomicU64,
@@ -287,6 +291,8 @@ impl Cluster {
             advisor: Default::default(),
             next_session: AtomicU64::new(fresh_session_base()),
             broadcast_limit: AtomicU64::new(100_000),
+            advisor_read_threshold: AtomicU64::new(75),
+            advisor_max_bytes: AtomicU64::new(10 * 1024 * 1024),
             in_list_limit: AtomicU64::new(20_000),
             in_join_min: AtomicU64::new(100),
             lock_timeout_ms: AtomicU64::new(5000),
@@ -431,6 +437,22 @@ impl Cluster {
 
     pub fn set_broadcast_limit(&self, rows: u64) {
         self.broadcast_limit.store(rows, Ordering::Relaxed);
+    }
+
+    pub fn set_advisor_read_threshold(&self, pct: u64) {
+        self.advisor_read_threshold.store(pct.min(100), Ordering::Relaxed);
+    }
+
+    pub fn advisor_read_threshold(&self) -> u64 {
+        self.advisor_read_threshold.load(Ordering::Relaxed)
+    }
+
+    pub fn set_advisor_max_bytes(&self, bytes: u64) {
+        self.advisor_max_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    pub fn advisor_max_bytes(&self) -> u64 {
+        self.advisor_max_bytes.load(Ordering::Relaxed)
     }
 
     pub fn session(self: &Arc<Self>) -> ClusterSession {
@@ -787,7 +809,7 @@ impl ClusterSession {
         front::note_xact_state(sql);
         let cl = self.cluster.clone();
         let mut events = vec![];
-        // ADVISE DISTRIBUTION [RESET]: what the queries had to move or gather so far, and the distribution that would have spared it
+        // ADVISE DISTRIBUTION [RESET | SET THRESHOLD <pct> | SET MAX_BYTES <bytes> | THRESHOLD <pct>]:
         {
             let words: Vec<String> = sql.trim().trim_end_matches(';').split_whitespace().map(|w| w.to_lowercase()).collect();
             if words.len() >= 2 && words[0] == "advise" && words[1] == "distribution" {
@@ -795,8 +817,43 @@ impl ClusterSession {
                     cl.advisor.clear();
                     return BatchResult { events: vec![Event::Message("The record of moved tables is cleared.".into())] };
                 }
-                let rs = advisor::advise(&cl.advisor, &cl.tables(), cl.broadcast_limit.load(Ordering::Relaxed));
+                if words.len() >= 5 && words[2] == "set" && (words[3] == "threshold" || words[3] == "read_threshold") {
+                    if let Ok(pct) = words[4].parse::<u64>() {
+                        cl.set_advisor_read_threshold(pct);
+                        return BatchResult { events: vec![Event::Message(format!("Advisor read threshold set to {}%.", cl.advisor_read_threshold()))] };
+                    }
+                }
+                if words.len() >= 5 && words[2] == "set" && words[3] == "max_bytes" {
+                    if let Ok(b) = words[4].parse::<u64>() {
+                        cl.set_advisor_max_bytes(b);
+                        return BatchResult { events: vec![Event::Message(format!("Advisor max bytes set to {}.", cl.advisor_max_bytes()))] };
+                    }
+                }
+                let mut threshold = cl.advisor_read_threshold();
+                if words.len() == 4 && (words[2] == "threshold" || words[2] == "read_threshold") {
+                    if let Ok(pct) = words[3].parse::<u64>() {
+                        threshold = pct.min(100);
+                    }
+                } else if words.len() == 3 {
+                    if let Ok(pct) = words[2].parse::<u64>() {
+                        threshold = pct.min(100);
+                    }
+                }
+                let rs = advisor::advise(
+                    &cl.advisor,
+                    &cl.tables(),
+                    cl.broadcast_limit.load(Ordering::Relaxed),
+                    threshold,
+                    cl.advisor_max_bytes(),
+                );
                 return BatchResult { events: vec![Event::Rows(rs)] };
+            }
+            if words.len() >= 3 && words[0] == "set" && (words[1] == "advisor_read_threshold" || words[1] == "advisor_threshold") {
+                let val_str = words[2].trim_start_matches('=');
+                if let Ok(pct) = val_str.parse::<u64>() {
+                    cl.set_advisor_read_threshold(pct);
+                    return BatchResult { events: vec![Event::Message(format!("Advisor read threshold set to {}%.", cl.advisor_read_threshold()))] };
+                }
             }
         }
         if let Some(cmd) = parse_distribute(sql) {
@@ -1473,13 +1530,35 @@ impl ClusterSession {
                 if self.cluster.fks_of_parent(&t.id).iter().any(|f| f.child != t.id) {
                     return Err(SqlError::new(4712, format!("Cannot truncate table '{}' because it is being referenced by a FOREIGN KEY constraint.", name.join("."))));
                 }
+                self.cluster.advisor.record_write(&t.id);
                 self.broadcast(st).await?;
                 self.bump(&t.id);
                 Ok(())
             }
-            Stmt::Insert(ins) => self.insert(ins, events).await,
-            Stmt::Update(u) => self.update(u, events).await,
-            Stmt::Delete(d) => self.delete(d, events).await,
+            Stmt::Insert(ins) => {
+                if let Target::Table(name) = &ins.target {
+                    if let Ok(t) = self.table(name) {
+                        self.cluster.advisor.record_write(&t.id);
+                    }
+                }
+                self.insert(ins, events).await
+            }
+            Stmt::Update(u) => {
+                if let Target::Table(name) = &u.target {
+                    if let Ok(t) = self.table(name) {
+                        self.cluster.advisor.record_write(&t.id);
+                    }
+                }
+                self.update(u, events).await
+            }
+            Stmt::Delete(d) => {
+                if let Target::Table(name) = &d.target {
+                    if let Ok(t) = self.table(name) {
+                        self.cluster.advisor.record_write(&t.id);
+                    }
+                }
+                self.delete(d, events).await
+            }
             Stmt::Query(q) => {
                 if let Some(assigns) = assign_targets(q) {
                     return self.select_assign(q, assigns).await;
@@ -2722,6 +2801,9 @@ impl ClusterSession {
         tsql_server::span!("ctl_run_query_flat");
         let ids = referenced_tables(q);
         let tables: Vec<DistTable> = ids.iter().filter_map(|i| self.table_by_id(i)).collect();
+        for t in &tables {
+            self.cluster.advisor.record_read(&t.id);
+        }
         if tables.is_empty() {
             // (a function it calls may read a replicated table, which every shard holds and the control node's own copy does not)
             if self.calls_function_reading_tables(q) {
@@ -2808,6 +2890,9 @@ impl ClusterSession {
             _ => return Ok(None),
         };
         self.plan.push(format!("pushdown: the subqueries run on the shards {:?} with the rest of the query", shards));
+        for t in map.values() {
+            self.cluster.advisor.record_read(&t.id);
+        }
         self.scatter(shape, &shards).await.map(Some)
     }
 
@@ -2845,12 +2930,231 @@ impl ClusterSession {
         Ok(n)
     }
 
+    /// Discovers key sets of small reference dimension tables (<= 100 rows) by evaluating constant filters on shards,
+    /// and propagates those keys transitively across equijoins.
+    async fn resolve_dimension_filters(&mut self, q: &Query, tables: &[DistTable]) -> Result<Query, SqlError> {
+        let QueryBody::Select(sel) = &q.body else { return Ok(q.clone()) };
+        if sel.from.is_empty() {
+            return Ok(q.clone());
+        }
+        fn inner_only(tr: &TableRef) -> bool {
+            match tr {
+                TableRef::Table { .. } => true,
+                TableRef::Join { kind, left, right, .. } => {
+                    matches!(kind, JoinKind::Inner | JoinKind::Cross) && inner_only(left) && inner_only(right)
+                }
+                _ => false,
+            }
+        }
+        if !sel.from.iter().all(inner_only) {
+            return Ok(q.clone());
+        }
+        let mut leaves: Vec<joins::Leaf> = vec![];
+        let mut on_preds: Vec<Expr> = vec![];
+        let map: HashMap<String, DistTable> = tables.iter().map(|t| (t.id.clone(), t.clone())).collect();
+        for tr in &sel.from {
+            if joins::build(tr, &map, &mut leaves, &mut on_preds).is_none() {
+                return Ok(q.clone());
+            }
+        }
+        if leaves.len() < 2 {
+            return Ok(q.clone());
+        }
+        let mut where_conjuncts: Vec<Expr> = vec![];
+        if let Some(w) = &sel.where_ {
+            let mut cs = vec![];
+            joins::conjuncts(w, &mut cs);
+            where_conjuncts.extend(cs.into_iter().cloned());
+        }
+        let mut all_conds: Vec<Expr> = on_preds;
+        all_conds.extend(where_conjuncts.clone());
+
+        let mut newly_derived: Vec<Expr> = vec![];
+        let mut factored = vec![];
+        for w in &all_conds {
+            factored.extend(joins::factor_disjuncts(w, &leaves));
+        }
+        for f in factored {
+            if !all_conds.iter().any(|x| joins::expr_eq(x, &f)) {
+                all_conds.push(f.clone());
+                newly_derived.push(f);
+            }
+        }
+
+        let mut dim_leaves = vec![];
+        for (l, leaf) in leaves.iter().enumerate() {
+            let r = self.table_rows(&leaf.table).await.unwrap_or(u64::MAX);
+            if r <= 100 {
+                dim_leaves.push(l);
+            }
+        }
+
+        if dim_leaves.is_empty() {
+            if newly_derived.is_empty() {
+                return Ok(q.clone());
+            }
+            let mut nq = q.clone();
+            if let QueryBody::Select(s) = &mut nq.body {
+                let combined = newly_derived.into_iter().reduce(|a, b| Expr::And(Box::new(a), Box::new(b))).unwrap();
+                s.where_ = match &s.where_ {
+                    Some(w) => Some(Expr::And(Box::new(w.clone()), Box::new(combined))),
+                    None => Some(combined),
+                };
+            }
+            return Ok(nq);
+        }
+
+        let shards = self.all_shards();
+        for _pass in 0..3 {
+            let mut eqs = vec![];
+            for p in &all_conds {
+                if let Expr::Binary(BinOp::Eq, a, b) = p {
+                    if let (Expr::Col(x), Expr::Col(y)) = (&**a, &**b) {
+                        if let (Some((l1, c1)), Some((l2, c2))) = (joins::resolve(&leaves, x), joins::resolve(&leaves, y)) {
+                            if l1 != l2 {
+                                eqs.push((l1, c1, l2, c2));
+                                eqs.push((l2, c2, l1, c1));
+                            }
+                        }
+                    }
+                }
+            }
+            let before_len = all_conds.len();
+            joins::propagate_equijoins(&mut all_conds, &eqs, &leaves);
+            for p in &all_conds[before_len..] {
+                newly_derived.push(p.clone());
+            }
+
+            let mut pass_derived = vec![];
+            for &l in &dim_leaves {
+                let mut leaf_filters: Vec<Expr> = vec![];
+                for w in &all_conds {
+                    if has_subquery(w) {
+                        continue;
+                    }
+                    let mut only = true;
+                    let mut any = false;
+                    walk_expr(w, &mut |x| match x {
+                        Expr::Col(p) => match joins::resolve(&leaves, p) {
+                            Some((li, _)) if li == l => any = true,
+                            _ => only = false,
+                        },
+                        Expr::Var(_) | Expr::SysVar(_) | Expr::NextValue(_) => only = false,
+                        _ => {}
+                    });
+                    if only && any && !leaf_filters.iter().any(|x| joins::expr_eq(x, w)) {
+                        leaf_filters.push(w.clone());
+                    }
+                }
+                if leaf_filters.is_empty() {
+                    continue;
+                }
+                let join_cols: Vec<usize> = eqs.iter().filter(|(l1, _, _, _)| *l1 == l).map(|(_, c1, _, _)| *c1).collect();
+                for c in join_cols {
+                    let already_constrained = all_conds.iter().any(|w| match w {
+                        Expr::Binary(BinOp::Eq, a, b) => {
+                            let is_col = match &**a {
+                                Expr::Col(p) => joins::resolve(&leaves, p) == Some((l, c)),
+                                _ => false,
+                            };
+                            is_col && matches!(&**b, Expr::Lit(_))
+                        }
+                        Expr::InList(a, list, false) => {
+                            let is_col = match &**a {
+                                Expr::Col(p) => joins::resolve(&leaves, p) == Some((l, c)),
+                                _ => false,
+                            };
+                            is_col && list.iter().all(|x| matches!(x, Expr::Lit(_)))
+                        }
+                        _ => false,
+                    });
+                    if already_constrained {
+                        continue;
+                    }
+                    let clean_filter = leaf_filters.clone().into_iter().reduce(|a, b| Expr::And(Box::new(a), Box::new(b)));
+                    let clean_filter = clean_filter.map(|cf| {
+                        map_expr(&cf, &mut |x| match x {
+                            Expr::Col(p) => {
+                                if let Some((li, ci)) = joins::resolve(&leaves, p) {
+                                    if li == l {
+                                        return Some(Expr::Col(vec![leaves[l].table.cols[ci].name.clone()]));
+                                    }
+                                }
+                                None
+                            }
+                            _ => None,
+                        })
+                    });
+                    let dim_select = Select {
+                        distinct: true,
+                        top: None,
+                        items: vec![SelectItem::Expr {
+                            e: Expr::Col(vec![leaves[l].table.cols[c].name.clone()]),
+                            alias: None,
+                        }],
+                        into: None,
+                        from: vec![TableRef::Table {
+                            name: leaves[l].table.name.clone(),
+                            alias: None,
+                            hints: vec![],
+                        }],
+                        where_: clean_filter,
+                        group: None,
+                        having: None,
+                    };
+                    let dim_query = simple_query(dim_select);
+                    if let Ok(results) = self.fan_query(&shards, |_| Work::Stmts(vec![Stmt::Query(Box::new(dim_query.clone()))])).await {
+                        let mut vals: Vec<Value> = vec![];
+                        for r in results {
+                            for row in r.rows {
+                                if !row.is_empty() && !row[0].is_null() && !vals.iter().any(|v| joins::val_eq(v, &row[0])) {
+                                    vals.push(row[0].clone());
+                                }
+                            }
+                        }
+                        if !vals.is_empty() && vals.len() <= 50 {
+                            let col_expr = Box::new(Expr::Col(vec![leaves[l].alias.clone(), leaves[l].table.cols[c].name.clone()]));
+                            let pred = if vals.len() == 1 {
+                                Expr::Binary(BinOp::Eq, col_expr, Box::new(Expr::Lit(vals[0].clone())))
+                            } else {
+                                Expr::InList(col_expr, vals.into_iter().map(Expr::Lit).collect(), false)
+                            };
+                            pass_derived.push(pred);
+                        }
+                    }
+                }
+            }
+            if pass_derived.is_empty() {
+                break;
+            }
+            for p in &pass_derived {
+                newly_derived.push(p.clone());
+                all_conds.push(p.clone());
+            }
+        }
+
+        if newly_derived.is_empty() {
+            return Ok(q.clone());
+        }
+        let mut nq = q.clone();
+        if let QueryBody::Select(s) = &mut nq.body {
+            let combined = newly_derived.into_iter().reduce(|a, b| Expr::And(Box::new(a), Box::new(b))).unwrap();
+            s.where_ = match &s.where_ {
+                Some(w) => Some(Expr::And(Box::new(w.clone()), Box::new(combined))),
+                None => Some(combined),
+            };
+        }
+        Ok(nq)
+    }
+
     /// A join of several tables run shard by shard (co-located, broadcast or repartitioned); None when it cannot be.
     /// `nested`: the query has subqueries in its `WHERE`; the tables moved are then broadcast (never repartitioned), and the query goes
     /// on only when the shards can evaluate the subqueries against what they hold once those copies are in place (the tables that
     /// stay where they are are co-located with each other, and each subquery is co-located with them or reads replicated tables).
     async fn try_join(&mut self, q: &Query, tables: &[DistTable], nested: bool) -> Result<Option<ResultSet>, SqlError> {
         tsql_server::span!("ctl_try_join");
+        let q_opt = self.resolve_dimension_filters(q, tables).await.unwrap_or_else(|_| q.clone());
+        let q = &q_opt;
         let map: HashMap<String, DistTable> = tables.iter().map(|t| (t.id.clone(), t.clone())).collect();
         let limit = self.cluster.broadcast_limit.load(Ordering::Relaxed);
         let n = self.cluster.shard_count();
@@ -2890,6 +3194,9 @@ impl ClusterSession {
                         let mut t = p.table.clone();
                         t.dist = Dist::Replicated;
                         t.id = table_id(std::slice::from_ref(&p.temp));
+                        if let Some(cols) = &p.cols {
+                            t.cols = cols.iter().map(|&i| p.table.cols[i].clone()).collect();
+                        }
                         (t.id.clone(), t)
                     })
                     .collect()
@@ -2984,6 +3291,8 @@ impl ClusterSession {
         if tables.len() < 2 {
             return Ok(None);
         }
+        let q_opt = self.resolve_dimension_filters(q, tables).await.unwrap_or_else(|_| q.clone());
+        let q = &q_opt;
         let map: HashMap<String, DistTable> = tables.iter().map(|t| (t.id.clone(), t.clone())).collect();
         let mut rows = HashMap::new();
         for t in tables {
@@ -3043,10 +3352,27 @@ impl ClusterSession {
     async fn prepare_copy(&mut self, p: &joins::PrepSpec) -> Result<(), SqlError> {
         let shards = self.all_shards();
         let n = shards.len();
+        let (items, rp_key) = match &p.cols {
+            Some(cols) => {
+                let items: Vec<SelectItem> = cols
+                    .iter()
+                    .map(|&c| SelectItem::Expr {
+                        e: Expr::Col(vec![p.table.cols[c].name.clone()]),
+                        alias: None,
+                    })
+                    .collect();
+                let rp_key = p.repartition.map(|(c, class)| {
+                    let pos = cols.iter().position(|&idx| idx == c).unwrap_or(0);
+                    (pos, class)
+                });
+                (items, rp_key)
+            }
+            None => (p.table.copy_items(), p.repartition),
+        };
         let scan = simple_query(Select {
             distinct: false,
             top: None,
-            items: p.table.copy_items(),
+            items: items.clone(),
             into: None,
             from: vec![TableRef::Table { name: p.table.name.clone(), alias: Some(p.alias.clone()), hints: vec![] }],
             where_: p.filter.clone(),
@@ -3057,7 +3383,7 @@ impl ClusterSession {
         let create = Stmt::Query(Box::new(simple_query(Select {
             distinct: false,
             top: Some(Top { e: Expr::Lit(Value::Int(0)), percent: false, ties: false }),
-            items: p.table.copy_items(),
+            items,
             into: Some(vec![p.temp.clone()]),
             from: vec![TableRef::Table { name: p.table.name.clone(), alias: None, hints: vec![] }],
             where_: None,
@@ -3073,7 +3399,7 @@ impl ClusterSession {
         let futs: Vec<_> = clients
             .iter()
             .zip(&shards)
-            .map(|(c, &me)| c.shuffle(tsql_shared_ces::wire::ShuffleReq { session: self.id, scan: Stmt::Query(Box::new(scan.clone())), key: p.repartition, table: p.temp.clone(), slots: slots.clone(), peers: peers.clone(), me }))
+            .map(|(c, &me)| c.shuffle(tsql_shared_ces::wire::ShuffleReq { session: self.id, scan: Stmt::Query(Box::new(scan.clone())), key: rp_key, table: p.temp.clone(), slots: slots.clone(), peers: peers.clone(), me }))
             .collect();
         for r in join_all(futs).await {
             r?;

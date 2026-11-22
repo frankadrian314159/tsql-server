@@ -125,6 +125,9 @@ impl ClusterSession {
         let star = !used_columns(&qj, &mut used) || whole;
         let mut eq_cols = HashSet::new();
         equated_columns(&qj, &mut eq_cols);
+        for t in tables {
+            cl.advisor.record_read(&t.id);
+        }
         for t in tables.iter().filter(|t| matches!(t.dist, Dist::Sharded { .. })) {
             let mine: Vec<String> = t.cols.iter().filter(|c| eq_cols.contains(&c.name.to_lowercase())).map(|c| c.name.clone()).collect();
             let rows = self.table_by_id(&t.id).and_then(|x| x.rows.map(|r| r.1)).unwrap_or(0);

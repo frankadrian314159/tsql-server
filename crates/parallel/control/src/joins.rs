@@ -18,6 +18,7 @@ use crate::astutil::*;
 use crate::{Dist, DistTable};
 use std::collections::HashMap;
 use tsql_server::ast::*;
+use tsql_server::Value;
 use tsql_shared_ces::route::KeyClass;
 
 pub(crate) struct Leaf {
@@ -44,6 +45,8 @@ pub struct PrepSpec {
     pub repartition: Option<(usize, KeyClass)>,
     /// columns to index the copy on once it is filled (a subquery that looks the copy up for each outer row needs them)
     pub index_on: Vec<String>,
+    /// column positions of the table to copy (None: copy all columns)
+    pub cols: Option<Vec<usize>>,
 }
 
 pub struct JoinPlan {
@@ -51,6 +54,35 @@ pub struct JoinPlan {
     pub query: Query,
     pub preps: Vec<PrepSpec>,
     pub description: String,
+}
+
+pub(crate) fn val_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null, Value::Null) => true,
+        (Value::Bit(x), Value::Bit(y)) => x == y,
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::BigInt(x), Value::BigInt(y)) => x == y,
+        (Value::Dec(x), Value::Dec(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
+        (Value::Str(x), Value::Str(y)) => x == y,
+        (Value::Bin(x), Value::Bin(y)) => x == y,
+        (Value::Date(x), Value::Date(y)) => x == y,
+        (Value::Time(x), Value::Time(y)) => x == y,
+        (Value::DateTime(x, k1), Value::DateTime(y, k2)) => x == y && k1 == k2,
+        (Value::Dto(x), Value::Dto(y)) => x == y,
+        (Value::Guid(x), Value::Guid(y)) => x == y,
+        _ => false,
+    }
+}
+
+pub(crate) fn expr_eq(a: &Expr, b: &Expr) -> bool {
+    match (a, b) {
+        (Expr::Lit(va), Expr::Lit(vb)) => val_eq(va, vb),
+        (Expr::Col(ca), Expr::Col(cb)) => ca.len() == cb.len() && ca.iter().zip(cb).all(|(x, y)| x.eq_ignore_ascii_case(y)),
+        (Expr::Binary(op1, a1, b1), Expr::Binary(op2, a2, b2)) => op1 == op2 && expr_eq(a1, a2) && expr_eq(b1, b2),
+        (Expr::InList(e1, l1, n1), Expr::InList(e2, l2, n2)) => n1 == n2 && expr_eq(e1, e2) && l1.len() == l2.len() && l1.iter().zip(l2).all(|(x, y)| expr_eq(x, y)),
+        _ => format!("{:?}", a) == format!("{:?}", b),
+    }
 }
 
 pub(crate) fn conjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
@@ -61,6 +93,198 @@ pub(crate) fn conjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
         }
         Expr::Paren(a) => conjuncts(a, out),
         other => out.push(other),
+    }
+}
+
+pub(crate) fn disjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match e {
+        Expr::Or(a, b) => {
+            disjuncts(a, out);
+            disjuncts(b, out);
+        }
+        Expr::Paren(a) => disjuncts(a, out),
+        other => out.push(other),
+    }
+}
+
+pub(crate) fn factor_disjuncts(e: &Expr, leaves: &[Leaf]) -> Vec<Expr> {
+    let mut branches = vec![];
+    disjuncts(e, &mut branches);
+    if branches.len() <= 1 {
+        return vec![];
+    }
+    let mut branch_conjuncts: Vec<Vec<&Expr>> = Vec::with_capacity(branches.len());
+    for b in &branches {
+        let mut cs = vec![];
+        conjuncts(b, &mut cs);
+        branch_conjuncts.push(cs);
+    }
+    let mut derived = vec![];
+    for (l, leaf) in leaves.iter().enumerate() {
+        let mut per_branch: Vec<Vec<&Expr>> = Vec::with_capacity(branches.len());
+        let mut all_have = true;
+        for cs in &branch_conjuncts {
+            let mut leaf_cs = vec![];
+            for &c in cs {
+                if has_subquery(c) {
+                    continue;
+                }
+                let mut only = true;
+                let mut any = false;
+                walk_expr(c, &mut |x| match x {
+                    Expr::Col(p) => match resolve(leaves, p) {
+                        Some((li, _)) if li == l => any = true,
+                        _ => only = false,
+                    },
+                    Expr::Var(_) | Expr::SysVar(_) | Expr::NextValue(_) => only = false,
+                    _ => {}
+                });
+                if only && any {
+                    leaf_cs.push(c);
+                }
+            }
+            if leaf_cs.is_empty() {
+                all_have = false;
+                break;
+            }
+            per_branch.push(leaf_cs);
+        }
+        if !all_have {
+            continue;
+        }
+
+        let get_eq_col = |cond: &Expr| -> Option<(usize, Vec<Expr>)> {
+            match cond {
+                Expr::Binary(BinOp::Eq, a, b) => {
+                    let col_lit = match (&**a, &**b) {
+                        (Expr::Col(p), Expr::Lit(v)) => resolve(leaves, p).map(|(li, c)| (li, c, Expr::Lit(v.clone()))),
+                        (Expr::Lit(v), Expr::Col(p)) => resolve(leaves, p).map(|(li, c)| (li, c, Expr::Lit(v.clone()))),
+                        _ => None,
+                    };
+                    if let Some((li, c, lit)) = col_lit {
+                        if li == l {
+                            return Some((c, vec![lit]));
+                        }
+                    }
+                    None
+                }
+                Expr::InList(a, list, false) => {
+                    if let Expr::Col(p) = &**a {
+                        if let Some((li, c)) = resolve(leaves, p) {
+                            if li == l && list.iter().all(|x| matches!(x, Expr::Lit(_))) {
+                                return Some((c, list.clone()));
+                            }
+                        }
+                    }
+                    None
+                }
+                _ => None,
+            }
+        };
+
+        let mut common_col: Option<usize> = None;
+        let mut combined_lits: Vec<Expr> = vec![];
+        let mut can_combine_inlist = true;
+        for branch in &per_branch {
+            let mut branch_col_found = None;
+            for &cond in branch {
+                if let Some((c, lits)) = get_eq_col(cond) {
+                    if common_col.is_none() || common_col == Some(c) {
+                        common_col = Some(c);
+                        branch_col_found = Some(lits);
+                        break;
+                    }
+                }
+            }
+            if let Some(lits) = branch_col_found {
+                for lit in lits {
+                    if !combined_lits.iter().any(|x| expr_eq(x, &lit)) {
+                        combined_lits.push(lit);
+                    }
+                }
+            } else {
+                can_combine_inlist = false;
+                break;
+            }
+        }
+
+        if can_combine_inlist && common_col.is_some() && !combined_lits.is_empty() {
+            let c = common_col.unwrap();
+            let col_name = leaf.table.cols[c].name.clone();
+            let col_expr = Box::new(Expr::Col(vec![leaf.alias.clone(), col_name]));
+            let factored = if combined_lits.len() == 1 {
+                Expr::Binary(BinOp::Eq, col_expr, Box::new(combined_lits.pop().unwrap()))
+            } else {
+                Expr::InList(col_expr, combined_lits, false)
+            };
+            derived.push(factored);
+        } else {
+            let mut branch_or_terms = vec![];
+            for branch in per_branch {
+                if let Some(conj) = branch.into_iter().cloned().reduce(|a, b| Expr::And(Box::new(a), Box::new(b))) {
+                    branch_or_terms.push(conj);
+                }
+            }
+            if let Some(factored) = branch_or_terms.into_iter().reduce(|a, b| Expr::Or(Box::new(a), Box::new(b))) {
+                derived.push(factored);
+            }
+        }
+    }
+    derived
+}
+
+pub(crate) fn propagate_equijoins(
+    where_conjuncts: &mut Vec<Expr>,
+    eqs: &[(usize, usize, usize, usize)],
+    leaves: &[Leaf],
+) {
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut to_add = vec![];
+        for &(l1, c1, l2, c2) in eqs {
+            let t1 = &leaves[l1].table.cols[c1].type_name;
+            let t2 = &leaves[l2].table.cols[c2].type_name;
+            if !t1.eq_ignore_ascii_case(t2) {
+                if KeyClass::of_type_name(t1) != KeyClass::of_type_name(t2) {
+                    continue;
+                }
+            }
+            for w in where_conjuncts.iter() {
+                match w {
+                    Expr::Binary(BinOp::Eq, a, b) => {
+                        let lit = match (&**a, &**b) {
+                            (Expr::Col(p), Expr::Lit(v)) if resolve(leaves, p) == Some((l1, c1)) => Some(v.clone()),
+                            (Expr::Lit(v), Expr::Col(p)) if resolve(leaves, p) == Some((l1, c1)) => Some(v.clone()),
+                            _ => None,
+                        };
+                        if let Some(val) = lit {
+                            let target_col = Box::new(Expr::Col(vec![leaves[l2].alias.clone(), leaves[l2].table.cols[c2].name.clone()]));
+                            let pred = Expr::Binary(BinOp::Eq, target_col, Box::new(Expr::Lit(val)));
+                            if !where_conjuncts.iter().any(|c| expr_eq(c, &pred)) && !to_add.iter().any(|c| expr_eq(c, &pred)) {
+                                to_add.push(pred);
+                            }
+                        }
+                    }
+                    Expr::InList(a, list, false) => {
+                        if let Expr::Col(p) = &**a {
+                            if resolve(leaves, p) == Some((l1, c1)) && list.iter().all(|x| matches!(x, Expr::Lit(_))) {
+                                let target_col = Box::new(Expr::Col(vec![leaves[l2].alias.clone(), leaves[l2].table.cols[c2].name.clone()]));
+                                let pred = Expr::InList(target_col, list.clone(), false);
+                                if !where_conjuncts.iter().any(|c| expr_eq(c, &pred)) && !to_add.iter().any(|c| expr_eq(c, &pred)) {
+                                    to_add.push(pred);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !to_add.is_empty() {
+            changed = true;
+            where_conjuncts.extend(to_add);
+        }
     }
 }
 
@@ -316,9 +540,22 @@ pub fn plan_join(q: &Query, tables: &HashMap<String, DistTable>, rows: &HashMap<
         }
         conjuncts(w, &mut where_conjuncts);
     }
+    let mut all_where: Vec<Expr> = preds.clone();
+    for &w in &where_conjuncts {
+        all_where.push(w.clone());
+    }
+    let mut factored = vec![];
+    for w in &all_where {
+        factored.extend(factor_disjuncts(w, &leaves));
+    }
+    for f in factored {
+        if !all_where.iter().any(|x| expr_eq(x, &f)) {
+            all_where.push(f);
+        }
+    }
     // column = column conditions between two leaves
     let mut eqs: Vec<(usize, usize, usize, usize)> = vec![];
-    for p in preds.iter().chain(where_conjuncts.iter().copied()) {
+    for p in &all_where {
         if let Expr::Binary(BinOp::Eq, a, b) = p {
             if let (Expr::Col(x), Expr::Col(y)) = (&**a, &**b) {
                 if let (Some((l1, c1)), Some((l2, c2))) = (resolve(&leaves, x), resolve(&leaves, y)) {
@@ -329,6 +566,11 @@ pub fn plan_join(q: &Query, tables: &HashMap<String, DistTable>, rows: &HashMap<
             }
         }
     }
+    let mut bi_eqs = eqs.clone();
+    for &(l1, c1, l2, c2) in &eqs {
+        bi_eqs.push((l2, c2, l1, c1));
+    }
+    propagate_equijoins(&mut all_where, &bi_eqs, &leaves);
     // the sharded leaves, grouped into co-located classes (joined on their shard keys)
     let sharded: Vec<usize> = (0..leaves.len()).filter(|i| key_of(&leaves[*i].table).is_some()).collect();
     if sharded.is_empty() {
@@ -437,7 +679,7 @@ pub fn plan_join(q: &Query, tables: &HashMap<String, DistTable>, rows: &HashMap<
     // the conditions of the WHERE clause that mention one moved table only are applied while copying it
     let filter_for = |l: usize| -> Option<Expr> {
         let mut fs: Vec<Expr> = vec![];
-        for w in &where_conjuncts {
+        for w in &all_where {
             if has_subquery(w) {
                 continue;
             }
@@ -451,19 +693,125 @@ pub fn plan_join(q: &Query, tables: &HashMap<String, DistTable>, rows: &HashMap<
                 Expr::Var(_) | Expr::SysVar(_) | Expr::NextValue(_) => only = false,
                 _ => {}
             });
-            if only && any {
-                fs.push((*w).clone());
+            if only && any && !fs.iter().any(|c| expr_eq(c, w)) {
+                fs.push(w.clone());
             }
         }
         fs.into_iter().reduce(|a, b| Expr::And(Box::new(a), Box::new(b)))
     };
+
+    // determine which columns of each leaf table are referenced in the query
+    let mut used_cols: Vec<Vec<bool>> = leaves.iter().map(|l| vec![false; l.table.cols.len()]).collect();
+    let mut star_leaves: Vec<bool> = vec![false; leaves.len()];
+
+    fn note_expr_cols(e: &Expr, leaves: &[Leaf], used_cols: &mut [Vec<bool>]) {
+        walk_expr(e, &mut |x| match x {
+            Expr::Col(p) => {
+                if let Some((l, c)) = resolve(leaves, p) {
+                    used_cols[l][c] = true;
+                }
+            }
+            Expr::InQuery(_, sq, _) | Expr::CmpQuant(_, _, _, sq) | Expr::Exists(sq) | Expr::Subquery(sq) => {
+                note_query_cols(sq, leaves, used_cols);
+            }
+            _ => {}
+        });
+    }
+
+    fn note_query_cols(q: &Query, leaves: &[Leaf], used_cols: &mut [Vec<bool>]) {
+        if let QueryBody::Select(s) = &q.body {
+            for it in &s.items {
+                if let SelectItem::Expr { e, .. } | SelectItem::Assign { e, .. } = it {
+                    note_expr_cols(e, leaves, used_cols);
+                }
+            }
+            if let Some(w) = &s.where_ {
+                note_expr_cols(w, leaves, used_cols);
+            }
+            if let Some(g) = &s.group {
+                for gi in g {
+                    if let GroupItem::Expr(e) = gi {
+                        note_expr_cols(e, leaves, used_cols);
+                    }
+                }
+            }
+            if let Some(h) = &s.having {
+                note_expr_cols(h, leaves, used_cols);
+            }
+        }
+        for o in &q.order {
+            note_expr_cols(&o.e, leaves, used_cols);
+        }
+    }
+
+    for it in &sel.items {
+        match it {
+            SelectItem::Star(None) => {
+                for s in star_leaves.iter_mut() {
+                    *s = true;
+                }
+            }
+            SelectItem::Star(Some(qual)) => {
+                for (l, leaf) in leaves.iter().enumerate() {
+                    let matches_alias = qual.last().is_some_and(|q| q.eq_ignore_ascii_case(&leaf.alias));
+                    let matches_name = leaf.table.name.ends_with(qual);
+                    if matches_alias || matches_name {
+                        star_leaves[l] = true;
+                    }
+                }
+            }
+            SelectItem::Expr { e, .. } | SelectItem::Assign { e, .. } => {
+                note_expr_cols(e, &leaves, &mut used_cols);
+            }
+        }
+    }
+    for p in &preds {
+        note_expr_cols(p, &leaves, &mut used_cols);
+    }
+    if let Some(w) = &sel.where_ {
+        note_expr_cols(w, &leaves, &mut used_cols);
+    }
+    for w in &all_where {
+        note_expr_cols(w, &leaves, &mut used_cols);
+    }
+    if let Some(g) = &sel.group {
+        for gi in g {
+            if let GroupItem::Expr(e) = gi {
+                note_expr_cols(e, &leaves, &mut used_cols);
+            }
+        }
+    }
+    if let Some(h) = &sel.having {
+        note_expr_cols(h, &leaves, &mut used_cols);
+    }
+    for o in &q.order {
+        note_expr_cols(&o.e, &leaves, &mut used_cols);
+    }
+
     let mut temps: Vec<Option<String>> = vec![None; leaves.len()];
     let mut preps = vec![];
     let mut desc = vec![];
     for (l, rp) in &moves {
         let temp = next_temp();
         temps[*l] = Some(temp.clone());
-        preps.push(PrepSpec { table: leaves[*l].table.clone(), alias: leaves[*l].alias.clone(), temp, filter: filter_for(*l), repartition: *rp, index_on: vec![] });
+        let cols = if star_leaves[*l] {
+            None
+        } else {
+            let mut used = used_cols[*l].clone();
+            if let Some((rp_col, _)) = rp {
+                used[*rp_col] = true;
+            }
+            let mut picked: Vec<usize> = (0..leaves[*l].table.cols.len()).filter(|&c| used[c]).collect();
+            if picked.is_empty() {
+                picked.push(0);
+            }
+            if picked.len() == leaves[*l].table.cols.len() {
+                None
+            } else {
+                Some(picked)
+            }
+        };
+        preps.push(PrepSpec { table: leaves[*l].table.clone(), alias: leaves[*l].alias.clone(), temp, filter: filter_for(*l), repartition: *rp, index_on: vec![], cols });
         desc.push(format!("{} {}", if rp.is_some() { "repartition" } else { "broadcast" }, leaves[*l].table.id));
     }
     let new_from = {

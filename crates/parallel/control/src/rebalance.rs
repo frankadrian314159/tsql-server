@@ -117,6 +117,8 @@ impl Cluster {
             advisor: Default::default(),
             next_session: AtomicU64::new(crate::fresh_session_base()),
             broadcast_limit: AtomicU64::new(100_000),
+            advisor_read_threshold: AtomicU64::new(75),
+            advisor_max_bytes: AtomicU64::new(10 * 1024 * 1024),
             in_list_limit: AtomicU64::new(20_000),
             in_join_min: AtomicU64::new(100),
             lock_timeout_ms: AtomicU64::new(5000),

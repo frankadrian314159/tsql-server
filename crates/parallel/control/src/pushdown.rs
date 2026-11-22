@@ -386,7 +386,7 @@ pub fn with_small_tables_copied(q: &Query, lookup: &dyn Fn(&str) -> Option<DistT
                         }
                     }
                 }
-                preps.push(PrepSpec { table: t.clone(), alias: alias.clone(), temp: temp.clone(), filter: None, repartition: None, index_on });
+                preps.push(PrepSpec { table: t.clone(), alias: alias.clone(), temp: temp.clone(), filter: None, repartition: None, index_on, cols: None });
                 names.push((t.id.clone(), temp));
             }
             fn rename(tr: &TableRef, names: &[(String, String)]) -> TableRef {

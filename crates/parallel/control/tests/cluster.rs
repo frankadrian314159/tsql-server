@@ -371,6 +371,128 @@ fn joins_run_shard_by_shard_when_the_rows_can_meet() {
     }
 }
 
+#[test]
+fn broadcast_copies_prune_unreferenced_columns() {
+    let mut p = Pair::new(3);
+    p.load();
+    let plan = p.check(
+        "SELECT c.region, COUNT(*) AS n FROM orders o JOIN customers c ON c.id = o.customer_id GROUP BY c.region ORDER BY c.region",
+        true,
+    );
+    assert!(plan.iter().any(|l| l.contains("broadcast dbo.customers")), "{:?}", plan);
+
+    let tables: std::collections::HashMap<String, tsql_control::DistTable> = p.h.cluster.tables().into_iter().map(|t| (t.id.clone(), t)).collect();
+    let q = match tsql_server::parser::parse("SELECT c.region, COUNT(*) AS n FROM orders o JOIN customers c ON c.id = o.customer_id GROUP BY c.region ORDER BY c.region").unwrap().remove(0) {
+        tsql_server::ast::Stmt::Query(q) => *q,
+        _ => unreachable!(),
+    };
+    let rows: std::collections::HashMap<String, u64> = tables.iter().map(|(id, _)| (id.clone(), if id.contains("orders") { 1000 } else { 100 })).collect();
+    let jp = tsql_control::joins::plan_join(&q, &tables, &rows, 100_000, 3, false, &mut || "#temp".into()).unwrap();
+    assert_eq!(jp.preps.len(), 1);
+    let prep = &jp.preps[0];
+    assert_eq!(prep.table.id, "dbo.customers");
+    assert_eq!(prep.table.cols.len(), 4);
+    let cols = prep.cols.as_ref().expect("columns should be pruned");
+    assert_eq!(cols.len(), 2);
+    let col_names: Vec<&str> = cols.iter().map(|&i| prep.table.cols[i].name.as_str()).collect();
+    assert!(col_names.contains(&"id") && col_names.contains(&"region"));
+    assert!(!col_names.contains(&"name") && !col_names.contains(&"credit"));
+
+    let q_star = match tsql_server::parser::parse("SELECT c.*, o.amount FROM orders o JOIN customers c ON c.id = o.customer_id").unwrap().remove(0) {
+        tsql_server::ast::Stmt::Query(q) => *q,
+        _ => unreachable!(),
+    };
+    let jp_star = tsql_control::joins::plan_join(&q_star, &tables, &rows, 100_000, 3, false, &mut || "#temp".into()).unwrap();
+    assert_eq!(jp_star.preps.len(), 1);
+    assert!(jp_star.preps[0].cols.is_none());
+}
+
+#[test]
+fn common_disjunct_factoring_and_transitive_propagation() {
+    let mut p = Pair::new(2);
+    p.both("CREATE TABLE supplier (s_suppkey INT PRIMARY KEY, s_nationkey INT, s_name VARCHAR(50))");
+    p.both("CREATE TABLE customer (c_custkey INT PRIMARY KEY, c_nationkey INT, c_name VARCHAR(50))");
+    p.both("CREATE TABLE nation (n_nationkey INT PRIMARY KEY, n_name VARCHAR(50))");
+    p.both("CREATE TABLE orders (o_orderkey INT PRIMARY KEY, o_custkey INT, o_totalprice DECIMAL(10,2))");
+
+    let tables: std::collections::HashMap<String, tsql_control::DistTable> = p.h.cluster.tables().into_iter().map(|t| (t.id.clone(), t)).collect();
+    let rows: std::collections::HashMap<String, u64> = tables.iter().map(|(id, _)| {
+        if id.contains("orders") { (id.clone(), 100_000) }
+        else if id.contains("customer") { (id.clone(), 45_000) }
+        else if id.contains("supplier") { (id.clone(), 3_000) }
+        else { (id.clone(), 25) }
+    }).collect();
+
+    // Q7-style query with cross-nation OR predicate
+    let sql = "SELECT o.o_orderkey FROM orders o \
+               JOIN customer c ON c.c_custkey = o.o_custkey \
+               JOIN supplier s ON s.s_suppkey = o.o_orderkey \
+               JOIN nation n1 ON s.s_nationkey = n1.n_nationkey \
+               JOIN nation n2 ON c.c_nationkey = n2.n_nationkey \
+               WHERE ((n1.n_name = 'FRANCE' AND n2.n_name = 'GERMANY') OR (n1.n_name = 'GERMANY' AND n2.n_name = 'FRANCE'))";
+    let q = match tsql_server::parser::parse(sql).unwrap().remove(0) {
+        tsql_server::ast::Stmt::Query(q) => *q,
+        _ => unreachable!(),
+    };
+
+    let jp = tsql_control::joins::plan_join(&q, &tables, &rows, 100_000, 2, false, &mut || "#temp".into()).unwrap();
+    // Verify that n1 and n2 received factored disjunct pushdown filters
+    let n1_prep = jp.preps.iter().find(|p| p.alias == "n1").expect("n1 prep");
+    assert!(n1_prep.filter.is_some(), "n1 should have a pushdown filter");
+    let n1_filt_str = format!("{:?}", n1_prep.filter.as_ref().unwrap());
+    assert!(n1_filt_str.contains("FRANCE") && n1_filt_str.contains("GERMANY"), "{:?}", n1_filt_str);
+
+    let n2_prep = jp.preps.iter().find(|p| p.alias == "n2").expect("n2 prep");
+    assert!(n2_prep.filter.is_some(), "n2 should have a pushdown filter");
+    let n2_filt_str = format!("{:?}", n2_prep.filter.as_ref().unwrap());
+    assert!(n2_filt_str.contains("FRANCE") && n2_filt_str.contains("GERMANY"), "{:?}", n2_filt_str);
+
+    // Test transitive equijoin propagation:
+    // If n1 has n_nationkey IN (7, 17) and c_nationkey = n1.n_nationkey, customer should receive c_nationkey IN (7, 17)
+    let sql_prop = "SELECT o.o_orderkey FROM orders o \
+                    JOIN customer c ON c.c_custkey = o.o_custkey \
+                    JOIN nation n1 ON c.c_nationkey = n1.n_nationkey \
+                    WHERE n1.n_nationkey IN (7, 17)";
+    let q_prop = match tsql_server::parser::parse(sql_prop).unwrap().remove(0) {
+        tsql_server::ast::Stmt::Query(q) => *q,
+        _ => unreachable!(),
+    };
+    let jp_prop = tsql_control::joins::plan_join(&q_prop, &tables, &rows, 100_000, 2, false, &mut || "#temp".into()).unwrap();
+    let cust_prep = jp_prop.preps.iter().find(|p| p.alias == "c").expect("customer prep");
+    assert!(cust_prep.filter.is_some(), "customer should have propagated filter");
+    let cust_filt_str = format!("{:?}", cust_prep.filter.as_ref().unwrap());
+    assert!(cust_filt_str.contains("c_nationkey"), "{:?}", cust_filt_str);
+}
+
+#[test]
+fn dimension_key_resolution_and_transitive_filtering() {
+    let mut p = Pair::new(2);
+    p.both("CREATE TABLE region (r_regionkey INT PRIMARY KEY, r_name VARCHAR(50))");
+    p.both("CREATE TABLE nation (n_nationkey INT PRIMARY KEY, n_regionkey INT, n_name VARCHAR(50))");
+    p.both("CREATE TABLE customer (c_custkey INT PRIMARY KEY, c_nationkey INT, c_name VARCHAR(50))");
+    p.both("CREATE TABLE orders (o_orderkey INT PRIMARY KEY, o_custkey INT, o_totalprice DECIMAL(10,2))");
+
+    p.both("INSERT INTO region VALUES (1, 'AMERICA'), (2, 'ASIA'), (3, 'EUROPE')");
+    p.both("INSERT INTO nation VALUES (7, 3, 'GERMANY'), (17, 3, 'FRANCE'), (8, 2, 'CHINA'), (9, 2, 'INDIA')");
+    p.both("INSERT INTO customer VALUES (101, 8, 'Alice'), (102, 7, 'Bob'), (103, 9, 'Charlie'), (104, 17, 'David')");
+    p.both("INSERT INTO orders VALUES (1, 101, 100.0), (2, 102, 200.0), (3, 103, 300.0), (4, 104, 400.0)");
+
+    // Q5-style query: r_name = 'ASIA' should transitively filter nation (n_nationkey IN (8, 9)) and customer
+    let q5_sql = "SELECT c.c_name, o.o_totalprice FROM orders o \
+                  JOIN customer c ON c.c_custkey = o.o_custkey \
+                  JOIN nation n ON c.c_nationkey = n.n_nationkey \
+                  JOIN region r ON n.n_regionkey = r.r_regionkey \
+                  WHERE r.r_name = 'ASIA' ORDER BY c.c_name";
+    p.check(q5_sql, true);
+
+    // Q7-style query: OR cross-nation filter
+    let q7_sql = "SELECT c.c_name, o.o_totalprice FROM orders o \
+                  JOIN customer c ON c.c_custkey = o.o_custkey \
+                  JOIN nation n ON c.c_nationkey = n.n_nationkey \
+                  WHERE ((n.n_name = 'FRANCE') OR (n.n_name = 'GERMANY')) ORDER BY c.c_name";
+    p.check(q7_sql, true);
+}
+
 fn shard_rows(s: &RunningShard, table: &str) -> i64 {
     let mut c = s.server.connect();
     match c.query(&format!("SELECT COUNT(*) FROM {}", table)).unwrap()[0][0].clone() {
@@ -1314,6 +1436,47 @@ fn the_advisor_says_which_tables_to_replicate_after_they_were_broadcast_again_an
     // what it says to do makes the copy go away
     p.cl.execute("ADVISE DISTRIBUTION RESET");
     assert!(rows_of(&p.cl.execute("ADVISE DISTRIBUTION")).is_empty());
+}
+
+#[test]
+fn the_advisor_checks_read_mostly_threshold_and_write_activity() {
+    let mut p = Pair::new(3);
+    p.load();
+    p.cl.execute("ADVISE DISTRIBUTION RESET");
+    for _ in 0..3 {
+        p.check("SELECT c.region, COUNT(*) AS n FROM orders o, customers c WHERE c.id = o.customer_id GROUP BY c.region ORDER BY c.region", true);
+    }
+    let advice = rows_of(&p.cl.execute("ADVISE DISTRIBUTION"));
+    let mine: Vec<&Vec<String>> = advice.iter().filter(|r| r[0].eq_ignore_ascii_case("customers")).collect();
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0][2], "broadcast");
+    assert_eq!(mine[0][6], "3"); // reads
+    assert_eq!(mine[0][7], "0"); // writes
+    assert_eq!(mine[0][8], "100.0%"); // read_ratio
+    assert!(mine[0][5].contains("DISTRIBUTE TABLE customers REPLICATED"));
+
+    // now perform writes to lower the read ratio below 75%
+    for i in 1..=5 {
+        p.cl.execute(&format!("UPDATE customers SET region = 'NORTH' WHERE id = {}", i));
+    }
+    let advice = rows_of(&p.cl.execute("ADVISE DISTRIBUTION"));
+    let mine: Vec<&Vec<String>> = advice.iter().filter(|r| r[0].eq_ignore_ascii_case("customers")).collect();
+    assert_eq!(mine[0][6], "3"); // reads
+    assert_eq!(mine[0][7], "5"); // writes
+    assert_eq!(mine[0][8], "37.5%"); // 3 / 8
+    assert!(mine[0][5].contains("below threshold 75%"), "actual advice: {}", mine[0][5]);
+
+    // lowering the threshold via command makes it advise replication again
+    let res = p.cl.execute("ADVISE DISTRIBUTION SET THRESHOLD 30");
+    assert!(format!("{:?}", res).contains("set to 30%"));
+    let advice = rows_of(&p.cl.execute("ADVISE DISTRIBUTION"));
+    let mine: Vec<&Vec<String>> = advice.iter().filter(|r| r[0].eq_ignore_ascii_case("customers")).collect();
+    assert!(mine[0][5].contains("DISTRIBUTE TABLE customers REPLICATED"), "actual advice: {}", mine[0][5]);
+
+    // per-query threshold override: THRESHOLD 50 rejects it (37.5% < 50%)
+    let advice = rows_of(&p.cl.execute("ADVISE DISTRIBUTION THRESHOLD 50"));
+    let mine: Vec<&Vec<String>> = advice.iter().filter(|r| r[0].eq_ignore_ascii_case("customers")).collect();
+    assert!(mine[0][5].contains("below threshold 50%"), "actual advice: {}", mine[0][5]);
 }
 
 #[test]
