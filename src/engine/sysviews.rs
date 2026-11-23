@@ -1694,21 +1694,21 @@ impl<'a> Engine<'a> {
                             _ => None,
                         };
                         if let Some(d) = def {
-                            rows.push(vec![Value::Int(o.object_id()), sv(&d), Value::Bit(true), Value::Bit(true), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Null, Value::Bit(false)]);
+                            rows.push(vec![Value::Int(o.object_id()), sv(&d), Value::Bit(true), Value::Bit(true), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Null, Value::Bit(false), Value::Bit(false), Value::Bit(false)]);
                         }
                     }
                     // triggers are modules too
                     for (_, trg) in db.triggers.values() {
-                        rows.push(vec![Value::Int(trg.object_id), sv(&trg.text), Value::Bit(true), Value::Bit(true), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Null, Value::Bit(false)]);
+                        rows.push(vec![Value::Int(trg.object_id), sv(&trg.text), Value::Bit(true), Value::Bit(true), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Null, Value::Bit(false), Value::Bit(false), Value::Bit(false)]);
                     }
                     for t in &db.ddl_triggers {
-                        rows.push(vec![Value::Int(t.object_id), sv(&t.text), Value::Bit(true), Value::Bit(true), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Null, Value::Bit(false)]);
+                        rows.push(vec![Value::Int(t.object_id), sv(&t.text), Value::Bit(true), Value::Bit(true), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Null, Value::Bit(false), Value::Bit(false), Value::Bit(false)]);
                     }
                     // (the system modules, the ones SQL Server ships, are not kept as text here)
                     if lname == "system_sql_modules" || lname == "server_sql_modules" {
                         rows.clear();
                     }
-                    Some(rs(&[("object_id", DataType::Int), ("definition", DataType::NVarChar(MAX)), ("uses_ansi_nulls", DataType::Bit), ("uses_quoted_identifier", DataType::Bit), ("is_schema_bound", DataType::Bit), ("uses_database_collation", DataType::Bit), ("is_recompiled", DataType::Bit), ("null_on_null_input", DataType::Bit), ("execute_as_principal_id", DataType::Int), ("uses_native_compilation", DataType::Bit)], rows))
+                    Some(rs(&[("object_id", DataType::Int), ("definition", DataType::NVarChar(MAX)), ("uses_ansi_nulls", DataType::Bit), ("uses_quoted_identifier", DataType::Bit), ("is_schema_bound", DataType::Bit), ("uses_database_collation", DataType::Bit), ("is_recompiled", DataType::Bit), ("null_on_null_input", DataType::Bit), ("execute_as_principal_id", DataType::Int), ("uses_native_compilation", DataType::Bit), ("inline_type", DataType::Bit), ("is_inlineable", DataType::Bit)], rows))
                 }
                 "database_principals" => {
                     let rows = db

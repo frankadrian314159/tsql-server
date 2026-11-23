@@ -275,6 +275,7 @@ impl ClusterSession {
                 let list: Vec<String> = clashes.iter().map(|(id, _)| id.clone()).collect();
                 return Err(SqlError::with(3159, 16, 1, format!("The database already has {}. Use RESTORE ... WITH REPLACE to drop them and restore the backup's.", list.join(", "))));
             }
+            self.no_ddl_triggers = true;
             // (views and procedures first: they may depend on the tables; then the tables, the last made first, with the foreign
             // keys between them forgotten so that the order does not matter)
             clashes.sort_by_key(|(_, kind)| kind == "Table");

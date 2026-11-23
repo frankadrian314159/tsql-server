@@ -65,3 +65,21 @@ fn proc_parameter_output_before_default() {
     let res = exec(&mut c, sql);
     assert!(res.first_error().is_none(), "CREATE PROCEDURE with OUTPUT before default failed: {:?}", res.first_error());
 }
+
+#[test]
+fn sql_modules_has_inline_type_and_is_inlineable() {
+    let s = server();
+    let mut c = s.connect();
+    exec(&mut c, "CREATE FUNCTION fn_test() RETURNS INT AS BEGIN RETURN 1; END");
+    let res = exec(&mut c, "SELECT inline_type, is_inlineable FROM sys.sql_modules WHERE object_id = OBJECT_ID('fn_test')");
+    assert!(res.first_error().is_none(), "sys.sql_modules failed: {:?}", res.first_error());
+    let rs = res.resultsets();
+    assert_eq!(rs.len(), 1);
+    assert_eq!(rs[0].rows[0][0].as_i64(), Some(0));
+    assert_eq!(rs[0].rows[0][1].as_i64(), Some(0));
+
+    let res2 = exec(&mut c, "SELECT OBJECTPROPERTYEX(OBJECT_ID('fn_test'), 'ExecIsAnsiNullsOn'), OBJECTPROPERTYEX(OBJECT_ID('fn_test'), 'ExecIsQuotedIdentOn')");
+    assert!(res2.first_error().is_none(), "OBJECTPROPERTYEX failed: {:?}", res2.first_error());
+    assert_eq!(res2.resultsets()[0].rows[0][0].as_i64(), Some(1));
+    assert_eq!(res2.resultsets()[0].rows[0][1].as_i64(), Some(1));
+}
