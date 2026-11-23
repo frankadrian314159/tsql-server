@@ -1890,7 +1890,7 @@ impl<'a> Engine<'a> {
                             (false, _) => Value::Null,
                             (_, "isclustered") => Value::Int(clustered as i32),
                             (_, "isunique") => Value::Int(unique as i32),
-                            (_, "isdisabled" | "ishypothetical" | "isautostatistics" | "ispagelockdisallowed" | "isrowlockdisallowed" | "isfulltextkey") => Value::Int(0),
+                            (_, "isdisabled" | "ishypothetical" | "isautostatistics" | "ispagelockdisallowed" | "isrowlockdisallowed" | "isfulltextkey" | "isstatistics") => Value::Int(0),
                             (_, "indexfillfactor") => Value::Int(0),
                             _ => Value::Null,
                         }
@@ -1906,6 +1906,16 @@ impl<'a> Engine<'a> {
                 }
             }
             "ORIGINAL_DB_NAME" => Value::Str(self.ses.db.clone()),
+            "STATS_DATE" => {
+                need_range(name, &a, 1, 2)?;
+                if a.iter().any(|v| v.is_null()) {
+                    Value::Null
+                } else {
+                    let db = self.srv.databases.get(&self.ses.db.to_lowercase());
+                    let dt = db.map(|d| d.created).unwrap_or(self.srv.start_time);
+                    Value::DateTime(convert::round_datetime(dt), DtKind::DateTime)
+                }
+            }
             // SID_BINARY(name): the SID of a Windows account, which this server cannot look up; NULL, as for an account that is not there
             "SID_BINARY" => Value::Null,
             // sys.fn_varbintohexsubstring(add_0x, binary, start, length): the hex of part of a binary value (length 0: the rest)
@@ -1994,6 +2004,7 @@ impl<'a> Engine<'a> {
                             Object::Func(f) => Some(f.def.text.clone()),
                             _ => None,
                         }).or_else(|| d.triggers.values().find(|(_, t)| t.object_id as i64 == id).map(|(_, t)| t.text.clone()))
+                          .or_else(|| d.ddl_triggers.iter().find(|t| t.object_id as i64 == id).map(|t| t.text.clone()))
                     });
                     text.map(Value::Str).unwrap_or(Value::Null)
                 }
@@ -2005,6 +2016,16 @@ impl<'a> Engine<'a> {
                     if let Some(db) = self.srv.databases.get(&self.ses.db.to_lowercase()) {
                         for o in db.objects.values() {
                             if o.object_id() == id { r = Value::Str(if name == "OBJECT_NAME" { o.name().to_string() } else { o.schema().to_string() }); }
+                        }
+                        if r.is_null() {
+                            for (_, t) in db.triggers.values() {
+                                if t.object_id == id { r = Value::Str(if name == "OBJECT_NAME" { t.name.clone() } else { t.schema.clone() }); }
+                            }
+                        }
+                        if r.is_null() {
+                            for t in &db.ddl_triggers {
+                                if t.object_id == id { r = Value::Str(if name == "OBJECT_NAME" { t.name.clone() } else { "dbo".to_string() }); }
+                            }
                         }
                     }
                     if r.is_null() {
@@ -2275,12 +2296,22 @@ impl<'a> Engine<'a> {
                                 "istablefunction" => matches!(o.type_code(), "IF" | "TF") as i32,
                                 "hasidentity" | "tablehasidentity" => if let Object::Table(t) = o { t.identity_col().is_some() as i32 } else { 0 },
                                 "tablehasprimarykey" => if let Object::Table(t) = o { t.pk.is_some() as i32 } else { 0 },
+                                "isindexed" => if let Object::Table(t) = o { (!t.indexes.is_empty() || t.pk.is_some()) as i32 } else { 0 },
+                                "isindexable" => matches!(o.type_code(), "U" | "V") as i32,
+                                "isquotedidenton" => 1,
+                                "hasaftertrigger" | "tablehasaftertrig" => if let Object::Table(t) = o { t.triggers.iter().any(|tr| !tr.instead) as i32 } else { 0 },
+                                "hasinsteadoftrigger" => if let Object::Table(t) = o { t.triggers.iter().any(|tr| tr.instead) as i32 } else { 0 },
+                                "hasinserttrigger" => if let Object::Table(t) = o { t.triggers.iter().any(|tr| tr.events.iter().any(|e| e.eq_ignore_ascii_case("INSERT"))) as i32 } else { 0 },
+                                "hasupdatetrigger" => if let Object::Table(t) = o { t.triggers.iter().any(|tr| tr.events.iter().any(|e| e.eq_ignore_ascii_case("UPDATE"))) as i32 } else { 0 },
+                                "hasdeletetrigger" => if let Object::Table(t) = o { t.triggers.iter().any(|tr| tr.events.iter().any(|e| e.eq_ignore_ascii_case("DELETE"))) as i32 } else { 0 },
+                                "ownerid" => db.schema_id(o.schema()),
                                 _ => 0,
                             });
+                            break;
                         }
                     }
                     // a constraint is an object too: the table designer reads IsDefaultCnst of a column's default
-                    if r.is_null() {
+                    if r.is_null() && id >= 1000 {
                         if let Some(c) = super::sysviews::constraint_objects(db).into_iter().find(|c| c.id == id) {
                             r = Value::Int(match prop.as_str() {
                                 "isdefaultcnst" => (c.code == "D") as i32,
@@ -2306,9 +2337,12 @@ impl<'a> Engine<'a> {
                 if let Some(db) = self.srv.databases.get(&self.ses.db.to_lowercase()) {
                     for o in db.objects.values() {
                         if let Object::Table(t) = o {
-                            if t.object_id == id { if let Some(i) = t.col_index(&cname) {
-                                r = Value::Int(match prop.as_str() { "allowsnull" => t.columns[i].nullable as i32, "isidentity" => t.columns[i].identity.is_some() as i32, "iscomputed" => t.columns[i].computed.is_some() as i32, "ordinal" => i as i32 + 1, _ => 0 });
-                            } }
+                            if t.object_id == id {
+                                if let Some(i) = t.col_index(&cname) {
+                                    r = Value::Int(match prop.as_str() { "allowsnull" => t.columns[i].nullable as i32, "isidentity" => t.columns[i].identity.is_some() as i32, "iscomputed" => t.columns[i].computed.is_some() as i32, "ordinal" => i as i32 + 1, _ => 0 });
+                                }
+                                break;
+                            }
                         }
                     }
                 }

@@ -468,13 +468,33 @@ impl<'a> Engine<'a> {
                 self.ses.dry_run = prev_dry;
                 self.ses.plan = saved_plan;
                 self.ses.cte_stack = saved;
-                let rs = probe?;
-                if let Some(c) = cols {
-                    if c.len() != rs.schema.cols.len() {
-                        return Err(SqlError::new(4511, format!("Create View or Function failed because no column name was specified for column {}.", c.len() + 1)));
+                let rs = match probe {
+                    Ok(r) => Some(r),
+                    Err(e) if e.number == 208 => {
+                        let is_external = e.message.strip_prefix("Invalid object name '")
+                            .and_then(|s| s.strip_suffix(".'").or_else(|| s.strip_suffix("'.")))
+                            .or_else(|| e.message.strip_prefix("Invalid object name '").and_then(|s| s.strip_suffix("'")))
+                            .map(|obj| {
+                                let parts: Vec<&str> = obj.split('.').collect();
+                                parts.len() >= 3 && !parts[0].eq_ignore_ascii_case(&db)
+                            })
+                            .unwrap_or(false);
+                        if is_external {
+                            None
+                        } else {
+                            return Err(e);
+                        }
                     }
-                } else if let Some((i, _)) = rs.schema.cols.iter().enumerate().find(|(_, c)| c.name.is_empty()) {
-                    return Err(SqlError::new(4511, format!("Create View or Function failed because no column name was specified for column {}.", i + 1)));
+                    Err(e) => return Err(e),
+                };
+                if let Some(rs) = &rs {
+                    if let Some(c) = cols {
+                        if c.len() != rs.schema.cols.len() {
+                            return Err(SqlError::new(4511, format!("Create View or Function failed because no column name was specified for column {}.", c.len() + 1)));
+                        }
+                    } else if let Some((i, _)) = rs.schema.cols.iter().enumerate().find(|(_, c)| c.name.is_empty()) {
+                        return Err(SqlError::new(4511, format!("Create View or Function failed because no column name was specified for column {}.", i + 1)));
+                    }
                 }
                 let dbname = self.srv.databases[&db].name.clone();
                 let oid = if exists { self.srv.databases[&db].objects[&key].object_id() } else { self.srv.new_object_id() };

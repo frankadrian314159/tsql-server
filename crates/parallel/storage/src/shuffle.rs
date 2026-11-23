@@ -1,6 +1,7 @@
 //! The connections from a shard to the other shards, used by the shuffle to send rows straight to the shard that owns them.
 use arrow_flight::client::FlightClient;
 use arrow_flight::error::FlightError;
+use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::Action;
 use futures::TryStreamExt;
 use std::collections::HashMap;
@@ -48,7 +49,11 @@ impl Peers {
             let body = postcard::to_allocvec(&LoadReq { session: req.session, table: req.table.clone(), rows: chunk.to_vec() }).map_err(|e| Status::internal(e.to_string()))?;
             let mut done = false;
             for a in addrs.split(',').map(str::trim).filter(|a| !a.is_empty()) {
-                let mut c = FlightClient::new(self.channel(a)?);
+                let mut c = FlightClient::new_from_inner(
+                    FlightServiceClient::new(self.channel(a)?)
+                        .max_decoding_message_size(128 * 1024 * 1024)
+                        .max_encoding_message_size(128 * 1024 * 1024),
+                );
                 let r = async {
                     let mut results = c.do_action(Action::new(ACTION_LOAD, body.clone())).await.map_err(status_of)?;
                     while results.try_next().await.map_err(status_of)?.is_some() {}

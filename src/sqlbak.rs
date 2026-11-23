@@ -221,6 +221,7 @@ pub struct IndexMeta {
     pub name: String,
     pub clustered: bool,
     pub unique: bool,
+    pub status: u32,
     /// the index behind a PRIMARY KEY constraint
     pub primary: bool,
     /// the index behind a UNIQUE constraint
@@ -229,6 +230,8 @@ pub struct IndexMeta {
     pub keys: Vec<(u32, bool)>,
     /// INCLUDE columns, as column ids
     pub included: Vec<u32>,
+    /// the predicate of a filtered index
+    pub filter: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -774,10 +777,12 @@ impl<R: Read + Seek> Backup<R> {
                         name,
                         clustered: ty == 1,
                         unique: status & 0x8 != 0,
+                        status,
                         primary: status & 0x20 != 0,
                         unique_constraint: status & 0x40 != 0,
                         keys: keys.into_iter().map(|k| (k.1, k.2)).collect(),
                         included,
+                        filter: None,
                     });
                 }
                 3 => {
@@ -801,10 +806,11 @@ impl<R: Read + Seek> Backup<R> {
         // value sql_variant, imageval image), the text in 8-bit characters, in pieces by valnum
         let want: std::collections::HashSet<u32> = cons.iter().filter(|c| c.1 != *b"F ").map(|c| c.0).collect();
         // class 1 is the definition of a default or check (objid), class 2 that of a computed column (objid the table,
-        // subobjid the column)
+        // subobjid the column), class 5 that of a filtered index (objid the table, subobjid the index id)
         let pieces = self.object_values(&|class, id| match class {
             1 => want.contains(&id),
             2 => by_id.contains_key(&id),
+            66 => by_id.contains_key(&id),
             _ => false,
         })?;
         let text = |key: Key| -> Option<String> { pieces.get(&key).map(|p| cp1252(&p.values().flatten().copied().collect::<Vec<u8>>())) };
@@ -813,6 +819,11 @@ impl<R: Read + Seek> Backup<R> {
             let tid = t.id;
             for c in t.cols.iter_mut().filter(|c| c.computed) {
                 c.definition = text((2, tid, c.colid));
+            }
+            for ix in &mut t.indexes {
+                if ix.status & 0x20000 != 0 {
+                    ix.filter = text((66, tid, ix.id));
+                }
             }
         }
         // foreign key columns: syssingleobjrefs (class tinyint, depid int, depsubid int, indepid int, indepsubid int, status);
@@ -1024,6 +1035,25 @@ pub fn fixed_size(c: &ColMeta) -> usize {
     }
 }
 
+fn default_for_type(ty: &DataType) -> Value {
+    match ty {
+        DataType::Bit => Value::Bit(false),
+        DataType::TinyInt | DataType::SmallInt | DataType::Int => Value::Int(0),
+        DataType::BigInt => Value::BigInt(0),
+        DataType::Decimal(_, s) => Value::Dec(Dec::new(0, *s)),
+        DataType::Money | DataType::SmallMoney => Value::Dec(Dec::new(0, 4)),
+        DataType::Float | DataType::Real => Value::Float(0.0),
+        DataType::Char(_) | DataType::VarChar(_) | DataType::NChar(_) | DataType::NVarChar(_) | DataType::Text | DataType::NText | DataType::Xml => Value::Str(String::new()),
+        DataType::Binary(_) | DataType::VarBinary(_) | DataType::Image | DataType::Timestamp | DataType::HierarchyId | DataType::Geometry | DataType::Geography => Value::Bin(vec![]),
+        DataType::Date => Value::Date(NaiveDate::from_ymd_opt(1900, 1, 1).unwrap()),
+        DataType::Time(_) => Value::Time(NaiveTime::from_hms_opt(0, 0, 0).unwrap()),
+        DataType::DateTime | DataType::SmallDateTime | DataType::DateTime2(_) => Value::DateTime(NaiveDate::from_ymd_opt(1900, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap(), DtKind::DateTime),
+        DataType::DateTimeOffset(_) => Value::Dto(chrono::DateTime::parse_from_rfc3339("1900-01-01T00:00:00Z").unwrap()),
+        DataType::Guid => Value::Guid(uuid::Uuid::nil()),
+        _ => Value::Str(String::new()),
+    }
+}
+
 impl Plan {
     fn new(t: &TableMeta, cols: &[&ColMeta]) -> Plan {
         let cols = cols
@@ -1076,7 +1106,11 @@ impl Plan {
                 Some(v) => row.push(v),
                 None => {
                     *skipped.entry(c.name.clone()).or_default() += 1;
-                    row.push(Value::Null);
+                    if c.nullable {
+                        row.push(Value::Null);
+                    } else {
+                        row.push(default_for_type(&c.ty));
+                    }
                 }
             }
         }

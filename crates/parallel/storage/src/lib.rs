@@ -356,6 +356,8 @@ impl ShardNode {
 
     pub fn into_service(self) -> FlightServiceServer<ShardNode> {
         FlightServiceServer::new(self)
+            .max_decoding_message_size(128 * 1024 * 1024)
+            .max_encoding_message_size(128 * 1024 * 1024)
     }
 }
 

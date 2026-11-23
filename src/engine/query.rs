@@ -771,27 +771,70 @@ impl<'a> Engine<'a> {
         if let Some(h) = &sel.having {
             self.validate_columns(h, &schema, outer)?;
         }
+        let has_assign = sel.items.iter().any(|i| matches!(i, SelectItem::Assign { .. }));
+        let item_exprs: Vec<&Expr> = sel.items.iter().filter_map(|i| if let SelectItem::Expr { e, .. } = i { Some(e) } else if let SelectItem::Assign { e, .. } = i { Some(e) } else { None }).collect();
+        let aggregated = sel.group.is_some() || sel.having.is_some() || item_exprs.iter().any(|e| has_agg(e)) || order.iter().any(|o| has_agg(&o.e));
+
+        // early limit for simple SELECT TOP N ... WHERE ... without ORDER BY or aggregations
+        let early_limit = if !aggregated && order.is_empty() {
+            sel.top.as_ref().and_then(|t| if !t.percent && !t.ties {
+                self.ev(&t.e, &Env::empty()).ok().and_then(|v| v.as_i64()).map(|n| n.max(0) as usize)
+            } else { None })
+        } else {
+            None
+        };
+
         // WHERE
         // (the rows are taken over, not copied, when nothing else holds the rowset)
         let mut rows: Vec<Row> = Vec::new();
         match &sel.where_ {
             Some(w) => {
-                for r in src.rows.into_vec() {
-                    let keep = {
-                        let env = Env::new(&schema, &r, outer);
-                        matches!(self.ev(w, &env)?, Value::Bit(true))
-                    };
-                    if keep {
-                        rows.push(r);
+                if src.rows.is_unique() {
+                    for r in src.rows.into_vec() {
+                        let keep = {
+                            let env = Env::new(&schema, &r, outer);
+                            matches!(self.ev(w, &env)?, Value::Bit(true))
+                        };
+                        if keep {
+                            rows.push(r);
+                            if let Some(lim) = early_limit {
+                                if rows.len() >= lim {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for r in src.rows.iter() {
+                        let keep = {
+                            let env = Env::new(&schema, r, outer);
+                            matches!(self.ev(w, &env)?, Value::Bit(true))
+                        };
+                        if keep {
+                            rows.push(r.clone());
+                            if let Some(lim) = early_limit {
+                                if rows.len() >= lim {
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
             }
-            None => rows = src.rows.into_vec(),
+            None => {
+                if let Some(lim) = early_limit {
+                    if src.rows.is_unique() {
+                        let mut v = src.rows.into_vec();
+                        v.truncate(lim);
+                        rows = v;
+                    } else {
+                        rows = src.rows.iter().take(lim).cloned().collect();
+                    }
+                } else {
+                    rows = src.rows.into_vec();
+                }
+            }
         }
-
-        let has_assign = sel.items.iter().any(|i| matches!(i, SelectItem::Assign { .. }));
-        let item_exprs: Vec<&Expr> = sel.items.iter().filter_map(|i| if let SelectItem::Expr { e, .. } = i { Some(e) } else if let SelectItem::Assign { e, .. } = i { Some(e) } else { None }).collect();
-        let aggregated = sel.group.is_some() || sel.having.is_some() || item_exprs.iter().any(|e| has_agg(e)) || order.iter().any(|o| has_agg(&o.e));
 
         // grouping
         let mut units: Vec<Unit> = Vec::new();
@@ -1866,6 +1909,39 @@ impl<'a> Engine<'a> {
         }
     }
 
+fn extract_object_id_eq(pushed: &[Expr]) -> Option<i32> {
+    fn unparen(mut e: &Expr) -> &Expr {
+        while let Expr::Paren(inner) = e {
+            e = inner;
+        }
+        e
+    }
+    for p in pushed {
+        let (left, right) = match unparen(p) {
+            Expr::Binary(crate::ast::BinOp::Eq, l, r) => (unparen(l), unparen(r)),
+            _ => continue,
+        };
+        let is_obj_id = |e: &Expr| match e {
+            Expr::Col(parts) => parts.last().is_some_and(|c| c.eq_ignore_ascii_case("object_id")),
+            _ => false,
+        };
+        if is_obj_id(left) {
+            if let Expr::Lit(v) = right {
+                if let Some(id) = v.as_i64() {
+                    return Some(id as i32);
+                }
+            }
+        } else if is_obj_id(right) {
+            if let Expr::Lit(v) = left {
+                if let Some(id) = v.as_i64() {
+                    return Some(id as i32);
+                }
+            }
+        }
+    }
+    None
+}
+
     pub(crate) fn eval_named_source(&mut self, name: &[String], alias: Option<&str>) -> Result<Rowset> {
         let display = name.last().unwrap().clone();
         let q = alias.unwrap_or(&display).to_string();
@@ -1918,11 +1994,47 @@ impl<'a> Engine<'a> {
         if name.len() >= 2 {
             let sch = &name[name.len() - 2];
             if sch.eq_ignore_ascii_case("sys") || sch.eq_ignore_ascii_case("information_schema") {
-                if sch.eq_ignore_ascii_case("sys") && matches!(display.to_lowercase().as_str(), "columns" | "all_columns") {
-                    self.prime_view_columns();
-                }
-                if let Some(mut rs) = self.sysview(sch, &display) {
+                let key = (sch.to_lowercase(), display.to_lowercase());
+                let rs_opt = if let Some(cached) = self.ses.sysview_cache.get(&key) {
+                    Some(cached.clone())
+                } else {
+                    if sch.eq_ignore_ascii_case("sys") && matches!(key.1.as_str(), "columns" | "all_columns") {
+                        self.prime_view_columns();
+                    }
+                    if let Some(rs) = self.sysview(sch, &display) {
+                        self.ses.sysview_cache.insert(key, rs.clone());
+                        Some(rs)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(mut rs) = rs_opt {
                     rs.schema.cols.iter_mut().for_each(|c| c.qual = Some(q.clone()));
+                    let pushed: Vec<Expr> = self.ses.pushdown.last().and_then(|v| v.iter().find(|(a, _)| a.eq_ignore_ascii_case(&q)).map(|(_, e)| e.clone())).unwrap_or_default();
+                    if !pushed.is_empty() {
+                        let target_oid = Self::extract_object_id_eq(&pushed);
+                        let col_idx = if display.eq_ignore_ascii_case("tables") { 1 } else { 0 };
+                        let mut filtered = Vec::new();
+                        for r in rs.rows.iter() {
+                            if let Some(toid) = target_oid {
+                                if !matches!(r.get(col_idx), Some(Value::Int(id)) if *id == toid) {
+                                    continue;
+                                }
+                            }
+                            let env = Env::new(&rs.schema, r, None);
+                            let mut ok = true;
+                            for p in &pushed {
+                                if !matches!(self.ev(p, &env)?, Value::Bit(true)) {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if ok {
+                                filtered.push(r.clone());
+                            }
+                        }
+                        rs.rows = filtered.into();
+                    }
                     return Ok(rs);
                 }
             }
@@ -1933,11 +2045,47 @@ impl<'a> Engine<'a> {
             let schema_ok = name.len() == 1 || name[name.len() - 2].eq_ignore_ascii_case("dbo") || name[name.len() - 2].is_empty();
             // (and the tables of the policy store, which msdb has: see `sysview`)
             let in_msdb = name.len() < 3 || name[name.len() - 3].eq_ignore_ascii_case("msdb");
-            if schema_ok && (matches!(last.to_lowercase().as_str(), "sysobjects" | "sysusers" | "sysdatabases" | "syscomments" | "sysprocesses" | "syscolumns" | "sysindexes" | "sysmembers" | "syslogins") || (in_msdb && (last.to_lowercase().starts_with("syspolicy_") || matches!(last.to_lowercase().as_str(), "sysjobs" | "syscategories" | "sysjobschedules" | "sysschedules" | "sysjobsteps" | "sysjobservers" | "sysjobhistory" | "backupset" | "backupmediafamily" | "backupmediaset" | "backupfile" | "backupfilegroup" | "restorehistory" | "restorefile" | "restorefilegroup" | "suspect_pages")))) {
+            if schema_ok && (matches!(last.to_lowercase().as_str(), "sysobjects" | "sysusers" | "sysdatabases" | "syscomments" | "sysprocesses" | "syscolumns" | "sysindexes" | "sysmembers" | "syslogins" | "spt_values") || (in_msdb && (last.to_lowercase().starts_with("syspolicy_") || matches!(last.to_lowercase().as_str(), "sysjobs" | "syscategories" | "sysjobschedules" | "sysschedules" | "sysjobsteps" | "sysjobservers" | "sysjobhistory" | "backupset" | "backupmediafamily" | "backupmediaset" | "backupfile" | "backupfilegroup" | "restorehistory" | "restorefile" | "restorefilegroup" | "suspect_pages")))) {
                 let found = self.locate(name);
                 if self.table_ref(&found).is_none() {
-                    if let Some(mut rs) = self.sysview("sys", &display) {
+                    let key = ("sys".to_string(), display.to_lowercase());
+                    let rs_opt = if let Some(cached) = self.ses.sysview_cache.get(&key) {
+                        Some(cached.clone())
+                    } else {
+                        if let Some(rs) = self.sysview("sys", &display) {
+                            self.ses.sysview_cache.insert(key, rs.clone());
+                            Some(rs)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(mut rs) = rs_opt {
                         rs.schema.cols.iter_mut().for_each(|c| c.qual = Some(q.clone()));
+                        let pushed: Vec<Expr> = self.ses.pushdown.last().and_then(|v| v.iter().find(|(a, _)| a.eq_ignore_ascii_case(&q)).map(|(_, e)| e.clone())).unwrap_or_default();
+                        if !pushed.is_empty() {
+                            let target_oid = Self::extract_object_id_eq(&pushed);
+                            let col_idx = if display.eq_ignore_ascii_case("tables") { 1 } else { 0 };
+                            let mut filtered = Vec::new();
+                            for r in rs.rows.iter() {
+                                if let Some(toid) = target_oid {
+                                    if !matches!(r.get(col_idx), Some(Value::Int(id)) if *id == toid) {
+                                        continue;
+                                    }
+                                }
+                                let env = Env::new(&rs.schema, r, None);
+                                let mut ok = true;
+                                for p in &pushed {
+                                    if !matches!(self.ev(p, &env)?, Value::Bit(true)) {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                                if ok {
+                                    filtered.push(r.clone());
+                                }
+                            }
+                            rs.rows = filtered.into();
+                        }
                         return Ok(rs);
                     }
                 }

@@ -197,6 +197,7 @@ pub struct SessionState {
     pub stat_buf: std::sync::Arc<crate::coord::StatBuf>,
     pub login: String,
     pub db: String,
+    pub no_ddl_triggers: bool,
     pub temp: HashMap<String, Table>,
     pub frames: Vec<Frame>,
     pub trancount: i32,
@@ -279,6 +280,7 @@ pub struct SessionState {
     /// second time the same scan is asked for (a correlated subquery reads the tables of its FROM again for every outer row).
     pub leaf_seen: std::collections::HashSet<String>,
     pub leaf_cache: HashMap<String, spill::RowsRef>,
+    pub sysview_cache: HashMap<(String, String), query::Rowset>,
     pub in_query: bool,
     /// `SET FMTONLY ON`: queries describe their result and return no rows, other statements are not run.
     pub fmtonly: bool,
@@ -334,6 +336,7 @@ impl SessionState {
             stat_buf: Default::default(),
             login: "sa".into(),
             db: "master".into(),
+            no_ddl_triggers: false,
             temp: HashMap::new(),
             frames: vec![],
             trancount: 0,
@@ -384,6 +387,7 @@ impl SessionState {
             sub_memo: HashMap::new(),
             leaf_seen: std::collections::HashSet::new(),
             leaf_cache: HashMap::new(),
+            sysview_cache: HashMap::new(),
             in_query: false,
             fmtonly: false,
             view_check: None,
@@ -905,12 +909,14 @@ impl<'a> Engine<'a> {
             let saved_plans = std::mem::take(&mut self.ses.push_plans);
             let saved_memo = (std::mem::take(&mut self.ses.sub_names), std::mem::take(&mut self.ses.sub_memo));
             let saved_leaf = (std::mem::take(&mut self.ses.leaf_seen), std::mem::take(&mut self.ses.leaf_cache), std::mem::replace(&mut self.ses.in_query, false));
+            let saved_sysview = std::mem::take(&mut self.ses.sysview_cache);
             let mut r = self.exec_inner(st);
             self.ses.sub_cache = saved;
             self.ses.in_sets = saved_sets;
             self.ses.push_plans = saved_plans;
             (self.ses.sub_names, self.ses.sub_memo) = saved_memo;
             (self.ses.leaf_seen, self.ses.leaf_cache, self.ses.in_query) = saved_leaf;
+            self.ses.sysview_cache = saved_sysview;
             (self.ses.hints, self.ses.nowait) = saved_hints;
             self.ses.view_check = None;
             if r.is_ok() && ddltrig::is_ddl_stmt(st) {

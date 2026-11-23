@@ -2115,3 +2115,82 @@ fn a_variable_or_a_comment_named_like_a_table_does_not_make_a_batch_the_clusters
     assert!(s.wants("SELECT * FROM orders"));
     assert!(s.wants("SELECT 1 FROM [orders] -- x"));
 }
+
+#[test]
+fn trigger_metadata_synchronized_to_mirror_sysviews() {
+    let h = start(2);
+    let mut s = h.cluster.session();
+    let r = s.execute("CREATE TABLE t_trg (id INT PRIMARY KEY, v VARCHAR(10))");
+    assert!(r.first_error().is_none(), "{:?}", r.first_error());
+    let r = s.execute("CREATE TRIGGER tr_dml ON t_trg AFTER INSERT AS PRINT 'inserted'");
+    assert!(r.first_error().is_none(), "{:?}", r.first_error());
+    let r = s.execute("CREATE TRIGGER tr_ddl ON DATABASE FOR CREATE_TABLE AS PRINT 'table created'");
+    assert!(r.first_error().is_none(), "{:?}", r.first_error());
+
+    // Front-end queries against sys.triggers:
+    let r = s.execute("SELECT name, parent_class, type FROM sys.triggers ORDER BY name");
+    assert!(r.first_error().is_none(), "{:?}", r.first_error());
+    let rs = r.resultsets();
+    assert_eq!(rs.len(), 1);
+    let names: Vec<String> = rs[0].rows.iter().map(|row| row[0].to_string()).collect();
+    assert!(names.contains(&"tr_ddl".to_string()), "DDL trigger missing in sys.triggers: {:?}", names);
+    assert!(names.contains(&"tr_dml".to_string()), "DML trigger missing in sys.triggers: {:?}", names);
+
+    // Check parent_class: tr_ddl must have parent_class = 0, tr_dml parent_class = 1
+    for row in &rs[0].rows {
+        if row[0].to_string() == "tr_ddl" {
+            assert_eq!(row[1].as_i64(), Some(0), "tr_ddl parent_class");
+        } else if row[0].to_string() == "tr_dml" {
+            assert_eq!(row[1].as_i64(), Some(1), "tr_dml parent_class");
+        }
+    }
+
+    // sys.trigger_events
+    let r = s.execute("SELECT type, type_desc FROM sys.trigger_events ORDER BY type_desc");
+    assert!(r.first_error().is_none(), "{:?}", r.first_error());
+    let rs = r.resultsets();
+    let events: Vec<(i64, String)> = rs[0].rows.iter().map(|row| (row[0].as_i64().unwrap(), row[1].to_string())).collect();
+    assert!(events.iter().any(|(t, e)| *t == 1 && e == "INSERT"), "INSERT event missing: {:?}", events);
+    assert!(events.iter().any(|(t, e)| *t == 21 && e == "CREATE_TABLE"), "CREATE_TABLE event missing: {:?}", events);
+
+    // Disable DML trigger
+    let r = s.execute("DISABLE TRIGGER tr_dml ON t_trg");
+    assert!(r.first_error().is_none(), "{:?}", r.first_error());
+    let r = s.execute("SELECT is_disabled FROM sys.triggers WHERE name = 'tr_dml'");
+    assert_eq!(r.resultsets()[0].rows[0][0].as_i64(), Some(1));
+
+    // Disable DDL trigger
+    let r = s.execute("DISABLE TRIGGER tr_ddl ON DATABASE");
+    assert!(r.first_error().is_none(), "{:?}", r.first_error());
+    let r = s.execute("SELECT is_disabled FROM sys.triggers WHERE name = 'tr_ddl'");
+    assert_eq!(r.resultsets()[0].rows[0][0].as_i64(), Some(1));
+
+    // Drop DML trigger
+    let r = s.execute("DROP TRIGGER tr_dml");
+    assert!(r.first_error().is_none(), "{:?}", r.first_error());
+    let r = s.execute("SELECT COUNT(*) FROM sys.triggers WHERE name = 'tr_dml'");
+    assert_eq!(r.resultsets()[0].rows[0][0].as_i64(), Some(0));
+
+    // Drop DDL trigger
+    let r = s.execute("DROP TRIGGER tr_ddl ON DATABASE");
+    assert!(r.first_error().is_none(), "{:?}", r.first_error());
+    let r = s.execute("SELECT COUNT(*) FROM sys.triggers WHERE name = 'tr_ddl'");
+    assert_eq!(r.resultsets()[0].rows[0][0].as_i64(), Some(0));
+
+    // master.dbo.spt_values space used query (used by SSMS for indexes)
+    let r = s.execute("DECLARE @PageSize float SELECT @PageSize = v.low / 1024.0 FROM master.dbo.spt_values v WHERE v.number = 1 AND v.type = 'E'; SELECT @PageSize");
+    assert!(r.first_error().is_none(), "{:?}", r.first_error());
+    assert_eq!(r.resultsets()[0].rows[0][0].as_i64(), Some(8));
+
+    // sys.stats with auto_drop, STATS_DATE, INDEXPROPERTY('IsStatistics'), and sys.stats_columns
+    let r = s.execute("SELECT st.name, st.auto_drop, STATS_DATE(st.object_id, st.stats_id), 1 - INDEXPROPERTY(st.object_id, st.name, N'IsStatistics') FROM sys.stats st JOIN sys.tables t ON st.object_id = t.object_id WHERE t.name = 't_trg'");
+    assert!(r.first_error().is_none(), "{:?}", r.first_error());
+    let rs = r.resultsets();
+    assert_eq!(rs[0].rows[0][1].as_i64(), Some(0));
+    assert!(!rs[0].rows[0][2].is_null());
+    assert_eq!(rs[0].rows[0][3].as_i64(), Some(1));
+
+    let r = s.execute("SELECT sc.column_id FROM sys.stats_columns sc JOIN sys.stats st ON sc.object_id = st.object_id AND sc.stats_id = st.stats_id JOIN sys.tables t ON st.object_id = t.object_id WHERE t.name = 't_trg'");
+    assert!(r.first_error().is_none(), "{:?}", r.first_error());
+    assert!(!r.resultsets()[0].rows.is_empty());
+}

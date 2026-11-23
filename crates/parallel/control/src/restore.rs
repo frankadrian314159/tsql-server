@@ -22,7 +22,7 @@ use tsql_server::engine::backup::BackupSource;
 use tsql_server::script;
 
 /// Rows of a table sent to a shard in one message.
-const LOAD_BATCH: usize = 5_000;
+const LOAD_BATCH: usize = 1_000;
 /// The largest table (in rows) restored as a replicated table when the `DISTRIBUTION` option does not name it.
 pub const REPLICATE_UPTO: u64 = 10_000;
 
@@ -238,16 +238,18 @@ impl ClusterSession {
             let choice = match choices.remove(&id) {
                 Some(c) => c,
                 None if rows <= REPLICATE_UPTO => DistChoice::Replicated,
-                None => DistChoice::By(default_key(t)?),
+                None => match default_key(t) {
+                    Some(k) => DistChoice::By(k),
+                    None => DistChoice::Replicated,
+                },
             };
             if let DistChoice::By(k) = &choice {
                 let at = check_key(t, k)?;
-                // a filtered unique index without the shard key cannot be checked across shards (see uniq.rs): refused, or (with
-                // CONTINUE_AFTER_ERROR) made an ordinary index, and said so
+                // a filtered unique index without the shard key cannot be checked across shards (see uniq.rs): made an ordinary index
                 let weak = script::uniques_without(t, at);
-                if !weak.is_empty() && !keep_going {
-                    return Err(unsupported(&format!(
-                        "the filtered unique key(s) {} of {} that do not contain the shard key {} (RESTORE ... WITH CONTINUE_AFTER_ERROR makes them ordinary indexes; or name another key with DISTRIBUTION, or REPLICATED)",
+                if !weak.is_empty() {
+                    events.push(Event::Message(format!(
+                        "Warning: the filtered unique key(s) {} of {} that do not contain the shard key {} were made ordinary indexes.",
                         weak.join(", "),
                         t.name,
                         k
@@ -462,7 +464,13 @@ impl ClusterSession {
         // the foreign keys, while the tables are empty (so the order of the tables does not matter)
         for (_, s) in &scripts {
             for x in &s.foreign_keys {
-                self.run_sql(x).await?;
+                if let Err(e) = self.run_sql(x).await {
+                    if keep_going {
+                        events.push(Event::Message(format!("Not restored: foreign key ({})", e.message)));
+                    } else {
+                        events.push(Event::Message(format!("Warning: foreign key was not created ({}).", e.message)));
+                    }
+                }
             }
         }
         // the rows, as they are read
@@ -478,7 +486,20 @@ impl ClusterSession {
         // the other indexes, the counts and the identity counters
         for (t, s) in &scripts {
             for x in &s.indexes {
-                self.run_sql(x).await?;
+                if let Err(e) = self.run_sql(x).await {
+                    if (e.number == 1505 || e.number == 2601) && x.starts_with("CREATE UNIQUE ") {
+                        let non_unique = x.replacen("CREATE UNIQUE ", "CREATE ", 1);
+                        if self.run_sql(&non_unique).await.is_ok() {
+                            events.push(Event::Message(format!("Warning: unique index could not be created because of duplicate keys ({}); created as ordinary index.", e.message)));
+                            continue;
+                        }
+                    }
+                    if keep_going {
+                        events.push(Event::Message(format!("Not restored: index ({})", e.message)));
+                    } else {
+                        events.push(Event::Message(format!("Warning: index was not created ({}).", e.message)));
+                    }
+                }
             }
             let id = self.qid(&vec![t.schema.clone(), t.name.clone()]);
             let rows = targets.get(&table_id(&[t.schema.clone(), t.name.clone()])).map(|x| x.rows).unwrap_or(0);
@@ -501,7 +522,9 @@ impl ClusterSession {
                     _ => Made::Proc(name.clone()),
                 }),
                 Err(e) if keep_going => events.push(Event::Message(format!("Not restored: the {} {} ({}).", what.to_lowercase(), name.join("."), e.message))),
-                Err(e) => return Err(e),
+                Err(e) => {
+                    events.push(Event::Message(format!("Warning: the {} {} was not created ({}).", what.to_lowercase(), name.join("."), e.message)));
+                }
             }
         }
         // the triggers of the tables (the rows are in: loading them fired nothing)
@@ -515,7 +538,9 @@ impl ClusterSession {
                     }
                 }
                 Err(e) if keep_going => events.push(Event::Message(format!("Not restored: the trigger {} ({}).", name.join("."), e.message))),
-                Err(e) => return Err(e),
+                Err(e) => {
+                    events.push(Event::Message(format!("Warning: the trigger {} was not created ({}).", name.join("."), e.message)));
+                }
             }
         }
         // the DDL triggers of the database, last: nothing the restore made ran them
@@ -601,15 +626,15 @@ fn object_id(o: &Object) -> i32 {
     }
 }
 
-/// The shard key `CREATE TABLE` would choose: the first column of the primary key.
-fn default_key(t: &Table) -> Result<String, SqlError> {
-    let shown = format!("{}.{}", t.schema, t.name);
-    let first = t.pk.as_ref().and_then(|p| p.cols.first()).map(|&c| &t.columns[c]).or_else(|| t.columns.iter().find(|c| c.computed.is_none()));
-    match first {
-        Some(c) if KeyClass::of_type_name(&script::type_name(&c.ty)).is_some() => Ok(c.name.clone()),
-        Some(c) => Err(unsupported(&format!("the shard key {} of {} (type {}); name another with RESTORE ... WITH DISTRIBUTION = N'{} BY column' or N'{} REPLICATED'", c.name, shown, c.ty, shown, shown))),
-        None => Err(SqlError::new(1113, format!("The table {} has no column to shard it on.", shown))),
-    }
+/// The shard key `CREATE TABLE` would choose: the first column of the primary key that has a hashable type, or any hashable column.
+fn default_key(t: &Table) -> Option<String> {
+    let pk_first = t.pk.as_ref().and_then(|p| {
+        p.cols.iter().map(|&c| &t.columns[c]).find(|c| KeyClass::of_type_name(&script::type_name(&c.ty)).is_some())
+    });
+    let usable = pk_first.or_else(|| {
+        t.columns.iter().find(|c| c.computed.is_none() && KeyClass::of_type_name(&script::type_name(&c.ty)).is_some())
+    });
+    usable.map(|c| c.name.clone())
 }
 
 /// A shard key must be a column of a type the cluster hashes, and in every unique key (else uniqueness is not checked across

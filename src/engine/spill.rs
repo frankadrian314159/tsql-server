@@ -245,6 +245,11 @@ impl RowsRef {
         self.0.file.is_some() && self.0.mem.get().is_none()
     }
 
+    /// Is this the sole reference to the rows?
+    pub fn is_unique(&self) -> bool {
+        Arc::strong_count(&self.0) == 1
+    }
+
     /// The rows one at a time, reading a spilled result from its file.
     pub fn stream(&self) -> RowsIter {
         match (self.0.mem.get(), &self.0.file) {

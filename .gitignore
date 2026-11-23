@@ -28,3 +28,4 @@ resources/*.bak
 # the data directory a server started here makes (database, log, snapshot, lock)
 data/
 target-test/
+scratch/

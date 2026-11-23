@@ -1010,8 +1010,14 @@ pub fn write_pages(img: &Image, src: &mut dyn RowSource, p: &mut Pager) -> Res<S
         }
         // indexes (the definitions only: this server rebuilds them from the rows)
         let mut write_index = |sys: &mut Sys, ix: &IndexMeta| {
-            let status = if ix.unique { 8 } else { 0 } | if ix.primary { 0x20 } else { 0 } | if ix.unique_constraint { 0x40 } else { 0 };
+            let status = if ix.unique { 8 } else { 0 }
+                | if ix.primary { 0x20 } else { 0 }
+                | if ix.unique_constraint { 0x40 } else { 0 }
+                | if ix.filter.is_some() { 0x20000 } else { 0 };
             sys.idxstat(obj, ix.id, status, if ix.clustered { 1 } else { 2 }, 0, &ix.name);
+            if let Some(f) = &ix.filter {
+                sys.text_value(66, obj, ix.id, f);
+            }
             for (n, (col, desc)) in ix.keys.iter().enumerate() {
                 sys.iscol(obj, ix.id, n as u32 + 1, if *desc { 4 } else { 0 }, *col, n as u8 + 1);
             }

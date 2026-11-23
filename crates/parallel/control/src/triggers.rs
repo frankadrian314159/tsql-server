@@ -125,6 +125,7 @@ pub(crate) fn body_problem(body: &[Stmt]) -> Option<String> {
             Stmt::Exec(_) | Stmt::ExecStr(_) | Stmt::Break | Stmt::Continue => None,
             Stmt::DeclareCursor { .. } | Stmt::CursorOp { .. } | Stmt::Fetch { .. } => None,
             Stmt::Return(Some(_)) => Some("RETURN with a value".into()),
+            Stmt::CreateTable { .. } | Stmt::Drop { .. } | Stmt::BeginTran(_) | Stmt::Commit(_) | Stmt::SaveTran(_) | Stmt::Goto(_) | Stmt::Label(_) => None,
             other => Some(stmt_kind(other)),
         }
     }
@@ -238,6 +239,32 @@ impl ClusterSession {
         drop(reg);
         self.plan.push("trigger: kept by the control node, which fires it around the statements that change the table".into());
         self.log_schema(st);
+
+        let Stmt::CreateTrigger { body, text, .. } = st else { return Ok(()) };
+        let db = if table.len() >= 3 { table[0].as_str() } else { self.cur_db.as_str() };
+        let (schema, trg_name) = match name.as_slice() {
+            [_, s, n] => (s.as_str(), n.as_str()),
+            [s, n] => (s.as_str(), n.as_str()),
+            _ => ("dbo", name.last().map(|s| s.as_str()).unwrap_or_default()),
+        };
+        let (tbl_schema, tbl_name) = match table.as_slice() {
+            [_, s, n] => (s.as_str(), n.as_str()),
+            [s, n] => (s.as_str(), n.as_str()),
+            _ => ("dbo", table.last().map(|s| s.as_str()).unwrap_or_default()),
+        };
+        let oid = self.cluster.mirror.new_object_id();
+        let trg = Arc::new(tsql_server::catalog::Trigger {
+            name: trg_name.to_string(),
+            schema: schema.to_string(),
+            events: events.clone(),
+            instead: *instead,
+            body: body.clone(),
+            text: text.clone(),
+            object_id: oid,
+            disabled: false,
+        });
+        self.cluster.mirror.register_trigger_meta(db, tbl_schema, tbl_name, trg);
+
         Ok(())
     }
 
@@ -249,6 +276,13 @@ impl ClusterSession {
             if reg.iter().any(|(i, _)| *i == id) {
                 reg.retain(|(i, _)| *i != id);
                 self.cluster.triggers_off.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                let db = if n.len() >= 3 { n[0].as_str() } else { self.cur_db.as_str() };
+                let (schema, trg_name) = match n.as_slice() {
+                    [_, s, name] => (s.as_str(), name.as_str()),
+                    [s, name] => (s.as_str(), name.as_str()),
+                    _ => ("dbo", n.last().map(|s| s.as_str()).unwrap_or_default()),
+                };
+                self.cluster.mirror.drop_trigger_meta(db, schema, trg_name);
             } else if !if_exists {
                 return Err(SqlError::new(3701, format!("Cannot drop the trigger '{}', because it does not exist or you do not have permission.", n.join("."))));
             }
@@ -286,12 +320,24 @@ impl ClusterSession {
         };
         {
             let mut off = self.cluster.triggers_off.lock().unwrap_or_else(|e| e.into_inner());
-            for id in ids {
+            for id in &ids {
                 if *on {
-                    off.remove(&id);
+                    off.remove(id);
                 } else {
-                    off.insert(id);
+                    off.insert(id.clone());
                 }
+            }
+        }
+        for id in &ids {
+            let reg = self.cluster.triggers.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((_, Stmt::CreateTrigger { name, table, .. })) = reg.iter().find(|(i, _)| i == id) {
+                let db = if table.len() >= 3 { table[0].as_str() } else { self.cur_db.as_str() };
+                let (schema, trg_name) = match name.as_slice() {
+                    [_, s, n] => (s.as_str(), n.as_str()),
+                    [s, n] => (s.as_str(), n.as_str()),
+                    _ => ("dbo", name.last().map(|s| s.as_str()).unwrap_or_default()),
+                };
+                self.cluster.mirror.enable_trigger_meta(db, schema, trg_name, *on);
             }
         }
         // (logged with the names in full, as `table_id` reads them back)
@@ -534,11 +580,22 @@ impl ClusterSession {
         let mut quiet: Vec<Event> = vec![];
         let mut r: Result<(), SqlError> = Ok(());
         self.returning = false;
-        for s in &stmts {
-            r = Box::pin(self.exec_stmt(s, &mut quiet)).await;
+        let mut i = 0;
+        while i < stmts.len() {
+            r = Box::pin(self.exec_stmt(&stmts[i], &mut quiet)).await;
             if r.is_err() || self.returning || (had_txn && self.txn.borrow().is_none()) {
                 break;
             }
+            if let Some(target) = self.goto_target.take() {
+                if let Some(idx) = stmts.iter().position(|s| matches!(s, Stmt::Label(l) if l.eq_ignore_ascii_case(&target))) {
+                    i = idx + 1;
+                    continue;
+                } else {
+                    self.goto_target = Some(target);
+                    break;
+                }
+            }
+            i += 1;
         }
         self.returning = false;
         // (an error that ends a trigger is one that the transaction cannot go on after, as in SQL Server, where XACT_ABORT is on in a trigger: the

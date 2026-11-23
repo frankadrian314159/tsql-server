@@ -450,7 +450,8 @@ fn create_keys(conn: &mut crate::Connection, tables: &[TableMeta], computed: &st
                 }
             } else {
                 let include = if inc.is_empty() { String::new() } else { format!(" INCLUDE ({})", inc.join(", ")) };
-                let sql = format!("CREATE {}{} INDEX {} ON {} ({}){}", if ix.unique { "UNIQUE " } else { "" }, cl, quote(&ix.name), qname(t), keys.join(", "), include);
+                let filter = ix.filter.as_ref().map(|f| format!(" WHERE {}", f)).unwrap_or_default();
+                let sql = format!("CREATE {}{} INDEX {} ON {} ({}){}{}", if ix.unique { "UNIQUE " } else { "" }, cl, quote(&ix.name), qname(t), keys.join(", "), include, filter);
                 if attempt(conn, &sql, format!("index {} on {}", ix.name, tn), &mut report.problems) {
                     report.indexes += 1;
                 }

@@ -144,10 +144,12 @@ fn table_meta(db: &Database, t: &Table, schema_ids: &HashMap<String, u32>) -> Ta
         name: k.name.clone(),
         clustered: k.clustered,
         unique: true,
+        status: 0,
         primary,
         unique_constraint: !primary && !k.is_index,
         keys: k.cols.iter().map(|c| (*c as u32 + 1, false)).collect(),
         included: k.include.iter().map(|c| *c as u32 + 1).collect(),
+        filter: k.filter.as_ref().map(|f| f.text.clone()),
     };
     let mut keys: Vec<(&crate::catalog::KeyDef, bool)> = vec![];
     if let Some(pk) = &t.pk {
@@ -167,10 +169,12 @@ fn table_meta(db: &Database, t: &Table, schema_ids: &HashMap<String, u32>) -> Ta
             name: ix.name.clone(),
             clustered: false,
             unique: ix.unique,
+            status: 0,
             primary: false,
             unique_constraint: false,
             keys: ix.cols.iter().map(|(c, d)| (*c as u32 + 1, *d)).collect(),
             included: ix.include.iter().map(|c| *c as u32 + 1).collect(),
+            filter: ix.filter.as_ref().map(|f| f.text.clone()),
         });
         id += 1;
     }

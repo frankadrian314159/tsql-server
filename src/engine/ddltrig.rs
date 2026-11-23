@@ -226,6 +226,9 @@ impl<'a> Engine<'a> {
 
     /// Run the DDL triggers that match the events `st` raised (it has just run successfully).
     pub fn fire_ddl_triggers(&mut self, st: &Stmt) -> Flow<()> {
+        if self.ses.no_ddl_triggers {
+            return Ok(());
+        }
         match st {
             Stmt::Backup(b) => self.audit_server_group("BACKUP_RESTORE_GROUP", "BACKUP", &b.db),
             Stmt::Restore(r) => self.audit_server_group("BACKUP_RESTORE_GROUP", "RESTORE", r.db.as_deref().unwrap_or("")),

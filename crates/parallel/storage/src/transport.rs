@@ -1,6 +1,7 @@
 //! Sending Raft messages to the other replicas: one Arrow Flight action per message, fire and forget (Raft tolerates loss).
 use crate::replica::Envelope;
 use arrow_flight::client::FlightClient;
+use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::Action;
 use futures::TryStreamExt;
 use std::collections::HashMap;
@@ -32,7 +33,11 @@ pub fn spawn_sender(me: NodeId, book: AddressBook, mut rx: UnboundedReceiver<(No
             };
             let Ok(body) = postcard::to_allocvec(&Envelope { from: me, msg }) else { continue };
             tokio::spawn(async move {
-                let mut c = FlightClient::new(ch);
+                let mut c = FlightClient::new_from_inner(
+                    FlightServiceClient::new(ch)
+                        .max_decoding_message_size(128 * 1024 * 1024)
+                        .max_encoding_message_size(128 * 1024 * 1024),
+                );
                 let send = async {
                     if let Ok(mut s) = c.do_action(Action::new(ACTION_RAFT, body)).await {
                         let _ = s.try_next().await;

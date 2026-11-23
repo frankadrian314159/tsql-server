@@ -359,6 +359,63 @@ impl Cluster {
         Some(out)
     }
 
+    /// Sync all current cluster triggers (DML and DDL) into the mirror engine catalog.
+    pub fn sync_mirror_triggers(&self) {
+        let ddl = self.ddl_triggers.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        for t in ddl {
+            let oid = self.mirror.new_object_id();
+            self.mirror.register_ddl_trigger_meta(&t.db, tsql_server::catalog::DdlTrigger {
+                name: t.name,
+                events: t.events,
+                body: t.body,
+                text: t.text,
+                object_id: oid,
+                disabled: t.disabled,
+            });
+        }
+        let off = self.triggers_off.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let triggers = self.triggers.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        for (id, st) in triggers {
+            if let Stmt::CreateTrigger { name, table, events, instead, body, text, .. } = st {
+                let db = if table.len() >= 3 {
+                    table[0].clone()
+                } else if let Some((d, _)) = id.split_once('.') {
+                    let known_dbs = self.dbs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    if known_dbs.iter().any(|x| x.eq_ignore_ascii_case(d)) {
+                        d.to_string()
+                    } else {
+                        "master".to_string()
+                    }
+                } else {
+                    "master".to_string()
+                };
+                let (schema, trg_name) = match name.as_slice() {
+                    [_, s, n] => (s.as_str(), n.as_str()),
+                    [s, n] => (s.as_str(), n.as_str()),
+                    _ => ("dbo", name.last().map(|s| s.as_str()).unwrap_or_default()),
+                };
+                let (tbl_schema, tbl_name) = match table.as_slice() {
+                    [_, s, n] => (s.as_str(), n.as_str()),
+                    [s, n] => (s.as_str(), n.as_str()),
+                    _ => ("dbo", table.last().map(|s| s.as_str()).unwrap_or_default()),
+                };
+                let disabled = off.contains(&id);
+                let oid = self.mirror.new_object_id();
+                let trg = Arc::new(tsql_server::catalog::Trigger {
+                    name: trg_name.to_string(),
+                    schema: schema.to_string(),
+                    events,
+                    instead,
+                    body,
+                    text,
+                    object_id: oid,
+                    disabled,
+                });
+                self.mirror.register_trigger_meta(&db, tbl_schema, tbl_name, trg);
+            }
+        }
+    }
+
     /// Reserve `count` `$graph_id`s of a node or edge table: the first of them (they go up by one). Saved with the control state.
     pub(crate) fn take_graph_ids(&self, id: &str, count: usize) -> Option<i64> {
         let first = {
@@ -456,7 +513,7 @@ impl Cluster {
     }
 
     pub fn session(self: &Arc<Self>) -> ClusterSession {
-        ClusterSession { cluster: self.clone(), id: self.next_session.fetch_add(1, Ordering::Relaxed), mirror: self.mirror.connect_internal(), plan: vec![], temp_counter: 0, own_temps: vec![], txn: std::cell::RefCell::new(None), stmt_shards: std::cell::Cell::new(0), commit_seq: 0, vars: HashMap::new(), local_tables: HashMap::new(), tvars: HashMap::new(), identity_insert: Default::default(), last_identity: None, create_dist: None, cur_db: "master".into(), capture: None, trigger_stack: vec![], returning: false, catch_stack: vec![], proc_depth: 0, return_value: None, loop_ctl: 0, temp_creates: HashMap::new(), mirror_temps: Default::default(), uniq_guards: vec![], eventdata: vec![], ddl_rolled_back: false, no_ddl_triggers: false, batch_text: String::new(), cursors: HashMap::new(), fetch_status: 0 }
+        ClusterSession { cluster: self.clone(), id: self.next_session.fetch_add(1, Ordering::Relaxed), mirror: self.mirror.connect_internal(), plan: vec![], temp_counter: 0, own_temps: vec![], txn: std::cell::RefCell::new(None), stmt_shards: std::cell::Cell::new(0), commit_seq: 0, vars: HashMap::new(), local_tables: HashMap::new(), tvars: HashMap::new(), identity_insert: Default::default(), last_identity: None, create_dist: None, cur_db: "master".into(), capture: None, trigger_stack: vec![], returning: false, catch_stack: vec![], proc_depth: 0, return_value: None, loop_ctl: 0, goto_target: None, temp_creates: HashMap::new(), mirror_temps: Default::default(), uniq_guards: vec![], eventdata: vec![], ddl_rolled_back: false, no_ddl_triggers: false, batch_text: String::new(), cursors: HashMap::new(), fetch_status: 0 }
     }
 
     pub fn shard_status(&self) -> Vec<Result<ShardStatus, SqlError>> {
@@ -515,6 +572,8 @@ pub struct ClusterSession {
     return_value: Option<Value>,
     /// `BREAK` (1) or `CONTINUE` (2) has been run: the statements around it stop, up to the `WHILE`
     loop_ctl: u8,
+    /// `GOTO label` target label being jumped to
+    goto_target: Option<String>,
     /// the `CREATE TABLE` of each temporary table the session materialized (by id), and those of them that the control node's engine has too
     /// (it is given one only when a query that it runs reads it: see `refresh_mirror`)
     temp_creates: HashMap<String, String>,
@@ -1339,7 +1398,11 @@ impl ClusterSession {
                 self.loop_ctl = 2;
                 Ok(())
             }
-            Stmt::Noop => Ok(()),
+            Stmt::Goto(lbl) => {
+                self.goto_target = Some(lbl.clone());
+                Ok(())
+            }
+            Stmt::Label(_) | Stmt::Noop => Ok(()),
             Stmt::DeclareCursor { .. } | Stmt::CursorOp { .. } | Stmt::Fetch { .. } => self.exec_cursor(st).await,
             // (sp_rename of an index or a column of a table of the cluster: the shards rename it too, see renames.rs)
             Stmt::Exec(ex) if self.is_cluster_rename(ex) => self.exec_rename(st, ex).await,
@@ -1704,11 +1767,22 @@ impl ClusterSession {
     async fn exec_flow(&mut self, st: &Stmt, events: &mut Vec<Event>) -> Result<(), SqlError> {
         match st {
             Stmt::Block(stmts) => {
-                for s in stmts {
-                    Box::pin(self.exec_stmt(s, events)).await?;
+                let mut i = 0;
+                while i < stmts.len() {
+                    Box::pin(self.exec_stmt(&stmts[i], events)).await?;
                     if self.returning || self.loop_ctl != 0 {
                         break;
                     }
+                    if let Some(target) = self.goto_target.take() {
+                        if let Some(idx) = stmts.iter().position(|s| matches!(s, Stmt::Label(l) if l.eq_ignore_ascii_case(&target))) {
+                            i = idx + 1;
+                            continue;
+                        } else {
+                            self.goto_target = Some(target);
+                            break;
+                        }
+                    }
+                    i += 1;
                 }
                 Ok(())
             }

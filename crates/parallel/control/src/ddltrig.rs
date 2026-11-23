@@ -226,11 +226,20 @@ impl ClusterSession {
                 if known.is_some() && !*or_alter {
                     return Err(SqlError::new(2714, format!("There is already an object named '{}' in the database.", name)));
                 }
-                let t = DdlTrig { db: db.clone(), name, events: events.clone(), body: Arc::new((**body).clone()), text: text.clone(), disabled: false };
+                let t = DdlTrig { db: db.clone(), name: name.clone(), events: events.clone(), body: Arc::new((**body).clone()), text: text.clone(), disabled: false };
                 match known {
                     Some(i) => reg[i] = t,
                     None => reg.push(t),
                 }
+                let oid = self.cluster.mirror.new_object_id();
+                self.cluster.mirror.register_ddl_trigger_meta(&db, tsql_server::catalog::DdlTrigger {
+                    name,
+                    events: events.clone(),
+                    body: Arc::new((**body).clone()),
+                    text: text.clone(),
+                    object_id: oid,
+                    disabled: false,
+                });
             }
             TriggerAct::Drop { if_exists } => {
                 let mut reg = self.cluster.ddl_triggers.lock().unwrap_or_else(|e| e.into_inner());
@@ -239,6 +248,7 @@ impl ClusterSession {
                     match reg.iter().position(|x| x.db == db && x.name.eq_ignore_ascii_case(&name)) {
                         Some(i) => {
                             reg.remove(i);
+                            self.cluster.mirror.drop_ddl_trigger_meta(&db, &name);
                         }
                         None if *if_exists => {}
                         None => return Err(SqlError::new(3701, format!("Cannot drop the trigger '{}', because it does not exist or you do not have permission.", name))),
@@ -248,12 +258,18 @@ impl ClusterSession {
             TriggerAct::Enable(on) => {
                 let mut reg = self.cluster.ddl_triggers.lock().unwrap_or_else(|e| e.into_inner());
                 if a.all {
-                    reg.iter_mut().filter(|x| x.db == db).for_each(|x| x.disabled = !*on);
+                    reg.iter_mut().filter(|x| x.db == db).for_each(|x| {
+                        x.disabled = !*on;
+                        self.cluster.mirror.enable_ddl_trigger_meta(&db, &x.name, *on);
+                    });
                 } else {
                     for n in &a.names {
                         let name = name_of(n);
                         match reg.iter_mut().find(|x| x.db == db && x.name.eq_ignore_ascii_case(&name)) {
-                            Some(x) => x.disabled = !*on,
+                            Some(x) => {
+                                x.disabled = !*on;
+                                self.cluster.mirror.enable_ddl_trigger_meta(&db, &name, *on);
+                            }
                             None => return Err(SqlError::new(4947, format!("Cannot find the trigger '{}', because it does not exist or you do not have permission.", name))),
                         }
                     }

@@ -404,9 +404,14 @@ impl Parser {
     }
     fn name_parts(&mut self) -> R<Vec<String>> {
         // `..name` (no database, no schema), as client libraries write a procedure of the current database
-        let mut parts = if self.is_op(".") && self.peek_is_op(1, ".") {
-            self.i += 2;
-            vec![String::new(), String::new(), self.ident()?]
+        let mut parts = if self.is_op(".") {
+            if self.peek_is_op(1, ".") {
+                self.i += 2;
+                vec![String::new(), String::new(), self.ident()?]
+            } else {
+                self.i += 1;
+                vec![String::new(), self.ident()?]
+            }
         } else {
             vec![self.ident()?]
         };
@@ -732,11 +737,23 @@ impl Parser {
             }
             Tok::Var(v) => {
                 self.i += 1;
-                if v.starts_with("@@") {
-                    Ok(Expr::SysVar(v.to_uppercase()))
+                let base = if v.starts_with("@@") {
+                    Expr::SysVar(v.to_uppercase())
                 } else {
-                    Ok(Expr::Var(v.to_lowercase()))
+                    Expr::Var(v.to_lowercase())
+                };
+                if self.is_op(".") && matches!(self.peek(1).tok, Tok::Id(_)) && self.peek_is_op(2, "(") {
+                    let method = self.peek(1).up.clone();
+                    if HID_METHODS.contains(&method.as_str()) {
+                        self.i += 2;
+                        return self.hid_call(Some(base), &method);
+                    }
+                    if matches!(method.as_str(), "VALUE" | "EXIST" | "QUERY") {
+                        self.i += 2;
+                        return self.xml_method_named(base, &method);
+                    }
                 }
+                Ok(base)
             }
             Tok::Op("(") => {
                 self.i += 1;
@@ -1682,12 +1699,11 @@ impl Parser {
         let t = &toks[self.i];
         let n1 = self.peek(1).clone();
         let n1_eq = matches!(n1.tok, Tok::Op("="));
-        let is_nonreserved_id = |t: &Token| match &t.tok {
-            Tok::Id(_) => !reserved().contains(t.up.as_str()),
-            Tok::QId(_) | Tok::Str(_) => true,
+        let is_alias_id = match &t.tok {
+            Tok::Id(_) | Tok::QId(_) | Tok::Str(_) => true,
             _ => false,
         };
-        if is_nonreserved_id(&t) && n1_eq {
+        if is_alias_id && n1_eq && !matches!(self.peek(2).tok, Tok::Op("=")) {
             let alias = match &t.tok {
                 Tok::Id(s) | Tok::QId(s) | Tok::Str(s) => s.clone(),
                 _ => unreachable!(),
@@ -1883,6 +1899,17 @@ impl Parser {
                 node = self.xml_nodes(col)?;
             } else if name.len() == 1 && (name[0].eq_ignore_ascii_case("CONTAINSTABLE") || name[0].eq_ignore_ascii_case("FREETEXTTABLE")) && self.is_op("(") {
                 node = self.fulltext_table(&name[0].to_uppercase())?;
+            } else if self.is_op("(") && matches!(&self.peek(1).tok, Tok::Id(_) if matches!(self.peek(1).up.as_str(), "NOLOCK" | "READUNCOMMITTED" | "UPDLOCK" | "REPEATABLEREAD" | "SERIALIZABLE" | "READCOMMITTED" | "TABLOCK" | "TABLOCKX" | "PAGLOCK" | "ROWLOCK" | "NOWAIT" | "READPAST" | "XLOCK" | "SNAPSHOT" | "NOEXPAND" | "FORCESCAN" | "FORCESEEK" | "HOLDLOCK" | "INDEX" | "FASTFIRSTROW")) {
+                self.i += 1;
+                let mut hints = vec![self.advance_up()];
+                while self.accept_op(",") {
+                    if matches!(&self.tok().tok, Tok::Id(_)) {
+                        hints.push(self.advance_up());
+                    }
+                }
+                self.expect_op(")")?;
+                let (alias, _) = self.opt_alias()?;
+                node = TableRef::Table { name, alias, hints };
             } else if self.is_op("(") {
                 self.i += 1;
                 let mut args = vec![];
@@ -1959,6 +1986,15 @@ impl Parser {
                             _ => {}
                         }
                     }
+                } else if self.is_op("(") && matches!(&self.peek(1).tok, Tok::Id(_) if matches!(self.peek(1).up.as_str(), "NOLOCK" | "READUNCOMMITTED" | "UPDLOCK" | "REPEATABLEREAD" | "SERIALIZABLE" | "READCOMMITTED" | "TABLOCK" | "TABLOCKX" | "PAGLOCK" | "ROWLOCK" | "NOWAIT" | "READPAST" | "XLOCK" | "SNAPSHOT" | "NOEXPAND" | "FORCESCAN" | "FORCESEEK" | "HOLDLOCK" | "INDEX" | "FASTFIRSTROW")) {
+                    self.i += 1;
+                    hints.push(self.advance_up());
+                    while self.accept_op(",") {
+                        if matches!(&self.tok().tok, Tok::Id(_)) {
+                            hints.push(self.advance_up());
+                        }
+                    }
+                    self.expect_op(")")?;
                 } else if self.accept_kw("TABLESAMPLE") && self.is_op("(") {
                     self.skip_parens()?;
                 }
@@ -3342,6 +3378,13 @@ impl Parser {
             let ty = self.parse_type()?;
             let mut default = None;
             let (mut out, mut readonly) = (false, false);
+            while self.is_kw_any(&["OUT", "OUTPUT", "READONLY", "VARYING"]) {
+                match self.advance_up().as_str() {
+                    "OUT" | "OUTPUT" => out = true,
+                    "READONLY" => readonly = true,
+                    _ => {}
+                }
+            }
             if self.accept_op("=") {
                 default = Some(self.expr()?);
             }

@@ -352,6 +352,77 @@ impl Server {
         (g.store.stats(), g.temp_store.stats())
     }
 
+    /// Register or update a table DML trigger's catalog metadata in `db.triggers`.
+    pub fn register_trigger_meta(&self, db: &str, table_schema: &str, table_name: &str, trg: std::sync::Arc<catalog::Trigger>) {
+        let mut g = self.shared.state.write().unwrap_or_else(|e| e.into_inner());
+        let dbk = db.to_lowercase();
+        if let Some(d) = g.databases.get_mut(&dbk) {
+            let tkey = engine::obj_key(&trg.schema, &trg.name);
+            let tk = engine::obj_key(table_schema, table_name);
+            d.triggers.insert(tkey, (tk, trg));
+        }
+    }
+
+    /// Remove a table DML trigger's metadata from `db.triggers`.
+    pub fn drop_trigger_meta(&self, db: &str, schema: &str, name: &str) {
+        let mut g = self.shared.state.write().unwrap_or_else(|e| e.into_inner());
+        let dbk = db.to_lowercase();
+        if let Some(d) = g.databases.get_mut(&dbk) {
+            let tkey = engine::obj_key(schema, name);
+            d.triggers.remove(&tkey);
+        }
+    }
+
+    /// Enable or disable a table DML trigger in `db.triggers`.
+    pub fn enable_trigger_meta(&self, db: &str, schema: &str, name: &str, enabled: bool) {
+        let mut g = self.shared.state.write().unwrap_or_else(|e| e.into_inner());
+        let dbk = db.to_lowercase();
+        if let Some(d) = g.databases.get_mut(&dbk) {
+            let tkey = engine::obj_key(schema, name);
+            if let Some((_, trg)) = d.triggers.get_mut(&tkey) {
+                let mut new_trg = (**trg).clone();
+                new_trg.disabled = !enabled;
+                *trg = std::sync::Arc::new(new_trg);
+            }
+        }
+    }
+
+    /// Register or update a database DDL trigger in `db.ddl_triggers`.
+    pub fn register_ddl_trigger_meta(&self, db: &str, trg: catalog::DdlTrigger) {
+        let mut g = self.shared.state.write().unwrap_or_else(|e| e.into_inner());
+        let dbk = db.to_lowercase();
+        if let Some(d) = g.databases.get_mut(&dbk) {
+            d.ddl_triggers.retain(|t| !t.name.eq_ignore_ascii_case(&trg.name));
+            d.ddl_triggers.push(trg);
+        }
+    }
+
+    /// Remove a database DDL trigger from `db.ddl_triggers`.
+    pub fn drop_ddl_trigger_meta(&self, db: &str, name: &str) {
+        let mut g = self.shared.state.write().unwrap_or_else(|e| e.into_inner());
+        let dbk = db.to_lowercase();
+        if let Some(d) = g.databases.get_mut(&dbk) {
+            d.ddl_triggers.retain(|t| !t.name.eq_ignore_ascii_case(name));
+        }
+    }
+
+    /// Enable or disable a database DDL trigger in `db.ddl_triggers`.
+    pub fn enable_ddl_trigger_meta(&self, db: &str, name: &str, enabled: bool) {
+        let mut g = self.shared.state.write().unwrap_or_else(|e| e.into_inner());
+        let dbk = db.to_lowercase();
+        if let Some(d) = g.databases.get_mut(&dbk) {
+            for t in d.ddl_triggers.iter_mut().filter(|t| t.name.eq_ignore_ascii_case(name)) {
+                t.disabled = !enabled;
+            }
+        }
+    }
+
+    /// Allocate a new object_id for metadata registration.
+    pub fn new_object_id(&self) -> i32 {
+        let g = self.shared.state.read().unwrap_or_else(|e| e.into_inner());
+        g.core.new_object_id()
+    }
+
     /// Open a trusted session as the built-in `sa` (sysadmin) login.
     pub fn connect(&self) -> Connection {
         let mut c = self.session_for("sa");
@@ -361,7 +432,9 @@ impl Server {
 
     /// Like [`Server::connect`] but the connection is never intercepted (for the interceptor's own use of the engine).
     pub fn connect_internal(&self) -> Connection {
-        self.session_for("sa")
+        let mut conn = self.session_for("sa");
+        conn.session.no_ddl_triggers = true;
+        conn
     }
 
     /// Install (or remove) the factory of the interceptors of the connections made from now on (see [`Interceptor`]).

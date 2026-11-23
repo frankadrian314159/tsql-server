@@ -417,9 +417,14 @@ fn run_plan_on(conn: &mut Connection, mut t: Option<&mut Transport>, plan: &rpc:
     if tracing() {
         trace(&format!("rpc batch: {:?}", plan.sql));
     }
+    let t0 = std::time::Instant::now();
     let mut live = Live::new(Reply::Proc);
     conn.execute_streaming(&plan.sql, &mut |item| live.on(item, out, t.as_deref_mut()));
+    let elapsed = t0.elapsed();
     let errored = live.errored;
+    if tracing() || elapsed.as_millis() > 200 || errored {
+        eprintln!("TDS rpc (took {:?}, errored={}): {}", elapsed, errored, &plan.sql[..plan.sql.len().min(300)]);
+    }
     if !errored {
         if let Some(tr) = &live.trailer {
             let status = status_override.unwrap_or_else(|| if plan.status { as_i32(&tr[0]) } else { 0 });
@@ -500,12 +505,17 @@ impl Session {
         }
         let mut out = vec![];
         let mut live = Live::new(Reply::Batch);
+        let t0 = std::time::Instant::now();
         {
             // rows of a big result go to the client while the statement is still running
             let Session { t, conn, .. } = self;
             conn.execute_streaming(&sql, &mut |item| live.on(item, &mut out, Some(&mut *t)));
         }
+        let elapsed = t0.elapsed();
         let errored = live.errored;
+        if tracing() || elapsed.as_millis() > 200 || errored {
+            eprintln!("TDS batch (took {:?}, errored={}): {}", elapsed, errored, &sql[..sql.len().min(300)]);
+        }
         self.changes(errored, sql.to_ascii_lowercase().contains("rollback"), &mut out);
         Ok(self.finish(out, errored, Reply::Batch))
     }

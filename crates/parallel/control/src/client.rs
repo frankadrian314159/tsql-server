@@ -1,6 +1,7 @@
 //! The control node's view of one shard: Arrow Flight calls, with the shard's errors turned back into SQL errors.
 use arrow_flight::client::FlightClient;
 use arrow_flight::error::FlightError;
+use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::{Action, Ticket};
 use futures::TryStreamExt;
 use tonic::transport::{Channel, Endpoint};
@@ -41,6 +42,14 @@ fn flight_error(e: FlightError) -> SqlError {
         FlightError::Tonic(s) => sql_error_of(&s),
         other => SqlError::new(40613, format!("A shard could not be reached or failed: {}", other)),
     }
+}
+
+fn make_flight_client(ch: Channel) -> FlightClient {
+    FlightClient::new_from_inner(
+        FlightServiceClient::new(ch)
+            .max_decoding_message_size(128 * 1024 * 1024)
+            .max_encoding_message_size(128 * 1024 * 1024),
+    )
 }
 
 impl ShardClient {
@@ -152,7 +161,7 @@ impl ShardClient {
         self.on_leader(|ch| {
             let body = body.clone();
             async move {
-                let mut c = FlightClient::new(ch);
+                let mut c = make_flight_client(ch);
                 let mut results = c.do_action(Action::new(kind, body)).await.map_err(flight_error)?;
                 let first = results.try_next().await.map_err(flight_error)?;
                 // (read the stream to its end: dropping it half read makes the connection send a reset for the stream, and a
@@ -205,7 +214,7 @@ impl ShardClient {
         self.on_leader(|ch| {
             let ticket = ticket.to_vec();
             async move {
-                let mut c = FlightClient::new(ch);
+                let mut c = make_flight_client(ch);
                 let mut stream = c.do_get(Ticket::new(ticket)).await.map_err(flight_error)?;
                 let mut batches = vec![];
                 while let Some(b) = stream.try_next().await.map_err(flight_error)? {

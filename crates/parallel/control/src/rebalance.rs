@@ -147,6 +147,7 @@ impl Cluster {
             let pure: std::collections::BTreeSet<String> = cluster.pure_functions().into_iter().map(|(i, _)| i).collect();
             *cluster.funcs_on_shards.lock().unwrap_or_else(|e| e.into_inner()) = pure;
         }
+        cluster.sync_mirror_triggers();
         cluster.start_deadlock_monitor();
         if attach {
             return Ok(cluster);
