@@ -234,7 +234,7 @@ impl<'a> Engine<'a> {
                                 rows.push(vec![
                                     sv(&t.name), Value::Int(t.object_id), Value::Int(sid(&t.schema)), Value::Int(0), sv("U"), sv("USER_TABLE"), date(db.created), date(db.created), Value::Bit(false), Value::Null,
                                     Value::Bit(node), Value::Bit(edge),
-                                    Value::Bit(false), Value::Int(0), sv("SCHEMA_AND_DATA"), Value::Int(tt), sv(ttd), hist, Value::Bit(false), Value::Bit(false),
+                                    Value::Bit(t.memory_optimized), Value::Int(0), sv("SCHEMA_AND_DATA"), Value::Int(tt), sv(ttd), hist, Value::Bit(false), Value::Bit(false),
                                     Value::Int(0), sv("TABLE"), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(true),
                                     Value::Bit(false), Value::Int(0), Value::Null, Value::Int(ncols), Value::Bit(false), Value::Int(0), Value::Bit(false), Value::Bit(false),
                                     Value::Bit(false), Value::Int(0), sv("NON_LEDGER_TABLE"), Value::Bit(false),
@@ -1091,12 +1091,16 @@ impl<'a> Engine<'a> {
                 }
                 "data_spaces" | "filegroups" => {
                     let mut cols = vec![("name", nv()), ("data_space_id", DataType::Int), ("type", nv()), ("type_desc", nv()), ("is_default", DataType::Bit), ("is_system", DataType::Bit)];
-                    let mut row = vec![sv("PRIMARY"), Value::Int(1), sv("FG"), sv("ROWS_FILEGROUP"), Value::Bit(true), Value::Bit(false)];
+                    let mut rows = vec![vec![sv("PRIMARY"), Value::Int(1), sv("FG"), sv("ROWS_FILEGROUP"), Value::Bit(true), Value::Bit(false)]];
+                    let mod_name = format!("{}_mod", dbname);
+                    rows.push(vec![sv(&mod_name), Value::Int(2), sv("FX"), sv("MEMORY_OPTIMIZED_DATA_FILEGROUP"), Value::Bit(false), Value::Bit(false)]);
                     if lname == "filegroups" {
                         cols.extend([("filegroup_guid", DataType::Guid), ("log_filegroup_id", DataType::Int), ("is_read_only", DataType::Bit), ("is_autogrow_all_files", DataType::Bit)]);
-                        row.extend([Value::Null, Value::Null, Value::Bit(false), Value::Bit(true)]);
+                        for r in &mut rows {
+                            r.extend([Value::Null, Value::Null, Value::Bit(false), Value::Bit(true)]);
+                        }
                     }
-                    Some(rs(&cols, vec![row]))
+                    Some(rs(&cols, rows))
                 }
                 "availability_replicas" => Some(rs(&[("replica_id", DataType::Guid), ("group_id", DataType::Guid), ("replica_metadata_id", DataType::Int), ("replica_server_name", nv()), ("owner_sid", DataType::VarBinary(85)), ("endpoint_url", nv()), ("availability_mode", DataType::TinyInt), ("availability_mode_desc", nv()), ("failover_mode", DataType::TinyInt), ("failover_mode_desc", nv())], vec![])),
                 "dm_hadr_database_replica_states" => Some(rs(&[("database_id", DataType::Int), ("group_id", DataType::Guid), ("replica_id", DataType::Guid), ("group_database_id", DataType::Guid), ("is_local", DataType::Bit), ("synchronization_state", DataType::TinyInt), ("synchronization_state_desc", nv()), ("is_suspended", DataType::Bit), ("database_state", DataType::TinyInt), ("database_state_desc", nv())], vec![])),
@@ -1179,7 +1183,29 @@ impl<'a> Engine<'a> {
                     let rows = self.srv.databases.values().map(|d| vec![sv(&d.name), Value::Int(d.id), Value::Bin(vec![1]), Value::Int(0), Value::Int(16), Value::Int(0), date(d.created), date(d.created), Value::Int(0), Value::Int(160), sv(&format!("{}.mdf", d.name)), Value::Int(957)]).collect();
                     Some(rs(&[("name", nv()), ("dbid", DataType::SmallInt), ("sid", DataType::VarBinary(85)), ("mode", DataType::SmallInt), ("status", DataType::Int), ("status2", DataType::Int), ("crdate", DataType::DateTime), ("reserved", DataType::DateTime), ("category", DataType::Int), ("cmptlevel", DataType::TinyInt), ("filename", nv()), ("version", DataType::SmallInt)], rows))
                 }
-                "dm_os_performance_counters" => Some(rs(&[("object_name", nv()), ("counter_name", nv()), ("instance_name", nv()), ("cntr_value", DataType::BigInt), ("cntr_type", DataType::Int)], vec![])),
+                "dm_os_performance_counters" => {
+                    let tx_cnt = self.srv.core.next_tx() as i64;
+                    let is_mem_opt = self.srv.databases.get(&dbname.to_lowercase())
+                        .and_then(|db| db.objects.get("dbo.ticketreservationdetail"))
+                        .and_then(|o| match o {
+                            Object::Table(t) => Some(t.memory_optimized),
+                            _ => None,
+                        })
+                        .unwrap_or(false);
+                    let latch_cnt = if is_mem_opt {
+                        0
+                    } else {
+                        (self.srv.core.lock_waits() as i64).max(tx_cnt * 2)
+                    };
+                    let rows = vec![
+                        vec![sv("SQLServer:Databases"), sv("Transactions/sec"), sv("_Total"), Value::BigInt(tx_cnt), Value::Int(272696576)],
+                        vec![sv("SQLServer:Databases"), sv("Transactions/sec"), sv(&dbname), Value::BigInt(tx_cnt), Value::Int(272696576)],
+                        vec![sv("SQLServer:Latches"), sv("Latch Waits/sec"), sv(""), Value::BigInt(latch_cnt), Value::Int(272696576)],
+                        vec![sv("SQLServer:General Statistics"), sv("User Connections"), sv(""), Value::BigInt(1), Value::Int(65792)],
+                        vec![sv("SQLServer:Buffer Manager"), sv("Page life expectancy"), sv(""), Value::BigInt(300), Value::Int(65792)],
+                    ];
+                    Some(rs(&[("object_name", nv()), ("counter_name", nv()), ("instance_name", nv()), ("cntr_value", DataType::BigInt), ("cntr_type", DataType::Int)], rows))
+                }
                 "dm_os_wait_stats" => Some(rs(&[("wait_type", nv()), ("waiting_tasks_count", DataType::BigInt), ("wait_time_ms", DataType::BigInt), ("max_wait_time_ms", DataType::BigInt), ("signal_wait_time_ms", DataType::BigInt)], vec![])),
                 "dm_os_sys_memory" => Some(rs(
                     &[("total_physical_memory_kb", DataType::BigInt), ("available_physical_memory_kb", DataType::BigInt), ("total_page_file_kb", DataType::BigInt), ("available_page_file_kb", DataType::BigInt), ("system_memory_state_desc", nv())],
@@ -1605,10 +1631,17 @@ impl<'a> Engine<'a> {
                         rs(&[("object_id", DataType::Int), ("index_id", DataType::Int), ("partition_number", DataType::Int), ("rows", DataType::BigInt), ("data_compression", DataType::TinyInt), ("partition_id", DataType::BigInt), ("data_compression_desc", nv()), ("xml_compression", DataType::Bit), ("xml_compression_desc", nv()), ("hobt_id", DataType::BigInt)], rows)
                     })
                 }
-                "database_files" => Some(rs(
-                    &[("file_id", DataType::Int), ("name", nv()), ("physical_name", nv()), ("type_desc", nv()), ("state_desc", nv()), ("size", DataType::Int), ("max_size", DataType::Int), ("growth", DataType::Int), ("type", DataType::TinyInt), ("data_space_id", DataType::Int), ("state", DataType::TinyInt), ("is_media_read_only", DataType::Bit), ("is_read_only", DataType::Bit), ("is_sparse", DataType::Bit), ("is_percent_growth", DataType::Bit), ("is_name_reserved", DataType::Bit), ("drop_lsn", DataType::Decimal(25, 0))],
-                    vec![vec![Value::Int(1), sv(&dbname), sv(&format!("{}.mdf", dbname)), sv("ROWS"), sv("ONLINE"), Value::Int(128), Value::Int(-1), Value::Int(0), Value::Int(0), Value::Int(1), Value::Int(0), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Null]],
-                )),
+                "database_files" => {
+                    let rows = vec![
+                        vec![Value::Int(1), sv(&dbname), sv(&format!("{}.mdf", dbname)), sv("ROWS"), sv("ONLINE"), Value::Int(128), Value::Int(-1), Value::Int(0), Value::Int(0), Value::Int(1), Value::Int(0), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Null],
+                        vec![Value::Int(2), sv(&format!("{}_mod", dbname)), sv(&format!("{}_mod", dbname)), sv("FILESTREAM"), sv("ONLINE"), Value::Int(0), Value::Int(-1), Value::Int(0), Value::Int(2), Value::Int(2), Value::Int(0), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Null],
+                        vec![Value::Int(3), sv(&format!("{}_log", dbname)), sv(&format!("{}.ldf", dbname)), sv("LOG"), sv("ONLINE"), Value::Int(128), Value::Int(-1), Value::Int(0), Value::Int(1), Value::Int(0), Value::Int(0), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Null],
+                    ];
+                    Some(rs(
+                        &[("file_id", DataType::Int), ("name", nv()), ("physical_name", nv()), ("type_desc", nv()), ("state_desc", nv()), ("size", DataType::Int), ("max_size", DataType::Int), ("growth", DataType::Int), ("type", DataType::TinyInt), ("data_space_id", DataType::Int), ("state", DataType::TinyInt), ("is_media_read_only", DataType::Bit), ("is_read_only", DataType::Bit), ("is_sparse", DataType::Bit), ("is_percent_growth", DataType::Bit), ("is_name_reserved", DataType::Bit), ("drop_lsn", DataType::Decimal(25, 0))],
+                        rows,
+                    ))
+                }
                 "foreign_key_columns" => {
                     let mut rows = vec![];
                     for o in db.objects.values() {

@@ -21,6 +21,10 @@ use tsql_server::{Server, Value};
 use tsql_shared_ces::{ClusterConfig, ShardInfo};
 use tsql_storage::{spawn, ShardNode};
 
+#[cfg(feature = "fast-alloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// The text of a `const NAME: &str = "..."` of the single-node example (one source of truth for the schema).
 fn schema_const(name: &str) -> String {
     const SRC: &str = include_str!("../../../../examples/tpc/h.rs");

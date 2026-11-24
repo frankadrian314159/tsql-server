@@ -1966,9 +1966,6 @@ impl Parser {
                     clause = Some(self.temporal_clause()?);
                 }
                 let (alias, _) = self.opt_alias()?;
-                if let Some(c) = clause {
-                    node = TableRef::Temporal { name, alias, clause: Box::new(c) };
-                } else {
                 let mut hints = vec![];
                 if self.is_kw("WITH") && self.peek_is_op(1, "(") {
                     self.i += 2;
@@ -1998,7 +1995,10 @@ impl Parser {
                 } else if self.accept_kw("TABLESAMPLE") && self.is_op("(") {
                     self.skip_parens()?;
                 }
-                node = TableRef::Table { name, alias, hints };
+                if let Some(c) = clause {
+                    node = TableRef::Temporal { name, alias, clause: Box::new(c) };
+                } else {
+                    node = TableRef::Table { name, alias, hints };
                 }
             }
         }
@@ -2294,48 +2294,71 @@ impl Parser {
                             self.i += 2;
                             return Ok(Stmt::AlterSecurityPolicy(Box::new(self.policy_body()?)));
                         }
-                        if self.is_kw("DATABASE") && self.peek_kw(2, &["COLLATE"]) {
+                        if self.is_kw("DATABASE") {
                             self.i += 1;
-                            let db = self.ident()?;
-                            self.expect_kw("COLLATE")?;
-                            let name = self.ident()?;
-                            return Ok(Stmt::AlterDatabase { db, options: vec![("COLLATE".to_string(), name)] });
-                        }
-                        if self.is_kw("DATABASE") && !self.peek_kw(2, &["MODIFY", "ADD", "REMOVE", "COLLATE"]) && self.peek_kw(2, &["SET"]) {
-                            self.i += 1;
-                            let db = self.ident()?;
-                            self.expect_kw("SET")?;
-                            let mut options = vec![];
-                            loop {
-                                let name = self.ident()?.to_uppercase();
-                                let mut val = String::new();
-                                if self.is_kw_any(&["ON", "OFF"]) {
-                                    val = self.advance_up();
-                                } else if self.accept_op("=") {
-                                    val = self.advance_up();
-                                } else if !self.at_eos() && !self.is_op(",") && !self.is_op("(") && !self.is_kw("WITH") && (!self.is_stmt_start() || name == "RECOVERY") {
-                                    // a bare value: RECOVERY SIMPLE, PAGE_VERIFY CHECKSUM, CURSOR_DEFAULT GLOBAL, TARGET_RECOVERY_TIME 60 SECONDS
-                                    val = self.advance_up();
+                            let db = if self.accept_kw("CURRENT") { "CURRENT".to_string() } else { self.ident()? };
+                            if self.accept_kw("COLLATE") {
+                                let name = self.ident()?;
+                                return Ok(Stmt::AlterDatabase { db, options: vec![("COLLATE".to_string(), name)] });
+                            }
+                            if self.accept_kw("ADD") {
+                                if self.accept_kw("FILEGROUP") {
+                                    let fg = self.ident()?;
+                                    if self.accept_kw("CONTAINS") {
+                                        self.expect_kw("MEMORY_OPTIMIZED_DATA")?;
+                                    }
+                                    return Ok(Stmt::AlterDatabase { db, options: vec![("ADD_FILEGROUP".to_string(), fg)] });
                                 }
-                                if self.is_kw_any(&["SECONDS", "MINUTES"]) {
-                                    self.i += 1;
-                                }
-                                // a suboption list, as in AUTO_CREATE_STATISTICS ON (INCREMENTAL = OFF): accepted, there is nothing to set
-                                if self.is_op("(") {
-                                    self.skip_parens()?;
-                                }
-                                options.push((name, val));
-                                if !self.accept_op(",") {
-                                    break;
+                                if self.accept_kw("FILE") {
+                                    if self.is_op("(") {
+                                        self.skip_parens()?;
+                                    }
+                                    if self.accept_kw("TO") {
+                                        self.expect_kw("FILEGROUP")?;
+                                        let _ = self.ident()?;
+                                    }
+                                    return Ok(Stmt::AlterDatabase { db, options: vec![("ADD_FILE".to_string(), String::new())] });
                                 }
                             }
-                            if self.accept_kw("WITH") {
-                                // (WITH ROLLBACK IMMEDIATE: ROLLBACK starts a statement elsewhere, but not here)
-                                while !self.at_eos() && (self.is_kw("ROLLBACK") || !self.is_stmt_start()) {
+                            if self.accept_kw("MODIFY") || self.accept_kw("REMOVE") {
+                                while !self.at_eos() && !self.is_stmt_start() {
                                     self.i += 1;
                                 }
+                                return Ok(Stmt::AlterDatabase { db, options: vec![] });
                             }
-                            return Ok(Stmt::AlterDatabase { db, options });
+                            if self.accept_kw("SET") {
+                                let mut options = vec![];
+                                loop {
+                                    let name = self.ident()?.to_uppercase();
+                                    let mut val = String::new();
+                                    if self.is_kw_any(&["ON", "OFF"]) {
+                                        val = self.advance_up();
+                                    } else if self.accept_op("=") {
+                                        val = self.advance_up();
+                                    } else if !self.at_eos() && !self.is_op(",") && !self.is_op("(") && !self.is_kw("WITH") && (!self.is_stmt_start() || name == "RECOVERY") {
+                                        // a bare value: RECOVERY SIMPLE, PAGE_VERIFY CHECKSUM, CURSOR_DEFAULT GLOBAL, TARGET_RECOVERY_TIME 60 SECONDS
+                                        val = self.advance_up();
+                                    }
+                                    if self.is_kw_any(&["SECONDS", "MINUTES"]) {
+                                        self.i += 1;
+                                    }
+                                    // a suboption list, as in AUTO_CREATE_STATISTICS ON (INCREMENTAL = OFF): accepted, there is nothing to set
+                                    if self.is_op("(") {
+                                        self.skip_parens()?;
+                                    }
+                                    options.push((name, val));
+                                    if !self.accept_op(",") {
+                                        break;
+                                    }
+                                }
+                                if self.accept_kw("WITH") {
+                                    // (WITH ROLLBACK IMMEDIATE: ROLLBACK starts a statement elsewhere, but not here)
+                                    while !self.at_eos() && (self.is_kw("ROLLBACK") || !self.is_stmt_start()) {
+                                        self.i += 1;
+                                    }
+                                }
+                                return Ok(Stmt::AlterDatabase { db, options });
+                            }
                         }
                         if self.is_kw("LOGIN") {
                             self.i += 1;
@@ -3142,6 +3165,11 @@ impl Parser {
             return Ok(Stmt::BeginTran(name));
         }
         self.i += 1;
+        if self.accept_kw("ATOMIC") {
+            if self.accept_kw("WITH") && self.is_op("(") {
+                self.skip_parens()?;
+            }
+        }
         let body = self.block_until_end()?;
         self.expect_kw("END")?;
         Ok(Stmt::Block(body))
@@ -3921,8 +3949,12 @@ impl Parser {
                 while self.is_kw_any(&["ON", "WITH", "TEXTIMAGE_ON"]) {
                     let with = self.advance_up() == "WITH";
                     if with && self.is_op("(") {
-                        if let Some(v) = self.table_with_options()? {
+                        let (v, mem_opt) = self.table_with_options()?;
+                        if let Some(v) = v {
                             versioning = Some(v);
+                        }
+                        if mem_opt {
+                            defs.push(TableDef::MemoryOptimized(true));
                         }
                     } else if self.is_op("(") {
                         self.skip_parens()?;
@@ -4134,7 +4166,11 @@ impl Parser {
                 }
                 self.expect_kw("AS")?;
                 self.expect_kw("TABLE")?;
-                Ok(Stmt::CreateType { name, base: None, nullable: None, table: Some(self.table_body()?) })
+                let defs = self.table_body()?;
+                if self.accept_kw("WITH") {
+                    self.skip_parens()?;
+                }
+                Ok(Stmt::CreateType { name, base: None, nullable: None, table: Some(defs) })
             }
             "SEQUENCE" => {
                 let name = self.name_parts()?;
@@ -4417,6 +4453,7 @@ impl Parser {
             if self.is_kw_any(&["CLUSTERED", "NONCLUSTERED"]) {
                 self.i += 1;
             }
+            self.accept_kw("HASH");
             let cols = self.col_list_ord()?;
             self.skip_index_opts()?;
             return Ok(TableDef::PrimaryKey { name: cname, cols });
@@ -4426,6 +4463,7 @@ impl Parser {
             if self.is_kw_any(&["CLUSTERED", "NONCLUSTERED"]) {
                 self.i += 1;
             }
+            self.accept_kw("HASH");
             let cols = self.col_list_ord()?;
             self.skip_index_opts()?;
             return Ok(TableDef::Unique { name: cname, cols });
@@ -4460,12 +4498,14 @@ impl Parser {
             if self.is_kw_any(&["CLUSTERED", "NONCLUSTERED"]) {
                 clustered = self.advance_up() == "CLUSTERED";
             }
+            self.accept_kw("HASH");
             if self.accept_kw("COLUMNSTORE") {
                 let cols = if self.is_op("(") { self.col_list()? } else { vec![] };
                 self.skip_index_opts()?;
                 return Ok(TableDef::Columnstore { name, clustered, cols });
             }
             let cols = self.col_list_ord()?;
+            self.skip_index_opts()?;
             return Ok(TableDef::Index { name, cols, unique: false });
         }
         self.column_def()
@@ -4475,7 +4515,13 @@ impl Parser {
     fn table_constraint_follows(&self) -> bool {
         let up = |n: usize| self.peek(n).up.as_str();
         let paren = |n: usize| matches!(self.peek(n).tok, Tok::Op("("));
-        let after_kind = |n: usize| if matches!(up(n), "CLUSTERED" | "NONCLUSTERED") { n + 1 } else { n };
+        let after_kind = |n: usize| {
+            let mut k = if matches!(up(n), "CLUSTERED" | "NONCLUSTERED") { n + 1 } else { n };
+            if up(k) == "HASH" {
+                k += 1;
+            }
+            k
+        };
         match up(2) {
             "PRIMARY" => up(3) == "KEY" && paren(after_kind(4)),
             "UNIQUE" => paren(after_kind(3)),
@@ -4534,12 +4580,14 @@ impl Parser {
                 if self.is_kw_any(&["CLUSTERED", "NONCLUSTERED"]) {
                     self.i += 1;
                 }
+                self.accept_kw("HASH");
                 col.pk = Some(cname);
                 self.skip_index_opts()?;
             } else if self.accept_kw("UNIQUE") {
                 if self.is_kw_any(&["CLUSTERED", "NONCLUSTERED"]) {
                     self.i += 1;
                 }
+                self.accept_kw("HASH");
                 col.unique = Some(cname);
             } else if self.accept_kw("CHECK") {
                 self.expect_op("(")?;
@@ -4586,14 +4634,24 @@ impl Parser {
         Ok(TableDef::Column(col))
     }
 
-    /// `( option [= value] , ... )` of a CREATE TABLE ... WITH: `SYSTEM_VERSIONING` is returned, the rest skipped.
-    fn table_with_options(&mut self) -> R<Option<Versioning>> {
+    /// `( option [= value] , ... )` of a CREATE TABLE ... WITH: `SYSTEM_VERSIONING` and `MEMORY_OPTIMIZED` are returned, the rest skipped.
+    fn table_with_options(&mut self) -> R<(Option<Versioning>, bool)> {
         self.expect_op("(")?;
         let mut out = None;
+        let mut memory_optimized = false;
         loop {
             if self.is_kw("SYSTEM_VERSIONING") {
                 self.i += 1;
                 out = Some(self.versioning_value()?);
+            } else if self.is_kw("MEMORY_OPTIMIZED") {
+                self.i += 1;
+                self.accept_op("=");
+                if self.is_kw("ON") {
+                    self.i += 1;
+                    memory_optimized = true;
+                } else if self.is_kw("OFF") {
+                    self.i += 1;
+                }
             } else {
                 let mut depth = 0;
                 while !self.is_eof() {
@@ -4615,7 +4673,7 @@ impl Parser {
             }
         }
         self.expect_op(")")?;
-        Ok(out)
+        Ok((out, memory_optimized))
     }
 
     /// `= ON [( HISTORY_TABLE = name [, ...] )]` or `= OFF`.

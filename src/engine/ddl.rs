@@ -105,6 +105,7 @@ impl<'a> Engine<'a> {
         }
         let store = if is_temp { self.srv.temp_store.clone() } else { self.srv.store.clone() };
         let mut t = Table::new(db, schema, name, cols, &store);
+        t.memory_optimized = defs.iter().any(|d| matches!(d, TableDef::MemoryOptimized(true)));
         t.object_id = oid;
         t.is_temp = is_temp;
         t.graph = graph;
@@ -152,7 +153,7 @@ impl<'a> Engine<'a> {
                 }
                 TableDef::Columnstore { name: n, clustered, cols } => Self::make_columnstore(&mut t, n, *clustered, cols)?,
                 TableDef::EdgeConstraint { name: n, pairs, cascade } => self.add_edge_constraint(&mut t, n, pairs, *cascade)?,
-                TableDef::Graph { .. } | TableDef::ForeignKey(_) | TableDef::Period { .. } => {}
+                TableDef::Graph { .. } | TableDef::ForeignKey(_) | TableDef::Period { .. } | TableDef::MemoryOptimized(_) => {}
             }
         }
         // foreign keys last (self references need the PK)
@@ -1295,7 +1296,7 @@ impl<'a> Engine<'a> {
                         TableDef::EdgeConstraint { name, pairs, cascade } => self.add_edge_constraint(t, name, pairs, *cascade)?,
                         TableDef::Graph { .. } => return Err(SqlError::new(13921, "A table cannot be made a node or edge table after it is created.")),
                         TableDef::Column(_) => {}
-                        TableDef::Period { .. } => {}
+                        TableDef::Period { .. } | TableDef::MemoryOptimized(_) => {}
                     }
                 }
             }

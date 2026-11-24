@@ -153,7 +153,10 @@ impl ClusterSession {
         let shards: Vec<usize> = tx.shards.iter().copied().collect();
         let sid = self.id;
         match shards.len() {
-            0 => Ok(()),
+            0 => {
+                self.cluster.mirror.inc_tx(1);
+                Ok(())
+            }
             1 => {
                 let r = self.cluster.shard(shards[0]).run(sid, Work::Sql("COMMIT TRANSACTION".into())).await;
                 let err = match r {
@@ -161,7 +164,10 @@ impl ClusterSession {
                     Err(e) => Some(e),
                 };
                 match err {
-                    None => Ok(()),
+                    None => {
+                        self.cluster.mirror.inc_tx(1);
+                        Ok(())
+                    }
                     Some(e) => {
                         self.finish_rollback(&tx).await;
                         Err(e)
@@ -252,6 +258,7 @@ impl ClusterSession {
             cl.save_state();
         }
         self.bump_written(&tx);
+        self.cluster.mirror.inc_tx(1);
         if !waiting.is_empty() {
             events.push(Event::Message(format!("The transaction is committed; shard(s) {:?} have not confirmed yet and will finish it when they are reachable (Cluster::resolve_pending).", waiting)));
         }

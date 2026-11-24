@@ -317,6 +317,8 @@ pub struct Table {
     pub graph: Option<GraphKind>,
     #[serde(default, deserialize_with = "read_unless_v5", skip_serializing_if = "legacy_v5_write")]
     pub edge_constraints: Vec<EdgeConstraintDef>,
+    #[serde(default)]
+    pub memory_optimized: bool,
     /// the next `$graph_id` of a graph table (a counter of its own, so that a table's `IDENTITY` column is not disturbed by it)
     #[serde(default, deserialize_with = "read_unless_v5", skip_serializing_if = "legacy_v5_write")]
     pub graph_next: SharedCounter,
@@ -398,6 +400,7 @@ impl Table {
             graph: None,
             edge_constraints: vec![],
             graph_next: SharedCounter::default(),
+            memory_optimized: false,
         }
     }
     pub fn col_index(&self, name: &str) -> Option<usize> {

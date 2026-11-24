@@ -417,6 +417,12 @@ fn run_plan_on(conn: &mut Connection, mut t: Option<&mut Transport>, plan: &rpc:
     if tracing() {
         trace(&format!("rpc batch: {:?}", plan.sql));
     }
+    for (i, p) in params.iter().enumerate() {
+        if let Some(tvp) = &p.tvp {
+            let var = format!("@__tv{}", i);
+            conn.bind_tvp(&var, &tvp.schema, &tvp.name, tvp.rows.clone());
+        }
+    }
     let t0 = std::time::Instant::now();
     let mut live = Live::new(Reply::Proc);
     conn.execute_streaming(&plan.sql, &mut |item| live.on(item, out, t.as_deref_mut()));
@@ -585,17 +591,29 @@ impl Session {
             },
         };
         let ps = &call.params;
+        let direct_tvp = self.conn.has_interceptor();
         match id {
             0 => {
                 let Proc::Name(n) = &call.proc else { unreachable!() };
-                let plan = rpc::plan_named(n, ps)?;
-                Ok(self.run_plan(&plan, ps, out, None))
+                let mut ps = call.params.clone();
+                for (idx, p) in ps.iter_mut().enumerate() {
+                    if let Some(tvp) = &mut p.tvp {
+                        if tvp.name.is_empty() {
+                            if let Some((s, tn)) = self.conn.proc_param_type(n, &p.name, idx) {
+                                tvp.schema = s;
+                                tvp.name = tn;
+                            }
+                        }
+                    }
+                }
+                let plan = rpc::plan_named_opt(n, &ps, direct_tvp)?;
+                Ok(self.run_plan(&plan, &ps, out, None))
             }
             rpc::SP_EXECUTESQL => {
                 let stmt = rpc::text_param(ps, 0, "@stmt")?.ok_or("@stmt must not be NULL")?;
                 let decl = rpc::text_param(ps, 1, "@params").unwrap_or(None);
                 let args: Vec<usize> = (2..ps.len()).collect();
-                let plan = rpc::plan_executesql(&stmt, decl.as_deref(), ps, &args)?;
+                let plan = rpc::plan_executesql_opt(&stmt, decl.as_deref(), ps, &args, direct_tvp)?;
                 Ok(self.run_plan(&plan, ps, out, None))
             }
             rpc::SP_PREPARE | rpc::SP_PREPEXEC => {
@@ -607,7 +625,7 @@ impl Session {
                 let mut errored = false;
                 if id == rpc::SP_PREPEXEC {
                     let args: Vec<usize> = (3..ps.len()).collect();
-                    let plan = rpc::plan_executesql(&stmt, decl.as_deref(), ps, &args)?;
+                    let plan = rpc::plan_executesql_opt(&stmt, decl.as_deref(), ps, &args, direct_tvp)?;
                     errored = self.run_plan(&plan, ps, out, None);
                 } else {
                     out.push(0x79);
@@ -628,7 +646,7 @@ impl Session {
                 };
                 let (decl, stmt) = self.prepared.get(&handle).cloned().ok_or_else(|| format!("The prepared statement handle {} is not valid in this context.", handle))?;
                 let args: Vec<usize> = (1..ps.len()).collect();
-                let plan = rpc::plan_executesql(&stmt, decl.as_deref(), ps, &args)?;
+                let plan = rpc::plan_executesql_opt(&stmt, decl.as_deref(), ps, &args, direct_tvp)?;
                 Ok(self.run_plan(&plan, ps, out, None))
             }
             rpc::SP_UNPREPARE => {

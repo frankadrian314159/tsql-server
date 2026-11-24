@@ -26,6 +26,10 @@ use tsql_control::Cluster;
 use tsql_server::{convert::display, Event};
 use tsql_shared_ces::ClusterConfig;
 
+#[cfg(feature = "fast-alloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     let mut config: Option<String> = None;
     let mut show_plan = false;

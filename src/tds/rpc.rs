@@ -6,6 +6,7 @@ use crate::convert;
 use crate::types::{DtKind, Value};
 use chrono::Timelike;
 
+#[derive(Clone, Debug)]
 pub struct Param {
     pub name: String,
     pub out: bool,
@@ -16,6 +17,7 @@ pub struct Param {
 }
 
 /// A table-valued parameter as the client sent it (TVP_TYPE_INFO and its rows).
+#[derive(Clone, Debug)]
 pub struct Tvp {
     pub schema: String,
     pub name: String,
@@ -207,12 +209,12 @@ fn safe_proc_name(n: &str) -> R<&str> {
 /// Build the batch for calling `target` (a procedure name, or `sp_executesql` with the text and declarations
 /// already in `lead`) with the parameters `args`, given as indexes into `params`.
 pub fn plan(target: &str, lead: &[String], params: &[Param], args: &[usize], capture_status: bool) -> R<Plan> {
-    plan_with_names(target, lead, params, args, capture_status, &[])
+    plan_with_names(target, lead, params, args, capture_status, &[], false)
 }
 
 /// As [`plan`]; `pnames` are the names the unnamed arguments take, by position (the parameter names of the declaration of
 /// `sp_executesql`, since a call may not put an unnamed argument after a named one).
-pub fn plan_with_names(target: &str, lead: &[String], params: &[Param], args: &[usize], capture_status: bool, pnames: &[String]) -> R<Plan> {
+pub fn plan_with_names(target: &str, lead: &[String], params: &[Param], args: &[usize], capture_status: bool, pnames: &[String], direct_tvp: bool) -> R<Plan> {
     let mut sql = String::from("DECLARE @__rc int = 0;\n");
     let mut outs = vec![];
     let mut call: Vec<String> = lead.to_vec();
@@ -224,9 +226,11 @@ pub fn plan_with_names(target: &str, lead: &[String], params: &[Param], args: &[
             let var = format!("@__tv{}", i);
             let q = |n: &str| format!("[{}]", n.replace(']', "]]"));
             sql.push_str(&format!("DECLARE {} {}.{};\n", var, q(if t.schema.is_empty() { "dbo" } else { &t.schema }), q(&t.name)));
-            for chunk in t.rows.chunks(500) {
-                let rows: Vec<String> = chunk.iter().map(|r| format!("({})", r.iter().map(literal).collect::<Vec<_>>().join(", "))).collect();
-                sql.push_str(&format!("INSERT {} VALUES {};\n", var, rows.join(", ")));
+            if !direct_tvp {
+                for chunk in t.rows.chunks(500) {
+                    let rows: Vec<String> = chunk.iter().map(|r| format!("({})", r.iter().map(literal).collect::<Vec<_>>().join(", "))).collect();
+                    sql.push_str(&format!("INSERT {} VALUES {};\n", var, rows.join(", ")));
+                }
             }
             var
         } else if p.out {
@@ -258,19 +262,27 @@ pub fn plan_with_names(target: &str, lead: &[String], params: &[Param], args: &[
 
 /// Parameters of a call to a user procedure, by name.
 pub fn plan_named(name: &str, params: &[Param]) -> R<Plan> {
+    plan_named_opt(name, params, false)
+}
+
+pub fn plan_named_opt(name: &str, params: &[Param], direct_tvp: bool) -> R<Plan> {
     let name = safe_proc_name(name)?;
     let args: Vec<usize> = (0..params.len()).collect();
-    plan(name, &[], params, &args, true)
+    plan_with_names(name, &[], params, &args, true, &[], direct_tvp)
 }
 
 /// `sp_executesql @stmt, @params, ...` with `args` as the user parameters.
 pub fn plan_executesql(stmt: &str, decl: Option<&str>, params: &[Param], args: &[usize]) -> R<Plan> {
+    plan_executesql_opt(stmt, decl, params, args, false)
+}
+
+pub fn plan_executesql_opt(stmt: &str, decl: Option<&str>, params: &[Param], args: &[usize], direct_tvp: bool) -> R<Plan> {
     let lead = vec![literal(&Value::str(stmt)), decl.map(|d| literal(&Value::str(d))).unwrap_or_else(|| "NULL".into())];
     // the names of the declared parameters: an unnamed argument after a named one (the Microsoft JDBC driver names a
     // table-valued parameter and not the others) must be named to be a valid call
     let pnames: Vec<String> = decl.and_then(|d| crate::parser::parse_param_decls(d).ok()).map(|v| v.into_iter().map(|p| p.name).collect()).unwrap_or_default();
     let mixed = args.iter().any(|&i| !params[i].name.is_empty()) && args.iter().any(|&i| params[i].name.is_empty());
-    plan_with_names("sp_executesql", &lead, params, args, true, if mixed { &pnames } else { &[] })
+    plan_with_names("sp_executesql", &lead, params, args, true, if mixed { &pnames } else { &[] }, direct_tvp)
 }
 
 pub fn text_param(params: &[Param], i: usize, what: &str) -> R<Option<String>> {

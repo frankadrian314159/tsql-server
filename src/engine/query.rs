@@ -774,9 +774,14 @@ impl<'a> Engine<'a> {
         let has_assign = sel.items.iter().any(|i| matches!(i, SelectItem::Assign { .. }));
         let item_exprs: Vec<&Expr> = sel.items.iter().filter_map(|i| if let SelectItem::Expr { e, .. } = i { Some(e) } else if let SelectItem::Assign { e, .. } = i { Some(e) } else { None }).collect();
         let aggregated = sel.group.is_some() || sel.having.is_some() || item_exprs.iter().any(|e| has_agg(e)) || order.iter().any(|o| has_agg(&o.e));
+        let has_window = item_exprs.iter().any(|e| {
+            let mut w = vec![];
+            collect_windows(e, &mut w);
+            !w.is_empty()
+        });
 
-        // early limit for simple SELECT TOP N ... WHERE ... without ORDER BY or aggregations
-        let early_limit = if !aggregated && order.is_empty() {
+        // early limit for simple SELECT TOP N ... WHERE ... without ORDER BY, aggregations, or window functions
+        let early_limit = if !aggregated && !has_window && order.is_empty() {
             sel.top.as_ref().and_then(|t| if !t.percent && !t.ties {
                 self.ev(&t.e, &Env::empty()).ok().and_then(|v| v.as_i64()).map(|n| n.max(0) as usize)
             } else { None })

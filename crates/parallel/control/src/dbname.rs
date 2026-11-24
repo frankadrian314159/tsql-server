@@ -263,6 +263,12 @@ impl ClusterSession {
         self.plan.push(format!("broadcast CREATE DATABASE to {} shards", shards.len()));
         // (the schema log is replayed after a restart; the file paths are not serialized with the statement, so a path taken since cannot fail it)
         self.cluster.dropped_dbs.lock().unwrap_or_else(|e| e.into_inner()).remove(&name.to_lowercase());
+        {
+            let mut dbs = self.cluster.dbs.lock().unwrap_or_else(|e| e.into_inner());
+            if !dbs.iter().any(|d| d.eq_ignore_ascii_case(name)) {
+                dbs.push(name.to_string());
+            }
+        }
         self.cluster.log_schema_in("master", st);
         Ok(())
     }
@@ -300,6 +306,7 @@ impl ClusterSession {
             self.cluster.triggers.lock().unwrap_or_else(|e| e.into_inner()).retain(|(k, _)| !k.starts_with(&prefix));
             self.cluster.ddl_triggers.lock().unwrap_or_else(|e| e.into_inner()).retain(|t| !t.db.eq_ignore_ascii_case(&db));
             self.cluster.dropped_dbs.lock().unwrap_or_else(|e| e.into_inner()).insert(db.to_lowercase());
+            self.cluster.dbs.lock().unwrap_or_else(|e| e.into_inner()).retain(|d| !d.eq_ignore_ascii_case(&db));
             self.cluster.log_schema_in("master", &one);
             self.plan.push(format!("broadcast DROP DATABASE to {} shards", shards.len()));
         }

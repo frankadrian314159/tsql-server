@@ -89,6 +89,524 @@ fn identifiers(sql: &str, literals: bool) -> Vec<String> {
     out
 }
 
+struct VarBinder<'a> {
+    vars: &'a HashMap<String, Value>,
+    ident: Option<&'a Value>,
+    caught: Option<&'a SqlError>,
+    xact: i32,
+    event: Option<&'a str>,
+    fetch: i32,
+    rowcount: i64,
+}
+
+impl<'a> VarBinder<'a> {
+    fn bind_expr(&self, e: &mut Expr) {
+        match e {
+            Expr::Var(name) => {
+                if let Some(val) = self.vars.get(&name.to_lowercase()) {
+                    *e = Expr::Lit(val.clone());
+                }
+            }
+            Expr::SysVar(name) => {
+                if name.eq_ignore_ascii_case("@@ROWCOUNT") {
+                    *e = Expr::Lit(Value::Int(self.rowcount as i32));
+                } else if name.eq_ignore_ascii_case("@@FETCH_STATUS") {
+                    *e = Expr::Lit(Value::Int(self.fetch));
+                } else if name.eq_ignore_ascii_case("@@IDENTITY") {
+                    let lit = self.ident.cloned().unwrap_or(Value::Null);
+                    *e = Expr::Lit(lit);
+                }
+            }
+            Expr::Func(fc) => {
+                let is_ident = fc.name.eq_ignore_ascii_case("SCOPE_IDENTITY");
+                if is_ident {
+                    let lit = self.ident.cloned().unwrap_or(Value::Null);
+                    *e = Expr::Lit(lit);
+                    return;
+                }
+                if fc.args.is_empty() {
+                    let func = fc.name.to_uppercase();
+                    if func == "EVENTDATA" {
+                        if let Some(ev) = self.event {
+                            *e = Expr::Cast {
+                                e: Box::new(Expr::Lit(Value::Str(ev.to_string()))),
+                                ty: TypeRef { parts: vec!["xml".into()], args: vec![], xml_schema: None },
+                                try_: false,
+                                style: None,
+                            };
+                            return;
+                        }
+                    }
+                    let value = match func.as_str() {
+                        "ROWCOUNT_BIG" => Some(Value::BigInt(self.rowcount)),
+                        "XACT_STATE" => Some(Value::Int(self.xact)),
+                        "ERROR_NUMBER" => Some(self.caught.as_ref().map(|err| Value::Int(err.number)).unwrap_or(Value::Null)),
+                        "ERROR_MESSAGE" => Some(self.caught.as_ref().map(|err| Value::Str(err.message.clone())).unwrap_or(Value::Null)),
+                        "ERROR_SEVERITY" => Some(self.caught.as_ref().map(|err| Value::Int(err.severity as i32)).unwrap_or(Value::Null)),
+                        "ERROR_STATE" => Some(self.caught.as_ref().map(|err| Value::Int(err.state as i32)).unwrap_or(Value::Null)),
+                        "ERROR_LINE" => Some(self.caught.as_ref().map(|_| Value::Int(1)).unwrap_or(Value::Null)),
+                        "ERROR_PROCEDURE" => Some(self.caught.as_ref().and_then(|err| err.procedure.clone()).map(Value::Str).unwrap_or(Value::Null)),
+                        _ => None,
+                    };
+                    if let Some(v) = value {
+                        *e = Expr::Lit(v);
+                        return;
+                    }
+                }
+                for arg in &mut fc.args {
+                    self.bind_expr(arg);
+                }
+                if let Some(over) = &mut fc.over {
+                    for p in &mut over.partition {
+                        self.bind_expr(p);
+                    }
+                    for oi in &mut over.order {
+                        self.bind_expr(&mut oi.e);
+                    }
+                }
+                if let Some(within) = &mut fc.within {
+                    for oi in within {
+                        self.bind_expr(&mut oi.e);
+                    }
+                }
+            }
+            Expr::Lit(_) | Expr::Col(_) | Expr::Star(_) | Expr::NextValue(_) | Expr::Default => {}
+            Expr::Neg(a) | Expr::BitNot(a) | Expr::Not(a) | Expr::IsNull(a, _) | Expr::Paren(a) | Expr::Collate(a, _) => {
+                self.bind_expr(a);
+            }
+            Expr::Binary(_, a, b) | Expr::And(a, b) | Expr::Or(a, b) | Expr::IsDistinct(a, b, _) | Expr::AtTimeZone(a, b) => {
+                self.bind_expr(a);
+                self.bind_expr(b);
+            }
+            Expr::InList(a, list, _) => {
+                self.bind_expr(a);
+                for item in list {
+                    self.bind_expr(item);
+                }
+            }
+            Expr::InQuery(a, q, _) => {
+                self.bind_expr(a);
+                self.bind_query(q);
+            }
+            Expr::Like(a, p, esc, _) => {
+                self.bind_expr(a);
+                self.bind_expr(p);
+                if let Some(esc) = esc {
+                    self.bind_expr(esc);
+                }
+            }
+            Expr::Between(a, lo, hi, _) => {
+                self.bind_expr(a);
+                self.bind_expr(lo);
+                self.bind_expr(hi);
+            }
+            Expr::CmpQuant(_, _, a, q) => {
+                self.bind_expr(a);
+                self.bind_query(q);
+            }
+            Expr::Exists(q) | Expr::Subquery(q) => {
+                self.bind_query(q);
+            }
+            Expr::Case { operand, whens, els } => {
+                if let Some(op) = operand {
+                    self.bind_expr(op);
+                }
+                for (w, t) in whens {
+                    self.bind_expr(w);
+                    self.bind_expr(t);
+                }
+                if let Some(el) = els {
+                    self.bind_expr(el);
+                }
+            }
+            Expr::Cast { e: inner, style, .. } => {
+                self.bind_expr(inner);
+                if let Some(st) = style {
+                    self.bind_expr(st);
+                }
+            }
+            Expr::IdentityFn { seed, inc, .. } => {
+                self.bind_expr(seed);
+                self.bind_expr(inc);
+            }
+        }
+    }
+
+    fn bind_query(&self, q: &mut Query) {
+        for cte in &mut q.ctes {
+            self.bind_query(std::sync::Arc::make_mut(&mut cte.query));
+        }
+        self.bind_query_body(&mut q.body);
+        for oi in &mut q.order {
+            self.bind_expr(&mut oi.e);
+        }
+        if let Some(offset) = &mut q.offset {
+            self.bind_expr(offset);
+        }
+        if let Some(fetch) = &mut q.fetch {
+            self.bind_expr(fetch);
+        }
+    }
+
+    fn bind_query_body(&self, body: &mut QueryBody) {
+        match body {
+            QueryBody::Select(s) => self.bind_select(s),
+            QueryBody::SetOp { left, right, .. } => {
+                self.bind_query_body(left);
+                self.bind_query_body(right);
+            }
+            QueryBody::Paren(q) => self.bind_query(q),
+        }
+    }
+
+    fn bind_select(&self, s: &mut Select) {
+        if let Some(top) = &mut s.top {
+            self.bind_expr(&mut top.e);
+        }
+        for item in &mut s.items {
+            match item {
+                SelectItem::Expr { e, .. } => self.bind_expr(e),
+                SelectItem::Star(_) => {}
+                SelectItem::Assign { e, .. } => self.bind_expr(e),
+            }
+        }
+        for tr in &mut s.from {
+            self.bind_table_ref(tr);
+        }
+        if let Some(w) = &mut s.where_ {
+            self.bind_expr(w);
+        }
+        if let Some(group) = &mut s.group {
+            for g in group {
+                match g {
+                    GroupItem::Expr(e) => self.bind_expr(e),
+                    GroupItem::Rollup(list) | GroupItem::Cube(list) => {
+                        for e in list {
+                            self.bind_expr(e);
+                        }
+                    }
+                    GroupItem::Sets(sets) => {
+                        for list in sets {
+                            for e in list {
+                                self.bind_expr(e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(h) = &mut s.having {
+            self.bind_expr(h);
+        }
+    }
+
+    fn bind_table_ref(&self, tr: &mut TableRef) {
+        match tr {
+            TableRef::Table { .. } | TableRef::TableVar { .. } => {}
+            TableRef::Temporal { clause, .. } => {
+                if let Some(a) = &mut clause.a {
+                    self.bind_expr(a);
+                }
+                if let Some(b) = &mut clause.b {
+                    self.bind_expr(b);
+                }
+            }
+            TableRef::Derived { query, .. } => self.bind_query(query),
+            TableRef::Values { rows, .. } => {
+                for row in rows {
+                    for e in row {
+                        self.bind_expr(e);
+                    }
+                }
+            }
+            TableRef::Func { args, .. } => {
+                for arg in args {
+                    self.bind_expr(arg);
+                }
+            }
+            TableRef::Join { left, right, on, .. } => {
+                self.bind_table_ref(left);
+                self.bind_table_ref(right);
+                if let Some(on) = on {
+                    self.bind_expr(on);
+                }
+            }
+            TableRef::Pivot { src, arg, .. } => {
+                self.bind_table_ref(src);
+                self.bind_expr(arg);
+            }
+            TableRef::Unpivot { src, .. } => {
+                self.bind_table_ref(src);
+            }
+        }
+    }
+
+    fn bind_output(&self, out: &mut Output) {
+        for item in &mut out.items {
+            match item {
+                SelectItem::Expr { e, .. } => self.bind_expr(e),
+                SelectItem::Star(_) => {}
+                SelectItem::Assign { e, .. } => self.bind_expr(e),
+            }
+        }
+    }
+
+    fn bind_stmt(&self, st: &mut Stmt) {
+        match st {
+            Stmt::Query(q) => self.bind_query(q),
+            Stmt::Insert(ins) => {
+                for cte in &mut ins.ctes {
+                    self.bind_query(std::sync::Arc::make_mut(&mut cte.query));
+                }
+                if let Some(out) = &mut ins.output {
+                    self.bind_output(out);
+                }
+                match &mut ins.src {
+                    InsertSrc::Values(rows) => {
+                        for row in rows {
+                            for e in row {
+                                self.bind_expr(e);
+                            }
+                        }
+                    }
+                    InsertSrc::Query(q) => self.bind_query(q),
+                    InsertSrc::Exec(st) => self.bind_stmt(st),
+                    InsertSrc::DefaultValues => {}
+                }
+                if let Some((top, _)) = &mut ins.top {
+                    self.bind_expr(top);
+                }
+            }
+            Stmt::Update(up) => {
+                for cte in &mut up.ctes {
+                    self.bind_query(std::sync::Arc::make_mut(&mut cte.query));
+                }
+                for set in &mut up.sets {
+                    match set {
+                        SetItem::Col { e, .. } | SetItem::Var { e, .. } => self.bind_expr(e),
+                    }
+                }
+                if let Some(out) = &mut up.output {
+                    self.bind_output(out);
+                }
+                for tr in &mut up.from {
+                    self.bind_table_ref(tr);
+                }
+                if let Some(w) = &mut up.where_ {
+                    self.bind_expr(w);
+                }
+                if let Some((top, _)) = &mut up.top {
+                    self.bind_expr(top);
+                }
+            }
+            Stmt::Delete(del) => {
+                for cte in &mut del.ctes {
+                    self.bind_query(std::sync::Arc::make_mut(&mut cte.query));
+                }
+                if let Some(out) = &mut del.output {
+                    self.bind_output(out);
+                }
+                for tr in &mut del.from {
+                    self.bind_table_ref(tr);
+                }
+                if let Some(w) = &mut del.where_ {
+                    self.bind_expr(w);
+                }
+                if let Some((top, _)) = &mut del.top {
+                    self.bind_expr(top);
+                }
+            }
+            Stmt::Merge(m) => {
+                for cte in &mut m.ctes {
+                    self.bind_query(std::sync::Arc::make_mut(&mut cte.query));
+                }
+                self.bind_table_ref(&mut m.source);
+                self.bind_expr(&mut m.on);
+                for when in &mut m.whens {
+                    if let Some(cond) = &mut when.cond {
+                        self.bind_expr(cond);
+                    }
+                    match &mut when.action {
+                        MergeAction::Delete => {}
+                        MergeAction::Update(sets) => {
+                            for set in sets {
+                                match set {
+                                    SetItem::Col { e, .. } | SetItem::Var { e, .. } => self.bind_expr(e),
+                                }
+                            }
+                        }
+                        MergeAction::Insert { values, .. } => {
+                            if let Some(vals) = values {
+                                for val in vals {
+                                    self.bind_expr(val);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(out) = &mut m.output {
+                    self.bind_output(out);
+                }
+            }
+            Stmt::Truncate(_) => {}
+            Stmt::Declare(decls) => {
+                for decl in decls {
+                    match decl {
+                        Decl::Var { default, .. } => {
+                            if let Some(d) = default {
+                                self.bind_expr(d);
+                            }
+                        }
+                        Decl::Table { defs, .. } => {
+                            for def in defs {
+                                match def {
+                                    TableDef::Column(c) => {
+                                        if let Some((seed, inc)) = &mut c.identity {
+                                            self.bind_expr(seed);
+                                            self.bind_expr(inc);
+                                        }
+                                        if let Some(d) = &mut c.default {
+                                            self.bind_expr(d);
+                                        }
+                                        if let Some(comp) = &mut c.computed {
+                                            self.bind_expr(comp);
+                                        }
+                                        for (_, chk, _) in &mut c.checks {
+                                            self.bind_expr(chk);
+                                        }
+                                    }
+                                    TableDef::Check { e, .. } => self.bind_expr(e),
+                                    TableDef::DefaultFor { e, .. } => self.bind_expr(e),
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Decl::CursorVar(_) => {}
+                    }
+                }
+            }
+            Stmt::Set { e, .. } => {
+                self.bind_expr(e);
+            }
+            Stmt::SetCursorVar { query, .. } => self.bind_query(query),
+            Stmt::SetOpts(opts) => {
+                for opt in opts {
+                    if let SetOpt::Expr(_, e) = opt {
+                        self.bind_expr(e);
+                    }
+                }
+            }
+            Stmt::If { cond, then, els } => {
+                self.bind_expr(cond);
+                self.bind_stmt(then);
+                if let Some(els) = els {
+                    self.bind_stmt(els);
+                }
+            }
+            Stmt::While { cond, body } => {
+                self.bind_expr(cond);
+                self.bind_stmt(body);
+            }
+            Stmt::Block(stmts) => {
+                for s in stmts {
+                    self.bind_stmt(s);
+                }
+            }
+            Stmt::Break | Stmt::Continue | Stmt::Goto(_) | Stmt::Label(_) | Stmt::Reconfigure | Stmt::Checkpoint | Stmt::Noop => {}
+            Stmt::Return(e) => {
+                if let Some(e) = e {
+                    self.bind_expr(e);
+                }
+            }
+            Stmt::Print(e) => self.bind_expr(e),
+            Stmt::Throw(t) => {
+                if let Some((a, b, c)) = t {
+                    self.bind_expr(a);
+                    self.bind_expr(b);
+                    self.bind_expr(c);
+                }
+            }
+            Stmt::RaiseError { args, .. } => {
+                for a in args {
+                    self.bind_expr(a);
+                }
+            }
+            Stmt::Try { body, catch } => {
+                for s in body {
+                    self.bind_stmt(s);
+                }
+                for s in catch {
+                    self.bind_stmt(s);
+                }
+            }
+            Stmt::BeginTran(_) | Stmt::Commit(_) | Stmt::Rollback(_) | Stmt::SaveTran(_) | Stmt::Use(_) => {}
+            Stmt::Exec(exec) => {
+                for arg in &mut exec.args {
+                    self.bind_expr(&mut arg.e);
+                }
+            }
+            Stmt::ExecStr(exprs) => {
+                for e in exprs {
+                    self.bind_expr(e);
+                }
+            }
+            Stmt::WaitFor { e, .. } => self.bind_expr(e),
+            Stmt::Kill(e) => self.bind_expr(e),
+            Stmt::CreateTable { defs, .. } => {
+                for def in defs {
+                    match def {
+                        TableDef::Column(c) => {
+                            if let Some((seed, inc)) = &mut c.identity {
+                                self.bind_expr(seed);
+                                self.bind_expr(inc);
+                            }
+                            if let Some(d) = &mut c.default {
+                                self.bind_expr(d);
+                            }
+                            if let Some(comp) = &mut c.computed {
+                                self.bind_expr(comp);
+                            }
+                            for (_, chk, _) in &mut c.checks {
+                                self.bind_expr(chk);
+                            }
+                        }
+                        TableDef::Check { e, .. } => self.bind_expr(e),
+                        TableDef::DefaultFor { e, .. } => self.bind_expr(e),
+                        _ => {}
+                    }
+                }
+            }
+            Stmt::CreateIndex { filter, .. } => {
+                if let Some((e, _)) = filter {
+                    self.bind_expr(e);
+                }
+            }
+            Stmt::DeclareCursor { query, .. } => {
+                self.bind_query(std::sync::Arc::make_mut(query));
+            }
+            Stmt::CursorOp { .. } => {}
+            Stmt::Fetch { arg, .. } => {
+                if let Some(arg) = arg {
+                    self.bind_expr(arg);
+                }
+            }
+            Stmt::Dbcc { args, .. } => {
+                for a in args {
+                    self.bind_expr(a);
+                }
+            }
+            Stmt::FullText(_) | Stmt::XmlSchema(_) | Stmt::CreateView { .. } | Stmt::CreateProc { .. }
+            | Stmt::CreateFunction(_) | Stmt::CreateTrigger { .. } | Stmt::CreateSchema(..)
+            | Stmt::CreateDatabase(..) | Stmt::CreateType { .. } | Stmt::CreateSequence { .. }
+            | Stmt::CreateSynonym { .. } | Stmt::AlterSequence { .. } | Stmt::AlterDatabase { .. }
+            | Stmt::Security(_) | Stmt::Backup(_) | Stmt::BulkInsert(_) | Stmt::TriggerAdmin(_)
+            | Stmt::Audit(_) | Stmt::CreateSecurityPolicy(_) | Stmt::AlterSecurityPolicy(_)
+            | Stmt::DropSecurityPolicy { .. } | Stmt::Restore(_) | Stmt::AlterTable { .. }
+            | Stmt::Drop { .. } | Stmt::DropIndex { .. } | Stmt::AlterIndex { .. } => {}
+        }
+    }
+}
+
 impl ClusterSession {
     /// Whether a batch needs the cluster (else the engine runs it itself).
     pub fn wants(&self, sql: &str) -> bool {
@@ -241,92 +759,34 @@ impl ClusterSession {
     /// `st` with the variables of the session replaced by their values.
     pub(crate) fn bind_vars(&self, st: &Stmt) -> Result<Stmt, SqlError> {
         let xact_read = XACT_STATE_SEEN.load(std::sync::atomic::Ordering::Relaxed) && self.txn.borrow().is_some() && matches!(st, Stmt::Query(_) | Stmt::Set { .. } | Stmt::If { .. } | Stmt::While { .. } | Stmt::Print(_));
-        if self.vars.is_empty() && self.last_identity.is_none() && self.catch_stack.is_empty() && self.eventdata.is_empty() && self.cursors.is_empty() && !xact_read {
+        if self.vars.is_empty() && self.last_identity.is_none() && self.catch_stack.is_empty() && self.eventdata.is_empty() && self.cursors.is_empty() && !xact_read && !matches!(st, Stmt::Query(_) | Stmt::Set { .. } | Stmt::If { .. } | Stmt::While { .. } | Stmt::Print(_) | Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)) {
             return Ok(st.clone());
         }
         // ERROR_NUMBER() and the like (in a CATCH block), XACT_STATE(): the control node's engine has no CATCH block, so the values go in
-        let caught = self.catch_stack.last().cloned();
+        let caught = self.catch_stack.last();
         let xact = match self.txn.borrow().as_ref() {
             None => 0,
             Some(t) if t.doomed => -1,
             Some(_) => 1,
         };
         // SCOPE_IDENTITY() and @@IDENTITY: the last value this session was given
-        let ident = self.last_identity.map(|v| serde_json::to_value(Value::Dec(tsql_server::decimal::Dec::from_int(v))).unwrap_or(serde_json::Value::Null));
+        let ident_val = self.last_identity.map(|v| Value::Dec(tsql_server::decimal::Dec::from_int(v)));
         // EVENTDATA() in a DDL trigger: the event's XML
-        let event = self.eventdata.last().and_then(|x| serde_json::to_value(Expr::Cast { e: Box::new(Expr::Lit(Value::Str(x.clone()))), ty: TypeRef { parts: vec!["xml".into()], args: vec![], xml_schema: None }, try_: false, style: None }).ok());
-        fn subst(v: &mut serde_json::Value, vars: &HashMap<String, Value>, ident: &Option<serde_json::Value>, caught: &Option<SqlError>, xact: i32, event: &Option<serde_json::Value>, fetch: i32) {
-            match v {
-                serde_json::Value::Object(m) => {
-                    let is_ident = match (m.len(), m.get("SysVar"), m.get("Func")) {
-                        (1, Some(serde_json::Value::String(s)), _) => s.eq_ignore_ascii_case("@@IDENTITY"),
-                        (1, _, Some(serde_json::Value::Object(f))) => f.get("name").and_then(|n| n.as_str()).map(|n| n.eq_ignore_ascii_case("SCOPE_IDENTITY")).unwrap_or(false),
-                        _ => false,
-                    };
-                    if let (1, Some(serde_json::Value::String(s))) = (m.len(), m.get("SysVar")) {
-                        if s.eq_ignore_ascii_case("@@FETCH_STATUS") {
-                            *v = serde_json::json!({ "Lit": serde_json::to_value(Value::Int(fetch)).unwrap_or(serde_json::Value::Null) });
-                            return;
-                        }
-                    }
-                    if is_ident {
-                        let lit = ident.clone().unwrap_or_else(|| serde_json::to_value(Value::Null).unwrap_or(serde_json::Value::Null));
-                        *v = serde_json::json!({ "Lit": lit });
-                        return;
-                    }
-                    if let (1, Some(serde_json::Value::Object(f))) = (m.len(), m.get("Func")) {
-                        let func = f.get("name").and_then(|n| n.as_str()).map(|n| n.to_uppercase()).unwrap_or_default();
-                        let is_call = f.get("args").and_then(|a| a.as_array()).is_some_and(|a| a.is_empty());
-                        if is_call && func == "EVENTDATA" {
-                            if let Some(e) = event {
-                                *v = e.clone();
-                                return;
-                            }
-                        }
-                        let value = if !is_call {
-                            None
-                        } else {
-                            match func.as_str() {
-                                "XACT_STATE" => Some(Value::Int(xact)),
-                                "ERROR_NUMBER" => Some(caught.as_ref().map(|e| Value::Int(e.number)).unwrap_or(Value::Null)),
-                                "ERROR_MESSAGE" => Some(caught.as_ref().map(|e| Value::Str(e.message.clone())).unwrap_or(Value::Null)),
-                                "ERROR_SEVERITY" => Some(caught.as_ref().map(|e| Value::Int(e.severity as i32)).unwrap_or(Value::Null)),
-                                "ERROR_STATE" => Some(caught.as_ref().map(|e| Value::Int(e.state as i32)).unwrap_or(Value::Null)),
-                                "ERROR_LINE" => Some(caught.as_ref().map(|_| Value::Int(1)).unwrap_or(Value::Null)),
-                                "ERROR_PROCEDURE" => Some(caught.as_ref().and_then(|e| e.procedure.clone()).map(Value::Str).unwrap_or(Value::Null)),
-                                _ => None,
-                            }
-                        };
-                        if let Some(j) = value.and_then(|x| serde_json::to_value(x).ok()) {
-                            *v = serde_json::json!({ "Lit": j });
-                            return;
-                        }
-                    }
-                    if m.len() == 1 {
-                        if let Some(serde_json::Value::String(name)) = m.get("Var") {
-                            if let Some(val) = vars.get(&name.to_lowercase()) {
-                                if let Ok(j) = serde_json::to_value(val) {
-                                    *v = serde_json::json!({ "Lit": j });
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                    for c in m.values_mut() {
-                        subst(c, vars, ident, caught, xact, event, fetch);
-                    }
-                }
-                serde_json::Value::Array(a) => {
-                    for c in a {
-                        subst(c, vars, ident, caught, xact, event, fetch);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let mut j = serde_json::to_value(st).map_err(|e| SqlError::new(50000, e.to_string()))?;
-        subst(&mut j, &self.vars, &ident, &caught, xact, &event, self.fetch_status);
-        serde_json::from_value(j).map_err(|e| SqlError::new(50000, format!("a variable could not be substituted: {}", e)))
+        let event = self.eventdata.last().map(|s| s.as_str());
+
+        let binder = VarBinder {
+            vars: &self.vars,
+            ident: ident_val.as_ref(),
+            caught,
+            xact,
+            event,
+            fetch: self.fetch_status,
+            rowcount: self.rowcount,
+        };
+
+        let mut out = st.clone();
+        binder.bind_stmt(&mut out);
+        Ok(out)
     }
 
     /// `DECLARE @v ...`, `SET @v = ...` and `EXEC sp_executesql`: the variables of the session. (Handled before the
@@ -357,8 +817,12 @@ impl ClusterSession {
                 }
                 Ok(true)
             }
-            Stmt::Set { var, op: None, e } => {
-                let b = self.bind_expr(e)?;
+            Stmt::Set { var, op, e } => {
+                let expr = match op {
+                    Some(bin_op) => Expr::Binary(*bin_op, Box::new(Expr::Var(var.clone())), Box::new(e.clone())),
+                    None => e.clone(),
+                };
+                let b = self.bind_expr(&expr)?;
                 let v = self.eval_scalar(&b).await?;
                 self.vars.insert(var.to_lowercase(), v);
                 Ok(true)
@@ -371,18 +835,21 @@ impl ClusterSession {
     /// what its columns are (it holds the schema and the table types) by declaring it and reading it in one batch, and the
     /// session keeps the variable. False when the declaration is not a table (an ordinary type).
     fn declare_table_var(&mut self, d: &Decl) -> bool {
+        let _ = self.sync_mirror_db();
         let name = match d {
             Decl::Table { name, .. } | Decl::Var { name, .. } => name.clone(),
             _ => return false,
         };
         let probe = simple_query(Select { distinct: false, top: None, items: vec![SelectItem::Star(None)], into: None, from: vec![TableRef::TableVar { name: name.clone(), alias: None }], where_: None, group: None, having: None });
         let res = self.mirror.execute_stmts(&[Stmt::Declare(vec![d.clone()]), Stmt::Query(Box::new(probe))]);
-        if res.first_error().is_some() {
+        if let Some(err) = res.first_error() {
+            eprintln!("declare_table_var error on mirror: {:?}", err);
             return false;
         }
         match res.resultsets().first() {
             Some(rs) => {
-                self.tvars.insert(name.to_lowercase(), ResultSet { columns: rs.columns.clone(), types: rs.types.clone(), rows: vec![] });
+                let rows = self.pending_tvps.remove(&name.to_lowercase()).unwrap_or_default();
+                self.tvars.insert(name.to_lowercase(), ResultSet { columns: rs.columns.clone(), types: rs.types.clone(), rows });
                 true
             }
             None => false,
@@ -390,11 +857,28 @@ impl ClusterSession {
     }
 
     pub(crate) fn bind_expr(&self, e: &Expr) -> Result<Expr, SqlError> {
-        let st = Stmt::Set { var: "@x".into(), op: None, e: e.clone() };
-        match self.bind_vars(&st)? {
-            Stmt::Set { e, .. } => Ok(e),
-            _ => Ok(e.clone()),
-        }
+        let caught = self.catch_stack.last();
+        let xact = match self.txn.borrow().as_ref() {
+            None => 0,
+            Some(t) if t.doomed => -1,
+            Some(_) => 1,
+        };
+        let ident_val = self.last_identity.map(|v| Value::Dec(tsql_server::decimal::Dec::from_int(v)));
+        let event = self.eventdata.last().map(|s| s.as_str());
+
+        let binder = VarBinder {
+            vars: &self.vars,
+            ident: ident_val.as_ref(),
+            caught,
+            xact,
+            event,
+            fetch: self.fetch_status,
+            rowcount: self.rowcount,
+        };
+
+        let mut out = e.clone();
+        binder.bind_expr(&mut out);
+        Ok(out)
     }
 
     /// `EXEC [@rc =] sp_executesql @stmt, @params, @p1 = v1, ...` with input parameters: the parameters become variables
@@ -425,7 +909,9 @@ impl ClusterSession {
             let key = if name.starts_with('@') { name.to_lowercase() } else { format!("@{}", name.to_lowercase()) };
             // a table-valued parameter: the table variable that is passed; its rows are what the statement reads
             if let Expr::Var(outer) = &a.e {
-                if let Some(rs) = self.tvars.get(&outer.to_lowercase()).cloned() {
+                let lower = outer.to_lowercase();
+                let trimmed = lower.trim_start_matches('@').to_string();
+                if let Some(rs) = self.tvars.get(&lower).or_else(|| self.tvars.get(&trimmed)).cloned() {
                     let old = self.tvars.insert(key.clone(), rs);
                     tvps.push((key, old));
                     continue;
@@ -441,9 +927,9 @@ impl ClusterSession {
             let v = self.eval_scalar(&b).await?;
             bound.push((key.clone(), self.vars.insert(key, v)));
         }
-        let stmts = tsql_server::parser::parse(&text)?;
+        let stmts = self.cluster.parse_cached(&text)?;
         let mut result = Ok(());
-        for st in &stmts {
+        for st in stmts.iter() {
             if let Err(e) = Box::pin(self.exec_stmt(st, events)).await {
                 result = Err(e);
                 break;
@@ -611,9 +1097,11 @@ impl Interceptor for ControlInterceptor {
 
     fn handle_stmts(&mut self, stmts: &[Stmt], sink: &mut dyn FnMut(Streamed) -> bool) -> bool {
         if !stmts.iter().any(|s| self.session.stmt_wants(s)) {
+            self.session.pending_tvps.clear();
             return false;
         }
         let res = self.session.execute_stmts(stmts);
+        self.session.pending_tvps.clear();
         for ev in res.events {
             if !sink(Streamed::Event(ev)) {
                 break;
@@ -625,15 +1113,37 @@ impl Interceptor for ControlInterceptor {
     fn handle(&mut self, sql: &str, sink: &mut dyn FnMut(Streamed) -> bool) -> bool {
         if !self.session.wants(sql) {
             self.note_locals(sql);
+            self.session.pending_tvps.clear();
             return false;
         }
         let res = self.session.execute(sql);
+        self.session.pending_tvps.clear();
         for ev in res.events {
             if !sink(Streamed::Event(ev)) {
                 break;
             }
         }
         true
+    }
+
+    fn bind_tvp(&mut self, name: &str, _schema: &str, _type_name: &str, rows: Vec<Vec<Value>>) {
+        self.session.pending_tvps.insert(name.to_lowercase(), rows);
+    }
+
+    fn proc_param_type(&self, proc_name: &str, param_name: &str, param_idx: usize) -> Option<(String, String)> {
+        let parts: Vec<String> = proc_name.split('.').map(|s| s.trim_matches('[').trim_matches(']').to_string()).collect();
+        let name = parts.last()?.clone();
+        let cur = self.session.current_database().to_lowercase();
+        let id = parts.join(".").to_lowercase();
+        let def = self.session.cluster.proc_def(&id)
+            .or_else(|| self.session.cluster.proc_def(&format!("{}.{}", cur, id)))
+            .or_else(|| self.session.cluster.proc_def(&format!("dbo.{}", name.to_lowercase())))
+            .or_else(|| self.session.cluster.proc_def(&name.to_lowercase()))?;
+        let p = def.params.iter().find(|p| p.name.trim_start_matches('@').eq_ignore_ascii_case(param_name.trim_start_matches('@')))
+            .or_else(|| def.params.get(param_idx))?;
+        let schema = if p.ty.parts.len() >= 2 { p.ty.parts[0].clone() } else { "dbo".to_string() };
+        let type_name = p.ty.parts.last().cloned()?;
+        Some((schema, type_name))
     }
 }
 

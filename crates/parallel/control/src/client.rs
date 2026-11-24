@@ -23,13 +23,16 @@ pub enum Verdict {
 
 pub type VerdictFn = std::sync::Arc<dyn Fn(u64) -> Verdict + Send + Sync>;
 
+const CHANNELS_PER_ENDPOINT: usize = 4;
+
 /// One shard: a single node, or the replicas of a replicated shard (whose leader serves the requests).
 #[derive(Clone)]
 pub struct ShardClient {
     pub id: u32,
     /// the addresses of the replicas, separated by commas (as given)
     pub addr: String,
-    channels: Vec<(String, Channel)>,
+    channels: Vec<(String, Vec<Channel>)>,
+    pool_rr: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// the replica that served last (the leader, as far as is known)
     current: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// how the coordinator decided a prepared transaction: lets a statement that finds the shard with in-doubt transactions
@@ -57,17 +60,27 @@ impl ShardClient {
     pub fn new(id: u32, addr: &str) -> Result<ShardClient, SqlError> {
         let mut channels = vec![];
         for a in addr.split(',').map(str::trim).filter(|a| !a.is_empty()) {
-            let ch = Endpoint::from_shared(format!("http://{}", a))
-                .map_err(|e| SqlError::new(40613, format!("bad shard address {}: {}", a, e)))?
-                .tcp_nodelay(true)
-                .connect_timeout(std::time::Duration::from_secs(2))
-                .connect_lazy();
-            channels.push((a.to_string(), ch));
+            let mut pool = Vec::with_capacity(CHANNELS_PER_ENDPOINT);
+            for _ in 0..CHANNELS_PER_ENDPOINT {
+                let ch = Endpoint::from_shared(format!("http://{}", a))
+                    .map_err(|e| SqlError::new(40613, format!("bad shard address {}: {}", a, e)))?
+                    .tcp_nodelay(true)
+                    .initial_stream_window_size(Some(1 << 20))
+                    .initial_connection_window_size(Some(8 << 20))
+                    .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+                    .keep_alive_timeout(std::time::Duration::from_secs(10))
+                    .keep_alive_while_idle(true)
+                    .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
+                    .connect_timeout(std::time::Duration::from_secs(2))
+                    .connect_lazy();
+                pool.push(ch);
+            }
+            channels.push((a.to_string(), pool));
         }
         if channels.is_empty() {
             return Err(SqlError::new(40613, "a shard needs an address"));
         }
-        Ok(ShardClient { id, addr: addr.to_string(), channels, current: Default::default(), verdict: None })
+        Ok(ShardClient { id, addr: addr.to_string(), channels, pool_rr: Default::default(), current: Default::default(), verdict: None })
     }
 
     /// The same shard, settling the in-doubt transactions it finds according to `v`.
@@ -136,7 +149,10 @@ impl ShardClient {
         let mut tries = 0usize;
         loop {
             let i = self.current.load(Ordering::Relaxed) % n;
-            match f(self.channels[i].1.clone()).await {
+            let rr = self.pool_rr.fetch_add(1, Ordering::Relaxed);
+            let pool = &self.channels[i].1;
+            let ch = pool[rr % pool.len()].clone();
+            match f(ch).await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
                     let not_leader = e.number == NOT_LEADER;

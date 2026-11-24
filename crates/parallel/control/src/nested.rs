@@ -578,7 +578,8 @@ impl ClusterSession {
                                 let obj = m[&key].clone();
                                 let var = obj.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
                                 let lower = var.to_lowercase();
-                                let Some(rs) = self.tvars.get(&lower).cloned() else { return Ok(false) };
+                                let trimmed = lower.trim_start_matches('@').to_string();
+                                let Some(rs) = self.tvars.get(&lower).or_else(|| self.tvars.get(&trimmed)).cloned() else { return Ok(false) };
                                 let Some(temp) = self.materialize(rs, None, temps).await? else { return Ok(false) };
                                 let alias = match obj.get("alias") {
                                     Some(a) if !a.is_null() => a.clone(),

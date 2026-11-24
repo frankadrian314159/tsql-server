@@ -2,6 +2,7 @@
 //! body here, statement by statement, as the session's own statements, so what the procedure reads and writes goes through the
 //! cluster like any batch does. This is what makes `EXEC` work anywhere a statement does: in a batch, in a procedure, in a trigger.
 use super::*;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// A procedure of the cluster (one made with `CREATE PROCEDURE` through the control node).
@@ -86,7 +87,9 @@ impl ClusterSession {
                 Some((e, out)) => {
                     // a table-valued parameter: the table variable that is passed
                     if let Expr::Var(v) = &e {
-                        if let Some(rs) = self.tvars.get(&v.to_lowercase()).cloned() {
+                        let lower = v.to_lowercase();
+                        let trimmed = lower.trim_start_matches('@').to_string();
+                        if let Some(rs) = self.tvars.get(&lower).or_else(|| self.tvars.get(&trimmed)).cloned() {
                             table_args.push((key.clone(), rs));
                             values.push(Value::Null);
                             continue;
@@ -114,6 +117,9 @@ impl ClusterSession {
                 self.eval_scalar(&Expr::Cast { e: Box::new(Expr::Lit(v)), ty: p.ty.clone(), try_: false, style: None }).await?
             };
             values.push(v);
+        }
+        if self.try_pushdown_proc(ex, &def, &values, &table_args, &outs, events).await? {
+            return Ok(true);
         }
         // the body, in a scope of its own: the parameters, nothing else of the caller's, in the database the procedure is in
         let saved_vars = std::mem::take(&mut self.vars);
@@ -163,10 +169,10 @@ impl ClusterSession {
             let v = self.eval_scalar(&b).await?;
             text.push_str(&tsql_server::convert::display(&v));
         }
-        let stmts = tsql_server::parser::parse(&text)?;
+        let stmts = self.cluster.parse_cached(&text)?;
         let saved_vars = std::mem::take(&mut self.vars);
         let mut r = Ok(());
-        for s in &stmts {
+        for s in stmts.iter() {
             r = Box::pin(self.exec_stmt(s, events)).await;
             if r.is_err() || self.returning {
                 break;
@@ -174,5 +180,190 @@ impl ClusterSession {
         }
         self.vars = saved_vars;
         r
+    }
+
+    /// Try to push down procedure execution directly to shards:
+    /// 1. TVP batch procedures: partition rows across shards by the target table's shard key,
+    ///    renumber row ids, and push down execution in parallel.
+    /// 2. Scalar procedures: validate whether single-shard routing is safe and auto-register route.
+    async fn try_pushdown_proc(
+        &mut self,
+        ex: &ExecStmt,
+        def: &ProcDef,
+        values: &[Value],
+        table_args: &[(String, ResultSet)],
+        outs: &[(String, String)],
+        events: &mut Vec<Event>,
+    ) -> Result<bool, SqlError> {
+        if !outs.is_empty() || ex.retvar.is_some() {
+            return Ok(false);
+        }
+        let id = table_id(&ex.name);
+
+        // Case 1: TVP batch loop pushdown
+        if table_args.len() == 1 {
+            let (tvp_key, rs) = &table_args[0];
+            if rs.rows.is_empty() {
+                return Ok(true);
+            }
+            let mut writes = vec![];
+            collect_writes(&def.body, &mut writes);
+            if !writes.is_empty() {
+                let target_name = &writes[0];
+                let all_same = writes.iter().all(|w| table_id(w) == table_id(target_name));
+                if all_same {
+                    let target_id = table_id(target_name);
+                    let target_table = self.table(target_name).ok();
+                    if let Some(t) = target_table {
+                        if let Dist::Sharded { key: key_idx, class } = t.dist {
+                            let key_col_name = &t.cols[key_idx].name;
+                            if let Some(tvp_key_idx) = rs.columns.iter().position(|c| c.eq_ignore_ascii_case(key_col_name)) {
+                                let mut shard_rows: HashMap<usize, Vec<Vec<Value>>> = HashMap::new();
+                                for r in &rs.rows {
+                                    if let Some(h) = key_hash(&r[tvp_key_idx], class) {
+                                        let s = self.cluster.shard_of_hash(h);
+                                        shard_rows.entry(s).or_default().push(r.clone());
+                                    }
+                                }
+                                let row_id_col = rs.columns.iter().position(|c| c.eq_ignore_ascii_case("rowid") || c.eq_ignore_ascii_case("id"));
+                                let tvp_param_pos = def.params.iter().position(|p| norm(&p.name) == norm(tvp_key));
+                                let Some(tvp_pos) = tvp_param_pos else { return Ok(false) };
+                                let tvp_param = &def.params[tvp_pos];
+
+                                let size_param_pos = def.params.iter().position(|p| {
+                                    let n = p.name.to_lowercase();
+                                    n.contains("size") || n.contains("count") || n.contains("batch")
+                                });
+
+                                let mut shard_futs = vec![];
+                                for (shard_id, mut sub_rows) in shard_rows {
+                                    if sub_rows.is_empty() {
+                                        continue;
+                                    }
+                                    if let Some(rid) = row_id_col {
+                                        for (i, row) in sub_rows.iter_mut().enumerate() {
+                                            row[rid] = Value::Int((i + 1) as i32);
+                                        }
+                                    }
+                                    let sub_len = sub_rows.len();
+                                    let sub_var = format!("@sub_{}", shard_id);
+                                    let decl = Stmt::Declare(vec![Decl::Var {
+                                        name: sub_var.clone(),
+                                        ty: tvp_param.ty.clone(),
+                                        default: None,
+                                    }]);
+                                    let ins = Stmt::Insert(Box::new(Insert {
+                                        ctes: vec![],
+                                        target: Target::Var(sub_var.clone()),
+                                        cols: Some(rs.columns.clone()),
+                                        output: None,
+                                        src: InsertSrc::Values(sub_rows.into_iter().map(|r| r.into_iter().map(Expr::Lit).collect()).collect()),
+                                        top: None,
+                                    }));
+                                    let mut shard_args = vec![];
+                                    for (i, p) in def.params.iter().enumerate() {
+                                        if i == tvp_pos {
+                                            shard_args.push(ExecArg {
+                                                name: Some(p.name.clone()),
+                                                e: Expr::Var(sub_var.clone()),
+                                                out: false,
+                                            });
+                                        } else if Some(i) == size_param_pos {
+                                            shard_args.push(ExecArg {
+                                                name: Some(p.name.clone()),
+                                                e: Expr::Lit(Value::Int(sub_len as i32)),
+                                                out: false,
+                                            });
+                                        } else {
+                                            shard_args.push(ExecArg {
+                                                name: Some(p.name.clone()),
+                                                e: Expr::Lit(values[i].clone()),
+                                                out: false,
+                                            });
+                                        }
+                                    }
+                                    let exec_stmt = Stmt::Exec(Box::new(ExecStmt {
+                                        name: ex.name.clone(),
+                                        name_is_var: false,
+                                        args: shard_args,
+                                        retvar: None,
+                                    }));
+                                    let mut stmts = vec![];
+                                    if !self.cur_db.is_empty() && !self.cur_db.eq_ignore_ascii_case("master") {
+                                        stmts.push(Stmt::Use(self.cur_db.clone()));
+                                    }
+                                    stmts.push(decl);
+                                    stmts.push(ins);
+                                    stmts.push(exec_stmt);
+                                    let work = self.prepared(shard_id, Work::Stmts(stmts)).await?;
+                                    shard_futs.push((shard_id, work));
+                                }
+
+                                let replies = futures::future::join_all(shard_futs.into_iter().map(|(s, w)| {
+                                    let client = self.cluster.shard(s);
+                                    let sid = self.id;
+                                    async move { client.run(sid, w).await }
+                                })).await;
+
+                                for reply in replies {
+                                    let r = reply?;
+                                    if let Some(e) = r.first_error() {
+                                        return Err(e.to_sql());
+                                    }
+                                }
+                                self.bump(&target_id);
+                                self.plan.push(format!("procedure {} pushed down to shards", ex.name.join(".")));
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Case 2: Scalar partitioned procedure auto-route
+        if table_args.is_empty() && !self.cluster.proc_routes.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&id) {
+            let tables = self.cluster.tables.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let lookup = |i: &str| tables.get(i).cloned();
+            for p in &def.params {
+                if let Ok(route) = procs::validate(&def.params, &p.name, &def.body, &lookup, &self.cluster) {
+                    self.cluster.proc_routes.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), route);
+                    return self.exec_routed_proc(ex, events).await;
+                }
+            }
+        }
+
+        Ok(false)
+    }
+}
+
+fn collect_writes(stmts: &[Stmt], writes: &mut Vec<Name>) {
+    for s in stmts {
+        match s {
+            Stmt::Insert(ins) => {
+                if let Target::Table(name) = &ins.target {
+                    writes.push(name.clone());
+                }
+            }
+            Stmt::Update(u) => {
+                if let Target::Table(name) = &u.target {
+                    writes.push(name.clone());
+                }
+            }
+            Stmt::Delete(d) => {
+                if let Target::Table(name) = &d.target {
+                    writes.push(name.clone());
+                }
+            }
+            Stmt::Block(b) => collect_writes(b, writes),
+            Stmt::While { body, .. } => collect_writes(std::slice::from_ref(body), writes),
+            Stmt::If { then, els, .. } => {
+                collect_writes(std::slice::from_ref(then), writes);
+                if let Some(e) = els {
+                    collect_writes(std::slice::from_ref(e), writes);
+                }
+            }
+            _ => {}
+        }
     }
 }

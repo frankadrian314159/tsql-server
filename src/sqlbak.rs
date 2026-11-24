@@ -415,7 +415,9 @@ impl<R: Read + Seek> Backup<R> {
         if p[1] != 13 {
             return Err("page 9 is not the boot page".to_string());
         }
-        self.db_name = utf16(p.get(0x94..0x94 + 256).ok_or("the boot page is short")?).trim_end().to_string();
+        let raw = p.get(0x94..0x94 + 256).ok_or("the boot page is short")?;
+        let name = utf16(raw);
+        self.db_name = name.split(|c| c == '\0' || c == '\u{2020}').next().unwrap_or("").trim().to_string();
         Ok(())
     }
 

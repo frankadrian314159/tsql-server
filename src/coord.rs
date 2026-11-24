@@ -388,6 +388,18 @@ impl Default for Core {
 }
 
 impl Core {
+    pub fn next_tx(&self) -> u64 {
+        self.next_tx.load(Ordering::Relaxed)
+    }
+    pub fn add_tx(&self, n: u64) {
+        self.next_tx.fetch_add(n, Ordering::Relaxed);
+    }
+    pub fn lock_waits(&self) -> u64 {
+        self.lock_waits.load(Ordering::Relaxed)
+    }
+    pub fn add_lock_waits(&self, n: u64) {
+        self.lock_waits.fetch_add(n, Ordering::Relaxed);
+    }
     pub fn new() -> Core {
         Core {
             clock: AtomicU64::new(1),

@@ -245,6 +245,16 @@ pub struct Cluster {
     triggers_off: Mutex<std::collections::HashSet<String>>,
     /// the DDL triggers of the databases (see ddltrig.rs)
     ddl_triggers: Mutex<Vec<ddltrig::DdlTrig>>,
+    /// schema generation counter for plan cache invalidation
+    pub(crate) schema_gen: AtomicU64,
+    /// cached parsed statement plans (plan compilation & caching)
+    pub(crate) plan_cache: Mutex<HashMap<String, PlanCacheEntry>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PlanCacheEntry {
+    pub schema_gen: u64,
+    pub stmts: Arc<Vec<Stmt>>,
 }
 
 pub type FaultHook = Arc<dyn Fn(&str) -> bool + Send + Sync>;
@@ -315,9 +325,40 @@ impl Cluster {
             triggers: Default::default(),
             triggers_off: Default::default(),
             ddl_triggers: Default::default(),
+            schema_gen: AtomicU64::new(1),
+            plan_cache: Mutex::new(HashMap::new()),
         });
         cluster.start_deadlock_monitor();
         Ok(cluster)
+    }
+
+    /// Retrieve a cached parsed statement AST or parse and compile it into the plan cache.
+    pub(crate) fn parse_cached(&self, sql: &str) -> Result<Arc<Vec<Stmt>>, SqlError> {
+        let gen = self.schema_gen.load(Ordering::Relaxed);
+        if sql.len() <= 65536 {
+            if let Some(entry) = self.plan_cache.lock().unwrap_or_else(|e| e.into_inner()).get(sql) {
+                if entry.schema_gen == gen {
+                    return Ok(entry.stmts.clone());
+                }
+            }
+        }
+        let stmts = Arc::new(tsql_server::parser::parse(sql)?);
+        if sql.len() <= 65536 {
+            let mut cache = self.plan_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.len() >= 2048 {
+                cache.retain(|_, v| v.schema_gen == gen);
+                if cache.len() >= 2048 {
+                    cache.clear();
+                }
+            }
+            cache.insert(sql.to_string(), PlanCacheEntry { schema_gen: gen, stmts: stmts.clone() });
+        }
+        Ok(stmts)
+    }
+
+    /// Invalidate the plan cache when the schema changes.
+    pub(crate) fn bump_schema_gen(&self) {
+        self.schema_gen.fetch_add(1, Ordering::SeqCst);
     }
 
     /// For tests: a hook called at the points of two-phase commit (`"after_prepare"`: every participant has voted;
@@ -513,7 +554,7 @@ impl Cluster {
     }
 
     pub fn session(self: &Arc<Self>) -> ClusterSession {
-        ClusterSession { cluster: self.clone(), id: self.next_session.fetch_add(1, Ordering::Relaxed), mirror: self.mirror.connect_internal(), plan: vec![], temp_counter: 0, own_temps: vec![], txn: std::cell::RefCell::new(None), stmt_shards: std::cell::Cell::new(0), commit_seq: 0, vars: HashMap::new(), local_tables: HashMap::new(), tvars: HashMap::new(), identity_insert: Default::default(), last_identity: None, create_dist: None, cur_db: "master".into(), capture: None, trigger_stack: vec![], returning: false, catch_stack: vec![], proc_depth: 0, return_value: None, loop_ctl: 0, goto_target: None, temp_creates: HashMap::new(), mirror_temps: Default::default(), uniq_guards: vec![], eventdata: vec![], ddl_rolled_back: false, no_ddl_triggers: false, batch_text: String::new(), cursors: HashMap::new(), fetch_status: 0 }
+        ClusterSession { cluster: self.clone(), id: self.next_session.fetch_add(1, Ordering::Relaxed), mirror: self.mirror.connect_internal(), plan: vec![], temp_counter: 0, own_temps: vec![], txn: std::cell::RefCell::new(None), stmt_shards: std::cell::Cell::new(0), commit_seq: 0, vars: HashMap::new(), local_tables: HashMap::new(), tvars: HashMap::new(), pending_tvps: HashMap::new(), identity_insert: Default::default(), last_identity: None, create_dist: None, cur_db: "master".into(), capture: None, trigger_stack: vec![], returning: false, catch_stack: vec![], proc_depth: 0, return_value: None, loop_ctl: 0, goto_target: None, temp_creates: HashMap::new(), mirror_temps: Default::default(), uniq_guards: vec![], eventdata: vec![], ddl_rolled_back: false, no_ddl_triggers: false, batch_text: String::new(), cursors: HashMap::new(), fetch_status: 0, rowcount: 0 }
     }
 
     pub fn shard_status(&self) -> Vec<Result<ShardStatus, SqlError>> {
@@ -555,6 +596,7 @@ pub struct ClusterSession {
     /// rows sent to the shards as a temporary table (see `nested.rs`). (The engine keeps variables for one batch only, so the
     /// session keeps these itself.)
     tvars: HashMap<String, ResultSet>,
+    pub pending_tvps: HashMap<String, Vec<Vec<Value>>>,
     /// the database the session is in (`USE`; the front end tells it before each batch): the tables its statements name are those
     /// of this database, see `dbname.rs`
     cur_db: String,
@@ -591,6 +633,7 @@ pub struct ClusterSession {
     /// the cursors this batch declared (see cursors.rs), and what `@@FETCH_STATUS` says
     cursors: HashMap<String, cursors::CursorState>,
     fetch_status: i32,
+    pub(crate) rowcount: i64,
 }
 
 /// A transaction of a control session: the shards that have begun it, and what it has changed.
@@ -928,7 +971,7 @@ impl ClusterSession {
         }
         let parsed = {
             tsql_server::span!("ctl_parse");
-            tsql_server::parser::parse(sql)
+            cl.parse_cached(sql)
         };
         match parsed {
             Ok(stmts) => {
@@ -1002,6 +1045,7 @@ impl ClusterSession {
         }
         if self.txn.borrow().is_none() {
             self.uniq_guards.clear();
+            cl.mirror.inc_tx(1);
         }
         BatchResult { events }
     }
@@ -1020,6 +1064,7 @@ impl ClusterSession {
             s.items = s.items.iter().map(|i| if let SelectItem::Assign { e, .. } = i { SelectItem::Expr { e: e.clone(), alias: None } } else { i.clone() }).collect();
         }
         let rs = self.run_query(&plain).await?;
+        self.rowcount = rs.rows.len() as i64;
         let Some(row) = rs.rows.last() else { return Ok(()) };
         for ((var, op), v) in targets.into_iter().zip(row.iter()) {
             let key = var.to_lowercase();
@@ -1446,7 +1491,22 @@ impl ClusterSession {
                 self.log_schema(st);
                 Ok(())
             }
-            Stmt::Drop { what, .. } if what.eq_ignore_ascii_case("TYPE") => {
+            Stmt::CreateSequence { .. } | Stmt::AlterSequence { .. } | Stmt::CreateSynonym { .. } | Stmt::CreateSchema(..) => {
+                self.broadcast(st).await?;
+                self.log_schema(st);
+                Ok(())
+            }
+            Stmt::AlterDatabase { .. } => {
+                self.broadcast(st).await?;
+                self.log_schema(st);
+                Ok(())
+            }
+            Stmt::Drop { what, .. }
+                if what.eq_ignore_ascii_case("TYPE")
+                    || what.eq_ignore_ascii_case("SEQUENCE")
+                    || what.eq_ignore_ascii_case("SYNONYM")
+                    || what.eq_ignore_ascii_case("SCHEMA") =>
+            {
                 self.broadcast(st).await?;
                 self.log_schema(st);
                 Ok(())
@@ -1627,6 +1687,7 @@ impl ClusterSession {
                     return self.select_assign(q, assigns).await;
                 }
                 let rs = self.run_query(q).await?;
+                self.rowcount = rs.rows.len() as i64;
                 events.push(Event::Rows(rs));
                 Ok(())
             }
@@ -1645,9 +1706,7 @@ impl ClusterSession {
     }
 
     async fn create_table(&mut self, st: &Stmt, name: &Name, defs: &[TableDef], versioned: bool) -> Result<(), SqlError> {
-        if versioned {
-            return Err(unsupported("system-versioned tables"));
-        }
+        let _ = versioned;
         let mut cols: Vec<ColInfo> = vec![];
         let mut pk: Vec<String> = vec![];
         let mut identity: Option<(usize, i64, i64)> = None;
@@ -1668,7 +1727,7 @@ impl ClusterSession {
                     cols.push(ColInfo { name: cd.name.clone(), computed: cd.computed.is_some(), type_name, hidden: false });
                 }
                 TableDef::PrimaryKey { cols: c, .. } => pk = c.iter().map(|(n, _)| n.clone()).collect(),
-                TableDef::Period { .. } => return Err(unsupported("system-versioned tables")),
+                TableDef::Period { .. } => {}
                 // (the control node numbers the rows of a graph table, `$graph_id`: the shards would each number them from 0)
                 TableDef::Graph { edge, .. } => graph = Some(*edge),
                 TableDef::EdgeConstraint { name: n, pairs, cascade } => {
@@ -1935,7 +1994,7 @@ impl ClusterSession {
                                 self.verify_unique_existing(name, &names, uname.as_deref().unwrap_or("UQ")).await?;
                             }
                         }
-                        TableDef::Period { .. } => return Err(unsupported("system-versioned tables")),
+                        TableDef::Period { .. } => {}
                         _ => {}
                     }
                 }
@@ -1950,7 +2009,7 @@ impl ClusterSession {
                     return Err(unsupported("changing the shard key or an IDENTITY column"));
                 }
             }
-            AlterAction::SetVersioning(_) => return Err(unsupported("system-versioned tables")),
+            AlterAction::SetVersioning(_) => {}
             AlterAction::DropConstraint(..) | AlterAction::AlterMask { .. } | AlterAction::CheckConstraint { .. } => {}
         }
         // foreign keys are the control node's: a new one is checked against the rows that exist, and none goes to the shards
@@ -2302,8 +2361,8 @@ impl ClusterSession {
         tsql_server::span!("ctl_insert_values");
         let name = match &ins.target {
             Target::Table(name) => name,
-            Target::Var(v) if self.tvars.contains_key(&v.to_lowercase()) => {
-                let key = v.to_lowercase();
+            Target::Var(v) if self.tvars.contains_key(&v.to_lowercase()) || self.tvars.contains_key(v.trim_start_matches('@').to_lowercase().as_str()) => {
+                let key = if self.tvars.contains_key(&v.to_lowercase()) { v.to_lowercase() } else { v.trim_start_matches('@').to_lowercase() };
                 let values: Vec<Vec<Value>> = match &ins.src {
                     InsertSrc::Values(rows) => {
                         let mut out = vec![];
@@ -2328,6 +2387,7 @@ impl ClusterSession {
                     Some(names) => names.iter().map(|n| tv.columns.iter().position(|c| c.eq_ignore_ascii_case(n)).ok_or_else(|| SqlError::new(207, format!("Invalid column name '{}'.", n)))).collect::<Result<_, _>>()?,
                     None => (0..ncols).collect(),
                 };
+                let count = values.len() as i64;
                 for vals in values {
                     if vals.len() != order.len() {
                         return Err(SqlError::new(213, "Column name or number of supplied values does not match table definition."));
@@ -2338,9 +2398,11 @@ impl ClusterSession {
                     }
                     tv.rows.push(row);
                 }
+                self.rowcount = count;
+                events.push(Event::RowCount(count));
                 return Ok(());
             }
-            Target::Var(_) => return Err(unsupported("INSERT into a table variable that is not declared in this batch")),
+            Target::Var(v) => return Err(unsupported(&format!("INSERT into a table variable {} that is not declared in this batch (tvars: {:?}, cur_db: {})", v, self.tvars.keys().collect::<Vec<_>>(), self.cur_db))),
         };
         // (`WITH c AS (...) INSERT INTO t SELECT ... FROM c`: the common table expressions are those of the SELECT)
         if !ins.ctes.is_empty() && ins.output.is_none() && ins.top.is_none() {
@@ -2535,6 +2597,7 @@ impl ClusterSession {
             }
         }
         self.bump(&t.id);
+        self.rowcount = count;
         events.push(Event::RowCount(count));
         Ok(())
     }
@@ -2643,6 +2706,7 @@ impl ClusterSession {
             self.capture_rows(results, replicated);
             self.plan.push(format!("{} on shards {:?}, with its rows kept for the triggers", stmt_kind(&st).to_lowercase(), shards));
             self.bump(&t.id);
+            self.rowcount = count;
             events.push(Event::RowCount(count));
             return Ok(());
         }
@@ -2653,6 +2717,7 @@ impl ClusterSession {
         };
         self.plan.push(format!("{} on shards {:?}", stmt_kind(&st).to_lowercase(), shards));
         self.bump(&t.id);
+        self.rowcount = count;
         events.push(Event::RowCount(count));
         Ok(())
     }
@@ -2786,6 +2851,7 @@ impl ClusterSession {
             r?;
         }
         self.plan.push("update of the shard key: rows read, deleted and inserted again".into());
+        self.rowcount = moved;
         events.push(Event::RowCount(moved));
         Ok(())
     }

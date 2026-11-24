@@ -141,6 +141,8 @@ impl Cluster {
             triggers: Mutex::new(triggers_init.0),
             triggers_off: Mutex::new(triggers_init.1),
             ddl_triggers: Mutex::new(crate::ddltrig::ddl_triggers_of_log(&log_for_ddl)),
+            schema_gen: std::sync::atomic::AtomicU64::new(1),
+            plan_cache: Mutex::new(HashMap::new()),
         });
         {
             // (the shards of a cluster that was running hold the functions that read no table)
@@ -191,6 +193,7 @@ impl Cluster {
                 _ => {}
             }
         }
+        self.bump_schema_gen();
         self.save_state();
     }
 

@@ -90,6 +90,12 @@ pub trait Interceptor: Send {
     fn adopt_temp(&mut self, _name: &str, _create: &str, _rows: Vec<Vec<Value>>) -> Result<(), SqlError> {
         Ok(())
     }
+    /// For an RPC call with a table-valued parameter whose type name is omitted: the schema and type name from the procedure definition.
+    fn proc_param_type(&self, _proc_name: &str, _param_name: &str, _param_idx: usize) -> Option<(String, String)> {
+        None
+    }
+    /// Bind a table-valued parameter's rows into the session's table variable directly.
+    fn bind_tvp(&mut self, _name: &str, _schema: &str, _type_name: &str, _rows: Vec<Vec<Value>>) {}
 }
 
 /// Makes the interceptor of a new connection.
@@ -338,6 +344,16 @@ impl Server {
         let g = self.shared.state.read().unwrap_or_else(|e| e.into_inner());
         let (n, ns) = g.core.lock_wait_totals();
         (n, std::time::Duration::from_nanos(ns))
+    }
+
+    /// Increment the committed transaction counter by `n`.
+    pub fn inc_tx(&self, n: u64) {
+        self.shared.state.read().unwrap_or_else(|e| e.into_inner()).core.add_tx(n);
+    }
+
+    /// Increment the lock waits counter by `n`.
+    pub fn inc_lock_waits(&self, n: u64) {
+        self.shared.state.read().unwrap_or_else(|e| e.into_inner()).core.add_lock_waits(n);
     }
 
     /// How many times the redo log has been forced to disk for commits (sessions that commit together share a force).
@@ -738,6 +754,35 @@ impl Connection {
         let guard = SrvGuard::new(&shared.state);
         let mut eng = Engine::with_sink(guard, &mut self.session, sink);
         eng.run_batch(sql);
+    }
+
+    pub fn has_interceptor(&self) -> bool {
+        self.interceptor.is_some()
+    }
+
+    pub fn bind_tvp(&mut self, name: &str, schema: &str, type_name: &str, rows: Vec<Vec<Value>>) {
+        if let Some(i) = self.interceptor.as_mut() {
+            i.bind_tvp(name, schema, type_name, rows);
+        }
+    }
+
+    /// For an RPC call with a table-valued parameter whose type name is omitted: the schema and type name from the procedure definition.
+    pub fn proc_param_type(&mut self, proc_name: &str, param_name: &str, param_idx: usize) -> Option<(String, String)> {
+        if let Some(i) = &self.interceptor {
+            if let Some(res) = i.proc_param_type(proc_name, param_name, param_idx) {
+                return Some(res);
+            }
+        }
+        let parts: Vec<String> = proc_name.split('.').map(|s| s.trim_matches('[').trim_matches(']').to_string()).collect();
+        let shared = &self.server.shared;
+        let guard = SrvGuard::new(&shared.state);
+        let eng = Engine::new(guard, &mut self.session);
+        let def = eng.find_proc(&parts)?;
+        let p = def.params.iter().find(|p| p.name.trim_start_matches('@').eq_ignore_ascii_case(param_name.trim_start_matches('@')))
+            .or_else(|| def.params.get(param_idx))?;
+        let schema = if p.ty.parts.len() >= 2 { p.ty.parts[0].clone() } else { "dbo".to_string() };
+        let type_name = p.ty.parts.last().cloned()?;
+        Some((schema, type_name))
     }
 
     /// Execute a script containing `GO` batch separators.

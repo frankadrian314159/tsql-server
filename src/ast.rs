@@ -372,6 +372,7 @@ pub enum TableDef {
     Columnstore { name: String, clustered: bool, cols: Vec<String> },
     /// `PERIOD FOR SYSTEM_TIME (start, end)`
     Period { start: String, end: String },
+    MemoryOptimized(bool),
     // (what is stored is the number of the variant: new ones go at the end, so that what an older version stored is still read)
     /// `AS NODE` or `AS EDGE` after the columns of a `CREATE TABLE`: a graph table. `external`: the `$graph_id` of its rows is given by the
     /// statement that inserts them (a plain column, not a counter of the table's own): how a cluster's shards make the table, since the

@@ -15,8 +15,8 @@ pub const DBLK_HEADER: usize = 52;
 /// Size of the header in front of every stream.
 pub const STREAM_HEADER: usize = 22;
 
-/// The block types of MTF. SQL Server adds its own (`MSCI`, ...): any four upper-case letters are accepted as a block type
-/// when the header checksum is right.
+/// The block types of MTF. SQL Server adds its own (`MSCI`, `MSDA`, `PH6S`, ...): any four alphanumeric characters
+/// are accepted as a block type when the header checksum is right.
 pub const BLOCK_TYPES: [&[u8; 4]; 10] = [b"TAPE", b"SSET", b"VOLB", b"DIRB", b"FILE", b"CFIL", b"ESPB", b"ESET", b"EOTM", b"SFMB"];
 
 #[derive(Debug, Clone)]
@@ -138,7 +138,11 @@ pub fn scan<R: Read + Seek>(r: &mut R) -> std::io::Result<Scan> {
         match block_at(r, at, file_len)? {
             Ok(b) => {
                 let end = b.streams.last().map(|s| stream_end(s.data_at, s.len)).unwrap_or(at + b.raw.len() as u64);
-                let complete = b.streams.last().map(|s| &s.id == b"SPAD").unwrap_or(false) && end <= file_len;
+                let complete = if b.streams.is_empty() {
+                    true
+                } else {
+                    b.streams.last().map(|s| &s.id == b"SPAD").unwrap_or(false) && end <= file_len
+                };
                 out.blocks.push(b);
                 if !complete {
                     out.problem = Some(format!("the stream list of the block at offset {} does not end with a pad stream (the file is cut short)", at));
@@ -149,9 +153,19 @@ pub fn scan<R: Read + Seek>(r: &mut R) -> std::io::Result<Scan> {
             Err(why) => {
                 // a file may end in zero fill
                 r.seek(SeekFrom::Start(at))?;
-                let mut rest = vec![0u8; (file_len - at).min(4096) as usize];
-                r.read_exact(&mut rest)?;
-                if !rest.iter().all(|b| *b == 0) {
+                let mut buf = [0u8; 4096];
+                let mut rem = file_len - at;
+                let mut all_zero = true;
+                while rem > 0 {
+                    let n = rem.min(buf.len() as u64) as usize;
+                    r.read_exact(&mut buf[..n])?;
+                    if !buf[..n].iter().all(|b| *b == 0) {
+                        all_zero = false;
+                        break;
+                    }
+                    rem -= n as u64;
+                }
+                if !all_zero {
                     out.problem = Some(why);
                 }
                 return Ok(out);
@@ -175,7 +189,7 @@ fn block_at<R: Read + Seek>(r: &mut R, at: u64, file_len: u64) -> std::io::Resul
     let mut h = [0u8; DBLK_HEADER];
     r.read_exact(&mut h)?;
     let kind: [u8; 4] = h[0..4].try_into().unwrap();
-    if !BLOCK_TYPES.iter().any(|t| **t == kind) && !kind.iter().all(|c| c.is_ascii_uppercase()) {
+    if !BLOCK_TYPES.iter().any(|t| **t == kind) && !kind.iter().all(|c| c.is_ascii_alphanumeric()) {
         return Ok(Err(format!("offset {}: '{}' is not a block type of MTF", at, printable(&kind))));
     }
     let stored = u16::from_le_bytes([h[50], h[51]]);
@@ -210,6 +224,9 @@ fn block_at<R: Read + Seek>(r: &mut R, at: u64, file_len: u64) -> std::io::Resul
         r.seek(SeekFrom::Start(pos))?;
         let mut s = [0u8; STREAM_HEADER];
         r.read_exact(&mut s)?;
+        if s.iter().all(|c| *c == 0) || !s[0..4].iter().all(|c| c.is_ascii_alphanumeric()) {
+            return Ok(Ok(b));
+        }
         if xor_words(&s[..20]) != u16::from_le_bytes([s[20], s[21]]) {
             return Ok(Err(format!("offset {}: the checksum of a stream header in the {} block at {} does not match", pos, printable(&kind), at)));
         }

@@ -4444,6 +4444,7 @@ dependencies = [
  "arrow-flight",
  "chrono",
  "futures",
+ "mimalloc",
  "postcard",
  "rand",
  "serde",
