@@ -155,23 +155,46 @@ impl<'a> Engine<'a> {
         let mut rows_seen: HashSet<(String, String, RowId)> = HashSet::new();
         let mut idents_seen: HashSet<(String, String)> = HashSet::new();
         for u in undo {
-            if let Undo::Row { tab: TabRef::Db(db, key), rowid } = u {
-                if dbs.contains(db) || dumped.contains(&(db.clone(), key.clone())) {
-                    continue;
-                }
-                if !rows_seen.insert((db.clone(), key.clone(), *rowid)) {
-                    continue;
-                }
-                if let Some(Object::Table(t)) = self.srv.databases.get(db).and_then(|d| d.objects.get(key)) {
-                    let row: Option<Row> = match t.data.last_version(*rowid) {
-                        Some(v) if v.stamp == Stamp::Tx(tx) => v.row,
-                        _ => continue,
-                    };
-                    ops.push(LogOp::Put { db: db.clone(), key: key.clone(), rowid: *rowid, row });
-                    if idents_seen.insert((db.clone(), key.clone())) && t.identity_col().is_some() {
-                        ops.push(LogOp::SetIdentity { db: db.clone(), key: key.clone(), next: t.identity_next.get() });
+            match u {
+                Undo::Row { tab: TabRef::Db(db, key), rowid } => {
+                    if dbs.contains(db) || dumped.contains(&(db.clone(), key.clone())) {
+                        continue;
+                    }
+                    if !rows_seen.insert((db.clone(), key.clone(), *rowid)) {
+                        continue;
+                    }
+                    if let Some(Object::Table(t)) = self.srv.databases.get(db).and_then(|d| d.objects.get(key)) {
+                        let row: Option<Row> = match t.data.last_version(*rowid) {
+                            Some(v) if v.stamp == Stamp::Tx(tx) => v.row,
+                            _ => continue,
+                        };
+                        ops.push(LogOp::Put { db: db.clone(), key: key.clone(), rowid: *rowid, row });
+                        if idents_seen.insert((db.clone(), key.clone())) && t.identity_col().is_some() {
+                            ops.push(LogOp::SetIdentity { db: db.clone(), key: key.clone(), next: t.identity_next.get() });
+                        }
                     }
                 }
+                Undo::Rows { tab: TabRef::Db(db, key), rowids } => {
+                    if dbs.contains(db) || dumped.contains(&(db.clone(), key.clone())) {
+                        continue;
+                    }
+                    if let Some(Object::Table(t)) = self.srv.databases.get(db).and_then(|d| d.objects.get(key)) {
+                        for rowid in rowids {
+                            if !rows_seen.insert((db.clone(), key.clone(), *rowid)) {
+                                continue;
+                            }
+                            let row: Option<Row> = match t.data.last_version(*rowid) {
+                                Some(v) if v.stamp == Stamp::Tx(tx) => v.row,
+                                _ => continue,
+                            };
+                            ops.push(LogOp::Put { db: db.clone(), key: key.clone(), rowid: *rowid, row });
+                            if idents_seen.insert((db.clone(), key.clone())) && t.identity_col().is_some() {
+                                ops.push(LogOp::SetIdentity { db: db.clone(), key: key.clone(), next: t.identity_next.get() });
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         ops

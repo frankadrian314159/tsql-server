@@ -688,10 +688,13 @@ impl<'a> Engine<'a> {
                 touched.push(rid);
             }
             d.push_versions(std::mem::take(&mut items), stamp);
+            let need_inserted = t.triggers.iter().any(|g| !g.disabled && !g.instead && g.events.iter().any(|e| e == "INSERT"));
             for row in &ch.inserts {
                 let rid = d.alloc();
                 items.push((rid, Some(row.clone())));
-                applied.inserted.push(row.clone());
+                if need_inserted {
+                    applied.inserted.push(row.clone());
+                }
                 touched.push(rid);
             }
             d.push_versions(items, stamp);
@@ -705,13 +708,15 @@ impl<'a> Engine<'a> {
             crate::span!("undo_and_locks");
             let n_new = ch.inserts.len();
             let first_new = touched.len() - n_new;
-            for (i, rid) in touched.iter().enumerate() {
-                if persistent && i >= first_new {
+            if persistent {
+                for rid in &touched[first_new..] {
                     // fresh rows are exclusively ours
                     let _ = self.srv.core.locks.acquire(tx, &crate::storage::lock::Res::Row(oid, *rid), Mode::X);
                 }
-                if let Some(tab) = &tab {
-                    self.push_undo(Undo::Row { tab: tab.clone(), rowid: *rid });
+            }
+            if let Some(tab) = tab {
+                if !touched.is_empty() {
+                    self.push_undo(Undo::Rows { tab, rowids: touched });
                 }
             }
             // A SERIALIZABLE reader's key range must not gain a row (a phantom). This is checked after the new

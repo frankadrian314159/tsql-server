@@ -99,7 +99,7 @@ impl<'a> Engine<'a> {
     fn finish_commit(&mut self, mut tx: Tx) -> Result<()> {
         let id = tx.id;
         let mut undo = std::mem::take(&mut tx.undo);
-        let wrote = undo.iter().any(|u| !matches!(u, Undo::Temp { .. } | Undo::GTemp { .. } | Undo::Row { tab: TabRef::Temp(_), .. } | Undo::Row { tab: TabRef::GTemp(_), .. }));
+        let wrote = undo.iter().any(|u| !matches!(u, Undo::Temp { .. } | Undo::GTemp { .. } | Undo::Row { tab: TabRef::Temp(_), .. } | Undo::Row { tab: TabRef::GTemp(_), .. } | Undo::Rows { tab: TabRef::Temp(_), .. } | Undo::Rows { tab: TabRef::GTemp(_), .. }));
         let core = self.srv.core.clone();
         if undo.is_empty() {
             // changed nothing (a query, or a transaction that rolled everything back): no timestamp, log record or
@@ -146,11 +146,16 @@ impl<'a> Engine<'a> {
         // stamp versions, grouped per table
         let mut rows: Vec<(TabRef, Vec<RowId>)> = vec![];
         for u in undo.drain(..) {
-            if let Undo::Row { tab, rowid } = u {
-                match rows.iter_mut().find(|(t, _)| *t == tab) {
+            match u {
+                Undo::Row { tab, rowid } => match rows.iter_mut().find(|(t, _)| *t == tab) {
                     Some((_, v)) => v.push(rowid),
                     None => rows.push((tab, vec![rowid])),
-                }
+                },
+                Undo::Rows { tab, rowids } => match rows.iter_mut().find(|(t, _)| *t == tab) {
+                    Some((_, v)) => v.extend(rowids),
+                    None => rows.push((tab, rowids)),
+                },
+                _ => {}
             }
         }
         for (tab, rids) in rows.iter_mut() {
@@ -218,6 +223,13 @@ impl<'a> Engine<'a> {
                 Undo::Row { tab, rowid } => {
                     if let Some(t) = self.table_by_ref(&tab) {
                         t.data.pop_version(rowid);
+                    }
+                }
+                Undo::Rows { tab, rowids } => {
+                    if let Some(t) = self.table_by_ref(&tab) {
+                        for rowid in rowids.into_iter().rev() {
+                            t.data.pop_version(rowid);
+                        }
                     }
                 }
                 Undo::Object { db, key, prev } => {
@@ -289,7 +301,7 @@ impl<'a> Engine<'a> {
     pub fn push_undo(&mut self, u: Undo) {
         if let Some(tx) = self.ses.tx.as_mut() {
             tx.wrote = true;
-            if !matches!(u, Undo::Row { .. } | Undo::Temp { .. } | Undo::GTemp { .. }) {
+            if !matches!(u, Undo::Row { .. } | Undo::Rows { .. } | Undo::Temp { .. } | Undo::GTemp { .. }) {
                 self.srv.core.mark_ddl(tx.id);
             }
             tx.undo.push(u);

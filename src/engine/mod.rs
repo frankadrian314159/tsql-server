@@ -571,9 +571,7 @@ pub struct Engine<'a> {
 // again, as most applications do, is not parsed again. The cache is keyed by the exact batch text; entries are dropped
 // at random-ish once there are too many. `DBCC FREEPROCCACHE` empties it. (Execution plans themselves are not cached:
 // the optimizer's decisions depend on the data and on the parameter values.)
-thread_local! {
-    static PARSE_CACHE: std::cell::RefCell<HashMap<String, (std::rc::Rc<Vec<Stmt>>, u64)>> = std::cell::RefCell::new(HashMap::new());
-}
+static PARSE_CACHE: std::sync::RwLock<Option<HashMap<String, (std::sync::Arc<Vec<Stmt>>, u64)>>> = std::sync::RwLock::new(None);
 
 thread_local! {
     static PARAM_CACHE: std::cell::RefCell<HashMap<String, std::rc::Rc<Vec<Param>>>> = std::cell::RefCell::new(HashMap::new());
@@ -601,40 +599,42 @@ pub fn cached_param_decls(decl: &str) -> std::result::Result<std::rc::Rc<Vec<Par
 const PARSE_CACHE_ENTRIES: usize = 512;
 const PARSE_CACHE_MAX_TEXT: usize = 64 << 10;
 
-pub fn cached_parse(sql: &str) -> std::result::Result<std::rc::Rc<Vec<Stmt>>, SqlError> {
+pub fn cached_parse(sql: &str) -> std::result::Result<std::sync::Arc<Vec<Stmt>>, SqlError> {
     if sql.len() <= PARSE_CACHE_MAX_TEXT {
-        let hit = PARSE_CACHE.with(|c| {
-            c.borrow_mut().get_mut(sql).map(|e| {
-                e.1 += 1;
-                e.0.clone()
-            })
-        });
-        if let Some(h) = hit {
-            return Ok(h);
+        if let Ok(c) = PARSE_CACHE.read() {
+            if let Some(map) = c.as_ref() {
+                if let Some(e) = map.get(sql) {
+                    return Ok(e.0.clone());
+                }
+            }
         }
     }
     let stmts = {
         crate::span!("parse");
-        std::rc::Rc::new(parser::parse(sql)?)
+        std::sync::Arc::new(parser::parse(sql)?)
     };
     if sql.len() <= PARSE_CACHE_MAX_TEXT {
-        PARSE_CACHE.with(|c| {
-            let mut c = c.borrow_mut();
-            if c.len() >= PARSE_CACHE_ENTRIES {
+        if let Ok(mut c) = PARSE_CACHE.write() {
+            let map = c.get_or_insert_with(HashMap::new);
+            if map.len() >= PARSE_CACHE_ENTRIES {
                 // make room: drop the least used half
-                let mut uses: Vec<u64> = c.values().map(|e| e.1).collect();
+                let mut uses: Vec<u64> = map.values().map(|e| e.1).collect();
                 uses.sort_unstable();
                 let cut = uses[uses.len() / 2];
-                c.retain(|_, e| e.1 > cut);
+                map.retain(|_, e| e.1 > cut);
             }
-            c.insert(sql.to_string(), (stmts.clone(), 1));
-        });
+            map.insert(sql.to_string(), (stmts.clone(), 1));
+        }
     }
     Ok(stmts)
 }
 
 pub fn clear_parse_cache() {
-    PARSE_CACHE.with(|c| c.borrow_mut().clear());
+    if let Ok(mut c) = PARSE_CACHE.write() {
+        if let Some(map) = c.as_mut() {
+            map.clear();
+        }
+    }
     PARAM_CACHE.with(|c| c.borrow_mut().clear());
 }
 
@@ -667,7 +667,12 @@ pub fn stmt_head_into(st: &Stmt, out: &mut String) {
 }
 
 pub fn parse_cache_entries() -> Vec<(String, u64)> {
-    PARSE_CACHE.with(|c| c.borrow().iter().map(|(k, v)| (k.clone(), v.1)).collect())
+    if let Ok(c) = PARSE_CACHE.read() {
+        if let Some(map) = c.as_ref() {
+            return map.iter().map(|(k, v)| (k.clone(), v.1)).collect();
+        }
+    }
+    vec![]
 }
 
 pub fn obj_key(schema: &str, name: &str) -> String {

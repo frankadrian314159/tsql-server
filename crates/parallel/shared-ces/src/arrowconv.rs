@@ -17,7 +17,7 @@ const META_TYPES: &str = "tsql.types";
 const META_PACK: &str = "tsql.pack";
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Kind {
+pub enum Kind {
     Bool,
     I32,
     I64,
@@ -37,6 +37,19 @@ fn kind_of_value(v: &Value) -> Option<Kind> {
         Value::Str(_) => Some(Kind::Utf8),
         Value::Bin(_) => Some(Kind::Bin),
         _ => Some(Kind::Pack),
+    }
+}
+
+fn kind_of_datatype(ty: &DataType) -> Option<Kind> {
+    match ty {
+        DataType::Bit => Some(Kind::Bool),
+        DataType::TinyInt | DataType::SmallInt | DataType::Int => Some(Kind::I32),
+        DataType::BigInt => Some(Kind::I64),
+        DataType::Float | DataType::Real => Some(Kind::F64),
+        DataType::Char(_) | DataType::VarChar(_) | DataType::NChar(_) | DataType::NVarChar(_) | DataType::Text | DataType::NText => Some(Kind::Utf8),
+        DataType::Binary(_) | DataType::VarBinary(_) | DataType::Image | DataType::Timestamp => Some(Kind::Bin),
+        DataType::Decimal(_, _) | DataType::Money | DataType::SmallMoney | DataType::Date | DataType::Time(_) | DataType::DateTime | DataType::SmallDateTime | DataType::DateTime2(_) | DataType::DateTimeOffset(_) | DataType::Guid | DataType::Xml | DataType::HierarchyId | DataType::Geometry | DataType::Geography => Some(Kind::Pack),
+        DataType::Variant | DataType::Other(_) => None,
     }
 }
 
@@ -144,9 +157,17 @@ fn build(kind: Kind, rows: &[Vec<Value>], c: usize) -> Result<ArrayRef, String> 
     })
 }
 
-/// The Arrow schema of a result set, and its rows as batches of at most `max_rows` rows (none for an empty result).
-pub fn to_batches(rs: &ResultSet, max_rows: usize) -> Result<(SchemaRef, Vec<RecordBatch>), String> {
-    let kinds: Vec<Kind> = (0..rs.columns.len()).map(|c| column_kind(&rs.rows, c)).collect();
+pub fn to_schema(rs: &ResultSet) -> Result<(SchemaRef, Vec<Kind>), String> {
+    let kinds: Vec<Kind> = (0..rs.columns.len())
+        .map(|c| {
+            if let Some(ty) = rs.types.get(c) {
+                if let Some(k) = kind_of_datatype(ty) {
+                    return k;
+                }
+            }
+            column_kind(&rs.rows, c)
+        })
+        .collect();
     let fields: Vec<Field> = rs
         .columns
         .iter()
@@ -170,10 +191,20 @@ pub fn to_batches(rs: &ResultSet, max_rows: usize) -> Result<(SchemaRef, Vec<Rec
         .collect();
     let types = postcard::to_allocvec(&rs.types).map_err(|e| e.to_string())?;
     let schema: SchemaRef = Arc::new(Schema::new_with_metadata(fields, HashMap::from([(META_TYPES.to_string(), hex(&types))])));
+    Ok((schema, kinds))
+}
+
+pub fn chunk_to_batch(schema: SchemaRef, kinds: &[Kind], chunk: &[Vec<Value>]) -> Result<RecordBatch, String> {
+    let cols: Result<Vec<ArrayRef>, String> = kinds.iter().enumerate().map(|(c, k)| build(*k, chunk, c)).collect();
+    RecordBatch::try_new(schema, cols?).map_err(|e| e.to_string())
+}
+
+/// The Arrow schema of a result set, and its rows as batches of at most `max_rows` rows (none for an empty result).
+pub fn to_batches(rs: &ResultSet, max_rows: usize) -> Result<(SchemaRef, Vec<RecordBatch>), String> {
+    let (schema, kinds) = to_schema(rs)?;
     let mut batches = vec![];
     for chunk in rs.rows.chunks(max_rows.max(1)) {
-        let cols: Result<Vec<ArrayRef>, String> = kinds.iter().enumerate().map(|(c, k)| build(*k, chunk, c)).collect();
-        batches.push(RecordBatch::try_new(schema.clone(), cols?).map_err(|e| e.to_string())?);
+        batches.push(chunk_to_batch(schema.clone(), &kinds, chunk)?);
     }
     Ok((schema, batches))
 }

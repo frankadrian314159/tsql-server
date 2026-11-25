@@ -413,17 +413,49 @@ impl FlightService for ShardNode {
         let frag: Fragment = postcard::from_bytes(&request.into_inner().ticket).map_err(|e| Status::invalid_argument(format!("bad ticket: {}", e)))?;
         let _busy = self.admit(frag.session)?;
         let conn = self.session(frag.session);
-        let rs = tokio::task::spawn_blocking(move || {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let (schema_tx, schema_rx) = tokio::sync::oneshot::channel();
+        tokio::task::spawn_blocking(move || {
             let mut c = conn.lock().unwrap_or_else(|e| e.into_inner());
-            first_result_set(&mut c, &frag.work)
-        })
-        .await
-        .map_err(|e| Status::internal(format!("the statement panicked: {}", e)))?
-        .map_err(|e| status_for(&e))?;
-        let (schema, batches) = arrowconv::to_batches(&rs, BATCH_ROWS).map_err(Status::internal)?;
+            let rs = match first_result_set(&mut c, &frag.work) {
+                Ok(rs) => rs,
+                Err(e) => {
+                    let _ = schema_tx.send(Err(status_for(&e)));
+                    return;
+                }
+            };
+            let (schema, kinds) = match arrowconv::to_schema(&rs) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = schema_tx.send(Err(Status::internal(e)));
+                    return;
+                }
+            };
+            if schema_tx.send(Ok(schema.clone())).is_err() {
+                return;
+            }
+            if rs.rows.is_empty() {
+                return;
+            }
+            for chunk in rs.rows.chunks(BATCH_ROWS) {
+                match arrowconv::chunk_to_batch(schema.clone(), &kinds, chunk) {
+                    Ok(batch) => {
+                        if tx.blocking_send(Ok(batch)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(arrow_flight::error::FlightError::Tonic(Box::new(Status::internal(e)))));
+                        break;
+                    }
+                }
+            }
+        });
+        let schema = schema_rx.await.map_err(|_| Status::internal("worker panicked before schema"))??;
+        let batch_stream = stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) });
         let out = FlightDataEncoderBuilder::new()
             .with_schema(schema)
-            .build(stream::iter(batches.into_iter().map(Ok)))
+            .build(batch_stream)
             .map_err(|e| Status::internal(e.to_string()));
         Ok(Response::new(out.boxed()))
     }

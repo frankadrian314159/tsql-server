@@ -55,6 +55,8 @@ pub enum TabRef {
 pub enum Undo {
     /// Pop the newest version of a slot.
     Row { tab: TabRef, rowid: RowId },
+    /// Pop the newest versions for a batch of slots.
+    Rows { tab: TabRef, rowids: Vec<RowId> },
     Object { db: String, key: String, prev: Option<Object> },
     Temp { name: String, prev: Option<Table> },
     GTemp { name: String, prev: Option<Table> },

@@ -13,7 +13,12 @@ path = "src/lib.rs"
 name = "tsql-shard"
 path = "src/main.rs"
 
+[features]
+default = ["fast-alloc"]
+fast-alloc = ["mimalloc"]
+
 [dependencies]
+mimalloc = { version = "0.1", default-features = false, optional = true }
 tsql-server = { path = "../../.." }
 tsql-shared-ces = { path = "../shared-ces" }
 tsql-raft = { path = "../raft" }

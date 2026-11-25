@@ -18,6 +18,10 @@ use std::net::SocketAddr;
 use tsql_server::Server;
 use tsql_storage::{spawn, ReplicaConfig, ShardNode};
 
+#[cfg(feature = "fast-alloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn usage() -> ! {
     eprintln!("usage: tsql-shard --id N --listen HOST:PORT [--data DIR]\n       tsql-shard --id N --listen HOST:PORT --data DIR --replica R --peers R2=HOST:PORT,R3=HOST:PORT [--raft-dir DIR]");
     std::process::exit(2);
