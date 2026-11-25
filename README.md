@@ -1,6 +1,6 @@
 # tsql-server
 
-A clone of Microsoft SQL Server written in Rust: a from-scratch T-SQL engine on top of a
+A clone of Microsoft SQL Server 2022 (v16.0) written in Rust: a from-scratch T-SQL engine on top of a
 durable, transactional storage layer with lock-based isolation levels, permission checking
 and a cost-based query optimizer. It runs as a library (`Server` / `Connection`) and as a
 `sqlcmd`-style shell (`tsql`).
