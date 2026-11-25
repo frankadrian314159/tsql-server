@@ -22,26 +22,76 @@ computing, joins shuffle rows from shard to shard, and no compute node was intro
 
 ## Running a cluster
 
+First make the certificates with which the nodes know one another (see [Security](#security)), and copy to each node
+`ca.pem` and its own `.pem` and `.key`:
+
+```
+tsql-cluster --make-certs certs control s0r1 s0r2 s0r3 s1
+```
+
 ```
 # one shard, three replicas (each its own data directory; --id is the shard, --replica the member of its group)
-tsql-shard --id 0 --listen 10.0.0.1:50051 --data /data/s0r1 --replica 1 --peers 2=10.0.0.2:50051,3=10.0.0.3:50051
-tsql-shard --id 0 --listen 10.0.0.2:50051 --data /data/s0r2 --replica 2 --peers 1=10.0.0.1:50051,3=10.0.0.3:50051
-tsql-shard --id 0 --listen 10.0.0.3:50051 --data /data/s0r3 --replica 3 --peers 1=10.0.0.1:50051,2=10.0.0.2:50051
+tsql-shard --id 0 --listen 10.0.0.1:50051 --data /data/s0r1 --replica 1 --peers 2=10.0.0.2:50051,3=10.0.0.3:50051 \
+    --node-ca ca.pem --node-cert s0r1.pem --node-key s0r1.key
+tsql-shard --id 0 --listen 10.0.0.2:50051 --data /data/s0r2 --replica 2 --peers 1=10.0.0.1:50051,3=10.0.0.3:50051 \
+    --node-ca ca.pem --node-cert s0r2.pem --node-key s0r2.key
+tsql-shard --id 0 --listen 10.0.0.3:50051 --data /data/s0r3 --replica 3 --peers 1=10.0.0.1:50051,2=10.0.0.2:50051 \
+    --node-ca ca.pem --node-cert s0r3.pem --node-key s0r3.key
 # an unreplicated shard
-tsql-shard --id 1 --listen 10.0.0.4:50051 [--data DIR]
+tsql-shard --id 1 --listen 10.0.0.4:50051 --data /data/s1 \
+    --node-ca ca.pem --node-cert s1.pem --node-key s1.key
 # the cluster file: a shard's replicas are listed in one address, separated by commas
 echo '{"shards":[{"id":0,"addr":"10.0.0.1:50051,10.0.0.2:50051,10.0.0.3:50051"},{"id":1,"addr":"10.0.0.4:50051"}]}' > cluster.json
-tsql-cluster --config cluster.json --state cluster.state --listen 1433 --sa-password PW      # serve SQL Server clients
-tsql-cluster --config cluster.json --state cluster.state --plan < script.sql               # or run a script (batches end at GO)
+# serve SQL Server clients (on this machine; see Security to serve others)
+tsql-cluster --config cluster.json --state cluster.state --listen 1433 --sa-password PW \
+    --node-ca ca.pem --node-cert control.pem --node-key control.key
+# or run a script (batches end at GO)
+tsql-cluster --config cluster.json --state cluster.state --plan \
+    --node-ca ca.pem --node-cert control.pem --node-key control.key < script.sql
 ```
 
 `--state` keeps the control node's state (shards, slot map, tables, schema, unfinished commits) in a file: a control node
-started on an existing file picks the cluster up where it was and ignores `--config`. From Rust: `Cluster::connect(&config)` or
-`Cluster::open(state_file, &config)`, then `cluster.session()` and `session.execute(sql)`; `session.last_plan()` says how each
+started on an existing file picks the cluster up where it was and ignores `--config`. From Rust:
+`Cluster::connect_with(&config, tls)` or `Cluster::open_with(state_file, &config, tls)`, where `tls` is a
+`NodeTls::from_files(..)` (`connect` and `open` use unprotected connections, to shards started with `--insecure`), then `cluster.session()` and `session.execute(sql)`; `session.last_plan()` says how each
 statement ran. `cargo run --release -p tsql-control --example tpch_cluster` runs TPC-H on a cluster and compares every
 answer with a single node; `--example tpcds_cluster` does the same for the 24 TPC-DS-style queries (and `oltp_cluster` runs TPC-C and the reduced TPC-E, `bench_cluster` the engine micro-benchmark and `sqlsmith_cluster` the fuzzer, each against one engine; see *Benchmarks on a cluster*) (dimensions replicated, fact
 tables sharded on the item), and its table shows how each query ran (`split`, `set`, `correlated`, `join`, `scatter-gather`,
 `gather`): none gathers.
+
+## Security
+
+All connections between nodes (control node to shard, shard to shard, and replica to replica) use **mutual TLS**: both
+ends show a certificate signed by the cluster's certificate authority, and refuse the connection otherwise. `tsql-shard`
+and `tsql-cluster` do not start without `--node-ca`, `--node-cert` and `--node-key`. `--insecure` starts them without
+protection, with a warning: then anyone who reaches a shard's port can run any T-SQL on it as `sa`, which includes
+reading and writing files through `BACKUP` and `BULK INSERT`. The two kinds of node cannot be mixed.
+
+```
+tsql-cluster --make-certs certs control shard0 shard1     # ca.pem, ca.key, and NAME.pem and NAME.key for each name
+tsql-cluster --make-certs certs shard2                    # later: another node, signed by the same authority
+```
+
+* **Guard `ca.key`.** It is only needed to make certificates; do not copy it to the nodes. Whoever holds it, or any
+  certificate it signed with its key, has that access to every shard.
+* Every certificate of the authority gives the same access, and none can be revoked: if a key leaks, make a new
+  authority in an empty directory and give every node a new certificate. Nodes may share one certificate (an image that
+  `deploy/gcp/scale-up.sh` starts shards from carries it).
+* Key files are readable only by their owner on Unix. On Windows they take the folder's permissions: restrict them.
+* Made certificates expire on 1 January ten years after the year they were made. Replace them before then and restart
+  the nodes.
+* **Your own certificates** work too (PEM files). The authority must sign nothing but this cluster's nodes. Every node's
+  certificate needs the DNS name `tsql-node` (callers check for that name, not for the host, so a node can move) and, if
+  it restricts key usage, both server and client authentication.
+
+**Clients** reach the control node over TDS, whose TLS is set separately and works as in `tsql-serve`
+([tds.md](tds.md#encryption-tls)): TLS is offered with a self-signed certificate made at start-up, or with
+`--tls-cert FILE --tls-key FILE`; `--force-encryption`, `--tls13` and `--no-tls`. To listen on an address that other
+machines can reach (`--bind`), `tsql-cluster` needs `--force-encryption`, or `--insecure-clients`. Clients then have to
+encrypt, and either trust the certificate (`TrustServerCertificate=True`; `--encrypt` in `tsql-gui`) or be given one
+they can verify. A login without a password cannot connect over the network.
+
+The `--metrics-listen` pages are plain HTTP without authentication.
 
 ## How a statement runs
 
@@ -517,7 +567,7 @@ commits just after its index; the log's records set rows and objects to absolute
 harmless. A snapshot is held in memory, so a very large shard needs the memory of its data for the moment of the export.
 
 **Changing the replicas.** Start the new replica on an empty directory with `tsql-shard --id N --replica R --join --peers
-...` (`--addr` if its address differs from `--listen`), then `Cluster::add_replica(shard, R, addr)`: the leader adds it as a
+...` (`--addr` if its address differs from `--listen`) and its own certificate flags, then `Cluster::add_replica(shard, R, addr)`: the leader adds it as a
 non-voting *learner*, sends it the snapshot and log, and when it has caught up makes it a voter (one voter changes at a time,
 as in the Raft dissertation); `Cluster::remove_replica(shard, addr)` takes one out, the leader included, and the control node
 and its state file follow (`replicas.rs`). A removed replica that keeps running cannot depose the group: a vote is refused
@@ -580,7 +630,8 @@ made by hand, see Replication); the numbers are starting points, to be set from 
 
 The drivers of the single-node examples run against a cluster too, through a cluster session (`util::Sql` is implemented for
 `Connection` and for `ClusterSession`); with `--config cluster.json` the control node connects to shard nodes that are already
-running (`tsql-shard` on other machines), otherwise `--shards N` starts them in the process.
+running (`tsql-shard --insecure` on other machines: the examples connect without TLS), otherwise `--shards N` starts
+them in the process.
 
 * `oltp_cluster [c|e]`: TPC-C and the reduced TPC-E. The drivers use no cluster procedures or sequences, so the transactions are
   **client-side**: the terminal sends `BEGIN`, each statement and `COMMIT` itself (`c.rs` / `e.rs` with `client = true`; the single-node
@@ -757,6 +808,9 @@ Q19 run over the shards and Q5 and Q19 beat one node on three shards in one proc
 generated rows.
 
 ## Limits (an error says so where a statement is refused)
+
+* **Every node is trusted fully.** A certificate of the cluster's authority gives full access to every shard, and
+  certificates cannot be revoked one by one (see [Security](#security)).
 
 * **Two-phase commit and the state file**: a vote is durable on the shard (it survives a crash, a restart and, on a replicated
   shard, the loss of the leader), and a control node that stops after deciding finishes the commit when it is opened on its

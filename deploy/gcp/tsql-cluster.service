@@ -7,7 +7,9 @@ Wants=network-online.target
 [Service]
 User=tsql
 EnvironmentFile=/etc/tsql/cluster.env
-ExecStart=/usr/local/bin/tsql-cluster --config /etc/tsql/cluster.json --state /var/lib/tsql/cluster.state --listen 1433 --bind 0.0.0.0 --wait-shards 120 --metrics-listen 0.0.0.0:9100
+# /etc/tsql/certs as on the shards. Clients must encrypt; CLIENT_TLS in cluster.env may name a certificate they can verify
+# (--tls-cert FILE --tls-key FILE), else a self-signed one is made at each start.
+ExecStart=/usr/local/bin/tsql-cluster --config /etc/tsql/cluster.json --state /var/lib/tsql/cluster.state --listen 1433 --bind 0.0.0.0 --force-encryption $CLIENT_TLS --wait-shards 120 --metrics-listen 0.0.0.0:9100 --node-ca /etc/tsql/certs/ca.pem --node-cert /etc/tsql/certs/node.pem --node-key /etc/tsql/certs/node.key
 KillSignal=SIGTERM
 TimeoutStopSec=30
 Restart=on-failure

@@ -3,7 +3,7 @@ mod common;
 use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
-use tsql_server::tds::{Config as ListenConfig, Encryption, Listener, TlsConfig};
+use tsql_server::tds::{Config as ListenConfig, Encryption, Listener, ListenerTls, TlsConfig};
 
 type C = Client<Compat<TcpStream>>;
 
@@ -133,4 +133,30 @@ async fn tls13_can_be_offered_alongside_tls12() {
     let mut c = login(&l, EncryptionLevel::Off, "Str0ng!pw").await.expect("TLS 1.3 login only");
     assert_eq!(two(&mut c).await, 2);
     l.shutdown();
+}
+
+#[test]
+fn beyond_this_machine_every_session_must_be_encrypted() {
+    let flags = |given: &str| {
+        let (mut flags, mut args) = (ListenerTls::default(), given.split_whitespace().map(String::from));
+        while let Some(a) = args.next() {
+            assert!(flags.take(&a, &mut args), "{a}");
+        }
+        flags
+    };
+    for local in ["127.0.0.1", "localhost", "::1"] {
+        assert!(flags("").check_exposure(local).is_ok(), "{local}");
+    }
+    for open in ["0.0.0.0", "::", "203.0.113.1", "no such host"] {
+        assert!(flags("").check_exposure(open).is_err(), "{open}");
+        assert!(flags("--force-encryption").check_exposure(open).is_ok(), "{open}");
+        assert!(flags("--force-encryption --no-tls").check_exposure(open).is_err(), "{open}");
+    }
+    let config = |given: &str| flags(given).config("127.0.0.1").map(|(c, _)| (c.tls.is_some(), c.encryption));
+    assert_eq!(config(""), Ok((true, Encryption::Optional)));
+    assert_eq!(config("--force-encryption --tls13"), Ok((true, Encryption::Required)));
+    assert_eq!(config("--no-tls").map(|c| c.0), Ok(false));
+    assert!(config("--no-tls --force-encryption").unwrap_err().contains("needs TLS"));
+    assert!(config("--tls-cert server.pem").unwrap_err().contains("go together"));
+    assert!(config("--tls-cert none.pem --tls-key none.key").unwrap_err().contains("cannot set up TLS"));
 }

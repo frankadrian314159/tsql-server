@@ -4,9 +4,10 @@ use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::{Action, Ticket};
 use futures::TryStreamExt;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 use tsql_server::{ResultSet, SqlError};
 use tsql_shared_ces::arrowconv;
+use tsql_shared_ces::tls::{self, NodeTls};
 use tsql_shared_ces::wire::{sql_error_of, Fragment, PrepareReq, RunReply, SettleReq, ShardStatus, Work, ACTION_CLOSE_SESSION, ACTION_KILL, ACTION_MEMBERS, ACTION_PREPARE, ACTION_PREPARED, ACTION_RUN, ACTION_SETTLE, ACTION_STATUS, ACTION_WAITS, IN_DOUBT, NOT_LEADER};
 use tsql_shared_ces::wire::MemberReq;
 use tsql_shared_ces::wire::{LoadReq, ShuffleReq, ACTION_LOAD, ACTION_METRICS, ACTION_SHUFFLE};
@@ -57,13 +58,13 @@ fn make_flight_client(ch: Channel) -> FlightClient {
 
 impl ShardClient {
     /// The connection is made on first use. Must be called inside a tokio runtime.
-    pub fn new(id: u32, addr: &str) -> Result<ShardClient, SqlError> {
+    pub fn new(id: u32, addr: &str, tls: Option<&NodeTls>) -> Result<ShardClient, SqlError> {
         let mut channels = vec![];
         for a in addr.split(',').map(str::trim).filter(|a| !a.is_empty()) {
             let mut pool = Vec::with_capacity(CHANNELS_PER_ENDPOINT);
             for _ in 0..CHANNELS_PER_ENDPOINT {
-                let ch = Endpoint::from_shared(format!("http://{}", a))
-                    .map_err(|e| SqlError::new(40613, format!("bad shard address {}: {}", a, e)))?
+                let ch = tls::endpoint(a, tls)
+                    .map_err(|e| SqlError::new(40613, e))?
                     .tcp_nodelay(true)
                     .initial_stream_window_size(Some(1 << 20))
                     .initial_connection_window_size(Some(8 << 20))

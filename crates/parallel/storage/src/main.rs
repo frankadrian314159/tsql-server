@@ -12,10 +12,15 @@
 //! SIGTERM (what systemd and Google Compute Engine send) and on Ctrl-C: it refuses new work, lets open transactions finish,
 //! rolls back what is still open, forces the log and writes a checkpoint, then closes its listener.
 //!
+//! Connections to and from other nodes use mutual TLS: give `--node-ca FILE --node-cert FILE --node-key FILE` (made by
+//! `tsql-cluster --make-certs`), or `--insecure` to leave them unprotected, so that anyone who reaches the port can run
+//! any T-SQL on the shard as `sa`.
+//!
 //! Without `--data` the shard keeps its data in memory; with it the shard is durable (write-ahead log and checkpoints in
 //! DIR, exactly like a single-node `tsql-serve DIR`).
 use std::net::SocketAddr;
 use tsql_server::Server;
+use tsql_shared_ces::tls::TlsFlags;
 use tsql_storage::{spawn, ReplicaConfig, ShardNode};
 
 #[cfg(feature = "fast-alloc")]
@@ -23,7 +28,7 @@ use tsql_storage::{spawn, ReplicaConfig, ShardNode};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn usage() -> ! {
-    eprintln!("usage: tsql-shard --id N --listen HOST:PORT [--data DIR]\n       tsql-shard --id N --listen HOST:PORT --data DIR --replica R --peers R2=HOST:PORT,R3=HOST:PORT [--raft-dir DIR]");
+    eprintln!("usage: tsql-shard --id N --listen HOST:PORT [--data DIR]\n       tsql-shard --id N --listen HOST:PORT --data DIR --replica R --peers R2=HOST:PORT,R3=HOST:PORT [--raft-dir DIR]\n       both need --node-ca FILE --node-cert FILE --node-key FILE, or --insecure");
     std::process::exit(2);
 }
 
@@ -40,8 +45,12 @@ async fn main() {
     let mut snapshot_every: Option<u64> = None;
     let mut drain_secs: u64 = 15;
     let mut metrics_listen: Option<String> = None;
+    let mut tls = TlsFlags::default();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
+        if tls.take(&a, &mut args) {
+            continue;
+        }
         match a.as_str() {
             "--id" => id = args.next().and_then(|v| v.parse().ok()),
             "--listen" => listen = args.next().and_then(|v| v.parse().ok()),
@@ -68,6 +77,13 @@ async fn main() {
         }
     }
     let (Some(id), Some(listen)) = (id, listen) else { usage() };
+    let tls = tls.load().unwrap_or_else(|e| {
+        eprintln!("tsql-shard: {}", e);
+        std::process::exit(2);
+    });
+    if tls.is_none() {
+        eprintln!("tsql-shard {}: WARNING: connections are neither encrypted nor authenticated (--insecure)", id);
+    }
     let server = match &data {
         Some(dir) => match Server::open(dir) {
             Ok(s) => s,
@@ -87,6 +103,7 @@ async fn main() {
             let dir = raft_dir.clone().unwrap_or_else(|| format!("{}.raft", d));
             let mut rc = ReplicaConfig::new(r, peers.clone(), dir);
             rc.join = join;
+            rc.tls = tls;
             rc.addr = addr.clone().unwrap_or_else(|| listen.to_string());
             if let Some(n) = snapshot_every {
                 rc.snapshot_every = n;
@@ -99,7 +116,7 @@ async fn main() {
                 }
             }
         }
-        None => ShardNode::new(id, server),
+        None => ShardNode::new(id, server).with_tls(tls),
     };
     let control = node.control();
     if let Some(addr) = &metrics_listen {

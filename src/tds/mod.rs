@@ -1318,6 +1318,59 @@ pub struct Config {
     pub encryption: Encryption,
 }
 
+/// The `--tls-cert`, `--tls-key`, `--no-tls`, `--force-encryption` and `--tls13` flags of `tsql-serve` and `tsql-cluster`.
+#[derive(Default)]
+pub struct ListenerTls {
+    cert: Option<String>,
+    key: Option<String>,
+    no_tls: bool,
+    force: bool,
+    tls13: bool,
+}
+
+impl ListenerTls {
+    /// Take `flag`, with its value from `args`, if it is one of these.
+    pub fn take(&mut self, flag: &str, args: &mut impl Iterator<Item = String>) -> bool {
+        match flag {
+            "--tls-cert" => self.cert = Some(args.next().unwrap_or_default()),
+            "--tls-key" => self.key = Some(args.next().unwrap_or_default()),
+            "--no-tls" => self.no_tls = true,
+            "--force-encryption" => self.force = true,
+            "--tls13" => self.tls13 = true,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Whether `bind` may be listened on: beyond this machine every session must be encrypted, or whoever sees the network
+    /// reads the statements and their results.
+    pub fn check_exposure(&self, bind: &str) -> Result<(), String> {
+        let local = std::net::ToSocketAddrs::to_socket_addrs(&(bind, 0)).is_ok_and(|found| {
+            let found: Vec<_> = found.collect();
+            !found.is_empty() && found.iter().all(|a| a.ip().is_loopback())
+        });
+        if local || (self.force && !self.no_tls) {
+            return Ok(());
+        }
+        Err(format!("listening on {bind}, beyond this machine, needs encryption for every client (--force-encryption)"))
+    }
+
+    /// The listener's configuration, and a note on its encryption. TLS is offered unless `--no-tls`: without a certificate
+    /// and key a self-signed certificate (for this machine's names and `bind`) is made.
+    pub fn config(&self, bind: &str) -> Result<(Config, &'static str), String> {
+        if self.no_tls {
+            return if self.force { Err("--force-encryption needs TLS".into()) } else { Ok((Config::default(), "no encryption")) };
+        }
+        let tls = match (&self.cert, &self.key) {
+            (Some(c), Some(k)) => TlsConfig::from_pem_files(c, k).map(|t| (t, "TLS")),
+            (None, None) => TlsConfig::self_signed(vec!["localhost".into(), "127.0.0.1".into(), bind.into()]).map(|t| (t, "TLS, self-signed certificate")),
+            _ => return Err("--tls-cert and --tls-key go together".into()),
+        };
+        let (tls, note) = tls.and_then(|(t, note)| if self.tls13 { t.tls13(true).map(|t| (t, note)) } else { Ok((t, note)) }).map_err(|e| format!("cannot set up TLS: {e}"))?;
+        Ok((Config::with_tls(tls, if self.force { Encryption::Required } else { Encryption::Optional }), note))
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config { max_packet: 32767, tls: None, encryption: Encryption::Optional, mars: true, auth: AuthConfig::default() }

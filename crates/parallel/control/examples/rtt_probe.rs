@@ -17,7 +17,7 @@ fn main() {
     assert!(cs.execute("INSERT t VALUES (1, 1), (2, 2)").first_error().is_none());
     let n = 3000;
     let _g = rt.enter();
-    let client = ShardClient::new(0, &addr).unwrap();
+    let client = ShardClient::new(0, &addr, None).unwrap();
     let t = Instant::now();
     for _ in 0..n {
         rt.block_on(client.status()).unwrap();

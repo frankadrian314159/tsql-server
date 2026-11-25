@@ -12,5 +12,7 @@ arrow-schema = "60"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 postcard = { version = "1", features = ["alloc"] }
-tonic = "0.14"
+tonic = { version = "0.14", features = ["tls-ring"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 sysinfo = { version = "0.30", default-features = false }

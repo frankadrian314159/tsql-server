@@ -145,7 +145,7 @@ first; run the whole suite in the paged and spill modes; `tests/paging.rs`, `per
 | `control` (`tsql-control`, binary `tsql-cluster`) | `src/lib.rs`: `Cluster` and `ClusterSession`, how each statement is routed (`exec_stmt`), `run_query_flat` (the order in which ways of running a query are tried). `plan.rs`: a query over one table split into a part for each shard and a combining part. `joins.rs`, `mpp.rs`: joins over sharded tables (co-located, broadcast, repartitioned, in stages). `pushdown.rs`, `nested.rs`: subqueries. `gather.rs`: the fallback that copies tables to the control node. `txn.rs`: two-phase commit. `fk.rs`, `procs.rs`, `advisor.rs`, `rebalance.rs`, `autoscale.rs`, `front.rs` (the TDS front end) |
 | `storage` (`tsql-storage`, binary `tsql-shard`) | a shard: the Arrow Flight service in `src/lib.rs`, the shard-to-shard row shuffle in `shuffle.rs`, replication in `replica.rs` |
 | `raft` | the consensus core |
-| `shared-ces` | what the nodes share: the wire messages (`wire.rs`), the key hash and slot function (`route.rs`), Arrow conversion, configuration |
+| `shared-ces` | what the nodes share: the wire messages (`wire.rs`), the key hash and slot function (`route.rs`), Arrow conversion, configuration, mutual TLS between nodes (`tls.rs`) |
 
 A rule the cluster follows: **the shards run the real engine**. Anything a shard can do for itself should be sent to it as a statement, not
 reimplemented in the control node; the control node's job is to decide where a statement runs and to combine the results. A new way of

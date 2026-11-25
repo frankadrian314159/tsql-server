@@ -58,6 +58,7 @@ pub mod txn;
 
 use astutil::*;
 use client::ShardClient;
+use tsql_shared_ces::tls::NodeTls;
 use fk::{without_fks, FkDef};
 use futures::future::join_all;
 use plan::Shape;
@@ -179,6 +180,8 @@ pub struct Identity {
 pub struct Cluster {
     rt: tokio::runtime::Runtime,
     shards: RwLock<Vec<ShardClient>>,
+    /// the certificates with which shards are reached (none: unprotected connections)
+    tls: Option<NodeTls>,
     /// which shard owns each hash slot
     slots: RwLock<Vec<u32>>,
     /// every successful CREATE / DROP of a table or index, in order: how a new shard (or a restarted control node) learns the
@@ -277,6 +280,11 @@ fn make_verdict(pending: &Arc<Mutex<Vec<(u64, Vec<usize>)>>>, preparing: &Arc<Mu
 
 impl Cluster {
     pub fn connect(config: &ClusterConfig) -> Result<Arc<Cluster>, SqlError> {
+        Cluster::connect_with(config, None)
+    }
+
+    /// [`Cluster::connect`], reaching the shards over mutual TLS when there is `tls`.
+    pub fn connect_with(config: &ClusterConfig, tls: Option<NodeTls>) -> Result<Arc<Cluster>, SqlError> {
         config.validate().map_err(|e| SqlError::new(50000, e))?;
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(2, 8)).enable_all().build().map_err(|e| SqlError::new(50000, e.to_string()))?;
         let pending = Arc::new(Mutex::new(vec![]));
@@ -284,12 +292,13 @@ impl Cluster {
         let verdict = make_verdict(&pending, &preparing);
         let shards = {
             let _g = rt.enter();
-            config.shards.iter().map(|s| ShardClient::new(s.id, &s.addr).map(|c| c.with_verdict(verdict.clone()))).collect::<Result<Vec<_>, _>>()?
+            config.shards.iter().map(|s| ShardClient::new(s.id, &s.addr, tls.as_ref()).map(|c| c.with_verdict(verdict.clone()))).collect::<Result<Vec<_>, _>>()?
         };
         let n = shards.len();
         let cluster = Arc::new(Cluster {
             rt,
             shards: RwLock::new(shards),
+            tls,
             slots: RwLock::new((0..SLOTS).map(|i| (i % n) as u32).collect()),
             schema_log: Mutex::new(vec![]),
             state_path: None,

@@ -60,7 +60,9 @@ on its own threads (one per client) and returns a handle with `local_addr()`, `w
 ## Encryption (TLS)
 
 `tsql-serve` offers TLS by default, with a self-signed certificate generated at start-up (as SQL Server does when no
-certificate is installed). Clients must then trust the server certificate (`TrustServerCertificate=True`,
+certificate is installed); so does a cluster's control node (`tsql-cluster --listen`), which takes the same flags and
+requires `--force-encryption` to listen beyond this machine ([distributed.md](distributed.md#security)). Clients must
+then trust the server certificate (`TrustServerCertificate=True`,
 `Encrypt=Optional`, tiberius `trust_cert()`), or you supply a real one:
 
 ```text

@@ -6,8 +6,9 @@ use arrow_flight::Action;
 use futures::TryStreamExt;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 use tonic::Status;
+use tsql_shared_ces::tls::{self, NodeTls};
 use tsql_shared_ces::wire::{LoadReq, ACTION_LOAD};
 
 /// Rows per `load` action (a message stays well under the transport's size limit).
@@ -15,6 +16,8 @@ const LOAD_ROWS: usize = 5000;
 
 #[derive(Default)]
 pub struct Peers {
+    /// this node's certificates: for these connections, and for its own listener
+    pub tls: Option<NodeTls>,
     channels: Mutex<HashMap<String, Channel>>,
 }
 
@@ -32,8 +35,8 @@ impl Peers {
         if let Some(c) = m.get(addr) {
             return Ok(c.clone());
         }
-        let ch = Endpoint::from_shared(format!("http://{}", addr))
-            .map_err(|e| Status::invalid_argument(format!("bad shard address {}: {}", addr, e)))?
+        let ch = tls::endpoint(addr, self.tls.as_ref())
+            .map_err(Status::invalid_argument)?
             .tcp_nodelay(true)
             .connect_timeout(std::time::Duration::from_secs(2))
             .connect_lazy();

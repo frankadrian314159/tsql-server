@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use tsql_server::ast::*;
 use tsql_server::{Server, SqlError, Value};
 use tsql_shared_ces::route::{key_hash, slot_of, SLOTS};
+use tsql_shared_ces::tls::NodeTls;
 use tsql_shared_ces::wire::Work;
 use tsql_shared_ces::ClusterConfig;
 
@@ -41,7 +42,12 @@ impl Cluster {
     /// the cluster is restored from it (and `config` is not consulted), else it is created from `config` and the file is
     /// written. The control node can then be restarted without losing track of the data on the shards.
     pub fn open(state_path: impl Into<PathBuf>, config: &ClusterConfig) -> Result<Arc<Cluster>, SqlError> {
-        Cluster::open_inner(state_path.into(), config, false)
+        Cluster::open_with(state_path, config, None)
+    }
+
+    /// [`Cluster::open`], reaching the shards over mutual TLS when there is `tls`.
+    pub fn open_with(state_path: impl Into<PathBuf>, config: &ClusterConfig, tls: Option<NodeTls>) -> Result<Arc<Cluster>, SqlError> {
+        Cluster::open_inner(state_path.into(), config, false, tls)
     }
 
     /// Another front end for a cluster that is running: a control node that reads the catalogue (shards, slot map, tables) from the
@@ -52,10 +58,15 @@ impl Cluster {
     /// control node that owns the state. Deadlocks across front ends are found by each one's detector (it sees all waits on the
     /// shards) or end at the lock timeout.
     pub fn attach(state_path: impl Into<PathBuf>) -> Result<Arc<Cluster>, SqlError> {
-        Cluster::open_inner(state_path.into(), &ClusterConfig::default(), true)
+        Cluster::attach_with(state_path, None)
     }
 
-    fn open_inner(path: PathBuf, config: &ClusterConfig, attach: bool) -> Result<Arc<Cluster>, SqlError> {
+    /// [`Cluster::attach`], reaching the shards over mutual TLS when there is `tls`.
+    pub fn attach_with(state_path: impl Into<PathBuf>, tls: Option<NodeTls>) -> Result<Arc<Cluster>, SqlError> {
+        Cluster::open_inner(state_path.into(), &ClusterConfig::default(), true, tls)
+    }
+
+    fn open_inner(path: PathBuf, config: &ClusterConfig, attach: bool, tls: Option<NodeTls>) -> Result<Arc<Cluster>, SqlError> {
         let (addrs, slots, tables, log, pending, views, fks, routes) = match std::fs::read(&path) {
             Ok(bytes) => {
                 let st: State = postcard::from_bytes(&bytes).map_err(|e| SqlError::new(50000, format!("{}: bad cluster state: {}", path.display(), e)))?;
@@ -74,7 +85,7 @@ impl Cluster {
         let verdict = crate::make_verdict(&pending, &preparing);
         let shards = {
             let _g = rt.enter();
-            addrs.iter().enumerate().map(|(i, a)| ShardClient::new(i as u32, a).map(|c| c.with_verdict(verdict.clone()))).collect::<Result<Vec<_>, _>>()?
+            addrs.iter().enumerate().map(|(i, a)| ShardClient::new(i as u32, a, tls.as_ref()).map(|c| c.with_verdict(verdict.clone()))).collect::<Result<Vec<_>, _>>()?
         };
         let n = shards.len();
         let slots = slots.unwrap_or_else(|| (0..SLOTS).map(|i| (i % n) as u32).collect());
@@ -106,6 +117,7 @@ impl Cluster {
         let cluster = Arc::new(Cluster {
             rt,
             shards: RwLock::new(shards),
+            tls,
             slots: RwLock::new(slots),
             schema_log: Mutex::new(log),
             state_path: if attach { None } else { Some(path) },
@@ -225,7 +237,7 @@ impl Cluster {
         let mut s = self.session();
         let id = self.rt.block_on(async {
             let id = s.cluster.shard_count();
-            let client = ShardClient::new(id as u32, addr)?.with_verdict(s.cluster.verdict_fn());
+            let client = ShardClient::new(id as u32, addr, self.tls.as_ref())?.with_verdict(s.cluster.verdict_fn());
             client.status().await?;
             s.cluster.shards.write().unwrap_or_else(|e| e.into_inner()).push(client);
             let r = async {

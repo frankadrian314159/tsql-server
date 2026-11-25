@@ -46,7 +46,7 @@ impl Cluster {
         let id = self.shard(shard).id;
         let client = {
             let _g = self.rt.enter();
-            ShardClient::new(id, &addrs.join(","))?.with_verdict(self.verdict_fn())
+            ShardClient::new(id, &addrs.join(","), self.tls.as_ref())?.with_verdict(self.verdict_fn())
         };
         self.shards.write().unwrap_or_else(|e| e.into_inner())[shard] = client;
         self.save_state();

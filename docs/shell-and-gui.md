@@ -52,7 +52,7 @@ cargo run --release --features gui --bin tsql-gui -- --connect HOST[:PORT] [-U L
 
 The app works on a server over TDS, like any client:
 
-* `--connect HOST[:PORT]` (with `-U`, `-P`, `-d`, `--encrypt`) names the server: a cluster's control node (`tsql-cluster --listen 1433`), `tsql-serve`,
+* `--connect HOST[:PORT]` (with `-U`, `-P`, `-d`, `--encrypt`, which a server that forces encryption requires) names the server: a cluster's control node (`tsql-cluster --listen 1433`), `tsql-serve`,
   or any server that speaks TDS. **File > Connect to server...** does the same from inside the app.
 * Without it, the app looks at `127.0.0.1:1433`. When something listens there it connects to it (the login is `sa` and the
   password is in the environment variable `TSQL_PASSWORD`; `TSQL_LOGIN` names another login). If the login is refused, the connect window opens

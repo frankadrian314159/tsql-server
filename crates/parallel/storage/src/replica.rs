@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use tsql_raft::{Conf, ConfError, Config, Entry, FileStorage, Member, Msg, NodeId, Raft, Role, Snapshot, Storage};
 use tsql_server::persist::{Replicator, WalRecord};
 use tsql_server::Server;
+use tsql_shared_ces::tls::NodeTls;
 
 /// What the group's log carries.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -59,11 +60,13 @@ pub struct ReplicaConfig {
     pub join: bool,
     /// take a snapshot and cut the log after this many applied entries (0: never)
     pub snapshot_every: u64,
+    /// mutual TLS with the other replicas (and for the node's listener); none: unprotected connections
+    pub tls: Option<NodeTls>,
 }
 
 impl ReplicaConfig {
     pub fn new(node_id: NodeId, peers: Vec<(NodeId, String)>, dir: impl Into<PathBuf>) -> ReplicaConfig {
-        ReplicaConfig { node_id, peers, dir: dir.into(), tick_ms: 20, election_ticks: 10, heartbeat_ticks: 2, sync: true, addr: String::new(), join: false, snapshot_every: 5000 }
+        ReplicaConfig { node_id, peers, dir: dir.into(), tick_ms: 20, election_ticks: 10, heartbeat_ticks: 2, sync: true, addr: String::new(), join: false, snapshot_every: 5000, tls: None }
     }
 }
 
@@ -152,7 +155,7 @@ impl Replica {
             snapshots_installed: Default::default(),
         });
         server.set_replicator(Some(Arc::new(ReplHandle(replica.clone()))));
-        crate::transport::spawn_sender(cfg.node_id, book, orx);
+        crate::transport::spawn_sender(cfg.node_id, book, cfg.tls.clone(), orx);
         let r2 = replica.clone();
         std::thread::Builder::new().name(format!("raft-{}", cfg.node_id)).spawn(move || r2.run()).expect("spawn the raft thread");
         Ok(replica)

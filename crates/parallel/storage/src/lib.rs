@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use tonic::{Request, Response, Status, Streaming};
 use tsql_server::{Connection, Event, ResultSet, Server};
 use tsql_shared_ces::arrowconv;
+use tsql_shared_ces::tls::NodeTls;
 use tsql_shared_ces::wire::{self, status_for, Fragment, PrepareReq, RunReply, SettleReq, WireError, WireEvent, Work, ACTION_CLOSE_SESSION, ACTION_PREPARE, ACTION_KILL, ACTION_MEMBERS, ACTION_PREPARED, ACTION_RAFT, ACTION_RUN, ACTION_RUN_SETS, ACTION_SETTLE, ACTION_STATUS, ACTION_WAITS, IN_DOUBT, MEMBERSHIP, NOT_LEADER};
 use tsql_shared_ces::wire::MemberReq;
 use tsql_shared_ces::wire::{LoadReq, ShuffleReq, ACTION_LOAD, ACTION_METRICS, ACTION_SHUFFLE, SHUTTING_DOWN};
@@ -190,8 +191,16 @@ impl ShardNode {
     /// in `cfg.dir`. Must be called inside a tokio runtime.
     pub fn replicated(shard_id: u32, server: Server, cfg: ReplicaConfig) -> std::io::Result<ShardNode> {
         let server = Arc::new(server);
+        let tls = cfg.tls.clone();
         let replica = Replica::start(cfg, server.clone())?;
-        Ok(ShardNode::build(shard_id, server, Some(replica)))
+        Ok(ShardNode::build(shard_id, server, Some(replica)).with_tls(tls))
+    }
+
+    /// The same node with mutual TLS (`None`: unprotected): its listener refuses callers without a certificate of the
+    /// cluster's authority, and it shows its own when it calls other shards. (A replica gets it from its `ReplicaConfig`.)
+    pub fn with_tls(mut self, tls: Option<NodeTls>) -> ShardNode {
+        self.peers.tls = tls;
+        self
     }
 
     fn build(shard_id: u32, server: Arc<Server>, replica: Option<Arc<Replica>>) -> ShardNode {
@@ -729,14 +738,18 @@ pub async fn spawn_on(node: ShardNode, listener: tokio::net::TcpListener) -> std
     let server = node.server().clone();
     let replica = node.replica().cloned();
     let control = node.control();
+    // (many sessions share one connection from the control node: lift the limits that would otherwise close it under load)
+    let mut builder = tonic::transport::Server::builder()
+        .max_concurrent_streams(Some(1024))
+        .http2_max_pending_accept_reset_streams(Some(4096))
+        .initial_stream_window_size(Some(1 << 20))
+        .initial_connection_window_size(Some(8 << 20));
+    if let Some(tls) = &node.peers.tls {
+        builder = builder.tls_config(tls.server()).map_err(std::io::Error::other)?;
+    }
     let svc = node.into_service();
     let join = tokio::spawn(async move {
-        // (many sessions share one connection from the control node: lift the limits that would otherwise close it under load)
-        let _ = tonic::transport::Server::builder()
-            .max_concurrent_streams(Some(1024))
-            .http2_max_pending_accept_reset_streams(Some(4096))
-            .initial_stream_window_size(Some(1 << 20))
-            .initial_connection_window_size(Some(8 << 20))
+        let _ = builder
             .add_service(svc)
             .serve_with_incoming_shutdown(incoming, async {
                 let _ = stopped.await;

@@ -6,7 +6,7 @@
 //!             [--aad-tenant ID --aad-jwks FILE [--aad-audience URI]...]
 //!             [--kerberos [--kerberos-service SPN] [--kerberos-keytab FILE] [--allow-ntlm]]
 //! ```
-use tsql_server::tds::{AadConfig, AuthConfig, Config, Encryption, JwksSource, KerberosConfig, Listener, TlsConfig};
+use tsql_server::tds::{AadConfig, AuthConfig, JwksSource, KerberosConfig, Listener, ListenerTls};
 use tsql_server::{Server, StorageOptions};
 
 fn usage() -> ! {
@@ -44,23 +44,20 @@ fn main() {
     let mut bind = "127.0.0.1".to_string();
     let mut sa = std::env::var("TSQL_SA_PASSWORD").ok();
     let mut opts = StorageOptions::default();
-    let (mut cert, mut key, mut no_tls, mut force) = (None::<String>, None::<String>, false, false);
-    let mut tls13 = false;
+    let mut tls = ListenerTls::default();
     let mut mars = true;
     let (mut aad_tenant, mut aad_jwks, mut aad_aud) = (None::<String>, None::<String>, Vec::<String>::new());
     let (mut kerberos, mut krb_service, mut krb_keytab, mut allow_ntlm) = (false, None::<String>, None::<String>, false);
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
+        if tls.take(&a, &mut args) {
+            continue;
+        }
         match a.as_str() {
             "--port" => port = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "--bind" => bind = args.next().unwrap_or_else(|| usage()),
             "--sa-password" => sa = Some(args.next().unwrap_or_else(|| usage())),
             "--pool-pages" => opts.pool_pages = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
-            "--tls-cert" => cert = Some(args.next().unwrap_or_else(|| usage())),
-            "--tls-key" => key = Some(args.next().unwrap_or_else(|| usage())),
-            "--no-tls" => no_tls = true,
-            "--force-encryption" => force = true,
-            "--tls13" => tls13 = true,
             "--no-mars" => mars = false,
             "--aad-tenant" => aad_tenant = Some(args.next().unwrap_or_else(|| usage())),
             "--aad-jwks" => aad_jwks = Some(args.next().unwrap_or_else(|| usage())),
@@ -92,29 +89,10 @@ fn main() {
             std::process::exit(1);
         }
     }
-    let mut cfg = Config::default();
-    let mut tls_note = "no encryption";
-    if !no_tls {
-        let tls = match (&cert, &key) {
-            (Some(c), Some(k)) => TlsConfig::from_pem_files(c, k).map(|t| (t, "TLS")),
-            (None, None) => TlsConfig::self_signed(vec!["localhost".into(), "127.0.0.1".into(), bind.clone()]).map(|t| (t, "TLS, self-signed certificate")),
-            _ => usage(),
-        };
-        let tls = tls.and_then(|(t, note)| if tls13 { t.tls13(true).map(|t| (t, note)) } else { Ok((t, note)) });
-        match tls {
-            Ok((t, note)) => {
-                cfg = Config::with_tls(t, if force { Encryption::Required } else { Encryption::Optional });
-                tls_note = note;
-            }
-            Err(e) => {
-                eprintln!("cannot set up TLS: {}", e);
-                std::process::exit(1);
-            }
-        }
-    } else if force {
-        eprintln!("--force-encryption needs TLS");
-        std::process::exit(2);
-    }
+    let (mut cfg, tls_note) = tls.config(&bind).unwrap_or_else(|e| {
+        eprintln!("{}", e);
+        std::process::exit(1);
+    });
     cfg.mars = mars;
     let mut auth = AuthConfig::default();
     match (aad_tenant, aad_jwks) {

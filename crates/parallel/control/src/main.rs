@@ -1,6 +1,10 @@
 //! `tsql-cluster`: a command-line shell for a distributed tsql-server cluster.
 //!
 //!   tsql-cluster --config cluster.json < script.sql
+//!   tsql-cluster --make-certs DIR NAME...
+//!
+//! Connections to the shards use mutual TLS: give `--node-ca FILE --node-cert FILE --node-key FILE`, or `--insecure` to
+//! leave them unprotected. `--make-certs` writes a certificate authority and a certificate for every node into DIR.
 //!
 //! Reads T-SQL batches from standard input (a batch ends at a line `GO`, or at the end of input), runs them through the
 //! control node and prints the result sets as tab-separated text, with the plan that was used on stderr (`--plan`).
@@ -8,6 +12,9 @@
 //! As a server (`--listen PORT`) it serves SQL Server clients over TDS. More flags for a server:
 //!
 //! * `--bind HOST` the address to listen on (default 127.0.0.1; use 0.0.0.0 for clients on other machines);
+//! * TLS for clients is as in `tsql-serve`: offered with a self-signed certificate, or `--tls-cert FILE --tls-key FILE`;
+//!   `--force-encryption`, `--tls13`, `--no-tls`. Listening on an address that other machines can reach needs
+//!   `--force-encryption`, or `--insecure-clients`;
 //! * `--wait-shards SECS` wait that long for every shard to answer before serving (default 30: shards and control node may be
 //!   started together), and exit with an error when some do not;
 //! * `--metrics-listen HOST:PORT` serve `/metrics` (Prometheus text: CPU, memory, disk and network use of the control node and
@@ -23,12 +30,19 @@ use std::io::BufRead;
 use tsql_control::autoscale::{Action, Autoscaler, CommandProvisioner};
 use tsql_control::rebalance::ScalePolicy;
 use tsql_control::Cluster;
+use tsql_server::tds::ListenerTls;
 use tsql_server::{convert::display, Event};
+use tsql_shared_ces::tls::{make_certs, TlsFlags};
 use tsql_shared_ces::ClusterConfig;
 
 #[cfg(feature = "fast-alloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+fn fail(why: impl std::fmt::Display) -> ! {
+    eprintln!("tsql-cluster: {}", why);
+    std::process::exit(2)
+}
 
 fn main() {
     let mut config: Option<String> = None;
@@ -42,13 +56,25 @@ fn main() {
     let (mut autoscale, mut up_cmd, mut down_cmd) = (false, None::<String>, None::<String>);
     let mut scale_interval: u64 = 10;
     let mut policy = ScalePolicy::default();
+    let (mut node_tls, mut client_tls, mut insecure_clients) = (TlsFlags::default(), ListenerTls::default(), false);
     let mut args = std::env::args().skip(1);
     let num = |v: Option<String>| v.and_then(|v| v.parse::<f64>().ok()).unwrap_or_else(|| {
         eprintln!("tsql-cluster: a number is needed after the flag");
         std::process::exit(2)
     });
     while let Some(a) = args.next() {
+        if node_tls.take(&a, &mut args) || client_tls.take(&a, &mut args) {
+            continue;
+        }
         match a.as_str() {
+            "--make-certs" => {
+                let dir = args.next().unwrap_or_else(|| fail("--make-certs needs a directory and the names of the nodes"));
+                let names: Vec<String> = args.collect();
+                make_certs(&dir, &names).unwrap_or_else(|e| fail(e));
+                eprintln!("tsql-cluster: certificates are in {}", dir);
+                return;
+            }
+            "--insecure-clients" => insecure_clients = true,
             "--config" => config = args.next(),
             "--plan" => show_plan = true,
             "--state" => state = args.next(),
@@ -71,7 +97,7 @@ fn main() {
             "--min-shards" => policy.min_shards = num(args.next()) as usize,
             "--max-shards" => policy.max_shards = num(args.next()) as usize,
             _ => {
-                eprintln!("usage: tsql-cluster --config cluster.json [--state FILE] [--plan] < script.sql\n       tsql-cluster --config cluster.json [--state FILE] --listen PORT [--sa-password PW]   (serve TDS clients)");
+                eprintln!("usage: tsql-cluster --config cluster.json [--state FILE] [--plan] < script.sql\n       tsql-cluster --config cluster.json [--state FILE] --listen PORT [--sa-password PW]   (serve TDS clients)\n         [--bind HOST] [--tls-cert FILE --tls-key FILE | --no-tls] [--force-encryption] [--tls13] [--insecure-clients]\n       tsql-cluster --make-certs DIR NAME...\n       connections to the shards need --node-ca FILE --node-cert FILE --node-key FILE, or --insecure");
                 std::process::exit(2);
             }
         }
@@ -84,9 +110,23 @@ fn main() {
         eprintln!("tsql-cluster: {}", e);
         std::process::exit(1);
     });
+    let node_tls = node_tls.load().unwrap_or_else(|e| fail(e));
+    if node_tls.is_none() {
+        eprintln!("tsql-cluster: WARNING: connections to the shards are neither encrypted nor authenticated (--insecure)");
+    }
+    // how clients will be served: refuse an unsafe address before anything is started
+    let serving = listen.map(|_| {
+        if let Err(why) = client_tls.check_exposure(&bind) {
+            if !insecure_clients {
+                fail(format!("{}, or --insecure-clients to listen unprotected", why));
+            }
+            eprintln!("tsql-cluster: WARNING: {}; continuing (--insecure-clients)", why);
+        }
+        client_tls.config(&bind).unwrap_or_else(|e| fail(e))
+    });
     let cluster = match &state {
-        Some(p) => Cluster::open(p, &cfg),
-        None => Cluster::connect(&cfg),
+        Some(p) => Cluster::open_with(p, &cfg, node_tls),
+        None => Cluster::connect_with(&cfg, node_tls),
     }
     .unwrap_or_else(|e| {
         eprintln!("tsql-cluster: {}", e.message);
@@ -108,7 +148,7 @@ fn main() {
             }
         }
     }
-    if let Some(port) = listen {
+    if let Some((port, (tds, encryption))) = listen.zip(serving) {
         // serve SQL Server clients (TDS): the control node's own engine is the front, and an interceptor sends what touches
         // distributed tables to the cluster
         cluster.enable_tds();
@@ -121,9 +161,9 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        match tsql_server::tds::Listener::bind(server, (bind.as_str(), port), tsql_server::tds::Config::default()) {
+        match tsql_server::tds::Listener::bind(server, (bind.as_str(), port), tds) {
             Ok(l) => {
-                eprintln!("tsql-cluster: control node listening on {} (TDS), {} shards", l.local_addr(), cluster.shard_count());
+                eprintln!("tsql-cluster: control node listening on {} (TDS, {}), {} shards", l.local_addr(), encryption, cluster.shard_count());
                 let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 if autoscale {
                     let (Some(up), Some(down)) = (up_cmd.clone(), down_cmd.clone()) else {

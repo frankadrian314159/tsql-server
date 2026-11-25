@@ -3566,6 +3566,7 @@ version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -4145,7 +4146,7 @@ dependencies = [
  "rustls-native-certs",
  "rustls-pemfile",
  "thiserror 1.0.69",
- "tokio-rustls",
+ "tokio-rustls 0.24.1",
  "tokio-util",
  "tracing",
  "uuid",
@@ -4272,6 +4273,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-rustls"
+version = "0.26.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
+dependencies = [
+ "rustls 0.23.46",
+ "tokio",
+]
+
+[[package]]
 name = "tokio-stream"
 version = "0.1.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4349,6 +4360,7 @@ dependencies = [
  "socket2",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls 0.26.6",
  "tokio-stream",
  "tokio-util",
  "tower",
@@ -4507,7 +4519,9 @@ version = "0.1.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "chrono",
  "postcard",
+ "rcgen",
  "serde",
  "serde_json",
  "sysinfo",

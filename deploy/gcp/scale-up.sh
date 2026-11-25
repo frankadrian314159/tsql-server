@@ -1,6 +1,7 @@
 #!/bin/sh
 # Autoscaler "up" command: make a shard node, wait until it answers, print its address (last line).
 # Used as:  tsql-cluster ... --autoscale --scale-up-cmd /usr/local/bin/scale-up.sh --scale-down-cmd /usr/local/bin/scale-down.sh
+# The image must hold /etc/tsql/certs (ca.pem, node.pem, node.key of the cluster's authority): see tsql-shard.service.
 set -e
 N="tsql-shard-$(date +%s)"
 gcloud compute instances create "$N" --zone "${ZONE:-us-central1-a}" --machine-type "${MACHINE:-n2-standard-16}" \
