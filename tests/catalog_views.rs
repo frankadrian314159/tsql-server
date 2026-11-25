@@ -719,3 +719,12 @@ fn msdb_has_the_sql_server_agent_tables_and_they_are_empty() {
     }
     assert_eq!(scalar(&mut c, "SELECT COUNT(*) FROM schedule s JOIN msdb.dbo.sysjobs j ON (CONVERT(sysname, s.scheduleid) = j.name)"), "0");
 }
+
+#[test]
+fn only_a_database_with_a_memory_optimized_table_shows_its_filegroup_and_file() {
+    let mut c = conn();
+    let both = "SELECT (SELECT COUNT(*) FROM sys.filegroups WHERE type = 'FX') + (SELECT COUNT(*) FROM sys.database_files WHERE type = 2)";
+    assert_eq!(scalar(&mut c, both), "0");
+    exec(&mut c, "CREATE TABLE m (id INT NOT NULL PRIMARY KEY NONCLUSTERED) WITH (MEMORY_OPTIMIZED = ON, DURABILITY = SCHEMA_ONLY)");
+    assert_eq!(scalar(&mut c, both), "2");
+}

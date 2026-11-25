@@ -327,6 +327,10 @@ impl ClusterSession {
             let lookup = |i: &str| tables.get(i).cloned();
             for p in &def.params {
                 if let Ok(route) = procs::validate(&def.params, &p.name, &def.body, &lookup, &self.cluster) {
+                    // as for DISTRIBUTE PROCEDURE: not one that calls a function which reads sharded tables
+                    if self.cluster.procedure_calling_reader(Some(&id), false).is_some() {
+                        break;
+                    }
                     self.cluster.proc_routes.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), route);
                     return self.exec_routed_proc(ex, events).await;
                 }

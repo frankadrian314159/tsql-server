@@ -490,7 +490,9 @@ node's engine after every change of the table, so the names of constraints the e
 ## Stored procedures
 
 A procedure made with `CREATE PROCEDURE` is made on every shard and on the control node. `EXEC` of one that is declared with
-`DISTRIBUTE PROCEDURE` goes to the shard of its key (see *Procedures that run on one shard*). `EXEC` of any other procedure of the cluster
+`DISTRIBUTE PROCEDURE` goes to the shard of its key (see *Procedures that run on one shard*). A call with no `OUTPUT` parameter, return
+value or table-valued argument also declares an undeclared procedure by itself, on the first parameter that passes the same check, unless it
+calls a function that reads sharded tables. `EXEC` of any other procedure of the cluster
 runs on the control node: its body is run statement by statement by the session's own executor, so what it reads and writes goes through
 the cluster like any batch (a query over sharded tables is scattered, gathered or moved as it would be alone, and DML keeps its triggers,
 foreign keys and global indexes). That is what makes `EXEC` work anywhere a statement does: in a batch, in a procedure, in a trigger body.

@@ -61,6 +61,7 @@ use crate::storage::tx::{Isolation, Tx};
 use crate::storage::TxId;
 use std::ops::Deref;
 use std::cell::OnceCell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 // ------------------------------------------------------------------ results
@@ -571,7 +572,8 @@ pub struct Engine<'a> {
 // again, as most applications do, is not parsed again. The cache is keyed by the exact batch text; entries are dropped
 // at random-ish once there are too many. `DBCC FREEPROCCACHE` empties it. (Execution plans themselves are not cached:
 // the optimizer's decisions depend on the data and on the parameter values.)
-static PARSE_CACHE: std::sync::RwLock<Option<HashMap<String, (std::sync::Arc<Vec<Stmt>>, u64)>>> = std::sync::RwLock::new(None);
+// (the use count is atomic, so that a hit needs only the read lock)
+static PARSE_CACHE: std::sync::RwLock<Option<HashMap<String, (std::sync::Arc<Vec<Stmt>>, AtomicU64)>>> = std::sync::RwLock::new(None);
 
 thread_local! {
     static PARAM_CACHE: std::cell::RefCell<HashMap<String, std::rc::Rc<Vec<Param>>>> = std::cell::RefCell::new(HashMap::new());
@@ -604,6 +606,7 @@ pub fn cached_parse(sql: &str) -> std::result::Result<std::sync::Arc<Vec<Stmt>>,
         if let Ok(c) = PARSE_CACHE.read() {
             if let Some(map) = c.as_ref() {
                 if let Some(e) = map.get(sql) {
+                    e.1.fetch_add(1, Ordering::Relaxed);
                     return Ok(e.0.clone());
                 }
             }
@@ -618,12 +621,12 @@ pub fn cached_parse(sql: &str) -> std::result::Result<std::sync::Arc<Vec<Stmt>>,
             let map = c.get_or_insert_with(HashMap::new);
             if map.len() >= PARSE_CACHE_ENTRIES {
                 // make room: drop the least used half
-                let mut uses: Vec<u64> = map.values().map(|e| e.1).collect();
+                let mut uses: Vec<u64> = map.values().map(|e| e.1.load(Ordering::Relaxed)).collect();
                 uses.sort_unstable();
                 let cut = uses[uses.len() / 2];
-                map.retain(|_, e| e.1 > cut);
+                map.retain(|_, e| e.1.load(Ordering::Relaxed) > cut);
             }
-            map.insert(sql.to_string(), (stmts.clone(), 1));
+            map.insert(sql.to_string(), (stmts.clone(), AtomicU64::new(1)));
         }
     }
     Ok(stmts)
@@ -669,7 +672,7 @@ pub fn stmt_head_into(st: &Stmt, out: &mut String) {
 pub fn parse_cache_entries() -> Vec<(String, u64)> {
     if let Ok(c) = PARSE_CACHE.read() {
         if let Some(map) = c.as_ref() {
-            return map.iter().map(|(k, v)| (k.clone(), v.1)).collect();
+            return map.iter().map(|(k, v)| (k.clone(), v.1.load(Ordering::Relaxed))).collect();
         }
     }
     vec![]

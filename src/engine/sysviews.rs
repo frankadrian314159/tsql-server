@@ -203,6 +203,8 @@ impl<'a> Engine<'a> {
     pub fn sysview(&self, schema: &str, name: &str) -> Option<Rowset> {
         let db = self.srv.databases.get(&self.ses.db.to_lowercase())?;
         let dbname = db.name.clone();
+        // whether to show the memory-optimized filegroup and its file: only a database with such a table has them
+        let memory_optimized = || db.objects.values().any(|o| matches!(o, Object::Table(t) if t.memory_optimized));
         let sid = |s: &str| -> i32 { db.schema_id(&s.to_lowercase()) };
         let date = |d: chrono::NaiveDateTime| Value::DateTime(d, DtKind::DateTime);
         let lname = name.to_lowercase();
@@ -1092,8 +1094,9 @@ impl<'a> Engine<'a> {
                 "data_spaces" | "filegroups" => {
                     let mut cols = vec![("name", nv()), ("data_space_id", DataType::Int), ("type", nv()), ("type_desc", nv()), ("is_default", DataType::Bit), ("is_system", DataType::Bit)];
                     let mut rows = vec![vec![sv("PRIMARY"), Value::Int(1), sv("FG"), sv("ROWS_FILEGROUP"), Value::Bit(true), Value::Bit(false)]];
-                    let mod_name = format!("{}_mod", dbname);
-                    rows.push(vec![sv(&mod_name), Value::Int(2), sv("FX"), sv("MEMORY_OPTIMIZED_DATA_FILEGROUP"), Value::Bit(false), Value::Bit(false)]);
+                    if memory_optimized() {
+                        rows.push(vec![sv(&format!("{}_mod", dbname)), Value::Int(2), sv("FX"), sv("MEMORY_OPTIMIZED_DATA_FILEGROUP"), Value::Bit(false), Value::Bit(false)]);
+                    }
                     if lname == "filegroups" {
                         cols.extend([("filegroup_guid", DataType::Guid), ("log_filegroup_id", DataType::Int), ("is_read_only", DataType::Bit), ("is_autogrow_all_files", DataType::Bit)]);
                         for r in &mut rows {
@@ -1632,11 +1635,14 @@ impl<'a> Engine<'a> {
                     })
                 }
                 "database_files" => {
-                    let rows = vec![
+                    let mut rows = vec![
                         vec![Value::Int(1), sv(&dbname), sv(&format!("{}.mdf", dbname)), sv("ROWS"), sv("ONLINE"), Value::Int(128), Value::Int(-1), Value::Int(0), Value::Int(0), Value::Int(1), Value::Int(0), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Null],
                         vec![Value::Int(2), sv(&format!("{}_mod", dbname)), sv(&format!("{}_mod", dbname)), sv("FILESTREAM"), sv("ONLINE"), Value::Int(0), Value::Int(-1), Value::Int(0), Value::Int(2), Value::Int(2), Value::Int(0), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Null],
                         vec![Value::Int(3), sv(&format!("{}_log", dbname)), sv(&format!("{}.ldf", dbname)), sv("LOG"), sv("ONLINE"), Value::Int(128), Value::Int(-1), Value::Int(0), Value::Int(1), Value::Int(0), Value::Int(0), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Bit(false), Value::Null],
                     ];
+                    if !memory_optimized() {
+                        rows.remove(1);
+                    }
                     Some(rs(
                         &[("file_id", DataType::Int), ("name", nv()), ("physical_name", nv()), ("type_desc", nv()), ("state_desc", nv()), ("size", DataType::Int), ("max_size", DataType::Int), ("growth", DataType::Int), ("type", DataType::TinyInt), ("data_space_id", DataType::Int), ("state", DataType::TinyInt), ("is_media_read_only", DataType::Bit), ("is_read_only", DataType::Bit), ("is_sparse", DataType::Bit), ("is_percent_growth", DataType::Bit), ("is_name_reserved", DataType::Bit), ("drop_lsn", DataType::Decimal(25, 0))],
                         rows,

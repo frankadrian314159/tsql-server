@@ -688,13 +688,9 @@ impl<'a> Engine<'a> {
                 touched.push(rid);
             }
             d.push_versions(std::mem::take(&mut items), stamp);
-            let need_inserted = t.triggers.iter().any(|g| !g.disabled && !g.instead && g.events.iter().any(|e| e == "INSERT"));
             for row in &ch.inserts {
                 let rid = d.alloc();
                 items.push((rid, Some(row.clone())));
-                if need_inserted {
-                    applied.inserted.push(row.clone());
-                }
                 touched.push(rid);
             }
             d.push_versions(items, stamp);
@@ -730,6 +726,8 @@ impl<'a> Engine<'a> {
                 self.check_key_ranges(t, &images)?;
             }
         }
+        // OUTPUT, triggers and the cluster read the new rows; they are moved, not copied
+        applied.inserted = ch.inserts;
         Ok(applied)
     }
 
